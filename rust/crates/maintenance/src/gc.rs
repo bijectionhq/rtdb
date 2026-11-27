@@ -55,6 +55,12 @@ pub trait CollectionObserver: Send + Sync {
     fn table_failed(&self, table: Option<&TableRef>, error: &Anomaly);
     /// The time taken to delete one collected trie's files, as XTDB's `xtdb.gc.tries.delete.timer`.
     fn trie_deleted(&self, _elapsed: Duration) {}
+    /// The time taken to delete one collected block file, as XTDB's `xtdb.gc.block_files.delete.timer`.
+    fn block_file_deleted(&self, _elapsed: Duration) {}
+    /// The time taken to delete one collected table block file, as XTDB's `xtdb.gc.table_block_files.delete.timer`.
+    fn table_block_file_deleted(&self, _elapsed: Duration) {}
+    /// The time taken to delete one collected offloaded payload, as XTDB's `xtdb.gc.offloaded_payloads.delete.timer`.
+    fn offloaded_payload_deleted(&self, _elapsed: Duration) {}
 }
 
 pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> bool {
@@ -629,7 +635,8 @@ impl BlockCollector {
     }
 
     async fn sweep(&self, prefix: &str, block_index: fn(&str) -> Option<BlockIndex>, latest: BlockIndex,
-        cancellation: &CancellationToken, deletes: &Semaphore) -> Result<()> {
+        cancellation: &CancellationToken, deletes: &Semaphore,
+        on_deleted: fn(&dyn CollectionObserver, Duration)) -> Result<()> {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let prefix = ObjectKey::new(prefix).map_err(crate::invalid)?;
         let objects = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?;
@@ -639,7 +646,10 @@ impl BlockCollector {
         let results = stream::iter(objects).map(|object| async move {
             let _permit = deletes.acquire().await.map_err(crate::invalid)?;
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            self.store.collect_recovery_file(&object.key).await
+            let started = std::time::Instant::now();
+            self.store.collect_recovery_file(&object.key).await?;
+            on_deleted(self.observer.as_ref(), started.elapsed());
+            Ok(())
         }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<Result<()>>>().await;
         for result in results { result?; }
         Ok(())
@@ -654,12 +664,12 @@ impl CycleWorker for BlockCollector {
         let Some(latest) = snapshot.table_catalog().block_index() else { return Ok(()); };
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
         let catalog_block = |key: &str| block_index_from_key(key).ok();
-        if let Err(error) = self.sweep("blocks", catalog_block, latest, cancellation, &deletes).await {
+        if let Err(error) = self.sweep("blocks", catalog_block, latest, cancellation, &deletes, CollectionObserver::block_file_deleted).await {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
         }
         if self.store.queues_offloaded_payload_reclamation()
-            && let Err(error) = self.sweep("oversized", oversized_block_index, latest, cancellation, &deletes).await
+            && let Err(error) = self.sweep("oversized", oversized_block_index, latest, cancellation, &deletes, CollectionObserver::offloaded_payload_deleted).await
         {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
@@ -668,7 +678,7 @@ impl CycleWorker for BlockCollector {
         stream::iter(entries).map(|entry| {
             let deletes = Arc::clone(&deletes);
             async move {
-            if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), catalog_block, latest, cancellation, &deletes).await
+            if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), catalog_block, latest, cancellation, &deletes, CollectionObserver::table_block_file_deleted).await
                     && !cancellation.is_cancelled() {
                     self.observer.table_failed(Some(&entry.table), &error);
                 }

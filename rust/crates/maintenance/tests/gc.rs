@@ -1161,3 +1161,47 @@ async fn term_directory_pages_are_released_on_the_window_of_their_retired_root_a
     assert!(state.value().trie_catalog().retired_term_directories(&table).next().is_none());
     assert!(observer.0.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn block_gc_times_block_table_block_and_offloaded_payload_deletes() {
+    #[derive(Default)]
+    struct CountingObserver {
+        failures: Mutex<Vec<Anomaly>>,
+        block_files: std::sync::atomic::AtomicUsize,
+        table_block_files: std::sync::atomic::AtomicUsize,
+        offloaded_payloads: std::sync::atomic::AtomicUsize,
+    }
+    impl CollectionObserver for CountingObserver {
+        fn table_failed(&self, _: Option<&TableRef>, error: &Anomaly) { self.failures.lock().unwrap().push(error.clone()); }
+        fn block_file_deleted(&self, _: std::time::Duration) { self.block_files.fetch_add(1, Ordering::Relaxed); }
+        fn table_block_file_deleted(&self, _: std::time::Duration) { self.table_block_files.fetch_add(1, Ordering::Relaxed); }
+        fn offloaded_payload_deleted(&self, _: std::time::Duration) { self.offloaded_payloads.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    let store = Arc::new(ObservedStore {
+        inner: Arc::new(MemoryStore::default()),
+        versions: BTreeMap::new(),
+        queued_payloads: Some(Mutex::default()),
+    });
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::load(Some(block(10)), &BTreeMap::new()).unwrap()
+        .with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let slug = tables.entry(&table).unwrap().slug.clone();
+    for index in [6, 7, 10] {
+        let key = block_key(BlockIndex(index)).unwrap();
+        store.put(&ObjectKey::new(key.clone()).unwrap(), Bytes::from(block(index).encode())).await.unwrap();
+        store.put(&ObjectKey::new(format!("{}/{}", slug.table_prefix(), key)).unwrap(), Bytes::from_static(b"tb")).await.unwrap();
+    }
+    store.put(&ObjectKey::new(oversized_key(BlockIndex(7), "old").unwrap()).unwrap(), Bytes::from_static(b"payload")).await.unwrap();
+    store.put(&ObjectKey::new(oversized_key(BlockIndex(8), "young").unwrap()).unwrap(), Bytes::from_static(b"payload")).await.unwrap();
+
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let observer = Arc::new(CountingObserver::default());
+    let collector = BlockCollector::new(store, state, observer.clone(), GarbageConfig { blocks_to_keep: 3, ..Default::default() }).unwrap();
+    collector.collect(&CancellationToken::new()).await.unwrap();
+
+    assert!(observer.failures.lock().unwrap().is_empty());
+    assert_eq!(observer.block_files.load(Ordering::Relaxed), 2);
+    assert_eq!(observer.table_block_files.load(Ordering::Relaxed), 2);
+    assert_eq!(observer.offloaded_payloads.load(Ordering::Relaxed), 1);
+}
