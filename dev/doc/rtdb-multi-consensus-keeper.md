@@ -518,9 +518,12 @@ If the slot offer commits and its reply is lost before receipt binding, a retry 
 RTDB's original issuer must recover the exact same booking by request identity in that case.
 Bijection's managed RTDB placement issuer mints version 6 writer-fence and version 7 first-placement provisioning grants. [Placement grant roles](https://github.com/bijectionhq/bijection/blob/56843bdd7c095fd209c3ea74e03b95eaa146b140/crates/cell_catalog/src/catalog/managed_workload.rs#L251-L285)
 Managed funded appointments require an enrolled issuer for the version 2 funded-appointment grant. [Funded appointment contract](rtdb-v1.allium)
+Bijection removed its managed v2 appointment credential wiring during the scoped v1 cutover. [Bijection cutover](https://github.com/bijectionhq/bijection/commit/64db580bd422d32cd93249f150cc288858dabeec)
+Its current Native Root path orders inbox slots in the Kernel's `_sys_slots`. Commission RTDB recovery against the provider that durably owns the booking inventory for the RTDB scope. [Native Root clock](https://github.com/bijectionhq/bijection/blob/29b7c79c889a6566807cb9469789f5a483432e58/crates/store_flight/src/owned_flight/engine_clocks.rs#L15-L17)
 
 A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
 Drive the same recovery through lost replies and process restart, prove the selected versions and keys stay usable with the verifier offline, and verify that supersession or publication settles only the selected operation's hold.
+The Object Lock qualification reconciles a signed funded refusal through the broker, exports it from the read-only predecessor, and checks the receipt after successor activation and checkpoint replacement.
 Exercise derivative staging and funded dispatch across that same handoff only after enrolling their effect authorities.
 
 ## Batches, placement, funded appends and journal size

@@ -17,7 +17,7 @@ use crate::multi::activation::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(in crate::multi::activation) mod tests;
 
 const BOOKINGS_PER_PAGE: u64 = 32;
 

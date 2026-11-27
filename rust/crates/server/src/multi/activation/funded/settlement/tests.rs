@@ -17,6 +17,61 @@ use crate::multi::activation::{
 
 mod issuer;
 
+#[cfg(all(unix, feature = "backup-object-holds"))]
+pub(in crate::multi) struct BookedRefusal {
+    issuer: issuer::OriginalIssuer,
+    pub key: Vec<u8>,
+    pub booking: Uuid,
+    pub scope_sha256: [u8; 32],
+}
+
+#[cfg(all(unix, feature = "backup-object-holds"))]
+impl BookedRefusal {
+    pub async fn commission(authority: &ActivationAuthority, database: &'static str, predecessor: Binding) -> Self {
+        let issuer = Ed25519KeyPair::from_seed_unchecked(&[60; 32]).unwrap();
+        let enrollment = Enrollment {
+            issuer: Uuid::new_v4(),
+            receiver_certificate_sha256: [4; 32],
+            verification_key: issuer.public_key().as_ref().try_into().unwrap(),
+        };
+        let scope = authority.commission_funded(database, predecessor, enrollment, None).await.unwrap();
+        let key = vec![61; 32];
+        let booking = Uuid::new_v4();
+        let mut resolution = Resolution {
+            scope_sha256: scope.scope_sha256,
+            index: 1,
+            booking: Booking {
+                id: booking,
+                receipt: ReceiptKey { namespace: None, key: key.clone() },
+                owner: [62; 32],
+                predecessor: Basis::new(*predecessor.incarnation.as_bytes(), 0),
+                intent_sha256: [63; 32],
+                kind: Kind::Transaction,
+                authorizations: Vec::new(),
+            },
+            disposition: Disposition::Refused,
+            stages: Vec::new(),
+            issuer_signature: Vec::new(),
+        };
+        let mut closure = Closure {
+            scope_sha256: scope.scope_sha256,
+            bookings: 1,
+            inventory_sha256: next_prefix([0; 32], &resolution.booking),
+            signature: Vec::new(),
+        };
+        closure.signature = issuer.sign(&closure.statement()).as_ref().to_vec();
+        resolution.issuer_signature = issuer.sign(&resolution.statement(&closure, closure.inventory_sha256)).as_ref().to_vec();
+        let issuer = issuer::OriginalIssuer::start(
+            enrollment, authority.identity(), database, predecessor, closure, vec![resolution],
+            serde_json::Value::Null, issuer::ReplyBehavior::Exact,
+        ).await;
+        Self { issuer, key, booking, scope_sha256: scope.scope_sha256 }
+    }
+
+    pub fn broker_profile(&self) -> &serde_json::Value { &self.issuer.profile }
+    pub fn requests(&self) -> usize { self.issuer.requests() }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_seal() {
     const PRINCIPAL: &str = "urn:logkeeper:client:funded-reconciliation";
@@ -180,6 +235,7 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
         enrollment, identity, DATABASE, predecessor, closure.clone(),
         resolutions.iter().map(|(_, resolution)| resolution.clone()).collect(),
         serde_json::json!({ "writer_epoch": original.epoch.0 + 1, "sealed_head": original.at }),
+        issuer::ReplyBehavior::LoseAndSubstitute,
     ).await;
     let providers = &original_issuer.providers;
     assert!(providers.reconcile(&authority, DATABASE, predecessor, 0).await.is_err());

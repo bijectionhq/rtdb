@@ -24,6 +24,13 @@ pub(super) struct OriginalIssuer {
     task: JoinHandle<()>,
     requests: Arc<AtomicUsize>,
     pub(super) providers: Providers,
+    pub(super) profile: Value,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplyBehavior {
+    Exact,
+    LoseAndSubstitute,
 }
 
 impl OriginalIssuer {
@@ -35,6 +42,7 @@ impl OriginalIssuer {
         closure: Closure,
         resolutions: Vec<Resolution>,
         expected_fence: Value,
+        replies: ReplyBehavior,
     ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let mut ca_profile = CertificateParams::default();
@@ -56,10 +64,15 @@ impl OriginalIssuer {
         fs::write(&ca_file, ca.pem()).unwrap();
         fs::write(&certificate_file, client.pem()).unwrap();
         fs::write(&key_file, client_key.serialize_pem()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let pin: [u8; 32] = Sha256::digest(server.der()).into();
-        let settings: Settings = serde_json::from_value(json!([{
+        let profile = json!({
             "enrollment": enrollment,
             "connection": {
                 "endpoint": format!("https://{}", listener.local_addr().unwrap()),
@@ -68,8 +81,8 @@ impl OriginalIssuer {
                 "client_private_key_file": key_file,
                 "server_certificate_sha256": pin,
             },
-        }]))
-        .unwrap();
+        });
+        let settings: Settings = serde_json::from_value(json!([profile])).unwrap();
         let providers = settings
             .connect(|path| Ok(fs::File::open(path).unwrap()))
             .unwrap();
@@ -121,7 +134,9 @@ impl OriginalIssuer {
                         let call = requests_seen.fetch_add(1, Ordering::Relaxed);
                         let action = &decoded["action"];
                         let result = match action["kind"].as_str() {
-                            Some("close") if call == 0 => {
+                            Some("close")
+                                if call == 0 && replies == ReplyBehavior::LoseAndSubstitute =>
+                            {
                                 return Err(io::Error::other("lost closure reply"));
                             }
                             Some("close") => json!(closure),
@@ -132,9 +147,13 @@ impl OriginalIssuer {
                                     json!(closure.inventory_sha256)
                                 );
                                 assert_eq!(action["source_fence"], expected_fence);
-                                match call {
-                                    2 => return Err(io::Error::other("lost resolution reply")),
-                                    3 => json!(outcomes[index as usize]),
+                                match (replies, call) {
+                                    (ReplyBehavior::LoseAndSubstitute, 2) => {
+                                        return Err(io::Error::other("lost resolution reply"));
+                                    }
+                                    (ReplyBehavior::LoseAndSubstitute, 3) => {
+                                        json!(outcomes[index as usize])
+                                    }
                                     _ => json!(outcomes[index as usize - 1]),
                                 }
                             }
@@ -159,6 +178,7 @@ impl OriginalIssuer {
             task,
             requests,
             providers,
+            profile,
         }
     }
 

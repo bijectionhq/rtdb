@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 mod clock;
 mod funded;
+#[cfg(all(test, unix, feature = "backup-object-holds"))]
+pub(super) use funded::settlement::tests::BookedRefusal;
 mod history;
 pub(super) mod journal_custody;
 pub(crate) mod operator;
