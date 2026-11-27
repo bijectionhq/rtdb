@@ -67,7 +67,8 @@ impl AsRef<[u8]> for HeldFile {
 
 impl MultiDatabase {
     pub fn has_ranked_work(&self) -> bool {
-        self.authority().is_ok()
+        !self.activation_required()
+            && self.authority().is_ok()
             && self
                 .committed
                 .as_ref()
@@ -75,6 +76,9 @@ impl MultiDatabase {
     }
 
     pub fn ranked_build(&self) -> Result<Option<RankedBuild>> {
+        if self.activation_required() {
+            return Ok(None);
+        }
         let lease = self.authority()?;
         let state = self.state();
         let index = state.transactions.index();
@@ -97,6 +101,12 @@ impl MultiDatabase {
         files: Vec<Bytes>,
         memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
+        if self.activation_required() {
+            return Err(Anomaly::unsupported(
+                "rtdb/activation-effects",
+                "Ranked catalogue publication requires an effect provider commissioned for database activation",
+            ));
+        }
         self.refresh().await?;
         let lease = self.authority()?;
         self.require_armed_rotation()?;

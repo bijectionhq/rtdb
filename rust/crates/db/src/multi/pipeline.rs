@@ -773,11 +773,12 @@ pub(super) enum Planned {
 
 impl MultiDatabase {
     pub fn supports_funded_transact(&self) -> bool {
-        self.authority().is_ok() && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some()
+        !self.activation_required() && self.authority().is_ok()
+            && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some()
     }
 
     pub fn supports_funded_appointment(&self) -> bool {
-        self.authority().is_ok()
+        !self.activation_required() && self.authority().is_ok()
             && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some_and(|limit| limit > 1024)
     }
 
@@ -809,6 +810,12 @@ impl MultiDatabase {
         command: rtdb_tx::transact::FundingCommand, clock: &dyn rtdb_tx::DecisionClock,
         managed: Option<&workload::ManagedAppointment>,
     ) -> Result<Receipt> {
+        if self.activation_required() {
+            return Err(Anomaly::unsupported(
+                "rtdb/activation-effects",
+                "Funded dispatch requires an effect provider commissioned for database activation",
+            ));
+        }
         self.refresh().await?;
         self.require_active()?;
         if command.is_appointment() && !self.supports_funded_appointment() {

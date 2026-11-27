@@ -136,6 +136,8 @@ The operator process owns the activation journal's writer credential and the run
 The runtime gates client operations, peer writes, journal mutations, and retained result delivery on the incarnation's grant.
 Transactions with an external custody or erasure effect, funded dispatch, and the existing local catalog's create, erase and checkpoint-transfer operations return an explicit refusal in activation mode.
 Those capabilities require separately commissioned effect fences before they can serve an activated database name.
+Funded dispatch checks this fence before contacting the receiver clock, even when the application journal supports timed originals.
+Ranked catalogue maintenance skips staging and publication for a commissioned incarnation until derivative custody is commissioned.
 
 On installed Multi nodes, `RTDB_ACTIVATION_JOURNAL_URL` selects the independent immutable consensus authority and `RTDB_ACTIVATION_AUTHORITY_ID` identifies it.
 Installed activation requires `multiJournal: {immutableStreams: true}` for the application journal.

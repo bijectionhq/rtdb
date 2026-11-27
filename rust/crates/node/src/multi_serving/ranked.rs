@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::{MultiServing, QuerySource, QueryView, interrupted};
+use super::{MultiServing, QuerySource, QueryView, ServingAccess, interrupted};
 use crate::serving::ranked_ivf::{self, Catalog, Target};
 
 const PUBLISH_INTERVAL: Duration = Duration::from_secs(5);
@@ -127,6 +127,9 @@ impl MultiServing {
     }
 
     pub async fn maintain_ranked_catalog(&self, cancellation: &CancellationToken) -> Result<()> {
+        if !matches!(self.access, ServingAccess::Unscoped) {
+            return Ok(());
+        }
         {
             let mut schedule = self.ranked_schedule.lock().await;
             let now = Instant::now();

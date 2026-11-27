@@ -5,7 +5,7 @@ use journal_contract::Journal;
 use rtdb_crypt::FileKms;
 use rtdb_db::{ActivationScope, MultiDatabase, MultiOptions, PortableBackup, Role};
 use rtdb_node::{Clock, MultiServing, SystemClock, serving::ServingDriver};
-use rtdb_storage::MemoryStore;
+use rtdb_storage::{MemoryStore, ObjectStore};
 use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
 use rtdb_types::{EntityId, StructFields, TableRef, Value, rtdb_v1::MAIN_BRANCH};
 use std::{
@@ -130,6 +130,14 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     assert!(matches!(source.tick(&live).await.unwrap(), Role::Writer(_)));
     let committed = source.transact_local(transaction(1), None).await.unwrap();
     assert_eq!(committed.outcome, Outcome::Then);
+    let stream = journal_contract::StreamId(predecessor_id.as_u128());
+    let head = source_journal.head(stream).await.unwrap();
+    let objects = source_store.list(None).await.unwrap().len();
+    assert!(source.maintenance_schedule().await.ranked_due.is_none());
+    source.maintain_ranked_catalog(&CancellationToken::new()).await.unwrap();
+    assert!(source.maintenance_schedule().await.ranked_cooldown.is_none());
+    assert_eq!(source_journal.head(stream).await.unwrap(), head);
+    assert_eq!(source_store.list(None).await.unwrap().len(), objects);
     let archive = source.portable_backup().await.unwrap().into_bytes();
 
     drop(source);

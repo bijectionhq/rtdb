@@ -1084,6 +1084,10 @@ contract FencedStreamWriter {
         -- The terminal slot precedes every later append.
         -- Refuse returns the unsent suffix for redecision against the refused state.
 
+    @invariant ActivationEffectAdmission
+        -- A commissioned incarnation requires funded effect authority before contacting the receiver clock for a funded command.
+        -- A commissioned incarnation requires derivative custody authority before staging or publishing a ranked catalogue.
+
     @invariant SpeculativeWriteSuffix
         -- The writer resolves ordinary requests in order against a private overlay of its durable prefix and staged writes.
         -- An ordinary transaction has one journal append.

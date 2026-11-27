@@ -2483,6 +2483,51 @@ mod tests {
         // Without keeper trust a consensus journal has no timed capacity.
         let plain = keepers.journal(PRINCIPAL, &keepers.journal_config(1 << 20, 4096)).unwrap();
         assert_eq!(ConsensusJournalBatch(Arc::new(plain)).maximum_timed_original_bytes(), None);
+
+        let mut authority_keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+        let control = authority_keepers.journal(PRINCIPAL, &authority_keepers.journal_config(1 << 20, 4096)).unwrap();
+        control.finalize_version(stream_logkeeper::stream::consensus::CLUSTER_VERSION_CURRENT).await.unwrap();
+        let activation = ActivationAuthority::new(Arc::new(control), Uuid::new_v4()).unwrap();
+        let incarnation = Uuid::new_v4();
+        activation.bootstrap("xtdb", incarnation).await.unwrap();
+        let node = Ipv4Addr::LOCALHOST.into();
+        let mut database = MultiDatabase::new(
+            MultiOptions { database: incarnation, node, lease_micros: 60_000_000, drift_micros: 0 },
+            journal.clone(),
+            Arc::new(rtdb_storage::MemoryStore::default()),
+            Arc::new(rtdb_crypt::LocalKms::new(|| SystemClock.now().0)),
+            Arc::new(|| SystemClock.now()),
+        ).unwrap().with_batch_appender(Arc::new(batch));
+        database.create().await.unwrap();
+        assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        assert!(database.supports_funded_transact());
+        assert!(database.supports_funded_appointment());
+        let database = database.with_serving_authority(activation.serving_authority("xtdb", incarnation).unwrap());
+        assert!(!database.supports_funded_transact());
+        assert!(!database.supports_funded_appointment());
+
+        struct UncalledClock;
+        #[async_trait::async_trait]
+        impl rtdb_tx::DecisionClock for UncalledClock {
+            async fn observe(&self) -> Result<rtdb_tx::DecisionObservation> { unreachable!() }
+            fn supports_funded_offers(&self) -> bool { unreachable!() }
+        }
+        let request = Transact {
+            key: vec![1; 16], require: vec![], window: Default::default(),
+            guards: vec![], requires: vec![], ops: vec![], otherwise: vec![],
+            custody_request_digest: None, request_memory: None,
+        };
+        let stream = database.journal_stream();
+        let head = journal.head(stream).await.unwrap();
+        let pipeline = rtdb_db::WritePipeline::start(Arc::new(tokio::sync::Mutex::new(database)));
+        let error = pipeline.transact_funded(
+            request, None, [2; 32], rtdb_tx::transact::FundingCommand::Consume { booking: [3; 16] },
+            Arc::new(UncalledClock),
+        ).await.unwrap_err();
+        assert_eq!(error.code, "rtdb/activation-effects");
+        assert_eq!(journal.head(stream).await.unwrap(), head);
+        drop(pipeline);
+        authority_keepers.shutdown().await.unwrap();
         keepers.shutdown().await.unwrap();
     }
 
