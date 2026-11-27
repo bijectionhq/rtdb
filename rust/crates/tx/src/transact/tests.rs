@@ -178,7 +178,7 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
         levels: level,
         mode: DeriveMode::Replace { interval: DeriveInterval::from_stamp(i64::MAX), entries: vec![marker(&idx_b)] },
     };
-    let d_purge = Derive { manifest_prefix: manifest_prefix.clone(), levels: Vec::new(), mode: DeriveMode::Purge };
+    let d_purge = Derive { manifest_prefix: manifest_prefix.clone(), levels: Vec::new(), mode: DeriveMode::Purge { bases: Vec::new() } };
 
     // 1. Enter idx_a.
     let c1 = plan(&state, &make(1, 0, Vec::new(), d_a.clone()), 1, 100, DEFAULT);
@@ -260,7 +260,7 @@ fn a_store_derive_claim_is_judged_on_its_filled_key_at_ordering() {
 }
 
 #[test]
-fn a_store_derive_close_retracts_a_claim_at_ordering() {
+fn a_store_derive_close_removes_a_claim_at_ordering() {
     use rtdb_index::branches::store::store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind};
     let mut state = TransactState::new(INCARNATION);
     let place = |family: u8, inner: &[u8]| {
@@ -299,13 +299,28 @@ fn a_store_derive_close_retracts_a_claim_at_ordering() {
     assert_eq!(apply(&mut state, 1, first.record()).unwrap().outcome, Outcome::Then);
     let refused = plan(&state, &make(2, claim(b"row2\x04")), 2, 200, DEFAULT);
     assert!(matches!(apply(&mut state, 2, refused.record()).unwrap().outcome, Outcome::Refused { .. }), "a second claimant is refused");
-    // Bijection aggregates-close: the first row's unit closes, and the
-    // resolver retracts its claim at the closing stamp, reading nothing for
-    // the writer, so the value is free from the closure on.
-    let closed = plan(&state, &make(3, derive(b"row1\x04", DeriveMode::Close)), 3, 300, DEFAULT);
+    // Bijection aggregates-close-2: the first row's unit closes, and the
+    // resolver deletes its claim's records at every stamp, reading nothing
+    // for the writer, so the value is free at every cut.
+    let closed = plan(&state, &make(3, derive(b"row1\x04", DeriveMode::Close { bases: Vec::new() })), 3, 300, DEFAULT);
     assert_eq!(apply(&mut state, 3, closed.record()).unwrap().outcome, Outcome::Then);
+    let read = rtdb_index::branches::store::StoreRead {
+        range: KeyRange { start: value.clone(), end: Some([value.as_slice(), &[0xff]].concat()) },
+        after: None,
+        limit: 16,
+        projection: rtdb_index::branches::store::Projection::Keys,
+        filter: None,
+        reverse: false,
+    };
+    assert!(state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(300)).unwrap().store_page(&read).unwrap().entries.is_empty(), "no record of the closed claim remains, at any stamp");
     let again = plan(&state, &make(4, claim(b"row2\x04")), 4, 400, DEFAULT);
     assert_eq!(apply(&mut state, 4, again.record()).unwrap().outcome, Outcome::Then, "the closed row's claim no longer counts");
+    // A closed line takes no further write: the first row's claim is not
+    // rebuilt, so the value's only record is the second row's.
+    let rewritten = plan(&state, &make(5, claim(b"row1\x04")), 5, 500, DEFAULT);
+    assert_eq!(apply(&mut state, 5, rewritten.record()).unwrap().outcome, Outcome::Then);
+    let records = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(500)).unwrap().store_page(&read).unwrap().entries;
+    assert_eq!(records.len(), 1, "the closed row wrote nothing: {records:?}");
 }
 
 #[test]

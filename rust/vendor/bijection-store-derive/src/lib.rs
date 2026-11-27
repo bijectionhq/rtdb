@@ -62,31 +62,36 @@
 //!
 //! A row's line also keeps the exact inventory of every key it ever
 //! emitted (each manifest version's `written_keys`): markers, singles,
-//! statistics deltas and unretained edged records, and the entries a path
-//! backfill wrote for its history ([`backfill`]). Erasure purges that whole
-//! history ([`purge`], erase-derive): every one of those keys is deleted at
-//! every stamp it was written, so no read at any cut, before the erasure or
-//! after it, counts or reveals the erased row through a derived key. Only an
-//! `Edged { retain: true }` contribution (`onErase: "retain"`) survives. A
-//! compaction base that already folded some of those keys in is re-derived
-//! without them by the engine in the same commit
-//! (`owned_relations::owned::OwnedStore::rebase_without`), from the line as
-//! of the base's cut ([`line_through`]).
+//! statistics and presence deltas, claims and unretained edged records,
+//! and the entries a path backfill wrote for its history ([`backfill`]).
 //!
-//! A unit's closure stops its rows counting before any purge ([`close`],
-//! aggregates-close): the closing commit names each closed row's line
-//! blindly, and the store, at ordering, writes at the closing stamp the
-//! negation of every counted contribution the line holds (unretained edged
-//! records, claims, statistics and presence deltas). The eraser reads
-//! nothing and no hold decides it, so every aggregate, count and claim
-//! changes at closure, the same whether a hold keeps the row or not. The
-//! retractions join the line's inventory, so the destruction's purge,
-//! whenever holds let it run, deletes them with the rest and changes no
-//! read at or after the closure.
+//! A unit's closure removes that whole derived history at every cut
+//! ([`close`], aggregates-close-2). The closing commit names each closed
+//! row's line blindly, with the compaction bases of the row's counted paths
+//! ([`CountedBase`], from the catalog alone). The store, at ordering,
+//! deletes every key of the inventory at every stamp it was written, and
+//! re-derives each base that folded some of them in without them, from the
+//! line as of the base's cut ([`line_through`]): it reads the bases, the
+//! floors and the row's records itself, so the eraser reads nothing. No
+//! read at any cut, before the closure or after it, counts or finds the
+//! closed row through a derived key (an index posting, a statistic, a
+//! presence count, a claim or an aggregate), and no hold decides any of it.
+//! Only an `Edged { retain: true }` contribution (`onErase: "retain"`)
+//! survives. The line's versions stay with the row's events, which holds
+//! keep, as its closed bookkeeping ([`Manifest::closed`]), and a closed
+//! line takes no further write, so nothing (a path installed later, a
+//! replay) rebuilds a contribution of it.
 //!
-//! The function is pure, total and deterministic: [`apply`], [`close`] and
-//! [`purge`] return a result for every input, and a malformed derive is a request error
-//! [`check`] decides before ordering. Every emitted key lies at the
+//! An erasure ([`purge`], `Erase`, `Expire`) runs the same removal and
+//! deletes the line's versions too. On a closed line it finds no derived
+//! key left and deletes only those versions, so a unit's destruction, which
+//! holds time, changes no derived read at any cut.
+//!
+//! [`apply`] and [`backfill`] are pure, total and deterministic, and a
+//! malformed derive is a request error [`check`] decides before ordering.
+//! [`close`] and [`purge`] read only through the store's lookup, at the
+//! ordering point, and refuse only a stored record that does not match its
+//! path's lanes (a corrupt store). Every emitted key lies at the
 //! manifest's own `(partition, world)` (P10, `emission_confined`), and
 //! [`apply`] judges nothing: its outcome never depends on a manifest (P8).
 //! The claim judgment ([`claims`], [`claim_levels`], [`claim_record`],
@@ -313,6 +318,53 @@ pub struct DeriveLevel {
     pub through: Option<[u8; STAMP_BYTES]>,
 }
 
+/// How one lane of a counted value combines. A compaction base is the
+/// lane-wise sum of the records it folded, so the store re-derives it
+/// without a row by subtracting, lane by lane, what the row folded in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
+pub enum Lane {
+    /// A big-endian two's-complement integer of this many bytes (1 to 16),
+    /// summed exactly: an overflow of its width is a corrupt store.
+    Sum(u8),
+    /// This many bytes every value of the path holds alike (a tally's
+    /// measure count), kept as they are.
+    Same(u8),
+}
+
+/// Where a counted path's compaction keeps its bases at a place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
+pub enum BaseLayout {
+    /// One base per group identity and edge (an aggregate path,
+    /// `store_read::tally::compaction`): `identity ‖ ordered(edge) ‖ through
+    /// ‖ 0⁸` (ordinal 0, which no derive emits), where `through` is the
+    /// path's floor, the stamp stored at `floor`. An edge whose merge was
+    /// zero keeps no base, and a record compaction skipped (its merge would
+    /// leave the exact bound) stays beside the edge's base.
+    Edged { floor: Vec<u8> },
+    /// One base per path, the newest key under `prefix`: `prefix ‖
+    /// through` (a counted search path's statistics, a presence path's
+    /// count). It folded every delta stamped at or below `through`.
+    Latest { prefix: Vec<u8> },
+}
+
+/// A counted path's compaction at the row's place, named blindly by the
+/// writer from the catalog (it reads nothing): what [`close`] and [`purge`]
+/// rebase at ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_keep_ghost, verifier::external_derive)]
+pub struct CountedBase {
+    /// The path's record identity: for [`BaseLayout::Edged`], the prefix
+    /// every group identity starts with (its `Edged { retain: false }`
+    /// segments'); for [`BaseLayout::Latest`], the one delta identity (its
+    /// live `Boundary` and `Present` segments').
+    pub records: Vec<u8>,
+    /// The layout of every value of the path, its records' and its bases'.
+    pub lanes: Vec<Lane>,
+    pub layout: BaseLayout,
+}
+
 /// What a [`Derive`] write does to the row's derived line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(verus_keep_ghost, verifier::external_derive)]
@@ -323,29 +375,24 @@ pub enum DeriveMode {
         interval: DeriveInterval,
         entries: Vec<DeriveEntry>,
     },
-    /// Purge (`Erase`, `Expire`): delete every key the row's line ever
-    /// emitted, recorded across all manifest versions (markers, singles,
-    /// statistics deltas and unretained edged records, at every stamp), and
-    /// delete the manifests. Nothing is retracted at the purge's stamp: the
-    /// row's whole derived history goes, so a read at any cut sums and finds
-    /// exactly what it would had the row never been written (erase-derive).
-    Purge,
+    /// Purge (`Erase`, `Expire`): remove the row's whole derived history at
+    /// every cut, rebasing `bases` ([`purge`]), and delete every manifest
+    /// version. Nothing is retracted at the purge's stamp, so a read at any
+    /// cut sums and finds exactly what it would had the row never been
+    /// written (erase-derive). On a closed line only the versions go.
+    Purge { bases: Vec<CountedBase> },
     /// A path backfill of the row's history (`install_path` over rows held
     /// before the path existed): write each entry as given (its key already
     /// names the stored precedence of the event it indexes) and add every
     /// one to the line's inventory, so a purge deletes them with the rest.
     /// The line's segments are unchanged (erase-derive).
     Backfill { writes: Vec<(Vec<u8>, Vec<u8>)> },
-    /// Close (a unit's closure, aggregates-close): from the append's stamp
-    /// on, the row's line counts nothing. The store retracts, at the stamp,
-    /// every live counted contribution of the line ([`close`]): each
-    /// unretained `Edged` and `Claim` segment's records, and each live
-    /// `Boundary` and `Present` delta. The retractions join the line's
-    /// inventory, so a later [`purge`] deletes them with the rest; the line
-    /// keeps its markers, singles and retained records. The writer reads
-    /// nothing: the store computes the compensation from the line at
-    /// ordering, whatever compaction folded before.
-    Close,
+    /// Close (a unit's closure, aggregates-close-2): remove the row's whole
+    /// derived history at every cut, rebasing `bases`, exactly as a purge
+    /// does, and keep the line's versions with a closed one on top
+    /// ([`close`]). The writer reads nothing: the store reads the line, the
+    /// bases and the row's records at ordering.
+    Close { bases: Vec<CountedBase> },
 }
 
 /// One derived write of a store append (`fact_store::persistence::Derive`).
@@ -384,17 +431,24 @@ pub struct Manifest {
     /// segment reaches it (a `Present` entry while any segment holds it).
     pub horizon: i64,
     /// Every concrete key this step emitted: `Marker` enters and leaves,
-    /// `Single` keys, `Boundary` and `Present` deltas and unretained `Edged` records (the
-    /// exact inventory `Purge` deletes across history, so no erased value or
-    /// contribution survives in any index, statistic or aggregate at any
-    /// cut). Retained `Edged` records are never listed: they outlive erasure.
+    /// `Single` keys, `Boundary` and `Present` deltas, claims and unretained
+    /// `Edged` records (the exact inventory a close or a purge deletes
+    /// across history, so no closed or erased value or contribution survives
+    /// in any index, statistic, count, claim or aggregate at any cut).
+    /// Retained `Edged` records are never listed: they outlive erasure.
     pub written_keys: Vec<Vec<u8>>,
+    /// Whether a unit's closure removed the line's derived history
+    /// ([`close`], aggregates-close-2). A closed version keeps only the
+    /// line's retained edged segments and lists no key; the store applies
+    /// no further write to a closed line, and the archive replays its
+    /// closure at the closed version's stamp.
+    pub closed: bool,
 }
 
 impl Manifest {
     /// The empty line: no segment, no horizon.
     pub fn empty() -> Self {
-        Self { segments: Vec::new(), horizon: i64::MIN, written_keys: Vec::new() }
+        Self { segments: Vec::new(), horizon: i64::MIN, written_keys: Vec::new(), closed: false }
     }
 }
 
@@ -968,6 +1022,16 @@ pub fn check(derive: &Derive) -> Result<(), DeriveError> {
     {
         return Err(DeriveError::new("A backfilled entry must stay in the manifest's partition and world"));
     }
+    if let DeriveMode::Purge { bases } | DeriveMode::Close { bases } = &derive.mode {
+        for base in bases {
+            if !lanes_valid(&base.lanes) {
+                return Err(DeriveError::new("A counted base names one or more lanes of 1 to 16 bytes"));
+            }
+            if !base_confined(base, &derive.manifest_prefix) {
+                return Err(DeriveError::new("A counted base must stay in the manifest's partition and world"));
+            }
+        }
+    }
     if let DeriveMode::Replace { interval, entries } = &derive.mode {
         // Two bounds of one kind order statically; a fixed bound against an
         // acceptance-relative one resolves at the stamp, and an empty
@@ -1132,9 +1196,11 @@ fn own_line(manifest_prefix: &[u8], target_world: &[u8], previous: &Manifest) ->
 /// into the target world). Pure, total and deterministic: both
 /// `MemoryPersistence` and RTDB's resolver run this exact function.
 ///
-/// A malformed prefix or an empty interval changes nothing. Entries outside
-/// the manifest's place are dropped, so every emitted key is confined (P10)
-/// whatever the input.
+/// A malformed prefix or an empty interval changes nothing, and neither
+/// does a closed line ([`Manifest::closed`]): it takes no further write, so
+/// nothing rebuilds a closed row's contributions (the store then keeps no
+/// new version). Entries outside the manifest's place are dropped, so every
+/// emitted key is confined (P10) whatever the input.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
 pub fn apply(
     manifest_prefix: &[u8],
@@ -1146,11 +1212,11 @@ pub fn apply(
 ) -> Applied {
     let unchanged = || Applied {
         writes: Vec::new(),
-        manifest: Manifest { segments: previous.segments.clone(), horizon: previous.horizon, written_keys: Vec::new() },
+        manifest: Manifest { written_keys: Vec::new(), ..previous.clone() },
         next_ordinal: ordinal,
     };
     let Some((m_partition, m_world_end)) = place_bounds(manifest_prefix) else { return unchanged() };
-    if interval.from >= interval.to {
+    if interval.from >= interval.to || previous.closed {
         return unchanged();
     }
     let mut ordinal = ordinal;
@@ -1329,42 +1395,324 @@ pub fn apply(
 
     Applied {
         writes,
-        manifest: Manifest { segments: next, horizon, written_keys },
+        manifest: Manifest { segments: next, horizon, written_keys, closed: false },
         next_ordinal: ordinal,
     }
 }
 
-/// Apply one `DeriveMode::Purge` step across all manifest versions stored under
-/// `manifest_prefix` (supplied in ascending stamp order, newest last). Total.
+/// Apply one `DeriveMode::Purge` step (an erasure, `Erase` or `Expire`)
+/// across all manifest versions stored under `manifest_prefix` (supplied in
+/// ascending key order, newest last). `lookup` is the one read the store
+/// answers at the ordering point: every live entry of the key range
+/// `[start, end)`, ascending by key, as the append sees the store (the state
+/// it orders after, under the derived writes of the append's earlier
+/// derives).
 ///
-/// Emits a delete of every key any manifest version recorded as written
-/// (markers, singles, statistics deltas, claims and unretained edged records, at
-/// every stamp: the row's whole derived history), and of every manifest key
-/// itself (so a later write finds no line), each once and confined to the
-/// manifest's place. Nothing is retracted at the purge's own stamp: with
-/// every delta and record of the row gone, a read at any cut sums exactly
-/// the other rows' contributions (Lean `purge_is_recount_without`), and no
-/// key anywhere still carries an erased value or contribution. A key a
-/// compaction already folded into a base is gone already; its base is
-/// re-derived by the engine in the same commit ([`line_through`]).
+/// On an open line it removes the row's whole derived history at every cut
+/// ([`close`] says how: each base of `bases` re-derived without the row,
+/// every key of the inventory deleted), then deletes every manifest version
+/// (so a later write finds no line). Nothing is retracted at the purge's
+/// own stamp: a read at any cut sums exactly the other rows' contributions
+/// (Lean `purge_is_recount_without`), and no key anywhere still carries an
+/// erased value or contribution. On a closed line the closure removed all
+/// of that already, so the purge deletes only the versions and changes no
+/// derived read at any cut (Lean `destruction_after_close_changes_nothing`):
+/// a unit's destruction, which holds time, purges its content alone.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
-pub fn purge(manifest_prefix: &[u8], stored_manifests: &[(Vec<u8>, Manifest)]) -> Vec<EmittedWrite> {
+pub fn purge<E: From<DeriveError>>(
+    manifest_prefix: &[u8],
+    stored_manifests: &[(Vec<u8>, Manifest)],
+    bases: &[CountedBase],
+    lookup: &mut dyn FnMut(&[u8], &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, E>,
+) -> Result<Vec<EmittedWrite>, E> {
     if place_bounds(manifest_prefix).is_none() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    let mut writes = if closed_line(stored_manifests) { Vec::new() } else { removal(manifest_prefix, stored_manifests, bases, lookup)? };
+    writes.extend(
+        stored_manifests
+            .iter()
+            .filter(|(manifest_key, _)| same_place(manifest_key, manifest_prefix))
+            .map(|(manifest_key, _)| EmittedWrite { key: manifest_key.clone(), value: None }),
+    );
+    Ok(writes)
+}
+
+/// Apply one `DeriveMode::Close` step (a unit's closure, aggregates-close-2)
+/// across all manifest versions stored under `manifest_prefix` (ascending,
+/// newest last), reading the store through `lookup`. The closing commit read
+/// nothing; this runs at the ordering point.
+///
+/// It removes the row's whole derived history at every cut, whatever
+/// compaction folded:
+/// - each base of `bases` that folded some of the row's records is
+///   re-derived without them: the line as of the base's cut
+///   ([`line_through`]) held, per edge of an aggregate group, the sum of the
+///   row's records stamped at or below it (P9), and for a statistics or
+///   presence path its live deltas ([`live_counts`]); less the row's records
+///   compaction left stored beside the base (deleted below), that is what
+///   the base holds of the row, and the store subtracts it lane by lane;
+/// - every key the line's versions list is deleted, at every stamp:
+///   markers, singles, statistics and presence deltas, claims and
+///   unretained edged records.
+///
+/// A read at every cut, before the closure or after it, then sums exactly
+/// the other rows (Lean `close_counts_zero`), and no derived key carries
+/// the row. Returns those writes and the closed version to store on top of
+/// the line's others: its retained edged segments only, no key listed
+/// ([`Manifest::closed`]). The line's versions stay with the row's events
+/// until destruction purges both. `None` where the row never sat (no
+/// version) or its line is closed already: nothing changes there.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+pub fn close<E: From<DeriveError>>(
+    manifest_prefix: &[u8],
+    stored_manifests: &[(Vec<u8>, Manifest)],
+    bases: &[CountedBase],
+    lookup: &mut dyn FnMut(&[u8], &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, E>,
+) -> Result<Option<(Vec<EmittedWrite>, Manifest)>, E> {
+    let Some((_, newest)) = stored_manifests.last() else { return Ok(None) };
+    if place_bounds(manifest_prefix).is_none() || newest.closed {
+        return Ok(None);
+    }
+    let writes = removal(manifest_prefix, stored_manifests, bases, lookup)?;
+    let segments = newest
+        .segments
+        .iter()
+        .filter(|segment| segment.kind == (EntryKind::Edged { retain: true }) && same_place(&segment.identity, manifest_prefix))
+        .map(|segment| Segment { live_key: Vec::new(), ..segment.clone() })
+        .collect();
+    Ok(Some((writes, Manifest { segments, horizon: newest.horizon, written_keys: Vec::new(), closed: true })))
+}
+
+/// Whether the newest stored version of a line is closed.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn closed_line(stored_manifests: &[(Vec<u8>, Manifest)]) -> bool {
+    stored_manifests.last().is_some_and(|(_, manifest)| manifest.closed)
+}
+
+/// The removal of an open line's derived history at every cut, shared by
+/// [`close`] and [`purge`]: each base of `bases` re-derived without the
+/// row, then a delete of every key the line's versions list. Reads the
+/// store through `lookup` alone, before any of its writes.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn removal<E: From<DeriveError>>(
+    manifest_prefix: &[u8],
+    stored_manifests: &[(Vec<u8>, Manifest)],
+    bases: &[CountedBase],
+    lookup: &mut dyn FnMut(&[u8], &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, E>,
+) -> Result<Vec<EmittedWrite>, E> {
+    // Where the row never sat there is nothing to remove or rebase.
+    if stored_manifests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inventory: std::collections::BTreeSet<Vec<u8>> = stored_manifests
+        .iter()
+        .flat_map(|(_, manifest)| manifest.written_keys.iter())
+        .filter(|key| same_place(key, manifest_prefix))
+        .cloned()
+        .collect();
     let mut writes = Vec::new();
-    let mut deleted = std::collections::BTreeSet::<Vec<u8>>::new();
-    for (manifest_key, manifest) in stored_manifests {
-        for key in &manifest.written_keys {
-            if same_place(key, manifest_prefix) && deleted.insert(key.clone()) {
-                writes.push(EmittedWrite { key: key.clone(), value: None });
+    // A base outside the row's place, or of malformed lanes, is refused by
+    // `check` before ordering.
+    for base in bases.iter().filter(|base| lanes_valid(&base.lanes) && base_confined(base, manifest_prefix)) {
+        match &base.layout {
+            BaseLayout::Edged { floor } => rebase_edged(manifest_prefix, stored_manifests, &inventory, base, floor, &mut *lookup, &mut writes)?,
+            BaseLayout::Latest { prefix } => rebase_latest(manifest_prefix, stored_manifests, &inventory, base, prefix, &mut *lookup, &mut writes)?,
+        }
+    }
+    writes.extend(inventory.into_iter().map(|key| EmittedWrite { key, value: None }));
+    Ok(writes)
+}
+
+/// Rebase an aggregate path's bases ([`BaseLayout::Edged`]) without the row:
+/// at each edge where the line as of the floor held a nonzero sum, the
+/// edge's base (whichever cut wrote it) less that sum, less the row's
+/// records compaction left beside it, which the removal deletes itself. An
+/// edge whose merge was zero keeps no base, so one is written at the floor;
+/// a base that comes to zero is deleted.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn rebase_edged<E: From<DeriveError>>(
+    manifest_prefix: &[u8],
+    stored_manifests: &[(Vec<u8>, Manifest)],
+    inventory: &std::collections::BTreeSet<Vec<u8>>,
+    base: &CountedBase,
+    floor: &[u8],
+    lookup: &mut dyn FnMut(&[u8], &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, E>,
+    writes: &mut Vec<EmittedWrite>,
+) -> Result<(), E> {
+    let Some((_, value)) = lookup(floor, &[floor, &[0x00][..]].concat())?.into_iter().find(|(key, _)| key.as_slice() == floor) else {
+        return Ok(());
+    };
+    let through: [u8; STAMP_BYTES] = value.as_slice().try_into().map_err(|_| DeriveError::new("A compaction floor holds one stamp"))?;
+    let Some(line) = line_through(manifest_prefix, stored_manifests, &through) else { return Ok(()) };
+    let mut held: std::collections::BTreeMap<(Vec<u8>, i64), Vec<u8>> = std::collections::BTreeMap::new();
+    for segment in line.segments.iter().filter(|segment| segment.kind == (EntryKind::Edged { retain: false }) && segment.identity.starts_with(&base.records)) {
+        let mut edges = vec![(segment.from, &segment.enter_value)];
+        if segment.to != OPEN_END {
+            edges.push((segment.to, &segment.leave_value));
+        }
+        for (edge, value) in edges {
+            let sum = lanes_add(&base.lanes, held.get(&(segment.identity.clone(), edge)).map(Vec::as_slice), value, false)?;
+            held.insert((segment.identity.clone(), edge), sum);
+        }
+    }
+    for ((identity, edge), sum) in held {
+        if lanes_zero(&base.lanes, &sum)? {
+            continue;
+        }
+        let at = [identity.as_slice(), &be_bytes(ordered(edge))[..]].concat();
+        let mut merged = sum;
+        let mut found: Option<(Vec<u8>, Vec<u8>)> = None;
+        for (key, value) in lookup(&at, &[at.as_slice(), &through[..], &[0xff; 8][..], &[0x00][..]].concat())? {
+            if key.len() != at.len() + PRECEDENCE_BYTES {
+                continue;
+            }
+            if key[key.len() - 8..] == [0u8; 8] {
+                found = Some((key, value));
+            } else if inventory.contains(&key) {
+                merged = lanes_add(&base.lanes, Some(&merged), &value, true)?;
             }
         }
-        if same_place(manifest_key, manifest_prefix) && deleted.insert(manifest_key.clone()) {
-            writes.push(EmittedWrite { key: manifest_key.clone(), value: None });
+        if lanes_zero(&base.lanes, &merged)? {
+            continue;
+        }
+        let (key, rest) = match found {
+            Some((key, value)) => (key, lanes_add(&base.lanes, Some(&value), &merged, true)?),
+            None => ([at.as_slice(), &through[..], &[0u8; 8][..]].concat(), lanes_add(&base.lanes, None, &merged, true)?),
+        };
+        let value = if lanes_zero(&base.lanes, &rest)? { None } else { Some(rest) };
+        writes.push(EmittedWrite { key, value });
+    }
+    Ok(())
+}
+
+/// Rebase a statistics or presence path's base ([`BaseLayout::Latest`])
+/// without the row: the newest base less the row's live deltas as of its
+/// cut, less any of the row's deltas still stored at or below it.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn rebase_latest<E: From<DeriveError>>(
+    manifest_prefix: &[u8],
+    stored_manifests: &[(Vec<u8>, Manifest)],
+    inventory: &std::collections::BTreeSet<Vec<u8>>,
+    base: &CountedBase,
+    prefix: &[u8],
+    lookup: &mut dyn FnMut(&[u8], &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, E>,
+    writes: &mut Vec<EmittedWrite>,
+) -> Result<(), E> {
+    let bases = lookup(prefix, &[prefix, &[0xff; STAMP_BYTES + 1][..]].concat())?;
+    let Some((key, value)) = bases.into_iter().filter(|(key, _)| key.len() == prefix.len() + STAMP_BYTES).last() else {
+        return Ok(());
+    };
+    let mut through = [0u8; STAMP_BYTES];
+    through.copy_from_slice(&key[prefix.len()..]);
+    let Some(line) = line_through(manifest_prefix, stored_manifests, &through) else { return Ok(()) };
+    let mut held: Option<Vec<u8>> = None;
+    for (identity, enter, _) in live_counts(&line.segments, line.horizon) {
+        if identity == base.records {
+            held = Some(lanes_add(&base.lanes, held.as_deref(), &enter, false)?);
         }
     }
-    writes
+    let Some(mut merged) = held else { return Ok(()) };
+    for (record, delta) in lookup(&base.records, &[base.records.as_slice(), &through[..], &[0xff; 8][..], &[0x00][..]].concat())? {
+        if record.len() == base.records.len() + PRECEDENCE_BYTES && inventory.contains(&record) {
+            merged = lanes_add(&base.lanes, Some(&merged), &delta, true)?;
+        }
+    }
+    if lanes_zero(&base.lanes, &merged)? {
+        return Ok(());
+    }
+    writes.push(put(key, lanes_add(&base.lanes, Some(&value), &merged, true)?));
+    Ok(())
+}
+
+/// Whether every lane is 1 to 16 bytes, and there is one.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn lanes_valid(lanes: &[Lane]) -> bool {
+    !lanes.is_empty() && lanes.iter().all(|lane| (1..=16).contains(&lane_width(*lane)))
+}
+
+/// Whether every key a base names lies at the manifest's place (P10).
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn base_confined(base: &CountedBase, manifest_prefix: &[u8]) -> bool {
+    let at = match &base.layout {
+        BaseLayout::Edged { floor } => floor,
+        BaseLayout::Latest { prefix } => prefix,
+    };
+    same_place(&base.records, manifest_prefix) && same_place(at, manifest_prefix)
+}
+
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn lane_width(lane: Lane) -> usize {
+    match lane {
+        Lane::Sum(width) | Lane::Same(width) => usize::from(width),
+    }
+}
+
+/// A big-endian two's-complement integer of 1 to 16 bytes.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn signed(bytes: &[u8]) -> i128 {
+    let fill = if bytes.first().is_some_and(|byte| byte & 0x80 != 0) { 0xff } else { 0 };
+    let mut word = [fill; 16];
+    word[16 - bytes.len()..].copy_from_slice(bytes);
+    i128::from_be_bytes(word)
+}
+
+/// The sum `a + b` (or `a − b`) of two counted values of one path, lane by
+/// lane: each `Sum` lane exactly, each `Same` lane equal in both. An absent
+/// `a` is zero. A value of another width, a `Same` lane that differs or a
+/// sum outside its lane's width is a corrupt store.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn lanes_add(lanes: &[Lane], a: Option<&[u8]>, b: &[u8], subtract: bool) -> Result<Vec<u8>, DeriveError> {
+    let width: usize = lanes.iter().map(|lane| lane_width(*lane)).sum();
+    if b.len() != width || a.is_some_and(|a| a.len() != width) {
+        return Err(DeriveError::new("A counted value does not match its path's lanes"));
+    }
+    let overflow = || DeriveError::new("A counted value overflows its lane");
+    let mut out = Vec::with_capacity(width);
+    let mut at = 0usize;
+    for lane in lanes {
+        let end = at + lane_width(*lane);
+        match lane {
+            Lane::Same(_) => {
+                if a.is_some_and(|a| a[at..end] != b[at..end]) {
+                    return Err(DeriveError::new("Two counted values of one path differ in a fixed lane"));
+                }
+                out.extend_from_slice(&b[at..end]);
+            },
+            Lane::Sum(_) => {
+                let y = signed(&b[at..end]);
+                let y = if subtract { y.checked_neg().ok_or_else(overflow)? } else { y };
+                let sum = a.map_or(0, |a| signed(&a[at..end])).checked_add(y).ok_or_else(overflow)?;
+                let word = sum.to_be_bytes();
+                let fitted = &word[16 - (end - at)..];
+                if signed(fitted) != sum {
+                    return Err(overflow());
+                }
+                out.extend_from_slice(fitted);
+            },
+        }
+        at = end;
+    }
+    Ok(out)
+}
+
+/// Whether every `Sum` lane of a counted value is zero.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn lanes_zero(lanes: &[Lane], value: &[u8]) -> Result<bool, DeriveError> {
+    let width: usize = lanes.iter().map(|lane| lane_width(*lane)).sum();
+    if value.len() != width {
+        return Err(DeriveError::new("A counted value does not match its path's lanes"));
+    }
+    let mut at = 0usize;
+    let mut zero = true;
+    for lane in lanes {
+        let end = at + lane_width(*lane);
+        if matches!(lane, Lane::Sum(_)) {
+            zero &= value[at..end].iter().all(|byte| *byte == 0);
+        }
+        at = end;
+    }
+    Ok(zero)
 }
 
 /// The row's derived line as of the store stamp `through`: the newest of its
@@ -1372,8 +1720,8 @@ pub fn purge(manifest_prefix: &[u8], stored_manifests: &[(Vec<u8>, Manifest)]) -
 /// ‖ ordinal`, in ascending key order) stamped at or below it, if any. A
 /// compaction base at `through` folded in exactly what this line held: an
 /// edged entry's records sum, per edge, to its segments' coverage jumps (P9),
-/// and a statistics delta log to its live boundaries. The engine subtracts
-/// that from the base when the row is purged.
+/// and a statistics or presence delta log to its live entries. A close or a
+/// purge subtracts that from the base ([`close`]).
 #[cfg_attr(verus_keep_ghost, verifier::external)]
 pub fn line_through<'a>(manifest_prefix: &[u8], stored_manifests: &'a [(Vec<u8>, Manifest)], through: &[u8; STAMP_BYTES]) -> Option<&'a Manifest> {
     stored_manifests
@@ -1477,86 +1825,21 @@ pub fn claim_exceeded(records: &[(i64, i64)], coverage: ValidInterval) -> bool {
 /// Apply one `DeriveMode::Backfill` step to the row's previous line: emit
 /// each backfilled entry as given, confined to the manifest's place (P10),
 /// and keep the line's segments and horizon with those keys as this step's
-/// inventory, so a purge deletes them (erase-derive). Total.
+/// inventory, so a purge deletes them (erase-derive). Total. A closed line
+/// takes none ([`Manifest::closed`]): a path installed after a closure
+/// indexes nothing of the closed row.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
 pub fn backfill(manifest_prefix: &[u8], previous: &Manifest, writes: &[(Vec<u8>, Vec<u8>)], ordinal: u64) -> Applied {
-    let confined = writes.iter().filter(|(key, _)| place_bounds(manifest_prefix).is_some() && same_place(key, manifest_prefix));
+    let confined = writes.iter().filter(|(key, _)| !previous.closed && place_bounds(manifest_prefix).is_some() && same_place(key, manifest_prefix));
     let emitted: Vec<EmittedWrite> = confined.map(|(key, value)| put(key.clone(), value.clone())).collect();
     Applied {
         manifest: Manifest {
             segments: previous.segments.clone(),
             horizon: previous.horizon,
             written_keys: emitted.iter().map(|write| write.key.clone()).collect(),
+            closed: previous.closed,
         },
         writes: emitted,
-        next_ordinal: ordinal,
-    }
-}
-
-/// Apply one `DeriveMode::Close` step to the row's previous line (a unit's
-/// closure, aggregates-close): from `stamp` on, the line counts nothing.
-/// Total, and judges nothing.
-///
-/// At `stamp` it writes the exact negation of every counted contribution
-/// the line holds: for each unretained [`EntryKind::Edged`] and each
-/// [`EntryKind::Claim`] segment, its leave value at its start edge and,
-/// unless open, its enter value at its end edge (the records then sum to
-/// zero at every instant, P9); and for each live [`EntryKind::Boundary`] and
-/// [`EntryKind::Present`] entry ([`live_counts`]), its leave delta. A read
-/// at any cut at or after `stamp` therefore sums exactly the other rows'
-/// contributions, whether or not a compaction already folded the row's
-/// older records into a base: the retractions are new records past every
-/// floor. A read below `stamp` is unchanged.
-///
-/// The new line keeps its markers, singles and retained edged segments
-/// (`onErase: "retain"` outlives erasure, so it outlives closure) and
-/// drops every counted segment, so its [`live_counts`] are empty and a base
-/// compacted at or after `stamp` folded nothing of it ([`line_through`]).
-/// The retractions are this step's inventory, so the destruction's
-/// [`purge`] deletes them with the rest of the row's history: the purge
-/// changes no read at or after `stamp` (it removes contributions summing to
-/// zero there), only the history below it. A line that counts nothing
-/// (none at all where the row never sat) writes nothing, and the store then
-/// keeps no new manifest version: a close changes a place only where the
-/// row counted.
-#[cfg_attr(verus_keep_ghost, verifier::external)]
-pub fn close(manifest_prefix: &[u8], previous: &Manifest, stamp: [u8; STAMP_BYTES], ordinal: u64) -> Applied {
-    let mut ordinal = ordinal;
-    let Some((m_partition, m_world_end)) = place_bounds(manifest_prefix) else {
-        return Applied { writes: Vec::new(), manifest: Manifest { written_keys: Vec::new(), ..previous.clone() }, next_ordinal: ordinal };
-    };
-    let prev = own_line(manifest_prefix, &manifest_prefix[m_partition + 1..m_world_end], previous);
-    let mut writes: Vec<EmittedWrite> = Vec::new();
-    let mut written_keys: Vec<Vec<u8>> = Vec::new();
-    let mut kept: Vec<Segment> = Vec::new();
-    for segment in &prev {
-        match segment.kind {
-            EntryKind::Edged { retain: false } | EntryKind::Claim => {
-                let key = edged_key(&segment.identity, segment.from, &stamp, ordinal);
-                ordinal = ordinal.wrapping_add(1);
-                written_keys.push(key.clone());
-                writes.push(put(key, segment.leave_value.clone()));
-                if segment.to != OPEN_END {
-                    let key = edged_key(&segment.identity, segment.to, &stamp, ordinal);
-                    ordinal = ordinal.wrapping_add(1);
-                    written_keys.push(key.clone());
-                    writes.push(put(key, segment.enter_value.clone()));
-                }
-            },
-            // The live set's retraction, below.
-            EntryKind::Boundary | EntryKind::Present => {},
-            EntryKind::Marker | EntryKind::Single { .. } | EntryKind::Edged { retain: true } => kept.push(segment.clone()),
-        }
-    }
-    for (identity, _, leave) in live_counts(&prev, previous.horizon) {
-        let key = stamped_key(&identity, &stamp, ordinal);
-        ordinal = ordinal.wrapping_add(1);
-        written_keys.push(key.clone());
-        writes.push(put(key, leave));
-    }
-    Applied {
-        writes,
-        manifest: Manifest { segments: kept, horizon: previous.horizon, written_keys },
         next_ordinal: ordinal,
     }
 }
@@ -1635,7 +1918,8 @@ impl Manifest {
     /// Canonical byte encoding stored under `manifest_prefix ‖ stamp ‖ ordinal`.
     #[cfg_attr(verus_keep_ghost, verifier::external)]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![1u8]; // format version 1
+        let mut out = vec![2u8]; // format version 2: the closed flag
+        out.push(u8::from(self.closed));
         out.extend_from_slice(&self.horizon.to_be_bytes());
         out.extend_from_slice(&(self.segments.len() as u32).to_be_bytes());
         for seg in &self.segments {
@@ -1658,9 +1942,14 @@ impl Manifest {
     pub fn decode(bytes: &[u8]) -> Result<Self, DeriveError> {
         let mut rest = bytes;
         let version = take_u8(&mut rest)?;
-        if version != 1 {
+        if version != 2 {
             return Err(DeriveError::new("Unsupported derive manifest version"));
         }
+        let closed = match take_u8(&mut rest)? {
+            0 => false,
+            1 => true,
+            _ => return Err(DeriveError::new("Invalid derive manifest closed flag")),
+        };
         let horizon = take_i64(&mut rest)?;
         let seg_count = take_u32(&mut rest)? as usize;
         let mut segments = Vec::with_capacity(seg_count.min(256));
@@ -1682,8 +1971,63 @@ impl Manifest {
         if !rest.is_empty() {
             return Err(DeriveError::new("Trailing bytes in derive manifest"));
         }
-        Ok(Self { segments, horizon, written_keys })
+        Ok(Self { segments, horizon, written_keys, closed })
     }
+}
+
+/// The wire encoding of a purge's or a close's counted bases.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn encode_bases(out: &mut Vec<u8>, bases: &[CountedBase]) {
+    out.extend_from_slice(&(bases.len() as u32).to_be_bytes());
+    for base in bases {
+        put_bytes(out, &base.records);
+        out.extend_from_slice(&(base.lanes.len() as u32).to_be_bytes());
+        for lane in &base.lanes {
+            let (tag, width) = match lane {
+                Lane::Sum(width) => (1u8, *width),
+                Lane::Same(width) => (2u8, *width),
+            };
+            out.push(tag);
+            out.push(width);
+        }
+        match &base.layout {
+            BaseLayout::Edged { floor } => {
+                out.push(1);
+                put_bytes(out, floor);
+            },
+            BaseLayout::Latest { prefix } => {
+                out.push(2);
+                put_bytes(out, prefix);
+            },
+        }
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn decode_bases(rest: &mut &[u8]) -> Result<Vec<CountedBase>, DeriveError> {
+    let count = take_u32(rest)? as usize;
+    let mut bases = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        let records = take_bytes(rest)?;
+        let lane_count = take_u32(rest)? as usize;
+        let mut lanes = Vec::with_capacity(lane_count.min(64));
+        for _ in 0..lane_count {
+            let tag = take_u8(rest)?;
+            let width = take_u8(rest)?;
+            lanes.push(match tag {
+                1 => Lane::Sum(width),
+                2 => Lane::Same(width),
+                _ => return Err(DeriveError::new("Invalid counted base lane tag")),
+            });
+        }
+        let layout = match take_u8(rest)? {
+            1 => BaseLayout::Edged { floor: take_bytes(rest)? },
+            2 => BaseLayout::Latest { prefix: take_bytes(rest)? },
+            _ => return Err(DeriveError::new("Invalid counted base layout tag")),
+        };
+        bases.push(CountedBase { records, lanes, layout });
+    }
+    Ok(bases)
 }
 
 impl Derive {
@@ -1704,8 +2048,14 @@ impl Derive {
             }
         }
         match &self.mode {
-            DeriveMode::Purge => out.push(0),
-            DeriveMode::Close => out.push(3),
+            DeriveMode::Purge { bases } => {
+                out.push(0);
+                encode_bases(&mut out, bases);
+            },
+            DeriveMode::Close { bases } => {
+                out.push(3);
+                encode_bases(&mut out, bases);
+            },
             DeriveMode::Backfill { writes } => {
                 out.push(2);
                 out.extend_from_slice(&(writes.len() as u32).to_be_bytes());
@@ -1787,8 +2137,8 @@ impl Derive {
             levels.push(DeriveLevel { prefix, through });
         }
         let mode = match take_u8(&mut rest)? {
-            0 => DeriveMode::Purge,
-            3 => DeriveMode::Close,
+            0 => DeriveMode::Purge { bases: decode_bases(&mut rest)? },
+            3 => DeriveMode::Close { bases: decode_bases(&mut rest)? },
             2 => {
                 let count = take_u32(&mut rest)? as usize;
                 let mut writes = Vec::with_capacity(count.min(256));
@@ -1890,6 +2240,29 @@ mod tests {
         key(b"p", ROW, [0; 16], b"row\x04")
     }
 
+    /// A store of live entries the lookup of [`close`] and [`purge`] reads.
+    struct Fake(std::collections::BTreeMap<Vec<u8>, Vec<u8>>);
+
+    impl Fake {
+        fn lookup(&self) -> impl FnMut(&[u8], &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DeriveError> + '_ {
+            |start, end| Ok(self.0.range::<[u8], _>((std::ops::Bound::Included(start), std::ops::Bound::Excluded(end))).map(|(key, value)| (key.clone(), value.clone())).collect())
+        }
+
+        fn apply(&mut self, writes: &[EmittedWrite]) {
+            for write in writes {
+                match &write.value {
+                    Some(value) => self.0.insert(write.key.clone(), value.clone()),
+                    None => self.0.remove(&write.key),
+                };
+            }
+        }
+    }
+
+    /// A purge with no counted base, over an empty store.
+    fn purge_all(stored: &[(Vec<u8>, Manifest)]) -> Vec<EmittedWrite> {
+        purge::<DeriveError>(&prefix(), stored, &[], &mut Fake(Default::default()).lookup()).unwrap()
+    }
+
     #[test]
     fn entries_of_every_family_share_the_rows_place() {
         assert!(same_place(&key(b"p", INDEX, [0; 16], b"x"), &prefix()));
@@ -1921,7 +2294,7 @@ mod tests {
         assert_eq!(second.writes[1].value, Some(vec![1]), "enter marker for b");
         let m1 = stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE);
         let m2 = stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE);
-        let purged = purge(&prefix(), &[(m1, first.manifest), (m2, second.manifest)]);
+        let purged = purge_all(&[(m1, first.manifest), (m2, second.manifest)]);
         // Three concrete markers (enter a, leave a, enter b) and two manifests.
         assert_eq!(purged.len(), 5);
         assert!(purged.iter().all(|write| write.value.is_none()));
@@ -1939,7 +2312,7 @@ mod tests {
         assert!(!retained.is_empty(), "the retained entry wrote its records");
         let m1 = stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100);
         let m2 = stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE + 100);
-        let purged: Vec<Vec<u8>> = purge(&prefix(), &[(m1.clone(), first.manifest), (m2.clone(), second.manifest)]).into_iter().map(|write| {
+        let purged: Vec<Vec<u8>> = purge_all(&[(m1.clone(), first.manifest), (m2.clone(), second.manifest)]).into_iter().map(|write| {
             assert!(write.value.is_none(), "a purge only deletes: nothing is retracted at its stamp");
             write.key
         }).collect();
@@ -1950,43 +2323,130 @@ mod tests {
     }
 
     #[test]
-    fn a_close_retracts_every_counted_contribution_at_its_stamp_and_the_purge_deletes_it() {
-        let marker = entry(EntryKind::Marker, INDEX, b"idx_a", &[1], &[]);
-        let stats = entry(EntryKind::Boundary, PERSISTENCE, b"stats", &[1], &[0x81]);
+    fn a_close_deletes_the_lines_whole_history_at_every_stamp_and_keeps_its_retained_records() {
+        let marker = |v: u8| entry(EntryKind::Marker, INDEX, b"idx_a", &[v], &[]);
+        let stats = |v: u8| entry(EntryKind::Boundary, PERSISTENCE, b"stats", &[v], &[0x80 | v]);
         let present = entry(EntryKind::Present, PERSISTENCE, b"rows", &[1], &[0x81]);
-        let edged = entry(EntryKind::Edged { retain: false }, PERSISTENCE, b"agg", &[2], &[0x82]);
-        let kept = entry(EntryKind::Edged { retain: true }, PERSISTENCE, b"kept", &[3], &[0x83]);
-        let entries = [marker.clone(), stats, present, edged.clone(), kept.clone()];
-        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 40 }, &entries, stamp(10, 1), DERIVE_ORDINAL_BASE);
-        let closed = close(&prefix(), &first.manifest, stamp(30, 2), DERIVE_ORDINAL_BASE);
-        // The edged segment's two records negated at the closing stamp, and
-        // the two live counts' leave deltas; nothing for the marker or the
-        // retained aggregate.
-        let agg = |edge: i64| edged_key(&edged.identity, edge, &stamp(30, 2), 0)[..edged.identity.len() + EDGE_BYTES].to_vec();
-        assert_eq!(closed.writes.len(), 4);
-        assert!(closed.writes.iter().any(|write| write.key.starts_with(&agg(10)) && write.value == Some(vec![0x82])), "the start edge takes the leave value");
-        assert!(closed.writes.iter().any(|write| write.key.starts_with(&agg(40)) && write.value == Some(vec![2])), "the end edge takes the enter value");
-        assert!(closed.writes.iter().any(|write| write.value == Some(vec![0x81]) && write.key.windows(5).any(|w| w == b"stats")));
-        assert!(closed.writes.iter().any(|write| write.value == Some(vec![0x81]) && write.key.windows(4).any(|w| w == b"rows")));
-        assert!(closed.writes.iter().all(|write| !write.key.windows(4).any(|w| w == b"kept") && !write.key.windows(5).any(|w| w == b"idx_a")));
-        assert!(closed.writes.iter().all(|write| write.key.windows(STAMP_BYTES).any(|w| w == stamp(30, 2))), "every retraction is stamped at the closure");
-        let kinds: Vec<EntryKind> = closed.manifest.segments.iter().map(|segment| segment.kind).collect();
-        assert_eq!(kinds, vec![EntryKind::Marker, EntryKind::Edged { retain: true }], "the line keeps its marker and its retained record");
-        assert!(live_counts(&closed.manifest.segments, closed.manifest.horizon).is_empty());
-        // A closed line counts nothing, so closing it again writes nothing;
-        // a place where the row never sat writes nothing either.
-        assert!(close(&prefix(), &closed.manifest, stamp(31, 3), DERIVE_ORDINAL_BASE).writes.is_empty());
-        assert!(close(&prefix(), &Manifest::empty(), stamp(31, 3), DERIVE_ORDINAL_BASE).writes.is_empty());
-        // The destruction's purge deletes the retractions with the rest.
-        let stored = [
-            (stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100), first.manifest),
-            (stamped_key(&prefix(), &stamp(30, 2), DERIVE_ORDINAL_BASE + 100), closed.manifest),
+        let claim = entry(EntryKind::Claim, PERSISTENCE, b"claim", &1i64.to_be_bytes(), &(-1i64).to_be_bytes());
+        let expiry = entry(EntryKind::Single { stamped: true }, PERSISTENCE, b"expiry", &[1], &[]);
+        let edged = |v: u8| entry(EntryKind::Edged { retain: false }, PERSISTENCE, b"agg", &[v], &[0x80 | v]);
+        let kept = |v: u8| entry(EntryKind::Edged { retain: true }, PERSISTENCE, b"kept", &[v], &[0x80 | v]);
+        let at = |v: u8| vec![marker(v), stats(v), present.clone(), claim.clone(), expiry.clone(), edged(v), kept(v)];
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 40 }, &at(1), stamp(10, 1), DERIVE_ORDINAL_BASE);
+        let second = apply(&prefix(), &first.manifest, ValidInterval { from: 20, to: 40 }, &at(2), stamp(20, 2), DERIVE_ORDINAL_BASE);
+        let stored = vec![
+            (stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100), first.manifest.clone()),
+            (stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE + 100), second.manifest.clone()),
         ];
-        let purged: Vec<Vec<u8>> = purge(&prefix(), &stored).into_iter().map(|write| write.key).collect();
-        assert!(closed.writes.iter().all(|write| purged.contains(&write.key)));
-        let derive = Derive { manifest_prefix: prefix(), levels: vec![DeriveLevel { prefix: prefix(), through: None }], mode: DeriveMode::Close };
+        let emitted: Vec<Vec<u8>> = first.writes.iter().chain(&second.writes).map(|write| write.key.clone()).collect();
+        let retained = |key: &Vec<u8>| key.windows(4).any(|w| w == b"kept");
+        let (writes, closed) = close::<DeriveError>(&prefix(), &stored, &[], &mut Fake(Default::default()).lookup()).unwrap().expect("the row sat here");
+        // Every key the line emitted, at either stamp (markers, statistics,
+        // presence, claims, the expiry entry, aggregate records), is deleted:
+        // nothing is retracted at the closure, so a read at a cut before it
+        // counts the row no more than one after it. Only the retained
+        // aggregate's records stay.
+        assert!(writes.iter().all(|write| write.value.is_none()), "a close only deletes");
+        for key in &emitted {
+            assert_eq!(writes.iter().any(|write| write.key == *key), !retained(key), "every unretained key at every stamp");
+        }
+        assert!(writes.iter().all(|write| !stored.iter().any(|(manifest, _)| *manifest == write.key)), "the line's versions stay with the row's events");
+        assert!(closed.closed && closed.written_keys.is_empty());
+        assert!(
+            !closed.segments.is_empty() && closed.segments.iter().all(|segment| segment.kind == (EntryKind::Edged { retain: true })),
+            "the closed version keeps only the retained segments"
+        );
+        assert_eq!(Manifest::decode(&closed.encode()).unwrap(), closed, "the closed flag round-trips");
+        // A closed line takes no further write and no second close, and a
+        // place where the row never sat closes nothing.
+        let mut stored = stored;
+        stored.push((stamped_key(&prefix(), &stamp(30, 3), DERIVE_ORDINAL_BASE + 100), closed.clone()));
+        assert!(close::<DeriveError>(&prefix(), &stored, &[], &mut Fake(Default::default()).lookup()).unwrap().is_none());
+        assert!(close::<DeriveError>(&prefix(), &[], &[], &mut Fake(Default::default()).lookup()).unwrap().is_none());
+        let rewritten = apply(&prefix(), &closed, ValidInterval { from: 50, to: OPEN_END }, &at(3), stamp(50, 4), DERIVE_ORDINAL_BASE);
+        assert!(rewritten.writes.is_empty() && rewritten.manifest.closed, "nothing rebuilds a closed row's contributions");
+        assert!(backfill(&prefix(), &closed, &[(key(b"p", INDEX, [0; 16], b"idx_old"), vec![1])], DERIVE_ORDINAL_BASE).writes.is_empty());
+        // The destruction's purge finds no derived key left: it deletes the
+        // line's versions alone.
+        let purged = purge_all(&stored);
+        assert_eq!(purged.len(), stored.len());
+        assert!(purged.iter().all(|write| write.value.is_none() && stored.iter().any(|(manifest, _)| *manifest == write.key)));
+        let derive = Derive { manifest_prefix: prefix(), levels: Vec::new(), mode: DeriveMode::Close { bases: Vec::new() } };
         check(&derive).unwrap();
         assert_eq!(Derive::decode(&derive.encode()).unwrap(), derive);
+    }
+
+    /// The store rebases what compaction folded of a closed row: an
+    /// aggregate edge's base less the row's sum there (and a record
+    /// compaction left beside it), a statistics base less the row's live
+    /// delta, a zero base deleted, and a base where the merge was zero
+    /// written at the floor.
+    #[test]
+    fn a_close_rebases_every_compaction_base_that_folded_the_row() {
+        let count = |n: i64| n.to_be_bytes().to_vec();
+        let agg = key(b"p", PERSISTENCE, [0; 16], b"agg/g");
+        let stats = key(b"p", PERSISTENCE, [0; 16], b"stats");
+        let floor = key(b"p", PERSISTENCE, [0; 16], b"agg-floor");
+        let stats_bases = key(b"p", PERSISTENCE, [0; 16], b"stats-base");
+        let edged = entry(EntryKind::Edged { retain: false }, PERSISTENCE, b"agg/g", &count(1), &count(-1));
+        let boundary = entry(EntryKind::Boundary, PERSISTENCE, b"stats", &count(3), &count(-3));
+        let first = apply(&prefix(), &Manifest::empty(), ValidInterval { from: 10, to: 20 }, &[edged, boundary], stamp(10, 1), DERIVE_ORDINAL_BASE);
+        let stored = vec![(stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100), first.manifest.clone())];
+        // A compaction through stamp (15, 0) folded the row's records: the
+        // edge at 10 into a base also holding another row's 4, the edge at
+        // 20 into none (its merge with another row's +1 was zero), the
+        // statistics delta into a base also holding another row's 5.
+        let through = stamp(15, 0);
+        let edge_base = |edge: i64| [agg.as_slice(), &ordered(edge).to_be_bytes()[..], &through[..], &[0u8; 8][..]].concat();
+        let mut store = Fake(std::collections::BTreeMap::from([
+            (floor.clone(), through.to_vec()),
+            (edge_base(10), count(5)),
+            ([stats_bases.as_slice(), &through[..]].concat(), count(8)),
+        ]));
+        let bases = vec![
+            CountedBase { records: agg.clone(), lanes: vec![Lane::Sum(8)], layout: BaseLayout::Edged { floor: floor.clone() } },
+            CountedBase { records: stats.clone(), lanes: vec![Lane::Sum(8)], layout: BaseLayout::Latest { prefix: stats_bases.clone() } },
+        ];
+        let (writes, _) = close::<DeriveError>(&prefix(), &stored, &bases, &mut store.lookup()).unwrap().unwrap();
+        store.apply(&writes);
+        assert_eq!(store.0.get(&edge_base(10)), Some(&count(4)), "the edge's base less the row's +1");
+        assert_eq!(store.0.get(&edge_base(20)), Some(&count(1)), "the zero merge's base takes the row's -1 back out");
+        assert_eq!(store.0.get(&[stats_bases.as_slice(), &through[..]].concat()), Some(&count(5)), "the statistics base less the row's live delta");
+        // A base that held the row alone is deleted.
+        let mut alone = Fake(std::collections::BTreeMap::from([(floor.clone(), through.to_vec()), (edge_base(10), count(1)), (edge_base(20), count(-1))]));
+        let (writes, _) = close::<DeriveError>(&prefix(), &stored, &bases[..1], &mut alone.lookup()).unwrap().unwrap();
+        alone.apply(&writes);
+        assert_eq!(alone.0.keys().cloned().collect::<Vec<_>>(), vec![floor.clone()], "no base and no record of the row remains");
+        // A record compaction skipped stays beside the base: the removal
+        // deletes it, and the base is rebased only by what it merged.
+        let mut skipped = Fake(std::collections::BTreeMap::from([(floor.clone(), through.to_vec()), (edge_base(20), count(-1))]));
+        skipped.0.extend(first.writes.iter().filter(|write| write.key.starts_with(&agg) && write.value == Some(count(1))).map(|write| (write.key.clone(), count(1))));
+        let (writes, _) = close::<DeriveError>(&prefix(), &stored, &bases[..1], &mut skipped.lookup()).unwrap().unwrap();
+        skipped.apply(&writes);
+        assert_eq!(skipped.0.keys().cloned().collect::<Vec<_>>(), vec![floor.clone()], "the skipped record is deleted, its edge is not rebased");
+        // A malformed stored base is a corrupt store.
+        let mut corrupt = Fake(std::collections::BTreeMap::from([(floor.clone(), through.to_vec()), (edge_base(10), vec![1])]));
+        assert!(close::<DeriveError>(&prefix(), &stored, &bases[..1], &mut corrupt.lookup()).is_err());
+        let derive = Derive { manifest_prefix: prefix(), levels: Vec::new(), mode: DeriveMode::Purge { bases: bases.clone() } };
+        check(&derive).unwrap();
+        assert_eq!(Derive::decode(&derive.encode()).unwrap(), derive);
+        let foreign = CountedBase { records: key(b"q", PERSISTENCE, [0; 16], b"agg"), ..bases[0].clone() };
+        assert!(check(&Derive { mode: DeriveMode::Close { bases: vec![foreign] }, ..derive.clone() }).is_err(), "a base elsewhere");
+        let wide = CountedBase { lanes: vec![Lane::Sum(17)], ..bases[0].clone() };
+        assert!(check(&Derive { mode: DeriveMode::Close { bases: vec![wide] }, ..derive }).is_err(), "a lane past 16 bytes");
+    }
+
+    #[test]
+    fn counted_lanes_add_exactly_and_keep_their_fixed_lanes() {
+        let tally = |count: i64, sum: i128| [&count.to_be_bytes()[..], &1u16.to_be_bytes()[..], &sum.to_be_bytes()[..]].concat();
+        let lanes = [Lane::Sum(8), Lane::Same(2), Lane::Sum(16)];
+        assert_eq!(lanes_add(&lanes, Some(&tally(2, 12)), &tally(1, 5), true).unwrap(), tally(1, 7));
+        assert_eq!(lanes_add(&lanes, None, &tally(1, 5), true).unwrap(), tally(-1, -5), "an absent base is zero");
+        assert!(lanes_zero(&lanes, &tally(0, 0)).unwrap() && !lanes_zero(&lanes, &tally(0, 1)).unwrap());
+        let other = [&1i64.to_be_bytes()[..], &2u16.to_be_bytes()[..], &5i128.to_be_bytes()[..]].concat();
+        assert!(lanes_add(&lanes, Some(&tally(2, 12)), &other, true).is_err(), "a fixed lane that differs");
+        assert!(lanes_add(&[Lane::Sum(1)], Some(&[0x7f]), &[1], false).is_err(), "a sum past its width");
+        assert_eq!(lanes_add(&[Lane::Sum(1)], Some(&[0x80]), &[0xff], true).unwrap(), vec![0x81]);
     }
 
     #[test]
@@ -2010,7 +2470,7 @@ mod tests {
             (stamped_key(&prefix(), &stamp(10, 1), DERIVE_ORDINAL_BASE + 100), first.manifest),
             (stamped_key(&prefix(), &stamp(20, 2), DERIVE_ORDINAL_BASE + 100), filled.manifest),
         ];
-        assert!(purge(&prefix(), &stored).iter().any(|write| write.key == historical && write.value.is_none()));
+        assert!(purge_all(&stored).iter().any(|write| write.key == historical && write.value.is_none()));
     }
 
     #[test]
@@ -2199,7 +2659,7 @@ mod tests {
         let levels = claim_levels(&derive, &claim.identity);
         assert_eq!(levels.len(), 2);
         assert_eq!(levels[1], (key(b"p", PERSISTENCE, [1; 16], b"claim"), Some(through)), "the parent's records under its own world");
-        let purged = purge(&prefix(), &[(stamped_key(&prefix(), &stamp(1, 1), DERIVE_ORDINAL_BASE), first.manifest)]);
+        let purged = purge_all(&[(stamped_key(&prefix(), &stamp(1, 1), DERIVE_ORDINAL_BASE), first.manifest)]);
         assert!(first.writes.iter().all(|write| purged.iter().any(|deleted| deleted.key == write.key && deleted.value.is_none())), "a purge deletes the claim's records");
     }
 }

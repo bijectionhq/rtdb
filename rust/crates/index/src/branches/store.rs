@@ -20,7 +20,7 @@ pub use store_filter::ValueFilter;
 
 /// SHA-256 of Bijection's `crates/store_read/src/derive.rs`, vendored verbatim
 /// as `rust/vendor/bijection-store-derive/src/lib.rs`.
-pub const DERIVE_DIGEST: &str = "b1585a69e9abb47f84aa479740462b7a174015b65463705f66d91b2d73bed157";
+pub const DERIVE_DIGEST: &str = "28573c08f8be69158d7834b14d06edcbe01ad67fed7fd4ea2974114f062a9de5";
 
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";
@@ -275,7 +275,7 @@ pub fn resolve_derives(
 
     for derive in derives {
         match &derive.mode {
-            store_derive::DeriveMode::Replace { .. } | store_derive::DeriveMode::Backfill { .. } | store_derive::DeriveMode::Close => {
+            store_derive::DeriveMode::Replace { .. } | store_derive::DeriveMode::Backfill { .. } => {
                 let mut previous = store_derive::Manifest::empty();
                 for level in &derive.levels {
                     if level.through.is_none() {
@@ -310,6 +310,11 @@ pub fn resolve_derives(
                         break;
                     }
                 }
+                // A closed line takes no further write (Bijection
+                // aggregates-close-2): no version is stored over it.
+                if previous.closed {
+                    continue;
+                }
                 // Total: the outcome never depends on the manifest (P8).
                 let applied = match &derive.mode {
                     store_derive::DeriveMode::Replace { interval, entries } => {
@@ -319,16 +324,8 @@ pub fn resolve_derives(
                     // A path backfill's history entries, joining the line's
                     // inventory (Bijection erase-derive).
                     store_derive::DeriveMode::Backfill { writes } => store_derive::backfill(&derive.manifest_prefix, &previous, writes, ordinal),
-                    // A unit's closure: the line's counted contributions
-                    // retracted at the stamp (Bijection aggregates-close).
-                    store_derive::DeriveMode::Close => store_derive::close(&derive.manifest_prefix, &previous, stamp_bytes, ordinal),
-                    store_derive::DeriveMode::Purge => unreachable!("matched above"),
+                    store_derive::DeriveMode::Purge { .. } | store_derive::DeriveMode::Close { .. } => unreachable!("matched above"),
                 };
-                // A close where the row counts nothing (or never sat)
-                // changes nothing there.
-                if matches!(derive.mode, store_derive::DeriveMode::Close) && applied.writes.is_empty() {
-                    continue;
-                }
                 ordinal = applied.next_ordinal;
                 for write in applied.writes {
                     out.push((write.key, write.value));
@@ -338,46 +335,109 @@ pub fn resolve_derives(
                 out.push((manifest_key.clone(), Some(applied.manifest.encode())));
                 pending_manifests.entry(derive.manifest_prefix.clone()).or_default().push((manifest_key, applied.manifest));
             },
-            store_derive::DeriveMode::Purge => {
+            // A unit's closure and an erasure remove the row's derived
+            // history at every cut and rebase the compaction bases that
+            // folded some of it, reading the store here, at the ordering
+            // point, through the vendored derive (Bijection
+            // aggregates-close-2).
+            store_derive::DeriveMode::Purge { bases } | store_derive::DeriveMode::Close { bases } => {
                 let mut stored = Vec::new();
                 if !purged_prefixes.contains(&derive.manifest_prefix) {
                     let range = KeyRange { start: derive.manifest_prefix.clone(), end: prefix_successor(&derive.manifest_prefix) };
-                    let mut after = None;
-                    loop {
-                        let page = view.store_page(&StoreRead {
-                            range: range.clone(),
-                            after: after.take(),
-                            limit: MAX_PAGE_ENTRIES,
-                            projection: Projection::Values,
-                            filter: None,
-                            reverse: false,
-                        })?;
-                        for entry in page.entries {
-                            if let Some(raw) = entry.value {
-                                let manifest = store_derive::Manifest::decode(&raw)
-                                    .map_err(|error| Anomaly::fault("rtdb.store/corrupt-derive-manifest", error.message))?;
-                                stored.push((entry.key, manifest));
-                            }
-                        }
-                        match page.resume {
-                            Some(resume) => after = Some(resume),
-                            None => break,
-                        }
+                    for (key, raw) in store_entries(view, range)? {
+                        let manifest = store_derive::Manifest::decode(&raw)
+                            .map_err(|error| Anomaly::fault("rtdb.store/corrupt-derive-manifest", error.message))?;
+                        stored.push((key, manifest));
                     }
                 }
                 if let Some(in_append) = pending_manifests.remove(&derive.manifest_prefix) {
                     stored.extend(in_append);
                 }
-                // The row's whole derived history goes, at every stamp; the
-                // purge emits only deletes (Bijection erase-derive).
-                for write in store_derive::purge(&derive.manifest_prefix, &stored) {
-                    out.push((write.key, write.value));
-                }
                 purged_prefixes.insert(derive.manifest_prefix.clone());
+                let mut lookup = |start: &[u8], end: &[u8]| -> std::result::Result<Vec<(Vec<u8>, Vec<u8>)>, Removal> {
+                    if start >= end {
+                        return Ok(Vec::new());
+                    }
+                    let range = KeyRange { start: start.to_vec(), end: Some(end.to_vec()) };
+                    let mut held: BTreeMap<Vec<u8>, Vec<u8>> = store_entries(view, range.clone()).map_err(Removal::Store)?.into_iter().collect();
+                    // This append's earlier derived writes, in order.
+                    for (key, value) in out.iter().filter(|(key, _)| range.contains(key)) {
+                        match value {
+                            Some(value) => held.insert(key.clone(), value.clone()),
+                            None => held.remove(key),
+                        };
+                    }
+                    Ok(held.into_iter().collect())
+                };
+                if matches!(derive.mode, store_derive::DeriveMode::Purge { .. }) {
+                    let emitted = store_derive::purge::<Removal>(&derive.manifest_prefix, &stored, bases, &mut lookup).map_err(Removal::anomaly)?;
+                    out.extend(emitted.into_iter().map(|write| (write.key, write.value)));
+                    continue;
+                }
+                // A close keeps the line's versions, with a closed one on
+                // top; where the row never sat, or its line is closed
+                // already, it changes nothing.
+                let Some((emitted, closed)) = store_derive::close::<Removal>(&derive.manifest_prefix, &stored, bases, &mut lookup).map_err(Removal::anomaly)? else {
+                    if !stored.is_empty() {
+                        pending_manifests.insert(derive.manifest_prefix.clone(), stored);
+                    }
+                    continue;
+                };
+                out.extend(emitted.into_iter().map(|write| (write.key, write.value)));
+                let manifest_key = store_derive::stamped_key(&derive.manifest_prefix, &stamp_bytes, ordinal);
+                ordinal = ordinal.wrapping_add(1);
+                out.push((manifest_key.clone(), Some(closed.encode())));
+                stored.push((manifest_key, closed));
+                pending_manifests.insert(derive.manifest_prefix.clone(), stored);
             },
         }
     }
     Ok(out)
+}
+
+/// Why a derived removal (`store_derive::close`, `store_derive::purge`)
+/// failed: the store's own read, or a stored record that does not match its
+/// path's lanes.
+enum Removal {
+    Store(Anomaly),
+    Corrupt(store_derive::DeriveError),
+}
+
+impl From<store_derive::DeriveError> for Removal {
+    fn from(error: store_derive::DeriveError) -> Self {
+        Self::Corrupt(error)
+    }
+}
+
+impl Removal {
+    fn anomaly(self) -> Anomaly {
+        match self {
+            Self::Store(anomaly) => anomaly,
+            Self::Corrupt(error) => Anomaly::fault("rtdb.store/corrupt-derived-record", error.message),
+        }
+    }
+}
+
+/// Every live entry of `range` in `view`, ascending, across pages.
+fn store_entries(view: &BranchView<'_>, range: KeyRange) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut entries = Vec::new();
+    let mut after = None;
+    loop {
+        let page = view.store_page(&StoreRead {
+            range: range.clone(),
+            after: after.take(),
+            limit: MAX_PAGE_ENTRIES,
+            projection: Projection::Values,
+            filter: None,
+            reverse: false,
+        })?;
+        entries.extend(page.entries.into_iter().filter_map(|entry| Some((entry.key, entry.value?))));
+        match page.resume {
+            Some(resume) => after = Some(resume),
+            None => break,
+        }
+    }
+    Ok(entries)
 }
 
 /// The first derive whose unique claim (`EntryKind::Claim`, Bijection T7-4)
