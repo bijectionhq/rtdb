@@ -83,6 +83,7 @@ GetFlightInfo encodes the SQL, Arrow parameters (a base64 Arrow stream), query c
 When the search path differs from `public`, the ticket includes the RTDB-only `searchPath` key.
 The server awaits the issuing session's writes before capturing the cut, so ordinary tickets remain compatible with the reference after a write.
 RTDB accepts the boolean `awaitFloor` key on previously issued JSON tickets.
+RTDB also redeems XTDB 2.2.0 run tickets with the four query fields and no `type` discriminator.
 A ticket issued by an earlier RTDB in its binary format is invalid.
 The server retains nothing per issued ticket, so the rate at which tickets are issued and redeemed is not bounded by `maximum_concurrent_calls`, and an unredeemed ticket holds no snapshot or catalog.
 The read cut names each database by name with its last visible system time; a database without a visible transaction, or one attached after the ticket was issued, keeps an empty cut, which later transactions do not enter.
@@ -190,7 +191,8 @@ The implementation uses https://docs.rs/arrow-flight/58.4.1/arrow_flight/[Arrow 
 Interop with Java, Go, Python, R, and ADBC drivers, external authentication, flow-control cancellation races, concurrent expiry/claim races, and every test listed here remain unexecuted qualification work.
 
 Ticket `currentTime` retains the query clock's nanoseconds through serialization and later execution.
-The captured snapshot-time cap and each database's cut retain their separate microsecond representation.
+The snapshot-time cap uses microsecond resolution.
+Redemption compares each database's supplied cut to the latest completed transaction at nanosecond precision before applying the microsecond scan bound.
 
 An existing anomaly with an absent message uses its `xtdb.api.error` category class name as the general Flight status description.
 An empty message remains empty.

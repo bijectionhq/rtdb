@@ -7,7 +7,7 @@ use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeS
 use rtdb_plan::{Binder, ControlStatement};
 use rtdb_query::{BoundParameters, QueryContext, QueryCursor};
 use rtdb_tx::SqlArguments;
-use rtdb_types::{Anomaly, LogicalType, ScalarType, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, Instant, LogicalType, ScalarType, TimeUnit, Value};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Response, Status};
 use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis, invalid_ticket}, wire};
@@ -55,7 +55,7 @@ async fn open_query(prepared: &PreparedSql, context: Arc<QueryContext>, params: 
 }
 
 /// Each database's last visible system time in a captured catalog, by name, so that a later read, after a restart too, can be capped to the same cut.
-fn visible_cut(context: &QueryContext, memory: &Arc<MemoryBudget>) -> Result<(BTreeMap<String, Option<Timestamp>>, Arc<MemoryReservation>), Status> {
+fn visible_cut(context: &QueryContext, memory: &Arc<MemoryBudget>) -> Result<(BTreeMap<String, Option<Instant>>, Arc<MemoryReservation>), Status> {
     let bytes = context.catalog.database_names().try_fold(256usize, |bytes, name| wire::add(bytes, wire::add(name.len(), 96)?))?;
     let charge = memory.reserve(bytes).map_err(status)?;
     let cut = context.catalog.database_names().map(|name| {
@@ -63,7 +63,7 @@ fn visible_cut(context: &QueryContext, memory: &Arc<MemoryBudget>) -> Result<(BT
         let through = database.partitions.first().and_then(|snapshot| snapshot.tx_basis().map(|head| {
             snapshot.system_time_cap().map_or(head.system_time, |cap| cap.min(head.system_time))
         }));
-        Ok((name.to_owned(), through))
+        Ok((name.to_owned(), through.map(Instant::from)))
     }).collect::<Result<_, Status>>()?;
     Ok((cut, charge))
 }

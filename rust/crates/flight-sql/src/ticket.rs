@@ -53,7 +53,7 @@ pub(crate) enum Cut {
     /// A restored SQL snapshot, which the token names.
     Snapshot(String),
     /// Each database's last visible system time, by name; `None`, or a database absent from the map, sees no transaction.
-    Visible(BTreeMap<String, Option<Timestamp>>),
+    Visible(BTreeMap<String, Option<Instant>>),
 }
 
 impl TicketBasis {
@@ -62,8 +62,8 @@ impl TicketBasis {
         let (snapshot, resume_token) = match &self.cut {
             Cut::Snapshot(token) => (TimeBasis::default(), Some(token.clone())),
             Cut::Visible(visible) => (TimeBasis { databases: databases.into_iter().chain(visible.keys().cloned()).map(|name| {
-                let time = visible.get(&name).copied().flatten().unwrap_or(Timestamp::MIN);
-                (name, vec![Some(Instant::from(time))])
+                let time = visible.get(&name).copied().flatten().unwrap_or_else(|| Instant::from(Timestamp::MIN));
+                (name, vec![Some(time)])
             }).collect() }, None),
         };
         QueryBasis {
@@ -162,7 +162,7 @@ impl Ticket {
                 let snapshot_token = match &basis.cut {
                     Cut::Snapshot(token) => token.clone(),
                     Cut::Visible(databases) => rtdb_format::basis::encode_time_basis(&TimeBasis {
-                        databases: databases.iter().map(|(name, through)| (name.clone(), vec![through.map(Instant::from)])).collect(),
+                        databases: databases.iter().map(|(name, through)| (name.clone(), vec![*through])).collect(),
                     }),
                 };
                 let mut query_basis = Map::new();
@@ -189,7 +189,12 @@ impl Ticket {
     /// Anything else, including a ticket an earlier RTDB issued in its binary format, is an invalid ticket, as the reference reports one.
     pub fn decode(bytes: &Bytes, binding: &Binding<'_>) -> Result<Self, Status> {
         let Ok(Value::Object(mut object)) = serde_json::from_slice::<Value>(bytes) else { return Err(invalid_ticket()); };
-        let ticket = match take_string(&mut object, "type")?.as_str() {
+        let kind = match object.remove("type") {
+            Some(Value::String(kind)) => kind,
+            None if object.len() == 4 => "run".into(),
+            _ => return Err(invalid_ticket()),
+        };
+        let ticket = match kind.as_str() {
             "empty" => Self::Empty,
             "run" => {
                 let database = take_string(&mut object, "dbName")?;
@@ -209,7 +214,7 @@ impl Ticket {
                 if object.remove("awaitFloor").is_some_and(|flag| !flag.is_boolean()) { return Err(invalid_ticket()); }
                 let cut = match rtdb_format::basis::decode_time_basis(&snapshot_token) {
                     Ok(time_basis) => Cut::Visible(time_basis.databases.into_iter().map(|(name, times)| match times.as_slice() {
-                        [through] => Ok((name, through.map(Instant::as_micros).transpose().map_err(|_| invalid_ticket())?)),
+                        [through] => Ok((name, *through)),
                         _ => Err(invalid_ticket()),
                     }).collect::<Result<_, Status>>()?),
                     Err(_) => Cut::Snapshot(snapshot_token),
@@ -310,7 +315,8 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let owner = Owner::Authenticated(Uuid::from_bytes([7; 16]));
         let signer = binding("session", owner, b"key");
-        let cut = Cut::Visible(BTreeMap::from([("empty".to_owned(), None), ("xtdb".to_owned(), Some(Timestamp(1_234_567)))]));
+        let instant = Instant::new(1, 234_567_001).unwrap();
+        let cut = Cut::Visible(BTreeMap::from([("empty".to_owned(), None), ("xtdb".to_owned(), Some(instant))]));
         let params = Bytes::from_static(b"\xff\x00\x83\x59");
         {
             let encoded = run(cut, Some(params.clone())).encode(&signer, &memory).unwrap();
@@ -319,12 +325,12 @@ mod tests {
             assert_eq!(decoded.search_path, ["public", "other"]);
             assert_eq!(decoded.params, Some(params));
             let Cut::Visible(cut) = &decoded.basis.cut else { panic!("visible cut") };
-            assert_eq!((cut["empty"], cut["xtdb"]), (None, Some(Timestamp(1_234_567))));
+            assert_eq!((cut["empty"], cut["xtdb"]), (None, Some(instant)));
             let basis = decoded.basis.query_basis(BTreeSet::from(["attached".to_owned()]));
             assert_eq!(basis.current_time, Instant::new(-1, 999_999_999).unwrap());
             assert_eq!((basis.timezone.as_str(), basis.snapshot_time, basis.resume_token), ("Europe/Paris", Some(Timestamp(-1)), None));
             assert_eq!(basis.snapshot.databases["empty"], [Some(Instant::from(Timestamp::MIN))]);
-            assert_eq!(basis.snapshot.databases["xtdb"], [Some(Instant::from(Timestamp(1_234_567)))]);
+            assert_eq!(basis.snapshot.databases["xtdb"], [Some(instant)]);
             assert_eq!(basis.snapshot.databases["attached"], [Some(Instant::from(Timestamp::MIN))]);
 
             let snapshot = run(Cut::Snapshot("token".into()), None).encode(&signer, &memory).unwrap();
@@ -366,7 +372,7 @@ mod tests {
         let ticket = Ticket::Run(QueryRun {
             database: "xtdb".into(), sql: "SELECT 1".into(), search_path: vec!["public".into()],
             basis: TicketBasis { current_time: Instant::new(1_577_836_800, 0).unwrap(), timezone: "Europe/London".into(), snapshot_time: None,
-                cut: Cut::Visible(BTreeMap::from([("xtdb".to_owned(), Some(Timestamp(1_577_836_800_000_000)))])) },
+                cut: Cut::Visible(BTreeMap::from([("xtdb".to_owned(), Some(Instant::new(1_577_836_800, 0).unwrap()))])) },
             params: Some(Bytes::from_static(b"\x01\x02\x03")),
         });
         let encoded = ticket.encode(&signer, &memory).unwrap();
@@ -384,7 +390,7 @@ mod tests {
         assert_eq!(decoded.basis.current_time, Instant::new(1_577_836_800, 123_000_000).unwrap());
         assert!(decoded.params.is_none());
         let Cut::Visible(cut) = decoded.basis.cut else { panic!("visible cut") };
-        assert_eq!(cut["xtdb"], Some(Timestamp(1_577_836_800_000_000)));
+        assert_eq!(cut["xtdb"], Some(Instant::new(1_577_836_800, 0).unwrap()));
     }
 
     #[test]
@@ -393,6 +399,16 @@ mod tests {
         let previous_rtdb = Bytes::from_static(br#"{"type":"run","dbName":"xtdb","sql":"SELECT ?","params":"AQI","basis":{"currentTime":"2020-01-01T00:00:00Z","defaultTz":"Z","snapshotToken":"","snapshotTime":null},"awaitFloor":true}"#);
         let Ok(Ticket::Run(decoded)) = Ticket::decode(&previous_rtdb, &signer) else { panic!("previous RTDB run ticket") };
         assert_eq!(decoded.params.as_deref(), Some(&[1, 2][..]));
+    }
+
+    #[test]
+    fn the_released_xtdb_run_ticket_has_no_type_discriminator() {
+        let signer = binding("session", Owner::Anonymous, b"key");
+        let released = Bytes::from_static(br#"{"dbName":"xtdb","sql":"SELECT 1","params":null,"basis":{"currentTime":"2020-01-01T00:00:00Z","defaultTz":"Z","snapshotToken":"ChAKBHh0ZGISCAoGCIDCr/AF","snapshotTime":null}}"#);
+        let Ok(Ticket::Run(decoded)) = Ticket::decode(&released, &signer) else { panic!("released XTDB run ticket") };
+        assert_eq!((decoded.database.as_str(), decoded.sql.as_str()), ("xtdb", "SELECT 1"));
+        let Cut::Visible(cut) = decoded.basis.cut else { panic!("visible cut") };
+        assert_eq!(cut["xtdb"], Some(Instant::new(1_577_836_800, 0).unwrap()));
     }
 
     #[test]

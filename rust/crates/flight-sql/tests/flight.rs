@@ -411,6 +411,36 @@ async fn query_ticket_keeps_an_empty_cut_and_the_original_clock() {
 }
 
 #[tokio::test]
+async fn a_query_ticket_one_nanosecond_ahead_of_the_indexed_head_is_refused() {
+    use arrow_flight::{Ticket, sql::TicketStatementQuery};
+    use rtdb_types::Instant;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id) VALUES (1)", None).await;
+    let info = client.info("SELECT count(*) AS n FROM docs", None).await;
+    let original = info.endpoint[0].ticket.as_ref().unwrap();
+    let wrapped = Any::decode(original.ticket.as_ref()).unwrap();
+    let run = wrapped.unpack::<TicketStatementQuery>().unwrap().unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&run.statement_handle).unwrap();
+    let snapshot_token = json["basis"]["snapshotToken"].as_str().unwrap();
+    let mut basis = rtdb_format::basis::decode_time_basis(snapshot_token).unwrap();
+    let first_partition = &mut basis.databases.get_mut("xtdb").unwrap()[0];
+    let head = first_partition.unwrap();
+    *first_partition = Some(Instant::new(head.seconds(), head.nanos() + 1).unwrap());
+    json["basis"]["snapshotToken"] = rtdb_format::basis::encode_time_basis(&basis).into();
+    let run = TicketStatementQuery { statement_handle: serde_json::to_vec(&json).unwrap().into() };
+    let request = client.request(Ticket { ticket: run.as_any().encode_to_vec().into() });
+    let error = client.client.do_get(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    let metadata = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+    let anomaly: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+    assert_eq!(anomaly["code"], "xtdb/unindexed-tx");
+    assert_eq!(integer(&client.redeem(&info).await[0], 0, 0), 1);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn query_tickets_are_unbounded_by_concurrent_calls_and_redeem_repeatedly_at_their_basis() {
     let config = FlightConfig { maximum_concurrent_calls: 4, ..Default::default() };
     let running = Running::start(None, config).await;

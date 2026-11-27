@@ -86,7 +86,9 @@
 -- A run ticket is encoded in XTDB's `QueryTicket.Run` JSON (`type`, `dbName`, `sql`, base64 Arrow `params` and `basis` with the read cut as an XTDB snapshot token), and an empty ticket is `{"type":"empty"}`, so any session redeems it across restarts and against XTDB.
 -- A run ticket carries the RTDB-only `searchPath` field when the path differs from `public`.
 -- The read basis is acquired after awaiting the issuing session's writes, so the ticket carries the visible cut without a separate await floor.
+-- Redemption compares each supplied cut instant to the corresponding indexed head at nanosecond precision before applying the microsecond scan bound.
 -- RTDB accepts the optional boolean `awaitFloor` on previously issued JSON tickets.
+-- RTDB accepts released XTDB 2.2.0 run tickets with the four query fields and no `type` discriminator.
 -- An inspection ticket is JSON of type `inspect` signed for its session.
 -- An XTDB run ticket for a session `SHOW` reads the redeeming connection's state.
 -- An XTDB run ticket for `SHOW CLOCK_TIME`, `SHOW SNAPSHOT_TOKEN`, `SHOW TIME ZONE` or `SHOW TRANSACTION ISOLATION LEVEL` runs at the captured basis.
