@@ -1290,6 +1290,49 @@ impl MultiDatabase {
         }).await
     }
 
+    pub(super) async fn commit_checkpoint(
+        &mut self,
+        lease: Lease,
+        write: Append,
+        covered_through_lsn: Lsn,
+    ) -> Result<bool> {
+        Box::pin(async move {
+            if self.stream.immutable_history() {
+                let authority = self.append_authority(lease.epoch)?;
+                if authority.next != write.at {
+                    let error = order_error("The checkpoint must follow the acknowledged prefix");
+                    return Err(self.begin_write_recovery(AttemptError::Local(error)));
+                }
+                let record = self.stream.encode(write.at, &write.entry).await
+                    .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
+                self.require_authority(lease)?;
+                let tail = Sha256::digest(&record).into();
+                let installation = journal_contract::CheckpointInstallation {
+                    operation_id: uuid::Uuid::new_v4().as_u128(),
+                    checkpoint_lsn: write.at,
+                    covered_through_lsn,
+                    record,
+                };
+                let receipt = self.stream.install_checkpoint(lease.epoch, installation).await
+                    .map_err(|error| self.begin_write_recovery(AttemptError::Journal(error)))?;
+                if let Some(receipt) = receipt {
+                    if receipt.checkpoint_lsn != write.at
+                        || receipt.covered_through_lsn != covered_through_lsn
+                        || next(covered_through_lsn).ok() != Some(receipt.logical_floor_lsn)
+                    {
+                        let error = order_error("The journal acknowledged a different checkpoint");
+                        return Err(self.begin_write_recovery(AttemptError::Local(error)));
+                    }
+                    self.publish_staged(lease, vec![write], tail).await
+                        .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
+                    return Ok(true);
+                }
+            }
+            self.commit_one(lease, write).await?;
+            Ok(false)
+        }).await
+    }
+
     pub(super) fn withdraw_writer(&mut self) {
         if let Some(mut writer) = self.writer.take() {
             writer.pipeline.withdraw();

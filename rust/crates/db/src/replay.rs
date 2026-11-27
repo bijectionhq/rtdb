@@ -1103,10 +1103,45 @@ enum BaseSearch {
     Moved(Lsn),
 }
 
-/// Finds the deferred base of a suffix whose floor is an ordinary record: the
-/// first retained checkpoint whose cut is the record before the floor. The
-/// writer announces it before trimming, so it lies within the retained head.
+/// Reads the selected deferred base directly. Floors written before the
+/// journal kept a selection are recovered by scanning the retained suffix.
 async fn find_deferred_base(stream: &Stream, floor: Lsn) -> Result<BaseSearch> {
+    if let Some(receipt) = stream.selected_checkpoint().await? {
+        if receipt.logical_floor_lsn > floor {
+            return Ok(BaseSearch::Moved(receipt.logical_floor_lsn));
+        }
+        if receipt.logical_floor_lsn != floor
+            || next(receipt.covered_through_lsn)? != floor
+            || receipt.checkpoint_lsn < floor
+        {
+            return Err(invalid("The selected checkpoint has invalid journal bounds"));
+        }
+        let announced = receipt.checkpoint_lsn;
+        let page = match stream.read_checkpoint_record(announced).await {
+            Ok(page) => page,
+            Err(JournalError::Trimmed { floor: moved }) if moved > floor => {
+                return Ok(BaseSearch::Moved(moved));
+            }
+            Err(error) => return Err(journal_error(error)),
+        };
+        if page.floor > floor {
+            return Ok(BaseSearch::Moved(page.floor));
+        }
+        let [(lsn, bytes)] = page.records.as_slice() else {
+            return Err(journal_error(JournalError::Unavailable));
+        };
+        if *lsn != announced || page.floor != floor {
+            return Err(journal_error(JournalError::Unavailable));
+        }
+        let entry = stream.decode(announced, bytes).await?;
+        if let Record::Checkpoint(checkpoint) = entry.record
+            && checkpoint.through == receipt.covered_through_lsn.0
+            && checkpoint.key_generation == entry.generation
+        {
+            return Ok(BaseSearch::Found { announced, epoch: entry.epoch, checkpoint });
+        }
+        return Err(invalid("The selected record does not announce the committed checkpoint"));
+    }
     let mut at = floor;
     loop {
         let page = match stream.read(at).await {

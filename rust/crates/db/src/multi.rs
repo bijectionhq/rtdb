@@ -938,12 +938,8 @@ impl MultiDatabase {
             restore: false,
             recovery_epoch: self.state().checkpoint_recovery_epoch(through),
         };
-        self.append_control(lease, Record::Checkpoint(checkpoint))
-            .await?;
-        timing.mark("append");
-        let announced = self.state().head;
-        self.trim_to_base(lease, announced, lease.until, store_history_floor).await?;
-        timing.mark("trim");
+        self.install_checkpoint(lease, checkpoint, lease.until, store_history_floor).await?;
+        timing.mark("install");
         timing.report(self.options.database, manifest.payload.len(), through);
         Ok(image.id())
         }).await
@@ -1085,17 +1081,39 @@ impl MultiDatabase {
         Box::pin(self.state().reachability(&self.stream, self.store.as_ref(), lease.epoch)).await
     }
 
-    /// Trims through the cut of a checkpoint this writer announced, then keeps
-    /// its replayed state over the new floor instead of replaying the
-    /// checkpoint again.
-    async fn trim_to_base(&mut self, lease: Lease, announced: Lsn, until: i64, store_history_floor: u64) -> Result<()> {
+    async fn install_checkpoint(
+        &mut self,
+        lease: Lease,
+        checkpoint: Checkpoint,
+        until: i64,
+        store_history_floor: u64,
+    ) -> Result<()> {
+        Box::pin(async move {
+            let covered_through_lsn = Lsn(checkpoint.through);
+            let write = self.reserve_control(
+                lease, checkpoint.key_generation, Record::Checkpoint(checkpoint),
+            )?;
+            let announced = write.at;
+            let installed = self.commit_checkpoint(lease, write, covered_through_lsn).await?;
+            self.finish_checkpoint(lease, announced, until, store_history_floor, installed).await
+        }).await
+    }
+
+    /// Keeps the applied state over the selected floor when it still covers
+    /// the same checkpoint. Restores and changed histories replay instead.
+    async fn finish_checkpoint(
+        &mut self, lease: Lease, announced: Lsn, until: i64,
+        store_history_floor: u64, installed: bool,
+    ) -> Result<()> {
         let base = self.state().checkpoint_at(announced)?;
         let retired = if store_history_floor != 0 && self.state().store_purge_floor != 0 {
             self.state().checkpoint_manifests_through(Lsn(base.checkpoint.through))
         } else {
             BTreeSet::new()
         };
-        self.trim_checkpoint(lease, &base).await?;
+        if !installed {
+            self.trim_checkpoint(lease, &base).await?;
+        }
         if let Some(writer) = self.writer.as_mut() {
             writer.retired_store_checkpoints.extend(retired);
         }
@@ -1202,6 +1220,13 @@ impl MultiDatabase {
         record: Record,
     ) -> Result<()> {
         Box::pin(async move {
+        let write = self.reserve_control(lease, generation, record)?;
+        self.commit_one(lease, write).await?;
+        Ok(())
+        }).await
+    }
+
+    fn reserve_control(&mut self, lease: Lease, generation: u64, record: Record) -> Result<Append> {
         self.authority()?;
         let coordinates = self.state().coordinates;
         let at = coordinates.lsn(self
@@ -1210,7 +1235,7 @@ impl MultiDatabase {
             .ok_or_else(no_writer)?
             .pipeline
             .reserve()?)?;
-        let write = Append {
+        Ok(Append {
             at,
             admit_before: None,
             entry: Entry {
@@ -1218,10 +1243,7 @@ impl MultiDatabase {
                 generation,
                 record,
             },
-        };
-        self.commit_one(lease, write).await?;
-        Ok(())
-        }).await
+        })
     }
 
     fn mutation_failed(&mut self, error: JournalError) -> Anomaly {

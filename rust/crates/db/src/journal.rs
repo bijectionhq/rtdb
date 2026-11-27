@@ -1,7 +1,7 @@
 use std::{sync::{Arc, RwLock}, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, CheckpointAnchor, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
+use journal_contract::{BoxFuture, CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::TransactionRecord;
@@ -438,6 +438,40 @@ impl Stream {
             writer_session_id: self.session.as_ref().map(|session| session.id),
             trim,
         })
+    }
+
+    pub(crate) async fn install_checkpoint(
+        &self,
+        epoch: Epoch,
+        checkpoint: CheckpointInstallation,
+    ) -> journal_contract::Result<Option<CheckpointReceipt>> {
+        let Some(fence) = self.session_fence(epoch)? else {
+            return Ok(None);
+        };
+        self.authorize_mutation().await?;
+        match self.journal.install_checkpoint(fence, checkpoint).await {
+            Ok(receipt) => Ok(Some(receipt)),
+            // Before the cluster finalizes atomic installation, publish the
+            // record and select it with the verified compatibility request.
+            Err(JournalError::Unsupported) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn selected_checkpoint(&self) -> Result<Option<CheckpointReceipt>> {
+        if !self.immutable_history() {
+            return Ok(None);
+        }
+        self.verify_history().await.map_err(journal_error)?;
+        match self.journal.selected_checkpoint(self.id()).await {
+            Ok(receipt) => Ok(receipt),
+            Err(JournalError::Unsupported) => Ok(None),
+            Err(error) => Err(journal_error(error)),
+        }
+    }
+
+    pub(crate) async fn read_checkpoint_record(&self, at: Lsn) -> journal_contract::Result<Page> {
+        self.page(at, at, 1, Duration::ZERO).await
     }
 
     pub(crate) async fn trim(

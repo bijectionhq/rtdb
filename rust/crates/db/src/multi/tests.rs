@@ -3221,10 +3221,59 @@ async fn immutable_trim_requires_the_exact_committed_checkpoint() {
     assert_eq!(reopened.stream.trim(lease.epoch, proof).await, Err(JournalError::Unsupported));
     assert_eq!(writer.stream.read_through(Lsn(1), announced).await.unwrap().floor, Lsn(1));
 
-    writer.trim_to_base(lease, announced, lease.until, 0).await.unwrap();
+    writer.finish_checkpoint(lease, announced, lease.until, 0, false).await.unwrap();
     assert_eq!(writer.state().floor, next(through).unwrap());
     assert_eq!(reopened.tx_status(&before_cut.key).await.unwrap().basis, before_receipt.basis);
     assert_eq!(reopened.tx_status(&after_cut.key).await.unwrap().basis, after_receipt.basis);
+    keepers.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immutable_checkpoint_installs_and_replays_the_exact_cut_after_keeper_restart() {
+    use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+    const PRINCIPAL: &str = "urn:logkeeper:client:checkpoint-install-rtdb";
+    let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+    let config = keepers.journal_config(8 << 30, 4 << 20);
+    let journal = Arc::new(keepers.journal(PRINCIPAL, &config).unwrap());
+    journal.client().finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, journal.clone()).with_immutable_journal();
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+
+    let before = put(1, 1, "captured");
+    let captured = writer.transact(&before).await.unwrap();
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let covered = capture.through();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    let after = put(2, 2, "retained");
+    let retained = writer.transact(&after).await.unwrap();
+    assert!(matches!(writer.announce_checkpoint(prepared).await.unwrap(), deferred::Announcement::Announced(_)));
+
+    let stream = writer.journal_stream();
+    let receipt = journal.selected_checkpoint(stream).await.unwrap().unwrap();
+    assert_eq!(receipt.covered_through_lsn, covered);
+    assert_eq!(receipt.logical_floor_lsn, next(covered).unwrap());
+    assert!(receipt.checkpoint_lsn > receipt.logical_floor_lsn);
+    drop(writer);
+    keepers.shutdown().await.unwrap();
+    for keeper in keepers.keepers().keys().copied().collect::<Vec<_>>() {
+        keepers.restart(keeper).await.unwrap();
+    }
+    assert_eq!(journal.selected_checkpoint(stream).await, Ok(Some(receipt)));
+    let mut reopened = cluster.node(2, journal.clone()).with_immutable_journal();
+    assert_eq!(reopened.tx_status(&before.key).await.unwrap().basis, captured.basis);
+    assert_eq!(reopened.tx_status(&after.key).await.unwrap().basis, retained.basis);
+    assert_eq!(reopened.retained_floor(), Some(receipt.logical_floor_lsn));
+
+    cluster.at(121);
+    assert!(matches!(reopened.tick(&live(2)).await.unwrap(), Role::Writer(_)));
+    let rotation = reopened.rotate_clean_checkpoint(&[]).await.unwrap();
+    let selected = journal.selected_checkpoint(stream).await.unwrap().unwrap();
+    assert_eq!(selected.checkpoint_lsn, rotation.checkpoint);
+    assert_eq!(selected.logical_floor_lsn, rotation.checkpoint);
+    assert_eq!(reopened.tx_status(&after.key).await.unwrap().basis, retained.basis);
     keepers.shutdown().await.unwrap();
 }
 

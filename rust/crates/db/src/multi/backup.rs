@@ -350,14 +350,13 @@ impl MultiDatabase {
         image.put(self.store.as_ref()).await?;
         check_source().await?;
         self.require_authority(lease)?;
-        self.append_control(lease, Record::Checkpoint(Checkpoint {
+        self.install_checkpoint(lease, Checkpoint {
             manifest: image.id(),
             through: through.0,
             key_generation: generation,
             restore: true,
             recovery_epoch: self.state().checkpoint_recovery_epoch(through),
-        })).await?;
-        self.trim_committed_checkpoint(lease, self.state().head, through).await?;
+        }, lease.until, 0).await?;
         Ok(cut)
     }
 }

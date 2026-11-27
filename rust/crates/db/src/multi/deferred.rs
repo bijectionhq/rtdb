@@ -3,8 +3,8 @@
 //!
 //! A deferred checkpoint describes the cut `through`, the head when the writer
 //! captured it. Commits continue while the manifest is built and uploaded, so
-//! the announcing record lands later. The writer then trims only through the
-//! cut. Replay installs the checkpoint as the base of the floor `through + 1`
+//! the announcing record lands later. Installation selects the checkpoint
+//! and trims through its cut. Replay uses the checkpoint at floor `through + 1`
 //! and applies every retained record after it, so the commits between the cut
 //! and the announcement are kept.
 
@@ -167,7 +167,7 @@ impl MultiDatabase {
         CheckpointBuilder { stream: self.stream.clone(), store: Arc::clone(&self.store) }
     }
 
-    /// Announces a prepared checkpoint and trims through its cut. Returns
+    /// Installs a prepared checkpoint through its cut. Returns
     /// [`Announcement::Invalidated`] when the writer epoch, key generation or
     /// restored history changed since the capture, or an erasure or key
     /// rotation started; the next bound check captures again.
@@ -194,11 +194,8 @@ impl MultiDatabase {
             return Ok(Announcement::Invalidated);
         }
         timing.mark("validate");
-        self.append_control(lease, Record::Checkpoint(checkpoint)).await?;
-        timing.mark("append");
-        let announced = self.state().head;
-        self.trim_to_base(lease, announced, prepared.lease.until, prepared.store_history_floor).await?;
-        timing.mark("trim");
+        self.install_checkpoint(lease, checkpoint, prepared.lease.until, prepared.store_history_floor).await?;
+        timing.mark("install");
         timing.report_phase("deferred_announce", self.options.database, 0, prepared.through);
         Ok(Announcement::Announced(prepared.manifest))
     }
