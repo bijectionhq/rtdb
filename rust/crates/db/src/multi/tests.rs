@@ -691,7 +691,7 @@ async fn store_version_hold_cannot_reopen_on_a_replacement_writer() {
     assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap_err().code, "rtdb/no-writer");
     let epoch = writer.authority().unwrap().epoch;
     let head = writer.stream.head().await.unwrap();
-    assert_eq!(next_journal.seal(writer.stream.id(), Epoch(epoch.0 + 1)).await.unwrap(), head);
+    assert_eq!(next_journal.seal(writer.journal_stream(), Epoch(epoch.0 + 1)).await.unwrap(), head);
     assert_eq!(writer.store_version_hold(reader, reopen).await.unwrap_err().code, "rtdb/writer-fenced");
     cluster.at(200);
     successor.tick(&live(2)).await.unwrap();
