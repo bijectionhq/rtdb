@@ -88,7 +88,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         Ok(())
     }
 
-    fn match_validated_terminal(
+    pub(super) fn match_validated_terminal(
         &mut self, number: u32, expected: TerminalExpectation,
     ) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
         if let TerminalExpectation::Atom(token) = expected && self.profile == ParserProfile::SllBail {

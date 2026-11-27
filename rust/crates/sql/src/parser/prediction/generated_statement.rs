@@ -23,7 +23,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         let mode = self.statement_root_mode()?;
         self.generated_ordinary(DIRECT_SQL_STATEMENT, |session, local| {
             session.set_state(352)?;
-            session.directly_executable_statement(mode)?;
+            session.directly_executable_statement(mode, false)?;
             session.set_state(354)?;
             session.sync_required_block()?;
             let (_, token) = session.lookahead_token(1)?;
@@ -38,13 +38,13 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         let mode = self.statement_root_mode()?;
         self.generated_ordinary(MULTI_SQL_STATEMENT, |session, local| {
             session.set_state(358)?;
-            session.directly_executable_statement(mode)?;
+            session.directly_executable_statement(mode, true)?;
             session.set_state(363)?;
             session.sync_statement()?;
             while session.adaptive_predict(1, mode)?.number() == 1 {
                 session.match_statement_terminal(*local, 359)?;
                 session.set_state(360)?;
-                session.directly_executable_statement(mode)?;
+                session.directly_executable_statement(mode, true)?;
                 session.set_state(365)?;
                 session.sync_statement()?;
             }
@@ -59,7 +59,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         })
     }
 
-    fn directly_executable_statement(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+    fn directly_executable_statement(&mut self, mode: PredictionMode, batch: bool) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_ordinary(DIRECTLY_EXECUTABLE_STATEMENT, |session, local| {
             session.set_state(574)?;
             session.sync_required_block()?;
@@ -67,6 +67,8 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             let class = match alt {
                 1 => ContextClass::QueryExpr,
                 2 => ContextClass::InsertStatement,
+                3 => ContextClass::UpdateStatement,
+                4 => ContextClass::DeleteStatement,
                 11 => ContextClass::StartTransactionStatement,
                 13 => ContextClass::CommitStatement,
                 14 => ContextClass::RollbackStatement,
@@ -77,8 +79,11 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             *local = session.labelled_context(*local, class)?;
             session.enter_outer_alt(*local)?;
             match class {
+                ContextClass::QueryExpr if batch => session.replay_statement_alternative(*local, alt, mode),
                 ContextClass::QueryExpr => session.generated_query(*local, mode),
-                ContextClass::InsertStatement => session.generated_insert(*local, mode),
+                ContextClass::InsertStatement | ContextClass::UpdateStatement | ContextClass::DeleteStatement => {
+                    session.replay_statement_alternative(*local, alt, mode)
+                }
                 ContextClass::StartTransactionStatement => session.start_transaction_statement(*local, mode),
                 ContextClass::CommitStatement => session.commit_statement(*local),
                 ContextClass::RollbackStatement => session.match_statement_terminal(*local, 488),

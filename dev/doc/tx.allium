@@ -576,6 +576,8 @@ external entity SqlParser {
     -- An initial Simple Query statement error distinguishes a mismatch from an unwanted token and carries the received SQL in its structured detail.
     -- Each parsed statement resolves its operands when the connection reaches it.
     -- Native Extended Parse lexes the full input before classifying the statement.
+    -- Extended Parse reports a reached grammar error before checking the single-statement constraint.
+    -- Its grammar diagnostics use the normalized message for line and column and carry the received SQL in structured detail.
     -- If classification cannot reserve memory, existing prepared statements remain registered.
     -- Bind reserves argument slots before publishing a portal.
     -- Memory exhaustion while decoding a Bind argument reports SQLSTATE `XX000`.

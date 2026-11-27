@@ -76,6 +76,13 @@ fn valid_insert_returning_preserves_the_values_planning_error() {
 }
 
 #[test]
+fn update_scalar_subqueries_remain_valid_with_returning() {
+    let sql = "UPDATE docs SET foo = (SELECT 'toto') WHERE _id = 1 RETURNING \"select\"";
+    assert!(parse(sql).is_ok());
+    assert!(rtdb_sql::prepare_tx(sql, &Fixture, &PrepareOptions::default()).is_ok());
+}
+
+#[test]
 fn returning_requires_select_list_syntax_and_is_rejected_by_erase_and_patch() {
     for returning in ["x FROM docs", "x WHERE TRUE", "x ORDER BY x", "x LIMIT 1", "x UNION SELECT 1", "x FOR ALL VALID_TIME", "DISTINCT x", "x DEFAULT", "x AS 'text'", "x+", "f(", "* EXCLUDE ()", "* RENAME x", "* EXCLUDE t.x", "t.* RENAME t.x AS y", "x,*,y", ",*,y", "*,*", "x,*,", "* EXCEPT (x)", "* REPLACE (1 AS x)", "(XTQL ('bad',1))"] {
         let sql = format!("INSERT INTO docs (_id) VALUES (1) RETURNING {returning}");

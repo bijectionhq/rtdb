@@ -34,8 +34,8 @@ mod generated_actions;
 #[path = "generated_expr.rs"]
 mod generated_expr;
 
-#[path = "generated_insert.rs"]
-mod generated_insert;
+#[path = "generated_dml.rs"]
+mod generated_dml;
 
 #[path = "generated_names.rs"]
 mod generated_names;
@@ -158,24 +158,22 @@ enum InvocationException<'parse, 'sql> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContextClass {
     RegularIdentifier, DelimitedIdentifier,
-    QueryExpr, InsertStatement, StartTransactionStatement, CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
+    QueryExpr, InsertStatement, UpdateStatement, DeleteStatement, StartTransactionStatement, CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
     QuerySpecification,
-    InsertValues, SingleExprRowConstructor, DmlReturningStatement,
+    DmlReturningStatement,
     DiscardAll, DiscardPlans, DiscardTemp, DiscardSequences,
     IntegerLiteral0, FloatLiteral, BooleanLiteral, NullLiteral, CharacterStringLiteral, SqlStandardString, CEscapesString, DollarString,
     TimeLiteral, DurationLiteral, UuidLiteral, UriLiteral, KeywordLiteral,
     BinaryStringLiteral, DateTimeLiteral0, DateLiteral, TimestampLiteral, WithTimeZone, WithoutTimeZone,
     IntervalLiteral0, MultiFieldInterval, SingleFieldInterval,
-    CommonValueExpr0, WrappedExpr, LiteralExpr, NumericFactorExpr, NumericTermExpr,
+    CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
     DynamicParameter, PostgresParameter,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
         match self {
-            Self::QueryExpr | Self::InsertStatement | Self::StartTransactionStatement | Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
+            Self::QueryExpr | Self::InsertStatement | Self::UpdateStatement | Self::DeleteStatement | Self::StartTransactionStatement | Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
             Self::QuerySpecification => 126,
-            Self::InsertValues => 157,
-            Self::SingleExprRowConstructor => 69,
             Self::DmlReturningStatement => 153,
             Self::DiscardAll | Self::DiscardPlans | Self::DiscardTemp | Self::DiscardSequences => 3,
             Self::DateLiteral | Self::TimestampLiteral => 12,
@@ -187,7 +185,7 @@ impl ContextClass {
             Self::WithTimeZone | Self::WithoutTimeZone => 30,
             Self::CommonValueExpr0 => 33,
             Self::RegularIdentifier | Self::DelimitedIdentifier => 22,
-            Self::WrappedExpr | Self::LiteralExpr | Self::NumericFactorExpr | Self::NumericTermExpr => 34,
+            Self::LiteralExpr | Self::NumericFactorExpr | Self::NumericTermExpr => 34,
             Self::DynamicParameter | Self::PostgresParameter => 39,
         }
     }

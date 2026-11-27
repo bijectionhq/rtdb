@@ -190,6 +190,23 @@ fn insert_values_uses_the_original_returning_rule_and_select_list_call() {
     assert_eq!(memory.used_bytes(), 0);
 }
 
+#[test]
+fn returning_after_a_multibyte_update_prefix_keeps_both_coordinates() {
+    let source = "UPDATE \"🙂\".\"select\" SET \"returning\" = $1 RETURNING CAST(a AS BLOB)";
+    let (result, memory) = wrapped(source, |_, _, _, _| {});
+    let RuntimeError::ReportedNoViableAlternative(report) = result.unwrap_err() else {
+        panic!("expected the listener's no-viable-alternative error");
+    };
+    let offending = report.cause().offending.lexeme();
+    let position = offending.span().start;
+    assert_eq!(offending.raw(), "BLOB");
+    assert_eq!(position.byte, source.find("BLOB").unwrap());
+    assert_eq!((position.line, position.column), (1, 61));
+    assert_eq!(position.byte, position.column + 3);
+    drop(report);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
 fn assert_initial_failure_tree<'parse>(
     session: &ParserSession<'parse, '_, '_, '_>, first: usize,
 ) -> (InvocationKey<'parse>, InvocationKey<'parse>) {

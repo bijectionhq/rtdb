@@ -8,7 +8,7 @@ use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::{BoundParameters, QueryCursor};
 use rtdb_tx::SqlArguments;
 use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, ExecutableSyntax, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax};
-use rtdb_types::{Anomaly, LogicalType, PgType, Result, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use crate::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
@@ -552,7 +552,13 @@ impl ProtocolSession {
         let input = rtdb_sql::parse_extended_statement(original, self.node.memory())?;
         let source = match input.statement {
             ExtendedStatement::Empty => "",
-            ExtendedStatement::Multiple => return Err(protocol("A prepared statement must contain exactly one statement")),
+            ExtendedStatement::Multiple => {
+                drop(input);
+                let memory = self.node.memory();
+                rtdb_sql::parse_statement_batch(original, memory)
+                    .map_err(|error| extended_syntax_error(original, original, error, memory))?;
+                return Err(protocol("A prepared statement must contain exactly one statement"));
+            }
             ExtendedStatement::Ordinary(source) => source,
             ExtendedStatement::Prepare(syntax) => return self.retain_sql_prepare(syntax, oids),
         };
@@ -1074,7 +1080,24 @@ fn sql_shape(prepared: PreparedSql, declared_parameters: usize) -> PreparedShape
 
 /// Extended Parse reaches the reference's multi-statement grammar, as Simple Query does.
 fn extended_syntax_error(source: &str, original: &str, error: Anomaly, memory: &Arc<MemoryBudget>) -> Anomaly {
-    match rtdb_sql::batch_syntax_diagnostic(source, &error, memory).and_then(|report| report.map(|report| report.with_sql_context(original)).transpose()) {
+    if error.category != AnomalyCategory::Incorrect || error.code != "xtdb/sql-error" {
+        return error;
+    }
+    let (body, suffix) = if source == DBEAVER_NAMESPACE_REPLACEMENT {
+        (source, "")
+    } else {
+        normalized_simple_text(original)
+    };
+    let replay = |source: &str| {
+        rtdb_sql::batch_syntax_diagnostic(source, &error, memory)
+            .and_then(|report| report.map(|report| report.with_sql_context(original)).transpose())
+    };
+    let report = if suffix.is_empty() {
+        replay(body)
+    } else {
+        memory.reserve(body.len() + suffix.len()).and_then(|_allocation| replay(&[body, suffix].concat()))
+    };
+    match report {
         Ok(Some(report)) => report.anomaly().clone(),
         Ok(None) => error,
         Err(admission) => admission,

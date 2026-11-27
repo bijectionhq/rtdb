@@ -1503,7 +1503,8 @@ async fn simple_batch_reports_the_first_statement_grammar_error_after_lexing() {
         ("SELEC 7; SELECT 1 LIMIT ALL", initial_statement_mismatch(1, 0)),
         ("SELECT 1 LIMIT ALL; SELEC 7", limit_all),
         ("SELEC 7; SELECT @", initial_statement_mismatch(1, 0)),
-        ("SELECT 1;\n  INSERT INTO docs (_id) VALUES (1)\n  RETURNING CAST(a /* gap */ AS BLOB), COUNT(ALL *);\nSELECT 2", invalid_returning),
+        ("SELECT 1;\n  INSERT INTO docs (_id) VALUES (1)\n  RETURNING CAST(a /* gap */ AS BLOB), COUNT(ALL *);\nSELECT 2", invalid_returning.clone()),
+        ("SELECT s._id FROM source_docs AS s WHERE s._id > 0;\n  DELETE FROM \"🙂\".\"select\" WHERE \"returning\" = 1\n  RETURNING CAST(a /* gap */ AS BLOB);\nUPDATE docs SET a 1", invalid_returning),
     ] {
         let frames = client.query(source).await;
         assert_eq!(tags(&frames), b"EZ");
@@ -2000,6 +2001,14 @@ async fn extended_parse_reports_the_reference_multi_statement_grammar_error() {
             "INSERT INTO docs (_id) VALUES (1) RETURNING CAST(a AS BLOB)",
             "Errors parsing SQL statement:\n  - line 1:54 no viable alternative at input 'CAST(aASBLOB'".to_owned(),
         ),
+        (
+            "  /* 🙂 leading */\n\tUPDATE \"🙂\".\"select\" SET \"returning\" = $1 RETURNING CAST(a AS BLOB);  ",
+            "Errors parsing SQL statement:\n  - line 2:62 no viable alternative at input 'CAST(aASBLOB'".to_owned(),
+        ),
+        (
+            "SELECT 1; UPDATE docs SET a 1 RETURNING CAST(a AS BLOB); DELETE docs",
+            "Errors parsing SQL statement:\n  - line 1:28 missing '=' at '1'".to_owned(),
+        ),
     ] {
         client.parse("broken", source, &[]).await;
         client.send(b'S', &[]).await;
@@ -2011,6 +2020,11 @@ async fn extended_parse_reports_the_reference_multi_statement_grammar_error() {
         assert_eq!(detail["category"], "incorrect");
         assert_eq!(detail["data"]["sql"], source);
     }
+    client.parse("multiple", "SELECT 1; SELECT 2", &[]).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"EZ");
+    assert_eq!(error_fields(&frames[0].1).1, "A prepared statement must contain exactly one statement");
     drop(client);
     running.stop().await;
 }

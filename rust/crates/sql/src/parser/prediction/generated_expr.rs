@@ -57,9 +57,6 @@ const DOLLAR_TEXT_BACKEDGE: SyncAction = SyncAction { state: 714, rule: DOLLAR_S
 const EXPR_VALUE: CallAction = CallAction {
     state: 1000, rule: EXPR, called: COMMON_VALUE, start: 68, follow: 1002, precedence: 0,
 };
-const WRAPPED_EXPRESSION: CallAction = CallAction {
-    state: 1137, rule: COMMON_VALUE, called: EXPR, start: 66, follow: 1138, precedence: 0,
-};
 const VALUE_LITERAL: CallAction = CallAction {
     state: 1140, rule: COMMON_VALUE, called: LITERAL, start: 28, follow: 1635, precedence: 0,
 };
@@ -121,8 +118,6 @@ const MATCH_INTEGER_SIGN: TerminalAction = TerminalAction { state: 683, rule: IN
 const MATCH_INTEGER: TerminalAction = TerminalAction { state: 686, rule: INTEGER_LITERAL, target: 687, tokens: TokenAction::Atom(5) };
 const MATCH_BOOLEAN: TerminalAction = TerminalAction { state: 707, rule: LITERAL, target: 710, tokens: TokenAction::Set(&[139, 227, 230, 326]) };
 const MATCH_NULL: TerminalAction = TerminalAction { state: 708, rule: LITERAL, target: 710, tokens: TokenAction::Atom(220) };
-const MATCH_WRAPPED_OPEN: TerminalAction = literal_atom(COMMON_VALUE, 1136, 15, 1137);
-const MATCH_WRAPPED_CLOSE: TerminalAction = literal_atom(COMMON_VALUE, 1138, 16, 1139);
 const MATCH_STANDARD_STRING: TerminalAction = TerminalAction { state: 716, rule: CHARACTER_STRING, target: 724, tokens: TokenAction::Atom(6) };
 const MATCH_C_ESCAPE_STRING: TerminalAction = TerminalAction { state: 717, rule: CHARACTER_STRING, target: 724, tokens: TokenAction::Atom(7) };
 const MATCH_DOLLAR_OPEN: TerminalAction = TerminalAction { state: 718, rule: CHARACTER_STRING, target: 720, tokens: TokenAction::Atom(364) };
@@ -226,28 +221,23 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     #[cfg(test)]
     pub(in crate::parser::prediction) fn numeric_expression(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         let mode = self.generated_mode()?;
-        self.numeric_expr_zero(mode, false)
+        self.numeric_expr_zero(mode)
     }
 
     pub(super) fn derived_column_expression(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_call(CallAction {
             state: 2405, rule: 120, called: EXPR, start: 66, follow: 2407, precedence: 0,
         })?;
-        self.numeric_expr_zero(mode, false)
+        self.numeric_expr_zero(mode)
     }
 
-    pub(super) fn generated_row_expression(&mut self, call: CallAction, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
-        self.generated_call(call)?;
-        self.numeric_expr_zero(mode, true)
-    }
-
-    fn numeric_expr_zero(&mut self, mode: PredictionMode, allow_wrapped_row: bool) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+    fn numeric_expr_zero(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_numeric_recursion(EXPR, 0, |session, entry, local| {
             if session.predict_numeric(EXPR_BASE, mode)?.number() != 3 {
                 return session.decline_numeric_site();
             }
             *local = session.label_recursion_base(entry, ContextClass::CommonValueExpr0)?;
-            session.call_common_value(EXPR_VALUE, mode, allow_wrapped_row)?;
+            session.call_common_value(EXPR_VALUE, mode)?;
             session.stop_numeric_base(*local)?;
             if session.predict_numeric(EXPR_LOOP, mode)?.number() == 1 {
                 session.predict_numeric(EXPR_TAIL, mode)?;
@@ -257,17 +247,10 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         })
     }
 
-    fn call_common_value(&mut self, call: CallAction, mode: PredictionMode, allow_wrapped_row: bool) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+    fn call_common_value(&mut self, call: CallAction, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
         self.generated_call(call)?;
         self.generated_numeric_recursion(COMMON_VALUE, call.precedence, |session, entry, local| {
             match session.predict_numeric(VALUE_BASE, mode)?.number() {
-                2 if allow_wrapped_row => {
-                    *local = session.label_recursion_base(entry, ContextClass::WrappedExpr)?;
-                    session.match_tree_action(*local, MATCH_WRAPPED_OPEN)?;
-                    session.generated_call(WRAPPED_EXPRESSION)?;
-                    session.numeric_expr_zero(mode, false)?;
-                    session.match_tree_action(*local, MATCH_WRAPPED_CLOSE)?;
-                }
                 3 => {
                     *local = session.label_recursion_base(entry, ContextClass::LiteralExpr)?;
                     session.generated_call(VALUE_LITERAL)?;
@@ -289,7 +272,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 session.push_recursion_tree(entry, replacement)?;
                 session.generated_predicate(tail.predicate)?;
                 session.match_tree_action(*local, tail.terminal)?;
-                session.call_common_value(tail.rhs, mode, false)?;
+                session.call_common_value(tail.rhs, mode)?;
                 next = VALUE_BACKEDGE;
             }
             Ok(())
@@ -532,7 +515,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         let state = self.state;
         let site = match (rule, state, precedence) {
             (EXPR, _, 0) if self.current.is_none() => self.precedence() == 0,
-            (EXPR, ParserState::State(1137 | 1953 | 2405), 0) => self.precedence() == 0,
+            (EXPR, ParserState::State(2405), 0) => self.precedence() == 0,
             (COMMON_VALUE, ParserState::State(1000), 0) => self.precedence() == 0,
             (COMMON_VALUE, ParserState::State(1644), 61) => self.precedence() <= TERM_PREDICATE.minimum,
             (COMMON_VALUE, ParserState::State(1641), 62) => self.precedence() <= FACTOR_PREDICATE.minimum,

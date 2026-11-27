@@ -160,17 +160,57 @@ mod tests {
     }
 
     #[test]
-    fn an_unported_insert_source_keeps_the_original_error() {
+    fn dml_source_replay_reaches_the_first_error_in_the_original_statement() {
         let memory = MemoryBudget::new(64 << 20);
-        for source in [
-            "INSERT INTO docs RECORDS {_id: 1} RETURNING CAST(a AS BLOB)",
-            "INSERT INTO docs (_id) VALUES (abs(1)) RETURNING CAST(a AS BLOB)",
+        for (source, location) in [
+            ("INSERT INTO docs (_id, foo) VALUES ($1, $2), ($3, $4) RETURNING CAST(a AS BLOB)", "1:74"),
+            ("INSERT INTO docs (_id, foo) VALUES ROW(1, abs(2)), (3, 4) RETURNING CAST(a AS BLOB)", "1:78"),
+            ("INSERT INTO docs (_id, foo) VALUES (?, ?) RETURNING CAST(a AS BLOB)", "1:62"),
+            ("INSERT INTO docs RECORDS {_id: 1}, {_id: 2} RETURNING CAST(a AS BLOB)", "1:64"),
+            ("INSERT INTO docs RECORDS $1, $2 RETURNING CAST(a AS BLOB)", "1:52"),
+            ("INSERT INTO docs (_id) SELECT s._id FROM source_docs AS s WHERE s._id = $1 RETURNING CAST(a AS BLOB)", "1:95"),
+            ("UPDATE \"🙂\".\"select\" FOR ALL VALID_TIME AS \"where\" SET \"returning\" = $1, a = a + 1 WHERE \"_id\" = $2 RETURNING CAST(a AS BLOB)", "1:119"),
+            ("UPDATE docs SET a = (SELECT 1) RETURNING CAST(a AS BLOB)", "1:51"),
+            ("DELETE FROM \"🙂\".\"select\" AS \"returning\"\nWHERE \"_id\" = ? RETURNING CAST(a AS BLOB)", "2:36"),
         ] {
             let legacy = crate::parse_in(source, &memory).unwrap_err();
-            assert!(statement_syntax_diagnostic(source, &legacy, &memory).unwrap().is_none(), "{source}");
-            assert!(batch_syntax_diagnostic(source, &legacy, &memory).unwrap().is_none(), "{source}");
+            for diagnose in [statement_syntax_diagnostic as fn(_, _, _) -> _, batch_syntax_diagnostic] {
+                let report = diagnose(source, &legacy, &memory).unwrap().unwrap();
+                assert_eq!(report.anomaly().message.as_deref().unwrap(),
+                    format!("Errors parsing SQL statement:\n  - line {location} no viable alternative at input 'CAST(aASBLOB'"), "{source}");
+            }
             assert_eq!(memory.used_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn dml_prefix_errors_win_over_a_malformed_returning_list() {
+        let memory = MemoryBudget::new(64 << 20);
+        for (source, expected) in [
+            ("UPDATE docs SET a 1 RETURNING CAST(b AS BLOB)", "line 1:18 missing '=' at '1'"),
+            ("DELETE docs WHERE a = 1 RETURNING CAST(a AS BLOB)", "line 1:7 missing 'FROM' at 'docs'"),
+            ("INSERT INTO docs (_id) SELECT 1 LIMIT ALL RETURNING CAST(a AS BLOB)",
+                "line 1:38 mismatched input 'ALL' expecting {UNSIGNED_INTEGER, POSTGRES_PARAMETER_SPECIFICATION, '?'}"),
+        ] {
+            let legacy = crate::parse_in(source, &memory).unwrap_err();
+            for diagnose in [statement_syntax_diagnostic as fn(_, _, _) -> _, batch_syntax_diagnostic] {
+                let report = diagnose(source, &legacy, &memory).unwrap().unwrap();
+                assert_eq!(report.anomaly().message.as_deref().unwrap(),
+                    format!("Errors parsing SQL statement:\n  - {expected}"), "{source}");
+            }
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn dml_replay_preserves_a_quoted_identifier_lexer_error() {
+        let memory = MemoryBudget::new(64 << 20);
+        let source = "DELETE FROM \"a/b\" RETURNING CAST(a AS BLOB)";
+        let legacy = crate::parse_in(source, &memory).unwrap_err();
+        assert!(legacy.message.as_deref().unwrap().contains("token recognition error"));
+        assert!(statement_syntax_diagnostic(source, &legacy, &memory).unwrap().is_none());
+        assert!(batch_syntax_diagnostic(source, &legacy, &memory).unwrap().is_none());
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]

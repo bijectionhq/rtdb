@@ -107,25 +107,44 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             Ok((NextTokensCapture { context, state: number }, shape))
         })();
         let (site, shape) = self.finish(site)?;
+        self.sync_tokens(site, Some(shape.nullable()), matches!(shape, SyncShape::Loopback))
+    }
+
+    pub(super) fn sync_replay_decision(&mut self, state: u32, rule: u16, loopback: bool) -> RuntimeResult<'sql, ()> {
+        self.generated_action_state(state, rule)?;
+        match self.profile {
+            ParserProfile::SllBail => return Ok(()),
+            ParserProfile::LlDefault => (),
+            ParserProfile::Kernel => return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite))),
+        }
+        let context = self.current.expect("validated replay invocation");
+        self.sync_tokens(NextTokensCapture { context, state }, None, loopback)
+    }
+
+    fn sync_tokens(
+        &mut self, site: NextTokensCapture<'parse>, nullable: Option<bool>, loopback: bool,
+    ) -> RuntimeResult<'sql, ()> {
         let (_, first) = self.lookahead_token(1)?;
-        let next = (|| {
+        let next = {
             let grammar = self.environment.storage.grammar_view();
-            let tokens = grammar.state(site.state)?.next_tokens(self.work)?;
-            if tokens.contains(ExpectedSymbol::Epsilon) != shape.nullable() {
-                return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
-            }
-            Ok(tokens)
-        })();
+            let scratch = self.work.scratch();
+            let work = if nullable.is_some() { self.work } else { &scratch };
+            grammar.state(site.state).and_then(|state| state.next_tokens(work)).map_err(RuntimeError::from)
+        };
         let expected = self.finish(next)?;
+        let accepts_epsilon = expected.contains(ExpectedSymbol::Epsilon);
+        if nullable.is_some_and(|nullable| nullable != accepts_epsilon) {
+            return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite)));
+        }
         if expected.contains(ExpectedSymbol::Token(first)) {
             self.next_tokens_capture = None;
             return Ok(());
         }
-        if shape.nullable() {
+        if accepts_epsilon {
             self.next_tokens_capture.get_or_insert(site);
             return Ok(());
         }
-        if matches!(shape, SyncShape::Loopback) {
+        if loopback {
             return self.report_unwanted_token(expected);
         }
 
