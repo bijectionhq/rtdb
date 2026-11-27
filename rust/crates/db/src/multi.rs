@@ -447,7 +447,9 @@ impl MultiDatabase {
                         Acknowledgement::Elsewhere => Some(Lsn(u64::MAX)),
                         Acknowledgement::Unsupported => {
                             self.stream.acknowledge_recovery().await.map_err(journal_error)?;
-                            Some(head)
+                            // A journal that records recoveries wrote its
+                            // entry after the recovered head.
+                            Some(self.stream.head().await?)
                         }
                     };
                     self.replay_afresh = true;
@@ -474,17 +476,21 @@ impl MultiDatabase {
     }
 
     /// Acknowledges the operator recovery that left the journal at `head`
-    /// and records it in the same journal decision: the journal appends the
-    /// `Recovered` marker right after the recovered head, under the
-    /// recovery's epoch, and lifts exactly that fence. The marker is the
-    /// only record of a recovery; the writer never appends one of its own.
-    /// So whichever node acknowledges also records, and a racing node's
-    /// marker is refused rather than written twice. Returns the journal head
-    /// after the acknowledgement, `Elsewhere` when another node or an
-    /// administrator lifted the fence, or `Unsupported` when the journal has
-    /// no recovery markers: the caller then only acknowledges, and the error
-    /// event, the counters and the followers' rebuilds are what remain of
-    /// the recovery.
+    /// and records it in the same journal decision. The journal writes its
+    /// typed recovery entry right after the recovered head, under the
+    /// recovery's epoch, with this writer's `Recovered` record inside it as
+    /// the consumer's marker, and lifts exactly that fence. That entry is
+    /// the only record of a recovery: the writer never appends one of its
+    /// own, and replay reads the entry (`Stream::decode_recovery`). An older
+    /// journal appends the marker as an ordinary record instead. So
+    /// whichever node acknowledges also records, and a racing node's marker
+    /// is refused rather than written twice. Returns the journal head after
+    /// the acknowledgement, `Elsewhere` when another node or an
+    /// administrator lifted the fence (an administrator's acknowledgement
+    /// still leaves the journal's entry, without a marker), or `Unsupported`
+    /// when the journal has no recovery markers: the caller then only
+    /// acknowledges, and the error event, the counters and the followers'
+    /// rebuilds are what remain of the recovery.
     async fn acknowledge_recovery_with_record(&mut self, head: Lsn) -> Result<Acknowledgement> {
         let fence = match self.stream.recovery_fence().await {
             Ok(Some(fence)) => fence,

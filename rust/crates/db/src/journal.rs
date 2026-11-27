@@ -1,7 +1,7 @@
 use std::{sync::{Arc, RwLock}, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
+use journal_contract::{BoxFuture, CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, Journal, JournalError, Lsn, Page, RecoveryEntry, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::TransactionRecord;
@@ -221,7 +221,10 @@ impl Stream {
             let Some((at, bytes)) = page.records.first().filter(|(at, _)| *at == head) else {
                 return Err(journal_error(JournalError::Unavailable));
             };
-            self.decode_unproven(*at, bytes).await?;
+            // The journal's recovery entry holds no RTDB record of its own.
+            if page.recovery(*at).is_none() {
+                self.decode_unproven(*at, bytes).await?;
+            }
             return Ok(());
         }
         Err(journal_error(JournalError::Unavailable))
@@ -521,6 +524,34 @@ impl Stream {
         Ok(entry)
     }
 
+    /// The entry the journal's typed recovery entry at `lsn` records. The
+    /// writer's marker inside it is its `Recovered` record, sealed at `lsn`
+    /// like any entry, and must name the same fence. Without one, as after
+    /// an administrator's acknowledgement, the entry is the journal's alone,
+    /// under the key generation `generation` the history has there.
+    pub(crate) async fn decode_recovery(&self, lsn: Lsn, typed: &RecoveryEntry, generation: u64) -> Result<Entry> {
+        let fence = typed.fence;
+        if typed.at() != lsn {
+            return Err(recovery_entry_invalid("The journal's recovery entry is not right after the recovered head"));
+        }
+        let Some(marker) = &typed.marker else {
+            return Ok(Entry {
+                epoch: fence.epoch,
+                generation,
+                record: Record::Recovered {
+                    head: fence.head.0,
+                    epoch: fence.epoch.0,
+                    time: i64::try_from(typed.time_unix_ms).unwrap_or(i64::MAX / 1_000).saturating_mul(1_000),
+                },
+            });
+        };
+        let entry = self.decode_unproven(lsn, marker).await?;
+        match entry.record {
+            Record::Recovered { head, epoch, .. } if head == fence.head.0 && epoch == fence.epoch.0 && entry.epoch == fence.epoch => Ok(entry),
+            _ => Err(recovery_entry_invalid("The writer's recovery marker does not name the journal's recovery fence")),
+        }
+    }
+
     /// Decodes an entry without proving a funded transaction's timed
     /// original, for comparing it with an entry already applied.
     pub(crate) async fn decode_unproven(&self, lsn: Lsn, bytes: &[u8]) -> Result<Entry> {
@@ -613,6 +644,10 @@ impl Stream {
         }
     }
 
+}
+
+fn recovery_entry_invalid(message: &str) -> Anomaly {
+    Anomaly::fault("rtdb/multi-replay", message)
 }
 
 pub(crate) fn next(lsn: Lsn) -> Result<Lsn> {

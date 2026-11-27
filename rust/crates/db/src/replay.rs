@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use journal_contract::{Epoch, JournalError, Lsn, Page};
+use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryEntry, RecoverySource};
 use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Record};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex};
 use rtdb_store::{ObjectStore, Reachability, VerifiedManifest, read_manifest};
@@ -223,19 +223,37 @@ pub(crate) struct ReplayBase {
     pub(crate) checkpoint: Checkpoint,
 }
 
-/// An operator recovery that a writer recorded in the retained journal.
+/// An operator recovery the retained journal records.
+///
+/// On a journal that records recoveries itself (Logkeeper at cluster level
+/// 10), this is its typed recovery entry, the one record of the recovery:
+/// the writer's acknowledgement places RTDB's marker inside it, and an
+/// administrator's leaves it without one. On an older journal the marker is
+/// an ordinary record the writer's acknowledgement appended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalRecovery {
     /// The position of the record.
     pub at: Lsn,
-    /// The head the recovery left; records acknowledged after it may be lost.
+    /// The head the recovery left: the last record it kept.
     pub head: Lsn,
-    /// The epoch the record was written under: the recovery fence's when the
-    /// journal recorded it atomically with the acknowledgement, otherwise
-    /// the epoch of the writer that resumed.
+    /// The epoch the record was written under: the recovery fence's.
     pub epoch: Epoch,
-    /// The writer's clock when it resumed.
+    /// The writer's clock when it acknowledged, or the journal's record of
+    /// the recovery's time when no writer's marker is inside the entry.
     pub time: Timestamp,
+    /// The journal's loss point: records acknowledged after it may be lost.
+    /// The head on an older journal.
+    pub loss_point: Lsn,
+    /// Where the journal's recovered history came from, when it says.
+    pub source: Option<RecoverySource>,
+    /// The configuration epoch the recovery installed, when the journal
+    /// says.
+    pub configuration_epoch: Option<u64>,
+}
+
+/// The typed recovery entry at `lsn` among a page's entries.
+pub(crate) fn typed_recovery(recoveries: &[(Lsn, RecoveryEntry)], lsn: Lsn) -> Option<&RecoveryEntry> {
+    recoveries.iter().find(|(at, _)| *at == lsn).map(|(_, entry)| entry)
 }
 
 pub(crate) struct Committed {
@@ -287,6 +305,16 @@ impl Committed {
             recovery_epoch: 0,
             prior_recovery_epoch: 0,
             tail: None,
+        }
+    }
+
+    /// Completes the recovery just applied from the journal's typed entry
+    /// with what only the journal knows.
+    fn note_typed_recovery(&mut self, typed: &RecoveryEntry) {
+        if let Some(recovery) = self.recovery.as_mut().filter(|recovery| recovery.at == typed.at()) {
+            recovery.loss_point = typed.loss_point;
+            recovery.source = Some(typed.source);
+            recovery.configuration_epoch = Some(typed.configuration_epoch);
         }
     }
 
@@ -345,7 +373,7 @@ impl Committed {
                 .map_err(|error| ReplayError::failed(error, previous.take()))?,
         };
         loop {
-            let page = match stream.read_through(from, end).await {
+            let mut page = match stream.read_through(from, end).await {
                 Ok(page) => page,
                 // A trim through the head leaves no record to re-read.
                 Err(JournalError::Trimmed { floor }) if verify.is_some_and(|at| next(at).ok() == Some(floor)) => {
@@ -394,19 +422,25 @@ impl Committed {
                     }
                 }
             }
+            let recoveries = std::mem::take(&mut page.recoveries);
             let mut records = page.records.into_iter().take_while(|(lsn, _)| *lsn <= end);
             if let Some(at) = verify.take() {
                 let Some((lsn, bytes)) = records.next().filter(|(lsn, _)| *lsn == at) else {
                     return Err(ReplayError::failed(journal_error(JournalError::Unavailable), Some(state)));
                 };
-                match state.replayed(stream, lsn, &bytes).await {
+                match state.replayed(stream, lsn, &bytes, typed_recovery(&recoveries, lsn)).await {
                     Ok(true) => state.tail = Some(Sha256::digest(&bytes).into()),
                     Ok(false) => return Err(ReplayError::Rewritten { at }),
                     Err(error) => return Err(ReplayError::failed(error, Some(state))),
                 }
             }
             for (lsn, bytes) in records {
-                let entry = match stream.decode(lsn, &bytes).await {
+                let typed = typed_recovery(&recoveries, lsn);
+                let decoded = match typed {
+                    Some(typed) => stream.decode_recovery(lsn, typed, state.generation).await,
+                    None => stream.decode(lsn, &bytes).await,
+                };
+                let entry = match decoded {
                     Ok(entry) => entry,
                     Err(error) => return Err(ReplayError::failed(error, Some(state))),
                 };
@@ -424,6 +458,9 @@ impl Committed {
                     .apply_entry(stream, store, lsn, entry)
                     .await
                     .map_err(|error| ReplayError::failed(error, None))?;
+                if let Some(typed) = typed {
+                    state.note_typed_recovery(typed);
+                }
                 state.tail = Some(Sha256::digest(&bytes).into());
             }
             if state.head == end {
@@ -447,13 +484,16 @@ impl Committed {
 
     /// Whether `bytes` at `lsn`, the head, are the record this state applied
     /// there.
-    async fn replayed(&self, stream: &Stream, lsn: Lsn, bytes: &[u8]) -> Result<bool> {
+    async fn replayed(&self, stream: &Stream, lsn: Lsn, bytes: &[u8], typed: Option<&RecoveryEntry>) -> Result<bool> {
         if let Some(tail) = self.tail {
             return Ok(<[u8; 32]>::from(Sha256::digest(bytes)) == tail);
         }
         // A state that applied its head without the journal bytes compares
         // the record decoded.
-        let entry = stream.decode_unproven(lsn, bytes).await?;
+        let entry = match typed {
+            Some(typed) => stream.decode_recovery(lsn, typed, self.generation).await?,
+            None => stream.decode_unproven(lsn, bytes).await?,
+        };
         Ok(entry.epoch == self.epoch && entry.generation == self.generation
             && self.records.last() == Some(&entry.record))
     }
@@ -702,7 +742,15 @@ impl Committed {
                 if *head >= lsn.0 || *epoch != entry.epoch.0 {
                     return Err(invalid("The recovery record does not follow the recovered head under its writer"));
                 }
-                self.recovery = Some(JournalRecovery { at: lsn, head: Lsn(*head), epoch: entry.epoch, time: Timestamp(*time) });
+                self.recovery = Some(JournalRecovery {
+                    at: lsn,
+                    head: Lsn(*head),
+                    epoch: entry.epoch,
+                    time: Timestamp(*time),
+                    loss_point: Lsn(*head),
+                    source: None,
+                    configuration_epoch: None,
+                });
                 self.prior_recovery_epoch = self.recovery_epoch;
                 self.recovery_epoch = self.recovery_epoch.max(*epoch);
                 self.generation
@@ -1180,6 +1228,11 @@ async fn scan_legacy_base(stream: &Stream, first_page: &Page) -> Result<BaseSear
             if *lsn != at {
                 return Err(journal_error(JournalError::Unavailable));
             }
+            // A recovery entry is never a checkpoint.
+            if page.recovery(*lsn).is_some() {
+                at = next(*lsn)?;
+                continue;
+            }
             if let Entry { epoch, record: Record::Checkpoint(checkpoint), .. } = stream.decode(*lsn, bytes).await?
                 && checkpoint.through.checked_add(1) == Some(floor.0)
             {
@@ -1212,14 +1265,19 @@ async fn find_clean_checkpoint(stream: &Stream, head: Lsn) -> Result<Option<Lsn>
         if page.records.first().is_none_or(|(lsn, _)| *lsn != at) {
             return Err(journal_error(JournalError::Unavailable));
         }
-        for (lsn, bytes) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= head) {
+        for (lsn, bytes) in page.records.iter().take_while(|(lsn, _)| *lsn <= head) {
+            let lsn = *lsn;
             if lsn != at {
                 return Err(invalid(
                     "The journal page omitted part of the rotation prefix",
                 ));
             }
             at = next(lsn)?;
-            match stream.decode(lsn, &bytes).await {
+            // A recovery entry neither checkpoints nor rotates keys.
+            if page.recovery(lsn).is_some() {
+                continue;
+            }
+            match stream.decode(lsn, bytes).await {
                 Ok(Entry {
                     record: Record::Checkpoint(checkpoint),
                     ..

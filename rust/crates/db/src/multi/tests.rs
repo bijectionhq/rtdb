@@ -1490,10 +1490,19 @@ struct Recoverable {
     rendezvous: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Refuses atomic recovery markers, as a journal without them does.
     without_markers: AtomicBool,
+    /// Appends the marker as an ordinary record and acknowledges without a
+    /// record, as a journal that does not record recoveries itself does.
+    legacy_markers: AtomicBool,
+    /// The typed recovery entries the journal wrote, by position.
+    entries: std::sync::Mutex<std::collections::BTreeMap<Lsn, journal_contract::RecoveryEntry>>,
 }
 
 const RECOVERY_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:recovery");
 const RECOVERY_FENCE: Epoch = Epoch(5);
+/// The configuration epoch and time the reference journal's recovery
+/// entries name.
+const RECOVERY_CONFIGURATION: u64 = 2;
+const RECOVERY_TIME_MS: u64 = 1_700;
 const OPERATOR_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:operator");
 
 impl Recoverable {
@@ -1530,6 +1539,36 @@ impl Recoverable {
         self.pending.lock().unwrap().map(|head| journal_contract::RecoveryFence { epoch: RECOVERY_FENCE, head })
     }
 
+    /// Whether the journal records each recovery in a typed entry, as
+    /// Logkeeper does once its cluster finalized level 10.
+    fn records_recoveries(&self) -> bool {
+        !self.legacy_markers.load(Ordering::SeqCst) && !self.without_markers.load(Ordering::SeqCst)
+    }
+
+    /// Writes the typed recovery entry of `fence` right after its head,
+    /// with `marker` inside it, as the consensus keeper does.
+    async fn write_entry(&self, stream: StreamId, fence: journal_contract::RecoveryFence, marker: Option<Bytes>) -> journal_contract::Result<Lsn> {
+        let entry = journal_contract::RecoveryEntry {
+            fence,
+            configuration_epoch: RECOVERY_CONFIGURATION,
+            loss_point: fence.head,
+            exact: true,
+            source: journal_contract::RecoverySource::Survivor,
+            time_unix_ms: RECOVERY_TIME_MS,
+            marker,
+        };
+        let at = self.journal(&OPERATOR_IDENTITY).append(stream, RECOVERY_FENCE, entry.at(), entry.encode()).await?;
+        self.entries.lock().unwrap().insert(at, entry);
+        Ok(at)
+    }
+
+    /// `page` with the typed entries among its records.
+    fn typed(&self, mut page: Page) -> Page {
+        let entries = self.entries.lock().unwrap();
+        page.recoveries = page.records.iter().filter_map(|(lsn, _)| entries.get(lsn).map(|entry| (*lsn, entry.clone()))).collect();
+        page
+    }
+
     /// Appends `marker` right after the recovered head under the recovery
     /// fence and lifts the fence in one step, as the consensus keeper does.
     async fn acknowledge_with_marker(&self, stream: StreamId, fence: journal_contract::RecoveryFence, marker: Bytes) -> journal_contract::Result<Lsn> {
@@ -1546,6 +1585,9 @@ impl Recoverable {
         if taken.is_none() {
             return Err(JournalError::Conflict { head: operator.head(stream).await? });
         }
+        if self.records_recoveries() {
+            return self.write_entry(stream, fence, Some(marker)).await;
+        }
         operator.append(stream, RECOVERY_FENCE, Lsn(fence.head.0 + 1), marker).await
     }
 
@@ -1555,7 +1597,13 @@ impl Recoverable {
             rendezvous.wait().await;
         }
         self.acknowledgements.fetch_add(1, Ordering::SeqCst);
-        self.pending.lock().unwrap().take();
+        let taken = self.pending.lock().unwrap().take();
+        // A journal that records recoveries writes the entry, without a
+        // marker, and answers with the last record kept.
+        if let Some(head) = taken.filter(|_| self.records_recoveries()) {
+            self.write_entry(stream, journal_contract::RecoveryFence { epoch: RECOVERY_FENCE, head }, None).await?;
+            return Ok(head);
+        }
         self.journal(&RECOVERY_IDENTITY).head(stream).await
     }
 }
@@ -1589,7 +1637,7 @@ impl Journal for RecoverableHandle {
 
     fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> BoxFuture<'_, journal_contract::Result<Page>> {
         let journal = self.shared.journal(&self.identity);
-        Box::pin(async move { journal.read(stream, from, max, wait).await })
+        Box::pin(async move { journal.read(stream, from, max, wait).await.map(|page| self.shared.typed(page)) })
     }
 
     fn head(&self, stream: StreamId) -> BoxFuture<'_, journal_contract::Result<Lsn>> {
@@ -1666,9 +1714,16 @@ async fn multi_driver_acknowledges_a_journal_recovery_records_it_and_resumes_wri
     assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
     assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 1);
     let recovery = follower.journal_recovery().unwrap();
-    // The journal recorded the recovery with the acknowledgement, right
-    // after the recovered head and under the recovery's fence.
+    // The journal recorded the recovery with the acknowledgement in its typed
+    // entry, right after the recovered head and under the recovery's fence,
+    // with the writer's record inside it.
     assert_eq!((recovery.at, recovery.head, recovery.epoch, recovery.time), (Lsn(kept.0 + 1), kept, RECOVERY_FENCE, Timestamp(10 + LEASE + DRIFT + 1)));
+    assert_eq!(
+        (recovery.loss_point, recovery.source, recovery.configuration_epoch),
+        (kept, Some(journal_contract::RecoverySource::Survivor), Some(RECOVERY_CONFIGURATION))
+    );
+    assert_eq!(journal.entries.lock().unwrap().get(&recovery.at).map(|entry| entry.marker.is_some()), Some(true));
+    assert_eq!(recovery_records(&follower).len(), 1);
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
     assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, None);
     follower.transact(&put(4, 2, "after recovery")).await.unwrap();
@@ -1678,6 +1733,30 @@ async fn multi_driver_acknowledges_a_journal_recovery_records_it_and_resumes_wri
     let mut reader = cluster.node(3, journal.handle(NODE_3_IDENTITY));
     assert_eq!(text_at(&mut reader, MAIN_BRANCH, 2).await, Some(Value::Utf8("after recovery".into())));
     assert_eq!(text_at(&mut reader, MAIN_BRANCH, 3).await, None);
+    assert_eq!(reader.journal_recovery(), Some(recovery));
+}
+
+/// On a journal that does not record recoveries itself, the writer's marker
+/// is an ordinary record right after the recovered head: still the one
+/// record of the recovery.
+#[tokio::test]
+async fn multi_driver_records_a_recovery_in_an_older_journals_marker_record() {
+    let cluster = Cluster::new();
+    let journal = Arc::new(Recoverable::default());
+    journal.legacy_markers.store(true, Ordering::SeqCst);
+    let (writer, mut follower, kept) = recoverable_cluster(&cluster, &journal).await;
+    let stream = writer.journal_stream();
+    drop(writer);
+    journal.recover(stream, kept).await;
+    cluster.at(10 + LEASE + DRIFT + 1);
+    assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
+    let recovery = follower.journal_recovery().unwrap();
+    assert_eq!((recovery.at, recovery.head, recovery.epoch, recovery.time), (Lsn(kept.0 + 1), kept, RECOVERY_FENCE, Timestamp(10 + LEASE + DRIFT + 1)));
+    assert_eq!((recovery.loss_point, recovery.source, recovery.configuration_epoch), (kept, None, None));
+    assert!(journal.entries.lock().unwrap().is_empty());
+    follower.transact(&put(4, 2, "after recovery")).await.unwrap();
+    let mut reader = cluster.node(3, journal.handle(NODE_3_IDENTITY));
+    assert_eq!(text_at(&mut reader, MAIN_BRANCH, 2).await, Some(Value::Utf8("after recovery".into())));
     assert_eq!(reader.journal_recovery(), Some(recovery));
 }
 
@@ -1718,13 +1797,20 @@ async fn multi_driver_holds_writes_after_a_journal_recovery_when_configured() {
     assert!(refused.message.as_deref().unwrap_or("").contains("acknowledges the recovery"));
     assert_eq!(held.role(), Role::Follower);
     assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 0);
-    // An administrator acknowledges it; the held writer then resumes without
-    // recording a recovery of its own.
-    journal.acknowledge(stream).await.unwrap();
-    assert_eq!(held.tick(&live(2)).await.unwrap(), Role::Follower);
-    cluster.at(10 + 2 * (LEASE + DRIFT + 1));
+    // An administrator acknowledges it, and the journal records the recovery
+    // in its typed entry without a writer's marker; the held writer then
+    // resumes without recording a recovery of its own.
+    // The entry shows the fence's epoch is the recovery's, held by no
+    // writer, so the held node seals above it at once rather than waiting
+    // out a competing writer's lease.
+    assert_eq!(journal.acknowledge(stream).await, Ok(kept));
     assert_eq!(held.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
-    assert_eq!(held.journal_recovery(), None);
+    let recovery = held.journal_recovery().unwrap();
+    assert_eq!(
+        (recovery.at, recovery.head, recovery.epoch, recovery.time, recovery.source),
+        (Lsn(kept.0 + 1), kept, RECOVERY_FENCE, Timestamp(RECOVERY_TIME_MS as i64 * 1_000), Some(journal_contract::RecoverySource::Survivor))
+    );
+    assert_eq!(recovery_records(&held).len(), 1);
     assert_eq!(text_at(&mut held, MAIN_BRANCH, 2).await, None);
     held.transact(&put(4, 2, "after recovery")).await.unwrap();
 }
@@ -1778,7 +1864,9 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     // Atomic recovery markers need the finalized current cluster version, as
     // after an upgrade; before it the writer records in two steps.
     let current = stream_logkeeper::stream::consensus::CLUSTER_VERSION_CURRENT;
-    let finalized = keepers.journal(&principals[0], &config).unwrap().client().finalize_version(current).await.unwrap();
+    // Every keeper learns the level before the writes, so the survivor
+    // records its commit index and the recovery keeps exactly the kept prefix.
+    let finalized = keepers.finalize_version(principals[0], current).await.unwrap();
     assert_eq!(finalized, current);
     let handle = |keepers: &LocalCluster, identity: Identity| -> Arc<dyn Journal> {
         Arc::new(keepers.journal(&keeper_principal(&identity), &config).unwrap())
@@ -1813,6 +1901,15 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     let report = keepers.recover_stream(survivor, stream, [lost_b, lost_c]).await.unwrap();
     assert!(report.written);
     assert_eq!(report.head, kept);
+    // The catalog fenced the stream for both lost voters, and the recovery
+    // waited out their leases (LocalCluster: 4 s plus a 400 ms margin)
+    // before the recovered configuration may serve.
+    let mut fenced = report.fenced.clone();
+    fenced.sort_unstable();
+    let mut expected = vec![lost_b, lost_c];
+    expected.sort_unstable();
+    assert_eq!(fenced, expected);
+    assert!(report.waited >= Duration::from_millis(4_400), "{:?}", report.waited);
     assert!(report.voters.contains(&survivor) && !report.voters.contains(&lost_b) && !report.voters.contains(&lost_c));
     keepers.restart(survivor).await.unwrap();
 
@@ -1836,6 +1933,14 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     // recovered head and under the recovery's fence.
     let recovery = successor.journal_recovery().unwrap();
     assert_eq!((recovery.at, recovery.head, recovery.epoch), (Lsn(kept.0 + 1), kept, report.epoch));
+    // It is the keeper's typed entry: the catalog's record of the recovery,
+    // with the writer's record inside it.
+    assert_eq!(
+        (recovery.loss_point, recovery.source, recovery.configuration_epoch),
+        (report.loss_point, Some(journal_contract::RecoverySource::Survivor), Some(report.revision))
+    );
+    let page = successor.stream.read(recovery.at).await.unwrap();
+    assert!(page.recovery(recovery.at).is_some_and(|entry| entry.marker.is_some() && entry.fence.head == kept));
     assert_eq!(recovery_records(&successor).len(), 1);
     for id in 10..16 {
         let receipt = successor.transact(&put(id as u8, id, "new")).await.unwrap();

@@ -3100,7 +3100,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=62478294451fdaac38753813b3d7e5e71ae61894#62478294451fdaac38753813b3d7e5e71ae61894"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f28ab95461fea050f5deaeae951d58fde6a2606f#f28ab95461fea050f5deaeae951d58fde6a2606f"
 dependencies = [
  "bytes",
  "serde",
@@ -3284,7 +3284,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=62478294451fdaac38753813b3d7e5e71ae61894#62478294451fdaac38753813b3d7e5e71ae61894"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f28ab95461fea050f5deaeae951d58fde6a2606f#f28ab95461fea050f5deaeae951d58fde6a2606f"
 dependencies = [
  "bincode",
  "bytes",
