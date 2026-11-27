@@ -3514,7 +3514,7 @@ mod tests {
 
         let misplaced = crate::ResolvedSearchRow { version, origin: None, location: crate::SearchRowLocation::Live(second), visibility: bounds };
         let error = verifier.verify_ranked(&BTreeSet::from([version.iid]), Some(vec![misplaced]), ColumnId(0), None, &scorer)
-            .await.unwrap_err();
+            .await.err().expect("a misplaced row is refused");
         assert_eq!(error.code, "rtdb.query/search-row");
     }
 

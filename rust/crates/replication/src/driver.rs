@@ -1464,9 +1464,6 @@ impl ReplicationDriver {
             && message.placed_slot_reservation.is_none()
             && message.serving_record.is_none()
         {
-            if let Some(until) = message.clock_lease_micros {
-                self.clock_lease = self.clock_lease.max(until);
-            }
             return self.record_applied(record.metadata.position);
         }
         if let Some(leader) = &mut self.leader {
@@ -2342,11 +2339,15 @@ impl ReplicationDriver {
     }
     /// Drops this node's cached copies of objects the log records as deleted.
     /// XTDB keeps no such copies to drop; a copy left behind costs only local disk, so a failure is reported rather than raised.
-    async fn forget_cached(&self, keys: impl IntoIterator<Item = rtdb_storage::ObjectKey>) {
+    fn forget_cached(&self, keys: impl IntoIterator<Item = rtdb_storage::ObjectKey>) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let storage = std::sync::Arc::clone(&self.resolve.storage);
+        let keys: Vec<_> = keys.into_iter().collect();
+        async move {
         for key in keys {
-            if let Err(error) = self.resolve.storage.invalidate(&key).await {
+            if let Err(error) = storage.invalidate(&key).await {
                 tracing::warn!(%key, %error, "Could not drop this node's cached copy of a deleted object");
             }
+        }
         }
     }
 

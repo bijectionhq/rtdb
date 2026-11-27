@@ -154,7 +154,7 @@ impl PartitionLogs {
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
     pub(crate) fn storage(&self) -> &Arc<dyn ObjectStore> { &self.store }
     pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
-    pub(crate) fn store(&self) -> &Arc<dyn ObjectStore> { &self.store }
+    pub fn store(&self) -> &Arc<dyn ObjectStore> { &self.store }
     pub(crate) fn local_recovery_store(&self) -> Option<&rtdb_storage::LocalStore> {
         if self.retains_recovery_history() { self.store.local_maintenance_store() } else { None }
     }

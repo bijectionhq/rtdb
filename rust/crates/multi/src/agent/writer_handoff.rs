@@ -1,6 +1,6 @@
 use super::*;
 
-use rtdb_directory::{RetainedWriterHandoff, WriterHandoffPlan, WriterHandoffState};
+use rtdb_directory::{Cas, RetainedWriterHandoff, WriterHandoffPlan, WriterHandoffState};
 
 use crate::control::{WriterHandoffAction, WriterHandoffCommand};
 

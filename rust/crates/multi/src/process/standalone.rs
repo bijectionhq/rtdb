@@ -529,7 +529,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(original.key_digest, digest(&key));
-        PreparedJournal::reopen_member(journal_options(&root), original.journal.0)
+        PreparedJournal::reopen_member(journal_options(&root, rtdb_storage::AppleSync::Full), original.journal.0)
             .await
             .unwrap();
     }

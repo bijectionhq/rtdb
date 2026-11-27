@@ -5176,6 +5176,7 @@ dependencies = [
  "chrono",
  "libc",
  "parking_lot",
+ "prost",
  "rtdb-columnar",
  "rtdb-kafka",
  "rtdb-maintenance",

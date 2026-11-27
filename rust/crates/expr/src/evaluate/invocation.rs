@@ -380,7 +380,8 @@ mod tests {
             args: vec![],
             return_type: LogicalType::Scalar(ScalarType::Utf8),
         };
-        let invocation = ExpressionInvocation::prepare(&non_reader, &Schema::default(), &context).unwrap();
+        let schema = Schema::default();
+        let invocation = ExpressionInvocation::prepare(&non_reader, &schema, &context).unwrap();
         assert!(!invocation.requires_reader);
         assert_eq!(
             invocation.replacements.prepared_call(&non_reader).unwrap().function,
@@ -393,7 +394,7 @@ mod tests {
             args: vec![Expr::Literal(Value::Null)],
             return_type: LogicalType::Null,
         };
-        let invocation = ExpressionInvocation::prepare(&unregistered, &Schema::default(), &context).unwrap();
+        let invocation = ExpressionInvocation::prepare(&unregistered, &schema, &context).unwrap();
         assert!(invocation.requires_reader);
         assert_eq!(invocation.replacements.prepared_call(&unregistered).unwrap().function, None);
         assert_eq!(invocation.evaluate(&[], &context).unwrap(), Value::Null);

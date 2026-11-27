@@ -1592,14 +1592,14 @@ async fn wait_maintenance_watches(
             Box::pin(async move {
                 match schedule.checkpoint_lsn {
                     Some(target) => {
-                        tokio::select! {
-                            _ = watch.wait_local_at_least(target) => (),
-                            result = watch.local_changed() => {
-                                if result.is_ok()
-                                    && let Some(cooldown) = schedule.ranked_cooldown
-                                {
-                                    tokio::time::sleep_until(cooldown).await;
-                                }
+                        // A target already reached returns on the first poll; otherwise wait for the next applied change.
+                        let reached = tokio::time::timeout(std::time::Duration::ZERO, watch.wait_local_at_least(target)).await.is_ok();
+                        if !reached {
+                            let result = watch.local_changed().await;
+                            if result.is_ok()
+                                && let Some(cooldown) = schedule.ranked_cooldown
+                            {
+                                tokio::time::sleep_until(cooldown).await;
                             }
                         }
                     }

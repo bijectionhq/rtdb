@@ -664,12 +664,12 @@ impl CycleWorker for BlockCollector {
         let Some(latest) = snapshot.table_catalog().block_index() else { return Ok(()); };
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
         let catalog_block = |key: &str| block_index_from_key(key).ok();
-        if let Err(error) = self.sweep("blocks", catalog_block, latest, cancellation, &deletes, CollectionObserver::block_file_deleted).await {
+        if let Err(error) = self.sweep("blocks", catalog_block, latest, cancellation, &deletes, |observer, elapsed| observer.block_file_deleted(elapsed)).await {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
         }
         if self.store.queues_offloaded_payload_reclamation()
-            && let Err(error) = self.sweep("oversized", oversized_block_index, latest, cancellation, &deletes, CollectionObserver::offloaded_payload_deleted).await
+            && let Err(error) = self.sweep("oversized", oversized_block_index, latest, cancellation, &deletes, |observer, elapsed| observer.offloaded_payload_deleted(elapsed)).await
         {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
@@ -678,7 +678,7 @@ impl CycleWorker for BlockCollector {
         stream::iter(entries).map(|entry| {
             let deletes = Arc::clone(&deletes);
             async move {
-            if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), catalog_block, latest, cancellation, &deletes, CollectionObserver::table_block_file_deleted).await
+            if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), catalog_block, latest, cancellation, &deletes, |observer, elapsed| observer.table_block_file_deleted(elapsed)).await
                     && !cancellation.is_cancelled() {
                     self.observer.table_failed(Some(&entry.table), &error);
                 }

@@ -1712,6 +1712,10 @@ async fn transactions_in_one_microsecond_get_distinct_system_times_that_tokens_n
     ).await.unwrap()).await;
     assert_eq!(reopened, [vec![Value::I64(10)]], "the first transaction's token never reads its successor");
     assert_eq!(rows(reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn sql_snapshot_tokens_combine_with_snapshot_time_await_token_and_clock_time() {
     let services = NodeServices {
         resources: Arc::new(NativeResources::default().with_log_clock({
@@ -3018,7 +3022,7 @@ async fn a_successor_retires_an_old_leaders_trie_once_it_leaves_the_garbage_wind
         let mut config = options();
         config.compaction_threads = 1;
         config.garbage.blocks_to_keep = 1;
-        config.garbage.garbage_lifetime = chrono::TimeDelta::from_std(lifetime).unwrap();
+        config.garbage.garbage_lifetime = lifetime;
 
         let mut predecessor_config = config.clone();
         predecessor_config.replication.idle_heartbeat = false;

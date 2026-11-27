@@ -951,7 +951,7 @@ impl MaintenanceSupervisor {
                         _ = cancellation.cancelled() => break Ok(()),
                         changed = status.changed() => { if changed.is_err() { break Err(closed()); } continue; }
                         started = self.start_term(handle, &cancellation) => match started {
-                            Ok(next) => { next.trie.signal(); region = Some(next); }
+                            Ok(next) => { next.garbage.signal(); region = Some(next); }
                             Err(error) => break Err(error),
                         },
                     }

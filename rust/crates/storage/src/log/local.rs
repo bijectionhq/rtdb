@@ -1231,6 +1231,57 @@ mod tests {
         writer.await.unwrap().unwrap();
         log.close_and_wait().await;
     }
+
+    #[test]
+    fn plain_local_log_writes_xtdbs_exact_0x1e_framing_and_extensions_fail_0x1e_check() -> Result<()> {
+        let scratch = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
+        let plain_path = Arc::new(scratch.path().join("LOG"));
+        let mut writer = Writer {
+            file: JournalFile::lock(&plain_path, true, AppleSync::Full)?,
+            path: Arc::clone(&plain_path),
+            timestamps: Arc::new(SuppliedTimestamp),
+            keys: None,
+        };
+        let payload = b"xtdb-record";
+        let timestamp = Timestamp(1_700_000_000_000_000);
+        let frames = writer.append(&[Queued {
+            payload: Bytes::from_static(payload), timestamp, durable: oneshot::channel().0,
+        }])?;
+        assert_eq!(frames[0].metadata.offset, LogOffset(0));
+        let mut expected = Vec::new();
+        expected.push(RECORD_SEPARATOR);
+        expected.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        expected.extend_from_slice(&timestamp.0.to_be_bytes());
+        expected.extend_from_slice(payload);
+        expected.extend_from_slice(&0i64.to_be_bytes());
+        assert_eq!(fs::read(plain_path.as_ref()).map_err(|error| Error::io(plain_path.as_ref(), error))?, expected);
+
+        // Retired and sealed separators are rejected by XTDB's `check(sep == 0x1E)`.
+        assert_ne!(RETIRED_SEPARATOR, RECORD_SEPARATOR);
+        assert_ne!(SEALED_SEPARATOR, RECORD_SEPARATOR);
+        assert_ne!(RETIRED_SEALED_SEPARATOR, RECORD_SEPARATOR);
+        let end = prefix_end(&mut writer.file, &plain_path, 1024, LogOffset(0), true)?;
+        settle_prefix(&mut writer.file, &plain_path, 1024, end, None)?;
+        assert_eq!(fs::read(plain_path.as_ref()).map_err(|error| Error::io(plain_path.as_ref(), error))?[0], RETIRED_SEPARATOR);
+
+        // Lineage-bound journals start with 0x1A (`\x1aRTDBJ01`), which XTDB's 0x1E check also rejects.
+        let lineage_path = scratch.path().join("REPLICA_LOG");
+        let (_log, driver) = open_replica(&lineage_path)?;
+        drop(driver);
+        assert_eq!(fs::read(&lineage_path).map_err(|error| Error::io(&lineage_path, error))?[0], 0x1a);
+        assert_ne!(0x1a, RECORD_SEPARATOR);
+        Ok(())
+    }
+
+    #[test]
+    fn multi_partition_log_directory_is_refused_loudly() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log_dir = scratch.path().join("LOG");
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::write(log_dir.join("0"), []).unwrap();
+        assert!(LocalLog::open(&log_dir, replica_options()).is_err());
+        assert!(crate::log::ReadOnlyLocalLog::open(&log_dir, crate::log::ReadOnlyLocalLogOptions::default()).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1301,56 +1352,6 @@ mod retention_tests {
         Ok(())
     }
 
-    #[test]
-    fn plain_local_log_writes_xtdbs_exact_0x1e_framing_and_extensions_fail_0x1e_check() -> Result<()> {
-        let scratch = tempfile::tempdir().map_err(|error| Error::Task(error.to_string()))?;
-        let plain_path = Arc::new(scratch.path().join("LOG"));
-        let mut writer = Writer {
-            file: JournalFile::lock(&plain_path, true)?,
-            path: Arc::clone(&plain_path),
-            timestamps: Arc::new(SuppliedTimestamp),
-            keys: None,
-        };
-        let payload = b"xtdb-record";
-        let timestamp = Timestamp(1_700_000_000_000_000);
-        let frames = writer.append(&[Queued {
-            payload: Bytes::from_static(payload), timestamp, durable: oneshot::channel().0,
-        }])?;
-        assert_eq!(frames[0].metadata.offset, LogOffset(0));
-        let mut expected = Vec::new();
-        expected.push(RECORD_SEPARATOR);
-        expected.extend_from_slice(&(payload.len() as i32).to_be_bytes());
-        expected.extend_from_slice(&timestamp.0.to_be_bytes());
-        expected.extend_from_slice(payload);
-        expected.extend_from_slice(&0i64.to_be_bytes());
-        assert_eq!(fs::read(plain_path.as_ref()).map_err(|error| Error::io(plain_path.as_ref(), error))?, expected);
-
-        // Retired and sealed separators are rejected by XTDB's `check(sep == 0x1E)`.
-        assert_ne!(RETIRED_SEPARATOR, RECORD_SEPARATOR);
-        assert_ne!(SEALED_SEPARATOR, RECORD_SEPARATOR);
-        assert_ne!(RETIRED_SEALED_SEPARATOR, RECORD_SEPARATOR);
-        let end = prefix_end(&mut writer.file, &plain_path, 1024, LogOffset(0), true)?;
-        settle_prefix(&mut writer.file, &plain_path, 1024, end, None)?;
-        assert_eq!(fs::read(plain_path.as_ref()).map_err(|error| Error::io(plain_path.as_ref(), error))?[0], RETIRED_SEPARATOR);
-
-        // Lineage-bound journals start with 0x1A (`\x1aRTDBJ01`), which XTDB's 0x1E check also rejects.
-        let lineage_path = scratch.path().join("REPLICA_LOG");
-        let (_log, driver) = open_replica(&lineage_path)?;
-        drop(driver);
-        assert_eq!(fs::read(&lineage_path).map_err(|error| Error::io(&lineage_path, error))?[0], 0x1a);
-        assert_ne!(0x1a, RECORD_SEPARATOR);
-        Ok(())
-    }
-
-    #[test]
-    fn multi_partition_log_directory_is_refused_loudly() {
-        let scratch = tempfile::tempdir().unwrap();
-        let log_dir = scratch.path().join("LOG");
-        fs::create_dir_all(&log_dir).unwrap();
-        fs::write(log_dir.join("0"), []).unwrap();
-        assert!(LocalLog::open(&log_dir, replica_options()).is_err());
-        assert!(ReadOnlyLocalLog::open(&log_dir, crate::log::ReadOnlyLocalLogOptions::default()).is_err());
-    }
 }
 
 #[cfg(test)]

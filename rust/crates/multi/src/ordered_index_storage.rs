@@ -113,12 +113,14 @@ impl HostedIndexPages {
                     tokio::select! {
                         biased;
                         _ = cancelled.cancelled() => break,
-                        _ = watched.wait_for(|record| record.as_ref().is_some_and(|record| {
-                            record.version >= version
-                                && (require_owner(record, owner, &scope.index, None).is_err()
-                                    || record.ordered_indexes.get(&scope.index)
-                                        .is_some_and(|index| !index.admits(scope.generation)))
-                        })) => break,
+                        _ = async {
+                            let _ = watched.wait_for(|record| record.as_ref().is_some_and(|record| {
+                                record.version >= version
+                                    && (require_owner(record, owner, &scope.index, None).is_err()
+                                        || record.ordered_indexes.get(&scope.index)
+                                            .is_some_and(|index| !index.admits(scope.generation)))
+                            })).await;
+                        } => break,
                         _ = renew.tick() => {
                             let renewed_at = tokio::time::Instant::now();
                             match renew_permit(directory.as_ref(), &deployment, owner, &scope, permit_id).await {
@@ -335,20 +337,20 @@ pub(crate) fn require_page_publication(
 async fn renew_permit(
     directory: &dyn Directory, deployment: &str, owner: Uuid, scope: &Scope, permit: Uuid,
 ) -> Result<bool> {
-    let mut active = false;
+    let active = std::sync::atomic::AtomicBool::new(false);
     update_installation(directory, deployment, |record| {
-        active = false;
+        active.store(false, std::sync::atomic::Ordering::Relaxed);
         if require_owner(record, owner, &scope.index, None).is_err() {
             return Ok(());
         }
         let Some(index) = record.ordered_indexes.get_mut(&scope.index) else { return Ok(()); };
         if index.generations.get(&scope.generation).is_some_and(|permits| permits.get(&permit) == Some(&owner)) {
             index.permit_expiries.insert(permit, permit_deadline_ms());
-            active = true;
+            active.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }).await?;
-    Ok(active)
+    Ok(active.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 async fn release_permit(

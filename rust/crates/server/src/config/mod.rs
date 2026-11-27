@@ -525,10 +525,4 @@ fn duration_nanos(value: &str) -> Result<i128> {
     Ok(nanos)
 }
 
-pub fn parse_signed_duration(value: &str) -> Result<chrono::TimeDelta> {
-    let nanos = parse_duration_nanos(value)?;
-    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| invalid("Duration exceeds range"))?;
-    let fraction = nanos.rem_euclid(1_000_000_000) as u32;
-    chrono::TimeDelta::new(seconds, fraction).ok_or_else(|| invalid("Duration exceeds range"))
-}
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb/invalid-node-config", message) }

@@ -163,16 +163,6 @@ impl ReplicaAppender {
                 receipt = receipts.next(), if !receipts.is_empty() => {
                     if let Some(Err(error)) = receipt { break Err(error); }
                 },
-                _ = timer.tick(), if self.heartbeat && !start_with_confirmation && !self.logs.data_suspended() => {
-                    let sequence = self.sequence;
-                    self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
-                    let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
-                    match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), (self.clock)()), &self.cancellation, &mut receipts).await {
-                        Ok(Some(receipt)) => receipts.push(track_receipt(receipt, None, None, None)),
-                        Ok(None) => break Ok(()),
-                        Err(error) => break Err(error),
-                    }
-                }
                 request = async {
                     match first.take() {
                         Some(write) => Some(AppendRequest { write, durable: None }),

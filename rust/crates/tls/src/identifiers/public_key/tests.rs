@@ -13,7 +13,7 @@ fn certificate(key: &[u8]) -> Vec<u8> {
     signed.extend_from_slice(key);
     encoded(0x30, &[encoded(0x30, &signed), encoded(0x30, &[]), encoded(3, &[0])].concat())
 }
-fn read(key: &[u8]) -> Result<CertificatePublicKeyEncoding> {
+fn read(key: &[u8]) -> TlsResult<CertificatePublicKeyEncoding> {
     CertificatePublicKeyEncoding::decode(&certificate(key), &MemoryBudget::new(16 << 20))
 }
 fn decode(oid: &[u8], parameters: &[u8], bits: &[u8]) -> CertificatePublicKeyEncoding {
