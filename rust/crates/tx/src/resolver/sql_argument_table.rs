@@ -15,7 +15,9 @@ use super::{
 };
 
 /// How the batched argument-table path ended: it wrote every row, or the statement's output has a shape only the
-/// row-by-row path writes the way XTDB does, and nothing was written.
+/// row-by-row path writes the way XTDB does, and nothing was written. Its errors are the statement's, except one an
+/// argument row's values raise: the batch cannot tell which row, so the row-by-row path raises it again with that
+/// row's `arg-idx`, as XTDB reports it.
 #[derive(Debug, PartialEq, Eq)]
 enum ArgumentTable {
     Applied,
@@ -57,7 +59,7 @@ impl OpenTransaction<'_> {
                         argument_column,
                         Arc::clone(&context),
                         Arc::clone(&syntax),
-                        page.batch(),
+                        page,
                     )
                     .await
                 {
@@ -89,19 +91,18 @@ impl OpenTransaction<'_> {
         argument_column: ColumnId,
         context: Arc<QueryContext>,
         syntax: Arc<MemoryReservation>,
-        page: &RecordBatch,
+        owned_page: &OwnedBatch,
     ) -> Result<ArgumentTable> {
         check_table(table)?;
 
         let memory = &context.memory;
-        let plan_bytes = rtdb_format::ipc::schema_translation_bound(page.schema_ref())?;
-        let bound = page
-            .get_array_memory_size()
-            .checked_add(plan_bytes)
-            .and_then(|size| size.checked_add(4096))
+        let page = owned_page.batch();
+        // The parameter wraps the page's own buffers, which the page's charge already covers: only the list's two
+        // offsets and the plan's schema translation are new.
+        let new_bytes = rtdb_format::ipc::schema_translation_bound(page.schema_ref())?
+            .checked_add(2 * std::mem::size_of::<i32>())
             .ok_or_else(overflow)?;
-        // The batched path copies the page; when the copy does not fit, the row-by-row path still can.
-        let Some(reservation) = memory.try_reserve(bound) else { return Ok(ArgumentTable::Unsupported); };
+        let _new = memory.reserve(new_bytes)?;
         let fields = page
             .schema_ref()
             .fields()
@@ -117,7 +118,7 @@ impl OpenTransaction<'_> {
         let types = [rtdb_columnar::from_field(&field)?];
         let parameter = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![Arc::new(list)])
             .map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?;
-        let parameter = OwnedBatch::with_reservation(parameter, reservation)?;
+        let parameter = owned_page.with_retained_buffers(parameter);
         let element = Field {
             id: argument_column,
             name: "sql_arguments".into(),
@@ -196,8 +197,7 @@ impl OpenTransaction<'_> {
             if inventory.is_none() {
                 let bytes = page.num_rows().checked_mul(std::mem::size_of::<OwnedBatch>() * 2)
                     .ok_or_else(overflow)?;
-                let Some(reserved) = memory.try_reserve(bytes) else { return Ok(ArgumentTable::Unsupported); };
-                inventory = Some(reserved);
+                inventory = Some(memory.reserve(bytes)?);
             }
             rest.push(output);
         }
@@ -214,10 +214,10 @@ impl OpenTransaction<'_> {
     }
 }
 
-/// Whether `error` is one an argument row's own values raise, rather than cancellation, exhaustion or a fault.
+/// Whether `error` is one an argument row's own values raise, rather than an unsupported feature, cancellation,
+/// exhaustion or a fault.
 fn raised_by_a_row(error: &Anomaly) -> bool {
-    matches!(error.category, AnomalyCategory::Incorrect | AnomalyCategory::Unsupported)
-        && error.kind != Some(AnomalyKind::ResourceExhausted)
+    error.category == AnomalyCategory::Incorrect && error.kind != Some(AnomalyKind::ResourceExhausted)
 }
 
 fn argument_put_document(batch: &RecordBatch) -> Option<&StructArray> {
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn only_a_row_error_runs_the_statement_again_row_by_row() {
         assert!(raised_by_a_row(&Anomaly::incorrect("xtdb.expression/division-by-zero", "division by zero")));
-        assert!(raised_by_a_row(&Anomaly::new(AnomalyCategory::Unsupported, "rtdb.test/unsupported", "unsupported")));
+        assert!(!raised_by_a_row(&Anomaly::new(AnomalyCategory::Unsupported, "rtdb.test/unsupported", "unsupported")));
         let mut exhausted = Anomaly::incorrect("rtdb/memory-budget-exceeded", "no room");
         exhausted.kind = Some(AnomalyKind::ResourceExhausted);
         assert!(!raised_by_a_row(&exhausted));
