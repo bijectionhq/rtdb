@@ -38,7 +38,12 @@ impl CatalogMetrics for Runtime {
 #[async_trait]
 impl CatalogRuntime for Runtime {
     async fn memberships(&self) -> Result<CatalogRows<(String, String)>> {
-        Ok(CatalogRows::new(vec![("alice".into(), "reader".into()), ("xtdb".into(), "alice".into())], self.0.reserve(4096)?))
+        Ok(CatalogRows::new(vec![
+            ("alice".into(), "reader".into()),
+            ("xtdb".into(), "alice".into()),
+            ("member\u{ff21}".into(), "role\u{ff21}".into()),
+            ("member\u{10400}".into(), "role\u{10400}".into()),
+        ], self.0.reserve(4096)?))
     }
 }
 async fn query(context: &Arc<QueryContext>, sql: &str) -> Vec<Vec<Value>> {
@@ -73,12 +78,16 @@ async fn information_schema_npgsql_get_schema_columns_query_joins_type_descripto
 }
 
 #[tokio::test]
-async fn catalog_roles_share_namespace_and_resolve_membership_only_superusers() {
+async fn catalog_roles_share_a_namespace_and_sort_login_names_before_granted_roles() {
     let context = context(true, None);
-    assert_eq!(query(&context, "SELECT rolname, rolsuper, rolcanlogin FROM pg_roles ORDER BY rolname").await, vec![
+    assert_eq!(query(&context, "SELECT rolname, rolsuper, rolcanlogin FROM pg_roles").await, vec![
         vec![Value::Utf8("alice".into()), Value::Bool(false), Value::Bool(true)],
-        vec![Value::Utf8("reader".into()), Value::Bool(false), Value::Bool(false)],
+        vec![Value::Utf8("member\u{10400}".into()), Value::Bool(false), Value::Bool(true)],
+        vec![Value::Utf8("member\u{ff21}".into()), Value::Bool(false), Value::Bool(true)],
         vec![Value::Utf8("xtdb".into()), Value::Bool(true), Value::Bool(true)],
+        vec![Value::Utf8("reader".into()), Value::Bool(false), Value::Bool(false)],
+        vec![Value::Utf8("role\u{10400}".into()), Value::Bool(false), Value::Bool(false)],
+        vec![Value::Utf8("role\u{ff21}".into()), Value::Bool(false), Value::Bool(false)],
     ]);
     assert_eq!(query(&context, "SELECT passwd IS NULL AS redacted FROM pg_user").await, vec![vec![Value::Bool(true)]]);
 }
@@ -105,11 +114,40 @@ async fn hidden_temporal_fields_bind_explicitly_and_stay_out_of_aliased_wildcard
 }
 
 #[tokio::test]
-async fn information_schema_columns_are_numbered_temporal_first_then_by_name() {
-    let context = context(false, Some(StructFields::from([("_id".into(), Value::I64(1)), ("zeta".into(), Value::I64(2)), ("alpha".into(), Value::I64(3))])));
-    let names: Vec<_> = query(&context, "SELECT column_name FROM information_schema.columns WHERE table_name = 'docs' ORDER BY ordinal_position").await.into_iter().map(|row| row[0].clone()).collect();
-    let expected = ["_id", "_system_from", "_system_to", "_valid_from", "_valid_to", "alpha", "zeta"].map(|name| Value::Utf8(name.into()));
-    assert_eq!(names, expected);
+async fn catalog_column_ordinals_put_internal_names_first_and_compare_utf16_within_each_group() {
+    let document = StructFields::from([
+        ("_id".into(), Value::I64(1)),
+        ("alpha".into(), Value::I64(2)),
+        ("zeta".into(), Value::I64(3)),
+        ("\u{ff21}".into(), Value::I64(4)),
+        ("\u{10400}".into(), Value::I64(5)),
+    ]);
+    let context = context(false, Some(document));
+    let expected = ["_id", "_system_from", "_system_to", "_valid_from", "_valid_to", "alpha", "zeta", "\u{10400}", "\u{ff21}"]
+        .into_iter().enumerate()
+        .map(|(index, name)| vec![Value::Utf8(name.into()), Value::I32(index as i32 + 1)])
+        .collect::<Vec<_>>();
+    assert_eq!(query(&context,
+        "SELECT column_name, ordinal_position FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'docs' ORDER BY ordinal_position"
+    ).await, expected);
+    assert_eq!(query(&context,
+        "SELECT attname, attnum FROM pg_attribute JOIN pg_class ON attrelid = oid
+         WHERE relname = 'docs' ORDER BY attnum"
+    ).await, expected);
+}
+
+#[tokio::test]
+async fn pg_type_discovers_native_float_array_element_types() {
+    let context = context(false, None);
+    assert_eq!(query(&context,
+        "SELECT e.oid AS element_oid, a.oid AS array_oid, a.typname, a.typelem FROM pg_type e
+         JOIN pg_type a ON e.typarray = a.oid
+         WHERE e.oid IN (700, 701) ORDER BY element_oid"
+    ).await, [
+        vec![Value::I32(700), Value::I32(1021), Value::Utf8("_float4".into()), Value::I32(700)],
+        vec![Value::I32(701), Value::I32(1022), Value::Utf8("_float8".into()), Value::I32(701)],
+    ]);
 }
 
 #[tokio::test]

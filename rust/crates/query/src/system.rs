@@ -414,7 +414,8 @@ fn catalog_pages(scan: Scan, context: Arc<QueryContext>) -> impl futures::Stream
                     _ => Err(invalid("catalog-runtime", "Role snapshot is absent"))?,
                 };
                 let entries = checked(users.rows().len(), scale(memberships.rows().len(), 2)?)?;
-                let _inventory = context.memory.reserve(checked(512, scale(entries, 128)?)?)?;
+                let entry_bytes = 128 + std::mem::size_of::<(&str, bool, bool)>();
+                let _inventory = context.memory.reserve(checked(512, scale(entries, entry_bytes)?)?)?;
                 let mut login = BTreeMap::new();
                 for (index, user) in users.rows().iter().enumerate() {
                     context.check_cancelled_at(index)?;
@@ -429,8 +430,11 @@ fn catalog_pages(scan: Scan, context: Arc<QueryContext>) -> impl futures::Stream
                     context.check_cancelled_at(index)?;
                     if !login.contains_key(role.as_str()) { roles.insert(role.as_str()); }
                 }
-                let rows = login.into_iter().map(|(name, superuser)| (name, superuser, true))
-                    .chain(roles.into_iter().map(|name| (name, false, false)));
+                let mut rows: Vec<_> = login.into_iter().map(|(name, superuser)| (name, superuser, true))
+                    .chain(roles.into_iter().map(|name| (name, false, false))).collect();
+                rows.sort_unstable_by(|(left, _, left_login), (right, _, right_login)| {
+                    right_login.cmp(left_login).then_with(|| catalog_name_order(left, right))
+                });
                 for (name, superuser, login) in rows {
                     if let Some(page) = record!(output, [("oid", Cell::I32(pg_name_oid(name))), ("rolname", Cell::Str(name)), ("rolsuper", Cell::Bool(superuser)), ("rolcanlogin", Cell::Bool(login))])? { yield page; }
                 }
@@ -581,12 +585,20 @@ fn column_bindings<'a>(context: &QueryContext, database: &str, tables: impl Iter
 
 type CatalogField<'a> = (&'a str, &'a LogicalType);
 
+fn catalog_name_order(left: &str, right: &str) -> std::cmp::Ordering {
+    left.encode_utf16().cmp(right.encode_utf16())
+}
+
 fn ordinal_order(left: &str, right: &str) -> std::cmp::Ordering {
-    (!left.starts_with('_'), left).cmp(&(!right.starts_with('_'), right))
+    right.starts_with('_').cmp(&left.starts_with('_'))
+        .then_with(|| catalog_name_order(left, right))
 }
 
 fn column_order<'a>(binding: &'a TableBinding, memory: &Arc<MemoryBudget>) -> Result<Option<CatalogRows<CatalogField<'a>>>> {
-    if [true, false].into_iter().all(|system| binding.columns.keys().filter(|name| name.starts_with('_') == system).is_sorted()) {
+    if [true, false].into_iter().all(|system| {
+        binding.columns.keys().filter(|name| name.starts_with('_') == system)
+            .is_sorted_by(|left, right| !catalog_name_order(left, right).is_gt())
+    }) {
         return Ok(None);
     }
     // StructFields preserves insertion order. Only out-of-order bindings need a permutation.

@@ -284,6 +284,9 @@ The source regressions in `tests/scan.rs` retain a capped live view across block
 
 Virtual `information_schema` and `pg_catalog` relations resolve from declared schemas and execute through passive `SystemCursor` instances.
 Their rows derive from the captured table registry, column types, database names, and shared PostgreSQL descriptors.
+The column ordinals in `information_schema.columns` and `pg_attribute` assign names beginning with an underscore first, then sort names within each group in UTF-16 code unit order.
+`pg_roles` emits login names before grant-only roles and orders names within each group the same way.
+The native float array types `_float4` (OID 1021) and `_float8` (OID 1022) are discoverable through `pg_type`, including the links from their element types.
 The declared empty constraint, dependency, extension, and index relations follow the pinned JVM information-schema producers.
 `xt.live_tables`, `xt.live_columns`, and `xt.trie_stats` read retained partition generations.
 `xt.live_trie_artefacts` reports one row per recorded object reachable from a live trie, including partition group objects shared by multiple tries.
