@@ -1546,6 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_version_settles_under_its_certified_fence_before_physical_trim() {
+        crate::residence_trace::install_from_env();
         use crate::{hosted_recovery::{ReplicaTrimPlan, advance_body_fence, observe_checkpoint, replay_start}, keys::LocalKeyService, lease::LeaseOptions,
             logs::JournalUnits, process};
         use rtdb_directory::{Checkpoint, CheckpointDecision, MemberId, MemoryDirectory};

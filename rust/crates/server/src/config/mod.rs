@@ -287,7 +287,8 @@ pub fn install_apple_sync(environment: &impl Fn(&str) -> Option<String>) -> Resu
 /// - Errors: a setting already installed or used with a different value.
 pub fn install_process_settings(environment: &impl Fn(&str) -> Option<String>) -> Result<()> {
     rtdb_types::install_runtime_version(environment("XTDB_VERSION").as_deref(), environment("GIT_SHA").as_deref())?;
-    rtdb_types::install_tzdb_file(environment("RTDB_TZDB_FILE").filter(|path| !path.is_empty()).map(std::path::PathBuf::from))
+    rtdb_types::install_tzdb_file(environment("RTDB_TZDB_FILE").filter(|path| !path.is_empty()).map(std::path::PathBuf::from))?;
+    rtdb_types::residence_trace::install(environment("RTDB_RESIDENCE_TRACE_PATH").filter(|path| !path.is_empty()).map(std::path::PathBuf::from))
 }
 
 /// The process setting that caps one query's spill files when the YAML sets no `query.spillLimitBytes`.

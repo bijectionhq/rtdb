@@ -2502,6 +2502,9 @@ async fn a_trusted_checkpoint_and_replica_journal_rebuild_after_l0_is_removed() 
 async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_through_collection() {
     use rtdb_format::{catalog::BlockCatalog, keys::{block_key, oversized_block_index}};
 
+    if let Some(path) = std::env::var_os("RTDB_RESIDENCE_TRACE_PATH").filter(|path| !path.is_empty()) {
+        rtdb_types::residence_trace::install(Some(std::path::PathBuf::from(path))).unwrap();
+    }
     let directory = tempfile::tempdir().unwrap();
     let source_storage = directory.path().join("source");
     let objects = source_storage.join("v06");

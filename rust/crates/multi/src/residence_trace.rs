@@ -6,6 +6,13 @@ use rtdb_types::PlacedAttempt;
 
 pub(crate) use rtdb_types::residence_trace::{enabled, record};
 
+#[cfg(test)]
+pub(crate) fn install_from_env() {
+    if let Some(path) = std::env::var_os("RTDB_RESIDENCE_TRACE_PATH").filter(|path| !path.is_empty()) {
+        rtdb_types::residence_trace::install(Some(std::path::PathBuf::from(path))).unwrap();
+    }
+}
+
 pub(crate) struct AttemptOutcome {
     attempt: PlacedAttempt,
     committed: bool,

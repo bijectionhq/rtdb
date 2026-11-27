@@ -270,6 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_payload_read_spends_its_directory_replay_hold() {
+        crate::residence_trace::install_from_env();
         use crate::{deployment::CellStorage, keys::LocalKeyService, lease::LeaseOptions,
             logs::JournalUnits, process, replay_broker::Client};
         use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::oversized_key, log::proto::NoOp};

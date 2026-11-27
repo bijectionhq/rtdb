@@ -1388,6 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fork_pack_edge_withdraws_only_after_its_exact_replacement_contains_the_release() {
+        crate::residence_trace::install_from_env();
         let directory = MemoryDirectory::new();
         let bucket: crate::reference::Bucket = std::sync::Arc::new(VersionedReleaseStore {
             addresses: true, ..Default::default()

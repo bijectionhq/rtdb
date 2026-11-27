@@ -1648,8 +1648,15 @@ async fn a_deployment_whose_activations_crash_is_quarantined_to_the_isolation_po
     cell.stop().await;
 }
 
+fn install_residence_trace() {
+    if let Some(path) = std::env::var_os("RTDB_RESIDENCE_TRACE_PATH").filter(|path| !path.is_empty()) {
+        rtdb_types::residence_trace::install(Some(std::path::PathBuf::from(path))).unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_nothing_readable() {
+    install_residence_trace();
     let cell = Cell::start(2, None).await;
     let parent = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
     let client = cell.connect("shop").await;
@@ -3647,6 +3654,7 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
     use rtdb_directory::StorageRegion;
     use rtdb_storage::log::{Log, LogOffset};
 
+    install_residence_trace();
     let directory = ObservedDirectory::new();
     let trace = std::env::var_os("RTDB_RECOVERY_TRACE_PATH")
         .map(|path| (path, directory.deployment_changes().unwrap()));
@@ -4695,6 +4703,7 @@ async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_i
     use rtdb_storage::ObjectStore;
     use rtdb_types::BlockIndex;
 
+    install_residence_trace();
     let cell = Cell::start(2, None).await;
     let directory = cell.directory.as_ref();
     let storage = cell.storage();
