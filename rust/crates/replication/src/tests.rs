@@ -3056,6 +3056,28 @@ async fn one_clock_stamps_the_boot_claim_external_transaction_and_source_flush()
     observation.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn flush_timeout_uses_wall_clock_rather_than_mock_replication_clock() {
+    let time = Arc::new(AtomicI64::new(1_000_000));
+    let clock: ReplicationClock = {
+        let time = Arc::clone(&time);
+        Arc::new(move || Timestamp(time.load(Ordering::SeqCst)))
+    };
+    let config = ReplicationConfig {
+        external_source: true,
+        assertion_interval: Duration::from_secs(60),
+        flush_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let mut fixture = fixture_with_clock(config, 1 << 27, Some(clock)).await;
+    fixture.driver.fence.admit(Term(1), Some(TermSequence(0))).unwrap();
+    fixture.driver.promote().await.unwrap();
+    time.store(1_000_000 + 86_400_000_000, Ordering::SeqCst);
+    fixture.driver.flush_if_due().await.unwrap();
+    assert!(fixture.driver.leader.as_ref().unwrap().cycle.accepting());
+    assert!(fixture.driver.pending_block.is_none());
+}
+
 async fn queue_external_write(fixture: &mut Fixture, token: &[u8]) -> (ExternalReceipt, TransactionKey) {
     let receipt = fixture.handle.term().unwrap()
         .submit_external(Box::new(CommitExternal), Some(Timestamp(100)), Some(token.to_vec()))

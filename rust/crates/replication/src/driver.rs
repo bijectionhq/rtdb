@@ -622,7 +622,7 @@ impl ReplicationDriver {
         let (sender, commands) = mpsc::channel(128);
         let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone(), clock: Arc::clone(&clock), partition: Arc::clone(&recovered.partition) };
         let persisted_tx = recovered.block.as_ref().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        let flush_timer = FlushTimer::new(clock(), persisted_tx, config.flush_timeout)?;
+        let flush_timer = FlushTimer::new(now(), persisted_tx, config.flush_timeout)?;
         let recovered_confirmation = if config.enabled && config.may_lead {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
@@ -1081,7 +1081,7 @@ impl ReplicationDriver {
     async fn promote_term(&mut self, term: Term) -> Result<()> {
         let progress = self.progress.current();
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        self.flush_timer = FlushTimer::new((self.clock)(), persisted, self.config.flush_timeout)?;
+        self.flush_timer = FlushTimer::new(now(), persisted, self.config.flush_timeout)?;
         let cancellation = self.cancellation.child_token();
         // Reopen from the installed source position after adopting an inherited block
         // or settling a recovered timed original.
@@ -2384,7 +2384,7 @@ impl ReplicationDriver {
         if self.default_erasure.is_none()
             && !self.waiting_for_checkpoint()
             && self.leader.as_ref().is_some_and(LeaderState::accepting_commands)
-            && self.flush_timer.should_flush((self.clock)(), persisted)
+            && self.flush_timer.should_flush(now(), persisted)
         {
             self.cut().await?;
         }
