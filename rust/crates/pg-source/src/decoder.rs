@@ -262,7 +262,19 @@ fn tuple<'a>(input: &mut Input<'a>) -> Result<Vec<Cell<'a>>> {
     Ok(values)
 }
 fn recover<'a>(value: Cell<'a>, old: Option<&[Cell<'a>]>, index: usize, name: &str, table: &TableRef) -> Result<Option<&'a str>> {
-    match value { Cell::Null => Ok(None), Cell::Text(value) => Ok(Some(value)), Cell::Unchanged => match old.and_then(|values| values.get(index)) { Some(Cell::Text(value)) => Ok(Some(value)), _ => Err(Anomaly::incorrect("xtdb.postgres/unchanged-toast", format!("Column {name} on {}.{} has an unrecoverable unchanged TOAST value; set REPLICA IDENTITY FULL and recreate the source", table.schema, table.table))) } }
+    match value {
+        Cell::Null => Ok(None),
+        Cell::Text(value) => Ok(Some(value)),
+        Cell::Unchanged => match old.and_then(|values| values.get(index)) {
+            Some(Cell::Text(value)) => Ok(Some(value)),
+            _ => Err(Anomaly::incorrect("xtdb.postgres/unchanged-toast", format!(
+                "Received unchanged TOASTed column '{name}' on {}.{}.\n\
+                 The value was omitted when this change was written, so it's unrecoverable and this source can't continue.\n\
+                 Set REPLICA IDENTITY FULL on the table to stop this recurring, then recreate the source.\n",
+                table.schema, table.table
+            ))),
+        },
+    }
 }
 pub(crate) fn text_bound(oid: u32, text: &str) -> Result<usize> {
     wire_value_bound(oid, text.as_bytes())

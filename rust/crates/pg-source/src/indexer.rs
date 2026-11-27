@@ -6,7 +6,7 @@ use arrow_schema::DataType;
 use rtdb_columnar::{ArrowCell, MemoryBudget, read_entity_id};
 use rtdb_format::data::{StoredEvent, StoredOperation};
 use rtdb_tx::{OpenTransaction, TransactionWriter, WriterResult};
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, Result, Timestamp, Value};
+use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, Result, TableRef, Timestamp, Value};
 use std::sync::Arc;
 use crate::{ArrowChanges, ArrowPgTransaction, PgTransaction, RowKind, decoder::DecodedTransaction};
 
@@ -28,7 +28,8 @@ pub struct DirectMirror;
 impl PgIndexer for DirectMirror {
     async fn index_transaction(&self, source: &PgTransaction, target: &mut OpenTransaction<'_>) -> Result<()> {
         for (index, operation) in source.operations.iter().enumerate() {
-            let id = operation.row.get("_id").ok_or_else(|| Anomaly::incorrect("xtdb.postgres/missing-id", "Source row has no _id column"))?.entity_id()?;
+            let id = operation.row.get("_id").filter(|id| !matches!(id, Value::Null))
+                .ok_or_else(|| missing_id(&operation.table, operation.kind))?.entity_id()?;
             let system_from = target.tx_key().system_time;
             let (valid_time, operation_value) = match operation.kind {
                 RowKind::Put => {
@@ -60,8 +61,8 @@ async fn index_arrow_runs<'a>(
     let system_from = target.tx_key().system_time;
     for (index, (operation, rows)) in runs.enumerate() {
         let batch = operation.rows.batch();
-        let missing_id = || Anomaly::incorrect("xtdb.postgres/missing-id", "Source row has no _id column");
-        let id = batch.schema_ref().index_of("_id").map_err(|_| missing_id())?;
+        let missing = || missing_id(&operation.table, operation.kind);
+        let id = batch.schema_ref().index_of("_id").map_err(|_| missing())?;
         let from = batch.schema_ref().index_of("_valid_from").ok();
         let to = batch.schema_ref().index_of("_valid_to").ok();
         match operation.kind {
@@ -72,7 +73,7 @@ async fn index_arrow_runs<'a>(
                 let mut headers = Vec::with_capacity(rows.len());
                 let mut failure = None;
                 for row in rows.clone() {
-                    let header = put_header(batch, row, id, from, to, system_from);
+                    let header = put_header(batch, row, id, from, to, system_from, &missing);
                     match header {
                         Ok(header) => headers.push(header),
                         Err(error) => { failure = Some(error); break; }
@@ -93,7 +94,7 @@ async fn index_arrow_runs<'a>(
             RowKind::Delete => {
                 for start in rows.clone().step_by(64) {
                     let len = (rows.end - start).min(64);
-                    let iids = (start..start + len).map(|row| cell_iid(cell(batch, id, row)));
+                    let iids = (start..start + len).map(|row| cell_iid(cell(batch, id, row))?.ok_or_else(&missing));
                     target.append_arrow_deletes(&operation.table, iids)?;
                     if len == 64 { tokio::task::yield_now().await; }
                 }
@@ -107,19 +108,26 @@ fn cell(batch: &RecordBatch, column: usize, row: usize) -> ArrowCell<'_> {
     ArrowCell { field: batch.schema_ref().field(column), array: batch.column(column).as_ref(), row }
 }
 
-fn cell_iid(cell: ArrowCell<'_>) -> Result<Iid> {
+fn missing_id(table: &TableRef, kind: RowKind) -> Anomaly {
+    let operation = match kind { RowKind::Put => "in row from", RowKind::Delete => "in delete on" };
+    Anomaly::incorrect("xtdb.postgres/missing-id", format!("Missing '_id' {operation} {}.{}", table.schema, table.table))
+}
+
+fn cell_iid(cell: ArrowCell<'_>) -> Result<Option<Iid>> {
     let cell = cell.physical()?;
-    if !cell.is_null()? && matches!(cell.field.data_type(), DataType::Date32 | DataType::Date64) {
+    if cell.is_null()? { return Ok(None); }
+    if matches!(cell.field.data_type(), DataType::Date32 | DataType::Date64) {
         return Err(Anomaly::invalid_entity_id("Invalid ID type: java.time.LocalDate")
             .with_context("type", "java.time.LocalDate".into()));
     }
-    Ok(read_entity_id(cell.field, cell.array, cell.row)?.iid())
+    Ok(Some(read_entity_id(cell.field, cell.array, cell.row)?.iid()))
 }
 
 fn put_header(
     batch: &RecordBatch, row: usize, id: usize, from: Option<usize>, to: Option<usize>, system_from: Timestamp,
+    missing: impl FnOnce() -> Anomaly,
 ) -> Result<EventHeader> {
-    let iid = cell_iid(cell(batch, id, row))?;
+    let iid = cell_iid(cell(batch, id, row))?.ok_or_else(missing)?;
     let lower = from.map(|column| valid_time_cell(cell(batch, column, row), "_valid_from")).transpose()?.flatten();
     let upper = to.map(|column| valid_time_cell(cell(batch, column, row), "_valid_to")).transpose()?.flatten();
     if upper.is_some() && lower.is_none() {
@@ -147,7 +155,8 @@ fn valid_time_cell(cell: ArrowCell<'_>, name: &str) -> Result<Option<Timestamp>>
 }
 
 fn invalid_valid_time(name: &str) -> Anomaly {
-    Anomaly::incorrect("xtdb.postgres/invalid-explicit-valid-time", format!("{name} must be a TIMESTAMPTZ column"))
+    Anomaly::incorrect("xtdb.postgres/invalid-explicit-valid-time", format!("'{name}' must be a TIMESTAMPTZ column"))
+        .with_context("column", name.into())
 }
 
 fn valid_time(value: Option<Value>, column: &str) -> Result<Option<Timestamp>> {
@@ -175,7 +184,19 @@ impl TransactionWriter for ImportWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Int32Array;
+    use arrow_schema::{Field, Schema};
     use rtdb_types::TimeUnit;
+
+    #[test]
+    fn a_nullable_source_id_reports_the_missing_id_with_table_context() {
+        let field = Field::new("_id", DataType::Int32, true);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(Int32Array::from(vec![None::<i32>]))]).unwrap();
+        let table = TableRef::new("public", "docs");
+        let error = put_header(&batch, 0, 0, None, None, Timestamp(1), || missing_id(&table, RowKind::Put)).unwrap_err();
+        assert_eq!(error.code, "xtdb.postgres/missing-id");
+        assert_eq!(error.message.as_deref(), Some("Missing '_id' in row from public.docs"));
+    }
 
     #[test]
     fn pg_source_arrow_headers_match_the_row_adapter() {
@@ -189,7 +210,8 @@ mod tests {
             let field = rtdb_columnar::to_field("_id", &logical).unwrap();
             let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
             let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
-            assert_eq!(cell_iid(cell), value.entity_id().map(|id| id.iid()));
+            let expected = match value { Value::Null => Ok(None), _ => value.entity_id().map(|id| Some(id.iid())) };
+            assert_eq!(cell_iid(cell), expected);
         }
         let values = [
             Value::Timestamp { value: -1, unit: TimeUnit::Nanosecond, timezone: Some("UTC".into()) },

@@ -9,6 +9,8 @@ These sources and their test cases have not been compiled or executed.
 The node resolves `SourceConfig.remote` through its configured remote registry and constructs a `Remote` with the credentials and transport settings.
 Credentials remain in that registry and the active source's cloned `Remote`; they are absent from the durable source protobuf and from debug formatting.
 `SourceConfig::decode` consumes the persisted `PostgresSourceConfig` Any, including legacy configurations whose missing indexer selects `DirectMirror`.
+An unqualified ignored-table name selects that table in `public`, with PostgreSQL case preserved.
+A `DirectMirror` entry must contain a valid protobuf payload.
 A custom configuration requires the caller to supply a native `PgIndexer` implementation.
 `SourceDriver::new` performs configuration validation without starting a connection.
 

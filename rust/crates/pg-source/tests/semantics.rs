@@ -1,8 +1,39 @@
 use rtdb_types::StructFields;
 use std::collections::BTreeSet;
+use prost::Message;
+use prost_types::Any;
 use rtdb_columnar::MemoryBudget;
-use rtdb_pg_source::{ConfirmationState, Decoder, Lsn, ReconnectPolicy, ResumeToken, RowKind, read_text};
-use rtdb_types::{TimeUnit, Value};
+use rtdb_format::postgres::proto::PostgresSourceConfig;
+use rtdb_pg_source::{CONFIG_TYPE, DIRECT_MIRROR_TYPE, ConfirmationState, Decoder, Lsn, ReconnectPolicy, ResumeToken, RowKind, SourceConfig, read_text};
+use rtdb_types::{TableRef, TimeUnit, Value};
+
+fn persisted_config(indexer: Option<Any>, ignore_tables: Vec<String>) -> Any {
+    let config = PostgresSourceConfig {
+        remote: Some("pg".into()),
+        slot_name: Some("mirror".into()),
+        publication_name: Some("changes".into()),
+        indexer,
+        ignore_tables,
+    };
+    Any { type_url: CONFIG_TYPE.into(), value: config.encode_to_vec() }
+}
+
+#[test]
+fn persisted_ignored_tables_accept_unqualified_names_and_preserve_case() {
+    let config = persisted_config(None, vec!["Audit".into(), "public.Audit".into(), "Custom.events".into()]);
+    let config = SourceConfig::decode(&config).unwrap();
+    assert!(config.indexer.is_none());
+    assert_eq!(config.ignore_tables, BTreeSet::from([TableRef::new("public", "Audit"), TableRef::new("Custom", "events")]));
+}
+
+#[test]
+fn persisted_direct_mirror_requires_valid_protobuf() {
+    let indexer = Any { type_url: DIRECT_MIRROR_TYPE.into(), value: Vec::new() };
+    assert!(SourceConfig::decode(&persisted_config(Some(indexer.clone()), Vec::new())).is_ok());
+    let malformed = Any { value: vec![0xff], ..indexer };
+    let error = SourceConfig::decode(&persisted_config(Some(malformed), Vec::new())).unwrap_err();
+    assert_eq!(error.code, "xtdb.postgres/invalid-config");
+}
 
 #[test]
 fn confirmation_waits_for_adopted_blocks_then_crosses_unpublished_wal_gaps() {
@@ -87,8 +118,12 @@ fn unchanged_toast_without_full_old_value_is_fatal_and_ignored_tables_skip_conve
     let memory = MemoryBudget::new(1 << 20); let mut decoder = Decoder::new(BTreeSet::new(), memory.clone());
     decoder.receive(&relation()).unwrap(); decoder.receive(&begin()).unwrap();
     let mut update = vec![b'U']; update.extend_from_slice(&1u32.to_be_bytes()); update.push(b'N'); update.extend(tuple(&[Some("1"), None]));
-    assert_eq!(decoder.receive(&update).unwrap_err().code, "xtdb.postgres/unchanged-toast");
-    let mut ignored = Decoder::new(BTreeSet::from([rtdb_types::TableRef::new("public", "docs")]), memory);
+    let error = decoder.receive(&update).unwrap_err();
+    assert_eq!(error.code, "xtdb.postgres/unchanged-toast");
+    let message = error.message.unwrap();
+    assert!(message.starts_with("Received unchanged TOASTed column 'payload' on public.docs."));
+    assert!(message.contains("Set REPLICA IDENTITY FULL on the table to stop this recurring, then recreate the source."));
+    let mut ignored = Decoder::new(BTreeSet::from([TableRef::new("public", "docs")]), memory);
     ignored.receive(&relation()).unwrap(); ignored.receive(&begin()).unwrap(); ignored.receive(&update).unwrap(); assert!(ignored.receive(&commit(123)).unwrap().is_none());
 }
 

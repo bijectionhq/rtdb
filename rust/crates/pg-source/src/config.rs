@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use prost::Message;
 use prost_types::Any;
-use rtdb_format::postgres::proto::PostgresSourceConfig;
+use rtdb_format::postgres::proto::{DirectMirrorConfig, PostgresSourceConfig};
 use rtdb_types::{Anomaly, Result, TableRef};
 
 pub const CONFIG_TYPE: &str = "proto.xtdb.com/xtdb.postgres.proto.PostgresSourceConfig";
@@ -21,9 +21,13 @@ impl SourceConfig {
         let wire = PostgresSourceConfig::decode(any.value.as_slice()).map_err(invalid)?;
         let mut ignore_tables = BTreeSet::new();
         for table in wire.ignore_tables {
-            let (schema, table) = table.split_once('.').ok_or_else(|| invalid("Ignored table requires schema.table"))?;
-            if schema.is_empty() || table.is_empty() { return Err(invalid("Ignored table requires nonempty schema and table names")); }
-            ignore_tables.insert(TableRef::new(schema, table));
+            let table = if let Some((schema, name)) = table.split_once('.') {
+                if schema.is_empty() || name.is_empty() { return Err(invalid("Ignored table requires nonempty schema and table names")); }
+                TableRef::new(schema, name)
+            } else {
+                TableRef::parse(&table)?
+            };
+            ignore_tables.insert(table);
         }
         let config = Self { remote: wire.remote.unwrap_or_default(), slot_name: wire.slot_name.unwrap_or_default(), publication_name: wire.publication_name.unwrap_or_default(), indexer: wire.indexer, ignore_tables };
         config.validate()?;
@@ -33,6 +37,9 @@ impl SourceConfig {
         if self.remote.is_empty() || self.slot_name.is_empty() || self.publication_name.is_empty() { return Err(invalid("PostgreSQL remote, slot name, and publication name are required")); }
         if self.slot_name.as_bytes().iter().any(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && *byte != b'_') { return Err(invalid("PostgreSQL slot names require lowercase letters, digits, or underscores")); }
         if self.publication_name.contains('\0') { return Err(invalid("Publication name contains a zero byte")); }
+        if let Some(indexer) = &self.indexer && indexer.type_url == DIRECT_MIRROR_TYPE {
+            DirectMirrorConfig::decode(indexer.value.as_slice()).map_err(invalid)?;
+        }
         Ok(())
     }
 }
