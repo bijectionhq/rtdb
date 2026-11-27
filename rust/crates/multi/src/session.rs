@@ -999,6 +999,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_an_implicit_read_retries_on_the_holder_after_replica_refusal() {
+        struct HolderRoute(tokio::sync::Mutex<Option<TcpStream>>);
+
+        #[async_trait::async_trait]
+        impl Router for HolderRoute {
+            async fn route(&self) -> Result<(TcpStream, Option<String>, u64)> {
+                panic!("a fresh-read refusal must route directly to the holder");
+            }
+
+            async fn route_holder(&self) -> Result<(TcpStream, Option<String>, u64)> {
+                Ok((self.0.lock().await.take().expect("a holder retry"), None, 0))
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for explicit in [false, true] {
+                let directory = rtdb_directory::MemoryDirectory::new();
+                let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let (mut client, gateway) = pair(&listener).await;
+                let (first, mut replica) = pair(&listener).await;
+                let (retry, mut holder) = pair(&listener).await;
+                let router = Arc::new(HolderRoute(tokio::sync::Mutex::new((!explicit).then_some(retry))));
+                let startup = crate::gateway::encode_startup(&BTreeMap::from([("user".into(), "xtdb".into())]));
+                let running = tokio::spawn(Session::new(Bytes::from(startup), router, directory, record.id, None, false)
+                    .run(gateway, first, None, 0));
+                greet(&mut replica).await;
+                assert_eq!(receive(&mut client).await.0, b'R');
+                assert_eq!(receive(&mut client).await.0, b'Z');
+                if explicit {
+                    send(&mut client, b'Q', b"BEGIN READ ONLY\0").await;
+                    assert_eq!(query(&mut replica).await, "BEGIN READ ONLY");
+                    send(&mut replica, b'C', b"BEGIN\0").await;
+                    send(&mut replica, b'Z', b"T").await;
+                    assert_eq!(receive(&mut client).await.0, b'C');
+                    assert_eq!(receive(&mut client).await, (b'Z', b"T".to_vec()));
+                }
+                send(&mut client, b'Q', b"SELECT 1\0").await;
+                assert_eq!(query(&mut replica).await, "SELECT 1");
+                let refused = format!("SERROR\0CXX000\0MThe replica could not establish a fresh snapshot\0{}{}\0\0",
+                    char::from(rtdb_pgwire::ANOMALY_CODE_FIELD), rtdb_node::REPLICA_BEHIND);
+                send(&mut replica, b'E', refused.as_bytes()).await;
+                send(&mut replica, b'Z', if explicit { b"E" } else { b"I" }).await;
+                if explicit {
+                    assert_eq!(receive(&mut client).await, (b'E', refused.into_bytes()));
+                    assert_eq!(receive(&mut client).await, (b'Z', b"E".to_vec()));
+                } else {
+                    greet(&mut holder).await;
+                    assert_eq!(query(&mut holder).await, "SELECT 1");
+                    send(&mut holder, b'C', b"SELECT 1\0").await;
+                    send(&mut holder, b'Z', b"I").await;
+                    assert_eq!(receive(&mut client).await, (b'C', b"SELECT 1\0".to_vec()));
+                    assert_eq!(receive(&mut client).await, (b'Z', b"I".to_vec()));
+                }
+                drop(client);
+                running.await.unwrap().unwrap();
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_gateway_refuses_a_frame_from_its_header_when_its_budget_cannot_hold_the_body() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();

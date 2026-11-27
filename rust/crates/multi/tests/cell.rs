@@ -1334,36 +1334,6 @@ async fn a_linearizable_subscriber_refuses_to_pin_a_basis_after_its_ensemble_is_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_gateway_retries_an_implicit_read_on_the_holder_when_the_subscriber_cannot_confirm() {
-    let cell = Cell::start_without_log_fsync(2).await;
-    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
-    admin::set_linearizable_reads(cell.directory.as_ref(), "shop", true).await.unwrap();
-    admin::set_read_width(cell.directory.as_ref(), "shop", 2).await.unwrap();
-    let writer = cell.connect("shop").await;
-    writer.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
-    let holder = cell.holder("shop").await.unwrap();
-    let reader_config = || {
-        let mut config = tokio_postgres::Config::new();
-        config.host("127.0.0.1").port(cell.gateway.port()).user("xtdb").password("cell-test").dbname("shop")
-            .options("-c default_transaction_read_only=on");
-        config
-    };
-    let (reader, connection) = reader_config().connect(NoTls).await.unwrap();
-    tokio::spawn(connection);
-    assert_eq!(cell.node(1 - holder).agent.subscribed(), ["shop"]);
-    assert_eq!(values(&reader, "SELECT total FROM orders").await, ["10"]);
-
-    let (transaction, connection) = reader_config().connect(NoTls).await.unwrap();
-    tokio::spawn(connection);
-    transaction.simple_query("BEGIN READ ONLY").await.unwrap();
-    let error = transaction.simple_query("SELECT total FROM orders").await.unwrap_err();
-    assert!(error.as_db_error().unwrap().message().contains("could not establish a fresh snapshot"));
-    transaction.simple_query("ROLLBACK").await.unwrap();
-    drop((reader, writer, transaction));
-    cell.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_only_sessions_spread_across_the_deployments_read_width() {
     let cell = Cell::start(3, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
