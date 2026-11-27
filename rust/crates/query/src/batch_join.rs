@@ -632,7 +632,8 @@ impl Spec {
         }
         let mut table = self.table(batches, rows, inventory)?;
         let blooms = matches!(self.kind, JoinKind::Inner | JoinKind::Semi) || self.tracks_build() && self.kind != JoinKind::Full;
-        let mut filters = PushdownBuilder::new(layout.condition.as_ref(), &layout.left.schema, &layout.right.original, i64::try_from(rows).map_err(|_| size_error())?, blooms, &self.execution)?;
+        let mut filters = PushdownBuilder::new(layout.condition.as_ref(), &layout.left.schema, &layout.right.original,
+            probe.runtime.relation(), i64::try_from(rows).map_err(|_| size_error())?, blooms, &self.execution)?;
         if blooms {
             for batch in &table.batches {
                 for row in 0..batch.len {

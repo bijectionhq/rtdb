@@ -2351,7 +2351,10 @@ surface QueryAccess {
         -- Key readers follow logical union leg names and run ends to borrow the selected scalar or vector values.
         -- URI keys retain the raw hash check and the SQL comparison of their spellings.
         -- Arrow join pushdown retains at most 1024 distinct IID candidates of supported identity cells alongside their Bloom positions.
-        -- When an additional distinct candidate exceeds that bound, the probe scan uses the Bloom filter and the join still checks exact equality.
+        -- A captured probe table row estimate limits a candidate set larger than a singleton to fewer IIDs than the estimated rows.
+        -- When an additional distinct candidate exceeds the bound, the probe scan uses the Bloom filter and the join still checks exact equality.
+        -- The candidate set is stored as a charged sorted slice, and a scan task walks it in the order in which it merges event headers.
+        -- Pruning by entity ID requires matching identity domains and proof that the scan's snapshot uses canonical IIDs.
         -- A composite set key reads an owned scalar cell for each column that requires scalar hashing or equality.
         -- Unfiltered counts and double-precision sums and averages without DISTINCT can reduce compatible Arrow vectors and selections without materialising a row mask.
         -- A null-extended selected position contributes a row to COUNT(*) and is null for argument reductions.

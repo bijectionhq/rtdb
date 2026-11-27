@@ -9,12 +9,15 @@ use crate::{QueryContext, invalid, pages::{BoxPageCursor, OwnedPage, PageCursor}
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ScanCounts {
     pub files_pruned: u64, pub files_used: u64, pub pages_pruned: u64, pub pages_used: u64, pub rows_read: u64,
+    pub join_iid_headers_checked: u64, pub join_iid_headers_rejected: u64,
 }
 impl ScanCounts {
     pub fn add(&mut self, other: Self) {
         self.files_pruned = self.files_pruned.saturating_add(other.files_pruned); self.files_used = self.files_used.saturating_add(other.files_used);
         self.pages_pruned = self.pages_pruned.saturating_add(other.pages_pruned); self.pages_used = self.pages_used.saturating_add(other.pages_used);
         self.rows_read = self.rows_read.saturating_add(other.rows_read);
+        self.join_iid_headers_checked = self.join_iid_headers_checked.saturating_add(other.join_iid_headers_checked);
+        self.join_iid_headers_rejected = self.join_iid_headers_rejected.saturating_add(other.join_iid_headers_rejected);
     }
 }
 

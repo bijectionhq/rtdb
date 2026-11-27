@@ -532,6 +532,60 @@ async fn join_bloom_prunes_a_nonmatching_older_page_and_preserves_a_newer_supers
 }
 
 #[tokio::test]
+async fn join_iid_admission_uses_distinct_keys_and_reports_header_pruning() {
+    use rtdb_plan::{JoinKind, RelationNode, Schema};
+
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    let mut write = tx(&state, &memory, 0, 100);
+    for id in 1..=4 {
+        write.put(table(), document(id, Value::I64(id)), Interval::ALL).unwrap();
+    }
+    state.apply(&write.stage().unwrap()).unwrap();
+
+    for (keys, expected, admitted) in [
+        (vec![3, 1, 3, 1, 1], vec![1, 3], true),
+        (vec![3, 1, 2, 4, 1], vec![1, 2, 3, 4], false),
+    ] {
+        let context = query_context(state.value().snapshot(), Arc::new(MemoryStore::default()), false);
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 16, true, true).unwrap();
+        let context = context.with_tracer(Some(tracer.clone()), None);
+        let probe = scan(&context, &["_id"], TemporalFilter::Default, TemporalFilter::Default, None);
+        let field = Field { id: ColumnId(100), name: "key".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::Scalar(ScalarType::I64) };
+        let condition = Expr::binary(BinaryOp::Eq, probe.schema().fields()[0].expression(), field.expression());
+        let build = Arc::new(Relation::new(Schema::new(vec![field]).unwrap(), RelationNode::Values {
+            rows: keys.into_iter().map(|key| vec![Expr::Literal(Value::I64(key))]).collect(),
+        }).unwrap());
+        let join = Arc::new(Relation::join(probe, build, JoinKind::Semi, Some(condition)).unwrap());
+        let mut rows = collect(join, context).await.unwrap();
+        rows.sort_by_key(|row| match row.as_slice() {
+            [Value::I64(id)] => *id,
+            _ => panic!("Expected one integer ID per probe row"),
+        });
+        assert_eq!(rows, expected.into_iter().map(|id| vec![Value::I64(id)]).collect::<Vec<_>>());
+
+        tracer.close();
+        let mut scan_span = None;
+        while let Some(span) = receiver.next().await {
+            if span.name == "query.cursor.scan.public.docs" { scan_span = Some(span); }
+        }
+        let scan_span = scan_span.unwrap();
+        let attributes: BTreeMap<_, _> = scan_span.attributes().collect();
+        assert_eq!(attributes["cursor.join_filter.build_distinct_keys"], if admitted { "2" } else { "4" });
+        assert_eq!(attributes["cursor.join_filter.build_distinct_keys_complete"], if admitted { "1" } else { "0" });
+        assert_eq!(attributes["cursor.join_filter.admitted_iids"], if admitted { "2" } else { "0" });
+        if admitted {
+            assert_eq!(attributes["cursor.join_filter.checked_headers"], "4");
+            assert_eq!(attributes["cursor.join_filter.rejected_headers"], "2");
+        } else {
+            assert!(!attributes.contains_key("cursor.join_filter.checked_headers"));
+            assert!(!attributes.contains_key("cursor.join_filter.rejected_headers"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn tracing_scan_reports_only_consulted_files_pages_and_loaded_rows() {
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
     let memory = MemoryBudget::new(1 << 27);

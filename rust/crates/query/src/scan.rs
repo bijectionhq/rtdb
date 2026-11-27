@@ -755,6 +755,7 @@ pub(crate) struct PartitionScan {
     counts: ScanCounts,
     pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
     canonical_entity_iids: bool,
+    observe_join_iids: bool,
     /// The inclusive IID range the scan is confined to, by its fragment's prefix and its `_id` range predicates; every IID, otherwise.
     confined: Option<(Iid, Iid)>,
     /// Set where the scan's rows must leave it in the order of their IIDs; they leave page by page, otherwise.
@@ -1043,7 +1044,9 @@ fn persisted_bytes(snapshot: &Snapshot) -> u64 {
 }
 
 /// `fragmenter` is held until the first pull dispatches the fragments.
-pub(crate) struct ScanCursor { parts: VecDeque<Part>, fragmenter: Option<Arc<dyn ScanFragmenter>>, completed: ScanCounts, database: String, source: String, memory: Arc<MemoryBudget>, _reservation: Arc<MemoryReservation> }
+pub(crate) struct ScanCursor { parts: VecDeque<Part>, fragmenter: Option<Arc<dyn ScanFragmenter>>, completed: ScanCounts,
+    database: String, source: String, memory: Arc<MemoryBudget>, join_iid_evidence: Option<crate::pushdown::JoinIidEvidence>,
+    _reservation: Arc<MemoryReservation> }
 impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
@@ -1096,6 +1099,11 @@ impl ScanCursor {
         let canonical_entity_iids = scan.iids.is_none() && restricted_iids.is_none()
             && pushdowns.as_ref().is_some_and(|filters| filters.needs_entity_iid_proof(&scan.columns))
             && database_partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
+        let join_iid_evidence = if crate::trace::operator_evidence_enabled(&execution.context) {
+            pushdowns.as_ref().and_then(|filters| filters.iid_evidence(&scan.columns, canonical_entity_iids,
+                scan.iids.is_some() || restricted_iids.is_some()))
+        } else { None };
+        let observe_join_iids = join_iid_evidence.as_ref().is_some_and(|evidence| evidence.admitted != 0);
         if let (Some(analysis), Some(pushdowns)) = (&execution.analysis, &pushdowns) {
             analysis.set_pushdowns(pushdowns, &scan.columns, canonical_entity_iids, &execution.context.memory)?;
         }
@@ -1291,7 +1299,7 @@ impl ScanCursor {
                     initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                     tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
                     output_reservation: None, filter: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
-                    canonical_entity_iids, confined, order, page_test: None,
+                    canonical_entity_iids, observe_join_iids, confined, order, page_test: None,
                 };
                 // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
                 let split = match (fragmenter, snapshot.tx_basis()) {
@@ -1315,7 +1323,8 @@ impl ScanCursor {
             parts.extend(partition);
             verified_counts.add(counts);
         }
-        Ok(Self { parts, fragmenter, completed: verified_counts, database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
+        Ok(Self { parts, fragmenter, completed: verified_counts, database: name, source, memory: Arc::clone(&execution.context.memory),
+            join_iid_evidence, _reservation: reservation })
     }
 }
 
@@ -1328,8 +1337,10 @@ impl PartitionScan {
             scan.iids = Some(Default::default());
             fragment
         });
+        let observe_join_iids = pushdowns.is_some() && crate::trace::operator_evidence_enabled(&execution.context);
         Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), ranking: None, candidate_iids: None, slots, metadata_time: None, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
-            output: VecDeque::new(), output_reservation: None, filter: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None, page_test: None }
+            output: VecDeque::new(), output_reservation: None, filter: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids,
+            observe_join_iids, confined, order: None, page_test: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
     pub(crate) fn fragment(snapshot: Snapshot, storage: Arc<BufferPool>, fragment: &ScanFragment, execution: Execution) -> Self {
@@ -2187,6 +2198,16 @@ impl BatchCursor for ScanCursor {
         span.attribute("scan_db", rtdb_plan::TraceValue::Text(&self.database));
         span.attribute("scan_source", rtdb_plan::TraceValue::Text(&self.source));
         for (name, value) in [("scan_files_pruned", counts.files_pruned), ("scan_files_used", counts.files_used), ("scan_pages_pruned", counts.pages_pruned), ("scan_pages_used", counts.pages_used), ("scan_rows_read", counts.rows_read)] { span.attribute(name, rtdb_plan::TraceValue::Unsigned(value)); }
+        if let Some(evidence) = &self.join_iid_evidence {
+            use crate::trace::OperatorCounter;
+            OperatorCounter::JoinFilterBuildDistinctKeys.record(span, evidence.build_distinct);
+            OperatorCounter::JoinFilterBuildDistinctKeysComplete.record(span, u64::from(evidence.complete));
+            OperatorCounter::JoinFilterAdmittedIids.record(span, evidence.admitted);
+            if evidence.admitted != 0 {
+                OperatorCounter::JoinFilterCheckedHeaders.record(span, counts.join_iid_headers_checked);
+                OperatorCounter::JoinFilterRejectedHeaders.record(span, counts.join_iid_headers_rejected);
+            }
+        }
     }
     fn scan_counts(&self) -> Option<ScanCounts> {
         let mut counts = self.completed; for part in &self.parts { counts.add(part.counts()); }
@@ -2627,6 +2648,13 @@ impl PartitionScan {
         // Resolved rows name their batch by its place here, so a row costs no handle on its batch.
         let mut batches: Vec<Arc<IndexBatch>> = Vec::new();
         let mut handles: Vec<Vec<u32>> = vec![Vec::new(); active.len()];
+        let mut join_iids = if self.candidate_iids.is_none() && self.scan.iids.is_none() {
+            self.pushdowns.as_ref().and_then(|filters| {
+                filters.sorted_iid_probe(&self.scan.columns, self.canonical_entity_iids, range_lower)
+            })
+        } else { None };
+        let observe_join_iids = self.observe_join_iids && join_iids.is_some();
+        let mut rejected_iids = 0u64;
         let mut next = heads.pop();
         while let Some(head) = next.take() {
             self.execution.context.check_cancelled_at(visited)?;
@@ -2647,7 +2675,8 @@ impl PartitionScan {
                 if !iids.contains(head.header.iid) { continue; }
             } else if let Some(iids) = &self.scan.iids {
                 if !iids.contains(&head.header.iid) { continue; }
-            } else if self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns, head.header.iid, self.canonical_entity_iids)) {
+            } else if let Some(probe) = &mut join_iids && !probe.matches(head.header.iid) {
+                if observe_join_iids { rejected_iids = rejected_iids.saturating_add(1); }
                 continue;
             }
             if let Some(cut) = transaction_cut && !rtdb_temporal::event_applies_at_cut(&head.header, cut)? {
@@ -2727,6 +2756,10 @@ impl PartitionScan {
                     next = skip_entity(next, &mut heads, &active, head.header.iid, range_upper)?;
                 }
             }
+        }
+        if observe_join_iids {
+            self.counts.join_iid_headers_checked = self.counts.join_iid_headers_checked.saturating_add(visited as u64);
+            self.counts.join_iid_headers_rejected = self.counts.join_iid_headers_rejected.saturating_add(rejected_iids);
         }
         if self.order == Some(IidOrder::Descending) && let Some(rows) = groups.first_mut() { rows.reverse(); }
         // A page is kept for the tasks still to come that read it: those above this one, or below it in a descending scan.
