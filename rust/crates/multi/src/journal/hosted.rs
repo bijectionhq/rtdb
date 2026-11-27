@@ -354,6 +354,14 @@ impl Routes {
         })
     }
 
+    pub(crate) fn all_placements(&self) -> Vec<Arc<Placement>> {
+        let mut placements: Vec<Arc<Placement>> = self.configured.values().cloned().collect();
+        if let Some(runtime) = &self.runtime {
+            placements.extend(runtime.opened.read().values().cloned());
+        }
+        placements
+    }
+
     fn resolve(&self, configuration: &Any) -> Result<(Arc<Placement>, Attachment)> {
         let attachment: Attachment = serde_json::from_slice(&configuration.value)
             .map_err(|error| invalid(&error.to_string()))?;

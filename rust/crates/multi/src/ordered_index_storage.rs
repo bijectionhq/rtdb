@@ -22,6 +22,13 @@ use crate::deployment::CellStorage;
 use crate::keys::{KeyService, UnitScope};
 
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
+const PERMIT_LEASE: Duration = Duration::from_secs(60);
+const PERMIT_RENEW_INTERVAL: Duration = Duration::from_secs(20);
+
+fn permit_deadline_ms() -> i64 {
+    rtdb_directory::now_ms()
+        .saturating_add(i64::try_from(PERMIT_LEASE.as_millis()).unwrap_or(i64::MAX))
+}
 
 type Permit = Arc<dyn Send + Sync>;
 type PermitSlot = Arc<Mutex<Option<Permit>>>;
@@ -79,6 +86,7 @@ impl HostedIndexPages {
         let store = self.store.clone();
         let scope = scope.clone();
         self.tasks.spawn(async move {
+            let mut lease_expires_at = tokio::time::Instant::now() + PERMIT_LEASE;
             let answer = update_installation(directory.as_ref(), &deployment, |record| {
                 require_owner(record, owner, &scope.index, None)?;
                 if let Some(catalog) = record.ordered_index_catalogs.get(&store)
@@ -91,29 +99,64 @@ impl HostedIndexPages {
                     return Err(closed_scope());
                 }
                 index.generations.entry(scope.generation).or_default().insert(permit_id, owner);
+                index.permit_expiries.insert(permit_id, permit_deadline_ms());
                 Ok(())
             }).await;
             let slot = Arc::new(Mutex::new(Some(Arc::new(release) as Permit)));
             let opened = answer.as_ref().ok().map(|record| record.version);
             let delivered = ready.send(answer.map(|_| slot.clone())).is_ok();
+            let mut renew = tokio::time::interval(PERMIT_RENEW_INTERVAL);
+            renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            renew.tick().await;
             if let Some(version) = opened.filter(|_| delivered) {
-                tokio::select! {
-                    _ = cancelled.cancelled() => {}
-                    _ = watched.wait_for(|record| record.as_ref().is_some_and(|record| {
-                        record.version >= version
-                            && (require_owner(record, owner, &scope.index, None).is_err()
-                                || record.ordered_indexes.get(&scope.index)
-                                    .is_some_and(|index| !index.admits(scope.generation)))
-                    })) => {}
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled.cancelled() => break,
+                        _ = watched.wait_for(|record| record.as_ref().is_some_and(|record| {
+                            record.version >= version
+                                && (require_owner(record, owner, &scope.index, None).is_err()
+                                    || record.ordered_indexes.get(&scope.index)
+                                        .is_some_and(|index| !index.admits(scope.generation)))
+                        })) => break,
+                        _ = renew.tick() => {
+                            let renewed_at = tokio::time::Instant::now();
+                            match renew_permit(directory.as_ref(), &deployment, owner, &scope, permit_id).await {
+                                Ok(true) => lease_expires_at = renewed_at + PERMIT_LEASE,
+                                Ok(false) => break,
+                                Err(error) => {
+                                    tracing::warn!(%permit_id, code = %error.code, "Ordered index permit lease renewal failed");
+                                    if tokio::time::Instant::now() >= lease_expires_at {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             slot.lock().take();
-            let _ = drained.await;
+            let mut drained = drained;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut drained => break,
+                    _ = renew.tick() => {
+                        if let Err(error) = renew_permit(directory.as_ref(), &deployment, owner, &scope, permit_id).await {
+                            tracing::warn!(%permit_id, code = %error.code, "Ordered index permit renewal during drain failed");
+                        }
+                    }
+                }
+            }
             // A lost CAS response may have recorded the permit. Fence an
             // ambiguous admission even if the first read sees it absent.
             let (directory, installation, scope) = (&directory, deployment.as_str(), &scope);
-            crate::hold_release::release_hold(format!("ordered index permit {permit_id} for {installation}"), &release_stop,
-                move || release_permit(directory.as_ref(), installation, scope, permit_id)).await;
+            crate::hold_release::release_hold_bounded(
+                format!("ordered index permit {permit_id} for {installation}"),
+                &release_stop,
+                PERMIT_LEASE,
+                move || release_permit(directory.as_ref(), installation, scope, permit_id),
+            ).await;
         });
         admitted.await.map_err(|_| closed_scope())?
     }
@@ -278,9 +321,10 @@ pub(crate) fn require_page_publication(
 ) -> Result<()> {
     let Some((index, generation)) = page_key(key.as_str()) else { return Ok(()) };
     let generation = generation.ok_or_else(closed_scope)?;
+    let now_ms = rtdb_directory::now_ms();
     if record.ordered_indexes.get(index).is_some_and(|index| {
         index.admits(generation) && index.generations.get(&generation)
-            .is_some_and(|permits| permits.values().any(|owner| *owner == region))
+            .is_some_and(|permits| permits.iter().any(|(permit, owner)| *owner == region && index.permit_active(permit, now_ms)))
     }) {
         Ok(())
     } else {
@@ -288,15 +332,35 @@ pub(crate) fn require_page_publication(
     }
 }
 
+async fn renew_permit(
+    directory: &dyn Directory, deployment: &str, owner: Uuid, scope: &Scope, permit: Uuid,
+) -> Result<bool> {
+    let mut active = false;
+    update_installation(directory, deployment, |record| {
+        active = false;
+        if require_owner(record, owner, &scope.index, None).is_err() {
+            return Ok(());
+        }
+        let Some(index) = record.ordered_indexes.get_mut(&scope.index) else { return Ok(()); };
+        if index.generations.get(&scope.generation).is_some_and(|permits| permits.get(&permit) == Some(&owner)) {
+            index.permit_expiries.insert(permit, permit_deadline_ms());
+            active = true;
+        }
+        Ok(())
+    }).await?;
+    Ok(active)
+}
+
 async fn release_permit(
     directory: &dyn Directory, deployment: &str, scope: &Scope, permit: Uuid,
 ) -> Result<()> {
     for _ in 0..8 {
         let Some(mut record) = directory.deployment(deployment).await? else { return Ok(()) };
-        if let Some(permits) = record.ordered_indexes.get_mut(&scope.index)
-            .and_then(|index| index.generations.get_mut(&scope.generation))
-        {
-            permits.remove(&permit);
+        if let Some(index) = record.ordered_indexes.get_mut(&scope.index) {
+            if let Some(permits) = index.generations.get_mut(&scope.generation) {
+                permits.remove(&permit);
+            }
+            index.permit_expiries.remove(&permit);
         }
         let version = record.version;
         match directory.replace_deployment(record, version).await {
@@ -324,7 +388,44 @@ fn untracked_regions_open(record: &DeploymentRecord) -> bool {
     })
 }
 
+fn has_inactive_permits(record: &DeploymentRecord, now_ms: i64) -> bool {
+    record.ordered_indexes.values().any(|index| {
+        index.generations.values().any(|users| {
+            users.iter().any(|(permit, owner)| {
+                !region_open(record.storage_regions.get(owner)) || !index.permit_active(permit, now_ms)
+            })
+        }) || index.permit_expiries.keys().any(|permit| {
+            !index.generations.values().any(|users| users.contains_key(permit))
+        })
+    })
+}
+
+async fn prune_inactive_permits(
+    directory: &dyn Directory, record: &DeploymentRecord, now_ms: i64,
+) -> Result<DeploymentRecord> {
+    update_installation(directory, &record.id, |current| {
+        let regions = &current.storage_regions;
+        for index in current.ordered_indexes.values_mut() {
+            let mut active = Vec::new();
+            for users in index.generations.values() {
+                for (permit, owner) in users {
+                    if region_open(regions.get(owner)) && index.permit_active(permit, now_ms) {
+                        active.push(*permit);
+                    }
+                }
+            }
+            let active: BTreeSet<Uuid> = active.into_iter().collect();
+            index.prune_permits(|permit, _| active.contains(permit));
+        }
+        Ok(())
+    }).await
+}
+
 fn ready_generations(record: &DeploymentRecord) -> Vec<(String, Option<u64>)> {
+    ready_generations_at(record, rtdb_directory::now_ms())
+}
+
+fn ready_generations_at(record: &DeploymentRecord, now_ms: i64) -> Vec<(String, Option<u64>)> {
     if untracked_regions_open(record) {
         return Vec::new();
     }
@@ -338,7 +439,9 @@ fn ready_generations(record: &DeploymentRecord) -> Vec<(String, Option<u64>)> {
             result.push((name.clone(), None));
         }
         for (&generation, users) in &index.generations {
-            if !index.admits(generation) && users.values().all(|owner| !region_open(record.storage_regions.get(owner))) {
+            if !index.admits(generation)
+                && users.iter().all(|(permit, owner)| !region_open(record.storage_regions.get(owner)) || !index.permit_active(permit, now_ms))
+            {
                 result.push((name.clone(), Some(generation)));
             }
         }
@@ -404,8 +507,20 @@ pub(crate) async fn reap(
         let before = if index.dropped { u64::MAX } else { index.oldest_generation };
         (before > index.audited_before && below(name, &residence).is_some()).then_some(before)
     };
-    if catalogs.is_empty() && ready_generations(record).is_empty()
+    let now_ms = rtdb_directory::now_ms();
+    let inactive_permits = has_inactive_permits(record, now_ms);
+    if !inactive_permits && catalogs.is_empty() && ready_generations_at(record, now_ms).is_empty()
         && !record.ordered_indexes.iter().any(|(name, index)| pending(name, index).is_some())
+    {
+        return Ok(());
+    }
+    let mut refreshed = if inactive_permits {
+        prune_inactive_permits(directory, record, now_ms).await?
+    } else {
+        record.clone()
+    };
+    if catalogs.is_empty() && ready_generations_at(&refreshed, now_ms).is_empty()
+        && !refreshed.ordered_indexes.iter().any(|(name, index)| pending(name, index).is_some())
     {
         return Ok(());
     }
@@ -413,7 +528,6 @@ pub(crate) async fn reap(
         CellStorage::S3 { config } => Some(CellStorage::s3_inventory(config).await?),
         CellStorage::Local { .. } => None,
     };
-    let mut refreshed = record.clone();
     for store in catalogs {
         refreshed = discover_dropped_definitions(
             directory, bucket, inventory.as_ref(), &refreshed, store,
@@ -680,6 +794,93 @@ mod tests {
         drop(indexes);
         tasks.close();
         tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_expired_permit_does_not_block_reaping_and_is_pruned_from_live_generations() {
+        let directory = MemoryDirectory::new();
+        let owner = Uuid::new_v4();
+        let retired_permit = Uuid::new_v4();
+        let stale_live_permit = Uuid::new_v4();
+        let active_live_permit = Uuid::new_v4();
+        let now = rtdb_directory::now_ms();
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 1;
+        record.holder = Some(MemberId("writer".into()));
+        record.storage_regions.insert(owner, crate::store::remote_storage_region(None, None));
+        let store = format!("{}/v06", record.storage_prefix());
+        let index = format!("{store}/{ORDERED_INDEX_ROOT}/0000000000000001-{}", "a".repeat(64));
+        record.ordered_indexes.insert(index.clone(), OrderedIndexStorage {
+            oldest_generation: 2,
+            generations: BTreeMap::from([
+                (0, BTreeMap::from([(retired_permit, owner)])),
+                (2, BTreeMap::from([(stale_live_permit, owner), (active_live_permit, owner)])),
+            ]),
+            permit_expiries: BTreeMap::from([
+                (retired_permit, now - 1),
+                (stale_live_permit, now - 1),
+                (active_live_permit, now + 60_000),
+            ]),
+            ..Default::default()
+        });
+        let record = directory.create_deployment(record).await.unwrap();
+        assert_eq!(ready_generations_at(&record, now), vec![(index.clone(), Some(0))]);
+
+        let bucket = MemoryStore::default();
+        let old_key = ObjectKey::new(format!("{index}/generations/0000000000000000/pages/old")).unwrap();
+        let live_key = ObjectKey::new(format!("{index}/generations/0000000000000002/pages/live")).unwrap();
+        bucket.put(&old_key, bytes::Bytes::from_static(b"old")).await.unwrap();
+        bucket.put(&live_key, bytes::Bytes::from_static(b"live")).await.unwrap();
+        let storage = CellStorage::Local { root: std::path::PathBuf::new() };
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path()).unwrap();
+
+        reap(directory.as_ref(), &storage, &bucket, &record, &keys).await.unwrap();
+        assert!(matches!(bucket.head(&old_key).await, Err(Error::MissingObject(_))));
+        assert!(bucket.head(&live_key).await.is_ok());
+        let after = directory.deployment(&record.id).await.unwrap().unwrap();
+        let state = &after.ordered_indexes[&index];
+        assert!(!state.generations.contains_key(&0));
+        assert!(!state.generations[&2].contains_key(&stale_live_permit));
+        assert_eq!(state.generations[&2].get(&active_live_permit), Some(&owner));
+        assert!(!state.permit_expiries.contains_key(&retired_permit));
+        assert!(!state.permit_expiries.contains_key(&stale_live_permit));
+        assert!(state.permit_expiries.contains_key(&active_live_permit));
+    }
+
+    #[tokio::test]
+    async fn cancelling_release_stop_ends_a_retrying_permit_release() {
+        use crate::hold_release::tests::{Fault, ScriptedDirectory};
+
+        let directory = ScriptedDirectory::new();
+        let owner = Uuid::new_v4();
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 1;
+        record.holder = Some(MemberId("writer".into()));
+        record.storage_regions.insert(owner, crate::store::remote_storage_region(None, None));
+        let record = directory.create_deployment(record).await.unwrap();
+        let store = format!("{}/v06", record.storage_prefix());
+        let tasks = TaskTracker::new();
+        let release_stop = CancellationToken::new();
+        let lifecycle = HostedIndexPages::new(
+            directory.clone(), record.id.clone(), store.clone(), owner, Some(1),
+            tasks.clone(), release_stop.child_token(),
+        );
+        let index = ObjectKey::new(format!("{ORDERED_INDEX_ROOT}/0000000000000001-{}", "b".repeat(64))).unwrap();
+        let permit = lifecycle.retain(IndexPageScope { index: &index, generation: 0 }).await.unwrap();
+        let stored = directory.inner.deployment(&record.id).await.unwrap().unwrap();
+        let state = &stored.ordered_indexes[&format!("{store}/{index}")];
+        assert_eq!(state.generations[&0].len(), 1);
+        assert_eq!(state.permit_expiries.len(), 1);
+
+        for _ in 0..8 {
+            directory.inject(Fault::Read);
+        }
+        drop(permit);
+        drop(lifecycle);
+        release_stop.cancel();
+        tasks.close();
+        tokio::time::timeout(Duration::from_secs(2), tasks.wait()).await.unwrap();
     }
 
 }

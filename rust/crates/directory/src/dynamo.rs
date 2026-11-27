@@ -269,6 +269,15 @@ enum PutConditional {
 
 const SEAT_REVISION: &str = "seat_revision";
 const SEAT_CHARGED: &str = "seat_charged";
+const SEAT_LEASE_UNTIL: &str = "seat_lease_until_ms";
+
+fn seat_lease_until_ms(now_ms: i64) -> i64 {
+    now_ms.saturating_add(i64::try_from(crate::AUDIENCE_SEAT_LEASE.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn seat_lease_expired(lease_until_ms: Option<i64>, now_ms: i64) -> bool {
+    lease_until_ms.is_some_and(|until| now_ms >= until)
+}
 
 struct DynamoAudienceSeat {
     client: Client,
@@ -282,15 +291,20 @@ struct DynamoAudienceSeat {
 }
 
 impl DynamoAudienceSeat {
-    fn write(&self, condition: &SeatCondition, revision: u128, charged: bool) -> Result<Put> {
+    fn write(&self, condition: &SeatCondition, revision: u128, charged: bool, lease_until_ms: Option<i64>) -> Result<Put> {
         let value = |revision| AttributeValue::S(uuid::Uuid::from_u128(revision).to_string());
         let mut item = Item::from([
             (NAME.to_owned(), AttributeValue::S(self.name.clone())),
             (SEAT_REVISION.to_owned(), value(revision)),
             (SEAT_CHARGED.to_owned(), AttributeValue::Bool(charged)),
         ]);
-        if let Some(task) = self.task.as_ref().filter(|_| charged) {
-            item.insert(RECORD.to_owned(), blob(task)?);
+        if charged {
+            if let Some(task) = self.task.as_ref() {
+                item.insert(RECORD.to_owned(), blob(task)?);
+            }
+            if let Some(until) = lease_until_ms {
+                item.insert(SEAT_LEASE_UNTIL.to_owned(), AttributeValue::N(until.to_string()));
+            }
         }
         let put = Put::builder().table_name(&self.names).set_item(Some(item));
         let put = match *condition {
@@ -313,15 +327,29 @@ impl DynamoAudienceSeat {
 impl AudienceSeatClaim for DynamoAudienceSeat {
     async fn acquire(&self) -> Result<bool> {
         let condition = acquire_condition(&self.predecessor);
-        let put = self.write(&condition, self.claimed, true)?;
+        let put = self.write(&condition, self.claimed, true, Some(seat_lease_until_ms(crate::now_ms())))?;
         let placement = TransactWriteItem::builder().condition_check(self.deployment.clone()).build();
         let seat = TransactWriteItem::builder().put(put).build();
         write_conditional_transaction(&self.client, vec![placement, seat]).await
     }
 
+    async fn renew(&self) -> Result<bool> {
+        let condition = SeatCondition::Exact(self.claimed);
+        let put = self.write(&condition, self.claimed, true, Some(seat_lease_until_ms(crate::now_ms())))?;
+        let request = self.client.put_item().table_name(&self.names).set_item(Some(put.item))
+            .set_condition_expression(put.condition_expression)
+            .set_expression_attribute_names(put.expression_attribute_names)
+            .set_expression_attribute_values(put.expression_attribute_values);
+        match request.send().await {
+            Ok(_) => Ok(true),
+            Err(error) if error.as_service_error().is_some_and(|error| error.is_conditional_check_failed_exception()) => Ok(false),
+            Err(error) => Err(sdk_anomaly("PutItem", error)),
+        }
+    }
+
     async fn release(&self) -> Result<()> {
         let condition = release_condition(&self.predecessor, self.claimed);
-        let put = self.write(&condition, self.released, false)?;
+        let put = self.write(&condition, self.released, false, None)?;
         let request = self.client.put_item().table_name(&self.names).set_item(Some(put.item))
             .set_condition_expression(put.condition_expression)
             .set_expression_attribute_names(put.expression_attribute_names)
@@ -515,7 +543,13 @@ impl DynamoDirectory {
                 match item.get(SEAT_CHARGED) {
                     Some(AttributeValue::Bool(false)) => SeatRevision::Free(revision),
                     Some(AttributeValue::Bool(true)) => {
-                        let stopped = match item.get(RECORD) {
+                        let lease_until_ms = match item.get(SEAT_LEASE_UNTIL) {
+                            Some(AttributeValue::N(value)) => Some(value.parse::<i64>()
+                                .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-lease", error.to_string()))?),
+                            None => None,
+                            _ => return Err(Anomaly::fault("rtdb.directory/audience-seat-lease", "Invalid audience seat lease")),
+                        };
+                        let stopped = seat_lease_expired(lease_until_ms, crate::now_ms()) || match item.get(RECORD) {
                             Some(AttributeValue::S(record)) => {
                                 let owner: HostedTask = serde_json::from_str(record)
                                     .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-owner", error.to_string()))?;
@@ -1601,5 +1635,18 @@ mod tests {
 
         let timeout: SdkError<PutItemError, ()> = SdkError::timeout_error("timed out");
         assert!(write_error_is_unknown(&timeout));
+    fn seat_lease_expiry_marks_unreleased_charged_seat_reclaimable() {
+        assert!(!seat_lease_expired(None, 1_000));
+        assert!(!seat_lease_expired(Some(2_000), 1_999));
+        assert!(seat_lease_expired(Some(2_000), 2_000));
+        assert!(seat_lease_expired(Some(2_000), 2_500));
+        assert!(matches!(
+            claim_predecessor(SeatRevision::Charged { revision: 42, stopped: seat_lease_expired(Some(2_000), 1_999) }),
+            None
+        ));
+        assert!(matches!(
+            claim_predecessor(SeatRevision::Charged { revision: 42, stopped: seat_lease_expired(Some(2_000), 2_000) }),
+            Some(SeatPredecessor::Exact(42))
+        ));
     }
 }

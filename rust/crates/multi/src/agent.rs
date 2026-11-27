@@ -1903,6 +1903,9 @@ impl NodeAgent {
     }
 
     async fn reconcile_ordered(&self) {
+        for placement in self.ordered.all_placements() {
+            placement.worker.reconcile_pending_releases().await;
+        }
         let active: Vec<_> = self.holdings.lock().iter().filter_map(|(name, holding)| {
             match &holding.authority {
                 HoldingAuthority::Journal(admission) => Some((name.clone(), *admission, holding.database.clone())),

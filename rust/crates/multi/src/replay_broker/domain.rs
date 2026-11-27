@@ -1,6 +1,7 @@
 //! Admission and drain records held by the credential-separated custody owner.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use bytes::Bytes;
 use ring::{
@@ -17,6 +18,9 @@ use crate::journal::hosted::erasure::CustodyWork;
 
 const MAX_RECORD_BYTES: u64 = 1 << 20;
 const MAX_ATTEMPTS: usize = 8;
+pub(crate) const DUTY_LEASE: Duration = Duration::from_secs(60);
+pub(crate) const DUTY_RENEW_INTERVAL: Duration = Duration::from_secs(20);
+const DUTY_LEASE_MS: i64 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -186,6 +190,8 @@ impl WorkJoin {
 struct Work {
     duty: Duty,
     join: Option<WorkJoin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,7 +374,20 @@ impl State {
         Ok(view)
     }
 
+    fn reconcile_expired_duties(&mut self, now_ms: i64) {
+        self.duties.retain(|_, work| {
+            work.join.is_some() || work.expires_at_ms.is_none_or(|until| now_ms < until)
+        });
+    }
+
     fn apply(&mut self, action: &Action) -> Result<()> {
+        self.apply_at(action, None)
+    }
+
+    fn apply_at(&mut self, action: &Action, now_ms: Option<i64>) -> Result<()> {
+        if let Some(now_ms) = now_ms {
+            self.reconcile_expired_duties(now_ms);
+        }
         match action {
             Action::Status => (),
             Action::AuthorizeRoot { operation, root, history } => {
@@ -605,6 +624,7 @@ impl State {
                     Work {
                         duty: *duty,
                         join: None,
+                        expires_at_ms: now_ms.map(|now| now.saturating_add(DUTY_LEASE_MS)),
                     },
                 );
             }
@@ -623,11 +643,34 @@ impl State {
                     &admission_bytes(self.domain, *generation, *id, *duty)?,
                     signature,
                 )?;
-                self.apply(&Action::Admit {
+                self.apply_at(&Action::Admit {
                     generation: *generation,
                     id: *id,
                     duty: *duty,
-                })?;
+                }, now_ms)?;
+            }
+            Action::RenewWorker {
+                generation,
+                id,
+                signature,
+            } => {
+                if *generation < self.generation {
+                    return Ok(());
+                }
+                if self.generation != *generation {
+                    return Err(conflict("The lease renewal belongs to another custody generation"));
+                }
+                let Some(work) = self.duties.get_mut(id) else {
+                    return Err(conflict("The custody work duty has already expired or finished"));
+                };
+                verify(
+                    work.duty.verification_key,
+                    &renew_bytes(self.domain, *generation, *id)?,
+                    signature,
+                )?;
+                if work.join.is_none() && let Some(now_ms) = now_ms {
+                    work.expires_at_ms = Some(now_ms.saturating_add(DUTY_LEASE_MS));
+                }
             }
             Action::Join {
                 generation,
@@ -861,6 +904,11 @@ pub enum Action {
         duty: Duty,
         signature: Vec<u8>,
     },
+    RenewWorker {
+        generation: u64,
+        id: Uuid,
+        signature: Vec<u8>,
+    },
     Join {
         generation: u64,
         id: Uuid,
@@ -959,6 +1007,10 @@ pub(crate) fn admission_bytes(
         b"rtdb.custody/work-admission/v1\0",
         &(domain, generation, id, duty),
     )
+}
+
+pub(crate) fn renew_bytes(domain: Uuid, generation: u64, id: Uuid) -> Result<Vec<u8>> {
+    statement(b"rtdb.custody/work-renew/v1\0", &(domain, generation, id))
 }
 
 fn verify(key: [u8; 32], message: &[u8], signature: &[u8]) -> Result<()> {
@@ -1095,7 +1147,7 @@ pub(super) async fn execute(store: &dyn ObjectStore, domain: Uuid, action: Actio
     for _ in 0..MAX_ATTEMPTS {
         let state = load(store, domain).await?;
         let mut next = state.clone();
-        next.apply(&action)?;
+        next.apply_at(&action, Some(rtdb_directory::now_ms()))?;
         if next == state {
             return next.view_for(&action);
         }
@@ -1430,5 +1482,132 @@ mod tests {
             state.view().unwrap().last_completed.unwrap().operation,
             operation
         );
+    }
+
+    #[test]
+    fn duty_leases_renew_while_active_and_expire_without_blocking_erasure() {
+        let mut state = State::new(Uuid::new_v4());
+        let signer = Ed25519KeyPair::from_seed_unchecked(&[31; 32]).unwrap();
+        let verification_key = signer.public_key().as_ref().try_into().unwrap();
+        let admission = Ed25519KeyPair::from_seed_unchecked(&[32; 32]).unwrap();
+        let admission_key = admission.public_key().as_ref().try_into().unwrap();
+        let root = Uuid::new_v4();
+        let enrollment = Root {
+            history: [33; 32],
+            verification_key,
+            admission_key,
+        };
+        state
+            .apply_at(
+                &Action::Enroll {
+                    generation: 1,
+                    root,
+                    enrollment,
+                },
+                Some(1_000),
+            )
+            .unwrap();
+        let duty = Duty {
+            root,
+            history: enrollment.history,
+            kind: CustodyWork::Plaintext,
+            verification_key,
+        };
+        let id = Uuid::new_v4();
+        let statement = admission_bytes(state.domain, 1, id, duty).unwrap();
+        state
+            .apply_at(
+                &Action::AdmitWorker {
+                    generation: 1,
+                    id,
+                    duty,
+                    signature: admission.sign(&statement).as_ref().to_vec(),
+                },
+                Some(1_000),
+            )
+            .unwrap();
+        assert_eq!(state.duties[&id].expires_at_ms, Some(1_000 + DUTY_LEASE_MS));
+
+        let renew_sig = signer
+            .sign(&renew_bytes(state.domain, 1, id).unwrap())
+            .as_ref()
+            .to_vec();
+        state
+            .apply_at(
+                &Action::RenewWorker {
+                    generation: 1,
+                    id,
+                    signature: renew_sig.clone(),
+                },
+                Some(40_000),
+            )
+            .unwrap();
+        assert_eq!(state.duties[&id].expires_at_ms, Some(40_000 + DUTY_LEASE_MS));
+
+        state
+            .apply_at(
+                &Action::Begin {
+                    operation: Uuid::new_v4(),
+                    target: [34; 32],
+                    generation: 1,
+                },
+                Some(50_000),
+            )
+            .unwrap();
+        let operation = state.operation.unwrap();
+        let drain = RootDrain {
+            original_head: [35; 32],
+            successor: [36; 32],
+            ordered_switch: [37; 32],
+            joined_custody: [38; 32],
+        };
+        let evidence = SignedRootDrain {
+            drain,
+            signature: signer
+                .sign(&drain.signing_bytes(operation, root, enrollment.history).unwrap())
+                .as_ref()
+                .to_vec(),
+        };
+        state
+            .apply_at(
+                &Action::RootDrain {
+                    operation,
+                    root,
+                    evidence,
+                },
+                Some(50_000),
+            )
+            .unwrap();
+        assert_eq!(state.view().unwrap().drained, None, "active duty still blocks drain");
+
+        // Once the lease expires without renewal, reconciliation retires the duty and unblocks drain.
+        state.apply_at(&Action::Status, Some(40_000 + DUTY_LEASE_MS)).unwrap();
+        assert!(state.duties.is_empty());
+        assert!(state.view().unwrap().drained.is_some());
+
+        // An expired duty cannot be renewed, while a late join remains idempotent.
+        assert!(
+            state
+                .apply_at(
+                    &Action::RenewWorker {
+                        generation: 1,
+                        id,
+                        signature: renew_sig,
+                    },
+                    Some(40_000 + DUTY_LEASE_MS),
+                )
+                .is_err()
+        );
+        let observation = [39; 32];
+        let join = WorkJoin {
+            observation,
+            signature: signer
+                .sign(&WorkJoin::signing_bytes(state.domain, 1, id, duty, observation).unwrap())
+                .as_ref()
+                .to_vec(),
+        };
+        state
+            .apply_at(&Action::Join { generation: 1, id, join }, Some(40_000 + DUTY_LEASE_MS))
+            .unwrap();
     }
 }

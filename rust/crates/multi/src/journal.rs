@@ -82,6 +82,62 @@ pub struct InstalledJournal {
     incarnation: u64,
     log_epoch: StorageEpoch,
     authority: Authority,
+    pending_releases: PendingHoldQueue,
+}
+
+/// Ordered replay holds whose bounded release gave up while this worker stayed
+/// enrolled. Reconciled on the next hold acquisition and on periodic maintenance
+/// passes so a transient failure cannot leak hold slots or pin the log floor.
+#[derive(Default)]
+pub(crate) struct PendingHoldQueue {
+    holds: parking_lot::Mutex<Vec<Hold>>,
+}
+
+impl PendingHoldQueue {
+    pub(crate) fn record(&self, hold: Hold) {
+        let mut holds = self.holds.lock();
+        if !holds.iter().any(|existing| existing.id == hold.id) {
+            holds.push(hold);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.holds.lock().len()
+    }
+
+    pub(crate) async fn reconcile<F, Fut>(&self, mut release: F)
+    where
+        F: FnMut(Hold) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let queued = std::mem::take(&mut *self.holds.lock());
+        if queued.is_empty() {
+            return;
+        }
+        let mut remaining = Vec::new();
+        for hold in queued {
+            match release(hold).await {
+                Ok(()) => {}
+                Err(error) if rtdb_storage::release::transient(&error) => remaining.push(hold),
+                Err(error) => {
+                    tracing::error!(
+                        hold = %hold.id.nonce,
+                        code = %error.code,
+                        "Abandoned ordered replay hold release was refused permanently"
+                    );
+                }
+            }
+        }
+        if !remaining.is_empty() {
+            let mut holds = self.holds.lock();
+            for hold in remaining {
+                if !holds.iter().any(|existing| existing.id == hold.id) {
+                    holds.push(hold);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -124,7 +180,16 @@ impl InstalledJournal {
             incarnation: config.incarnation,
             log_epoch: StorageEpoch(config.log_epoch),
             authority: config.authority,
+            pending_releases: PendingHoldQueue::default(),
         }))
+    }
+
+    pub(crate) fn record_pending_release(&self, hold: Hold) {
+        self.pending_releases.record(hold);
+    }
+
+    pub(crate) async fn reconcile_pending_releases(&self) {
+        self.pending_releases.reconcile(|hold| self.release(hold)).await;
     }
 
     pub fn deployment(&self) -> Uuid {
@@ -626,4 +691,66 @@ fn refused(reason: Refusal) -> Anomaly {
         code,
         format!("Ordered journal refused the operation ({reason:?})"),
     )
+}
+
+#[cfg(test)]
+mod pending_release_tests {
+    use super::*;
+    use ordered_logkeeper::ordered::Custody;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn sample_hold(nonce: Uuid) -> Hold {
+        let cut = Cut { next_lsn: 1, history: [0; 32] };
+        Hold {
+            id: RequestId { nonce, expires_at: 10 },
+            owner: Enrollment { worker: Uuid::new_v4(), serial: 1 },
+            admitted_at: 1,
+            checkpoint: Checkpoint {
+                cut,
+                root: [0; 32],
+                manifest: [0; 32],
+                custody: Custody { allocation: Uuid::new_v4(), revision: 1, provider: [0; 32] },
+            },
+            start: cut,
+            through: cut,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_hold_queue_reconciles_transient_failures_and_drops_permanent_refusals() {
+        let queue = PendingHoldQueue::default();
+        let first = sample_hold(Uuid::new_v4());
+        let second = sample_hold(Uuid::new_v4());
+        let refused = sample_hold(Uuid::new_v4());
+        queue.record(first);
+        queue.record(first);
+        queue.record(second);
+        queue.record(refused);
+        assert_eq!(queue.len(), 3, "duplicate abandoned holds are deduplicated");
+
+        let attempts = AtomicUsize::new(0);
+        queue
+            .reconcile(|hold| {
+                let first_id = first.id;
+                let refused_id = refused.id;
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if hold.id == first_id && attempt == 0 {
+                        Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.test/transient", "unavailable"))
+                    } else if hold.id == refused_id {
+                        Err(Anomaly::incorrect("rtdb.test/permanent", "invalid"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        assert_eq!(queue.len(), 1, "transiently failing hold stays queued; released and permanently refused holds drop");
+
+        queue.reconcile(|hold| async move {
+            assert_eq!(hold.id, first.id);
+            Ok(())
+        }).await;
+        assert_eq!(queue.len(), 0);
+    }
 }

@@ -33,6 +33,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const ORDERED_ADMISSION_RETRY: Duration = Duration::from_secs(1);
+const ORDERED_RELEASE_BOUND: Duration = Duration::from_secs(60);
 const DELIVERED_RECORD_OVERHEAD: usize = 256;
 const MAX_RANGE_RECORDS: usize = 4096;
 const MAX_RANGE_BYTES: usize = 32 << 20;
@@ -147,6 +148,7 @@ impl Held {
         let worker = tasks.clone();
         let stop = stop.child_token();
         tasks.spawn(async move {
+            journal.reconcile_pending_releases().await;
             let admitted = loop {
                 if send.is_closed() {
                     return;
@@ -182,8 +184,18 @@ impl Held {
         let stop = stop.child_token();
         tasks.spawn(async move {
             let _ = closed.await;
-            let journal = &journal;
-            crate::hold_release::release_hold(format!("ordered replay hold {}", hold.id.nonce), &stop, move || journal.release(hold)).await;
+            let settled = {
+                let journal = &journal;
+                crate::hold_release::release_hold_bounded(
+                    format!("ordered replay hold {}", hold.id.nonce),
+                    &stop,
+                    ORDERED_RELEASE_BOUND,
+                    move || journal.release(hold),
+                ).await
+            };
+            if matches!(settled, rtdb_storage::release::Settled::GaveUp(_)) {
+                journal.record_pending_release(hold);
+            }
         });
         Arc::new(Self {
             hold,

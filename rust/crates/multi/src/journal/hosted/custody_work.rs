@@ -125,8 +125,37 @@ impl WorkOwner {
                     },
                 )
                 .await;
-            let _ = send.send(admitted.map(|_| Arc::new(lease) as Arc<dyn Send + Sync>));
-            let _ = drained.await;
+            let opened = admitted.is_ok();
+            if send.send(admitted.map(|_| Arc::new(lease) as Arc<dyn Send + Sync>)).is_ok() && opened {
+                let renew_signature = domain::renew_bytes(owner.domain, generation, id)
+                    .ok()
+                    .map(|bytes| owner.process.sign(&bytes).as_ref().to_vec());
+                let mut drained = drained;
+                let mut renew = tokio::time::interval(domain::DUTY_RENEW_INTERVAL);
+                renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                renew.tick().await;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut drained => break,
+                        _ = renew.tick(), if renew_signature.is_some() => {
+                            if let Some(signature) = renew_signature.clone()
+                                && let Err(error) = owner
+                                    .broker
+                                    .custody_domain(
+                                        owner.domain,
+                                        Action::RenewWorker { generation, id, signature },
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(%id, generation, code = %error.code, "Custody work lease renewal failed");
+                            }
+                        }
+                    }
+                }
+            } else {
+                let _ = drained.await;
+            }
             // A lost admission response can leave a duty in the roster too.
             owner.join(generation, id, duty, &stop).await;
         });
@@ -149,8 +178,13 @@ impl WorkOwner {
             signature: self.process.sign(&statement).as_ref().to_vec(),
         };
         let join = &join;
-        crate::hold_release::release_hold(format!("custody work {id} join in generation {generation}"), stop, move || async move {
-            self.broker.custody_domain(self.domain, Action::Join { generation, id, join: join.clone() }).await.map(drop)
-        }).await;
+        crate::hold_release::release_hold_bounded(
+            format!("custody work {id} join in generation {generation}"),
+            stop,
+            domain::DUTY_LEASE,
+            move || async move {
+                self.broker.custody_domain(self.domain, Action::Join { generation, id, join: join.clone() }).await.map(drop)
+            },
+        ).await;
     }
 }

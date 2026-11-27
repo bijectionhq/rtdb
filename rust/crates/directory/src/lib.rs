@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -802,6 +802,10 @@ pub struct OrderedIndexStorage {
     pub audited_before: u64,
     /// Each generation maps a retained permit to its serving storage region.
     pub generations: BTreeMap<u64, BTreeMap<uuid::Uuid, uuid::Uuid>>,
+    /// Optional lease deadline (Unix milliseconds) for each retained permit,
+    /// so a permit whose bounded release is abandoned cannot leak.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permit_expiries: BTreeMap<uuid::Uuid, i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -819,6 +823,37 @@ impl OrderedIndexStorage {
 
     pub fn retire_earlier(&mut self, generation: u64) {
         self.oldest_generation = ordered_index::advance(self.oldest_generation, generation);
+    }
+
+    /// Whether a permit's lease has not expired (legacy permits without an expiry stay active).
+    pub fn permit_active(&self, permit: &uuid::Uuid, now_ms: i64) -> bool {
+        self.permit_expiries.get(permit).is_none_or(|&expires_at| now_ms < expires_at)
+    }
+
+    /// Retains only permits for which `keep(permit, owner)` returns `true`,
+    /// removing pruned permits' lease entries too. Returns whether any entry changed.
+    pub fn prune_permits(&mut self, mut keep: impl FnMut(&uuid::Uuid, &uuid::Uuid) -> bool) -> bool {
+        let generations = &mut self.generations;
+        let expiries = &mut self.permit_expiries;
+        let mut changed = false;
+        for permits in generations.values_mut() {
+            let before = permits.len();
+            permits.retain(|permit, owner| {
+                let retained = keep(permit, owner);
+                if !retained {
+                    expiries.remove(permit);
+                }
+                retained
+            });
+            if permits.len() != before {
+                changed = true;
+            }
+        }
+        let before_expiries = expiries.len();
+        expiries.retain(|permit, _| {
+            generations.values().any(|permits| permits.contains_key(permit))
+        });
+        changed || expiries.len() != before_expiries
     }
 }
 
@@ -1628,10 +1663,18 @@ impl<T> ReplaceOutcome<T> {
         }
     }
 }
+/// How long a claimed audience seat stays reserved without renewal before
+/// another caller may reclaim it.
+pub const AUDIENCE_SEAT_LEASE: Duration = Duration::from_secs(60);
 
 #[async_trait]
 pub trait AudienceSeatClaim: Send + Sync {
     async fn acquire(&self) -> Result<bool>;
+    /// Extends the seat's lease while its holder is still active; returns `false`
+    /// if the seat was already released or reclaimed.
+    async fn renew(&self) -> Result<bool> {
+        Ok(true)
+    }
     async fn release(&self) -> Result<()>;
 }
 
@@ -2801,5 +2844,37 @@ mod hosted_task_tests {
         assert!(HostedTask::new(&cluster.replace("cell-test", "cell-other"), task).is_err());
         assert!(HostedTask::new(&cluster.replace("eu-north-1", "eu-west-1"), task).is_err());
         assert!(HostedTask::new(cluster, &task[..task.len()-1]).is_err());
+    }
+
+    #[test]
+    fn ordered_index_storage_prunes_expired_and_dead_permits_with_legacy_defaults() {
+        use std::collections::BTreeMap;
+        use super::OrderedIndexStorage;
+
+        let legacy: OrderedIndexStorage = serde_json::from_str(
+            r#"{"oldest_generation":0,"dropped":false,"legacy_pages":"Retained","generations":{}}"#,
+        )
+        .unwrap();
+        assert!(legacy.permit_expiries.is_empty());
+
+        let owner = uuid::Uuid::new_v4();
+        let active = uuid::Uuid::new_v4();
+        let expired = uuid::Uuid::new_v4();
+        let unleased = uuid::Uuid::new_v4();
+        let mut storage = OrderedIndexStorage {
+            generations: BTreeMap::from([(0, BTreeMap::from([(active, owner), (expired, owner), (unleased, owner)]))]),
+            permit_expiries: BTreeMap::from([(active, 2_000), (expired, 1_000)]),
+            ..Default::default()
+        };
+        assert!(storage.permit_active(&active, 1_500));
+        assert!(!storage.permit_active(&expired, 1_500));
+        assert!(storage.permit_active(&unleased, 1_500));
+
+        assert!(storage.prune_permits(|permit, _| *permit != expired));
+        assert!(!storage.generations[&0].contains_key(&expired));
+        assert!(!storage.permit_expiries.contains_key(&expired));
+        assert!(storage.generations[&0].contains_key(&active));
+        assert!(storage.generations[&0].contains_key(&unleased));
+        assert!(!storage.prune_permits(|_, _| true));
     }
 }

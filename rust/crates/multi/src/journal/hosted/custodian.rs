@@ -211,6 +211,7 @@ pub(crate) async fn maintain_with_sync(
     limit: Duration,
     apple_sync: rtdb_storage::AppleSync,
 ) {
+    placement.worker.reconcile_pending_releases().await;
     if let Some(broker) = broker {
         let erasure = placement.advance_installed_erasure(broker, keys);
         if let Ok(Err(error)) = tokio::time::timeout(limit, erasure).await {

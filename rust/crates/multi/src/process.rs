@@ -374,12 +374,38 @@ impl rtdb_node::ReadFence for FenceSlot {
         let acquired = claim.acquire().await.and_then(|owned| owned.then_some(()).ok_or_else(audience_seat_unavailable));
         let owns_seat = acquired.is_ok();
         if ready.send(acquired).is_ok() && owns_seat {
+            let mut renew = tokio::time::interval(rtdb_directory::AUDIENCE_SEAT_LEASE / 3);
+            renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            renew.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = release.cancelled() => break,
+                    _ = renew.tick() => {
+                        match claim.renew().await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!(seat = index, "Audience seat lease was lost before release");
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(seat = index, code = %error.code, "Audience seat lease renewal failed");
+                            }
+                        }
+                    }
+                }
+            }
             release.cancelled().await;
         }
         // The write may have committed after losing its reply. Fence the
         // claim and its predecessor before returning the local permit.
         let claim = &claim;
-        crate::hold_release::release_hold(format!("audience seat {index}"), &self.release_stop, move || claim.release()).await;
+        crate::hold_release::release_hold_bounded(
+            format!("audience seat {index}"),
+            &self.release_stop,
+            rtdb_directory::AUDIENCE_SEAT_LEASE,
+            move || claim.release(),
+        ).await;
     }
 }
 

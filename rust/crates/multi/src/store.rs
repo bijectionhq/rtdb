@@ -396,7 +396,10 @@ impl ObjectCipher for ServingKeys {
                         && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
                         && record.ordered_indexes.iter().any(|(name, state)| {
                             name.ends_with(&definition) && state.admits(generation)
-                                && state.generations.get(&generation).is_some_and(|users| !users.is_empty())
+                                && state.generations.get(&generation).is_some_and(|users| {
+                                    let now = now_ms();
+                                    users.keys().any(|permit| state.permit_active(permit, now))
+                                })
                         })
                 });
                 if !admitted {
@@ -935,19 +938,30 @@ fn publication_error(key: &ObjectKey, error: Anomaly) -> Error {
     Error::Remote { key: key.to_string(), message: error.code.into() }
 }
 
+fn prune_region_ordered_index_permits(record: &mut DeploymentRecord, region: Uuid) -> bool {
+    let mut removed = false;
+    for index in record.ordered_indexes.values_mut() {
+        if index.prune_permits(|_, owner| *owner != region) {
+            removed = true;
+        }
+    }
+    removed
+}
+
 pub(crate) async fn release_region(directory: &dyn Directory, deployment: &str, region: Uuid, uncertain: bool) -> Result<()> {
     for _ in 0..8 {
         let Some(mut record) = directory.deployment(deployment).await? else { return Ok(()); };
         let readers = record.catalog_readers.len();
         record.catalog_readers.retain(|_, reader| reader.owner != region);
         let removed_readers = record.catalog_readers.len() != readers;
+        let removed_permits = prune_region_ordered_index_permits(&mut record, region);
         match record.storage_regions.get_mut(&region) {
             Some(StorageRegion::Remote { closed, .. } | StorageRegion::ReplicaPublication { closed, .. }) if *closed => {
-                if !removed_readers { return Ok(()); }
+                if !removed_readers && !removed_permits { return Ok(()); }
             }
             Some(StorageRegion::ReplicaPublication { closed, draft: Some(_), .. }) => *closed = true,
             Some(StorageRegion::Remote { closed, publications, .. } | StorageRegion::ReplicaPublication { closed, publications, .. }) if !publications.is_empty() => *closed = true,
-            None if !uncertain && !removed_readers => return Ok(()),
+            None if !uncertain && !removed_readers && !removed_permits => return Ok(()),
             _ => { record.storage_regions.remove(&region); }
         }
         let version = record.version;
@@ -1019,6 +1033,7 @@ pub(crate) async fn reconcile_storage_regions(
                     if current.storage_regions.get(&region) == Some(state) {
                         current.storage_regions.remove(&region);
                         current.catalog_readers.retain(|_, reader| reader.owner != region);
+                        prune_region_ordered_index_permits(current, region);
                     }
                     Ok(())
                 }).await?;
