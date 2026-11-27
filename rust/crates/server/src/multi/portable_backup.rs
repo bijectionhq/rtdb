@@ -33,7 +33,7 @@ Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
 Hosted backup commands require the backup-object-holds build feature.
 Attest emits the signed installation proof for the activation broker and requires Unix.
-Release-object-holds settles an abandoned candidate through the activation broker and requires Unix.
+Release-object-holds settles an abandoned candidate or a published candidate with a replacement checkpoint. It requires Unix.
 These commands run without a serving listener.
 ";
 

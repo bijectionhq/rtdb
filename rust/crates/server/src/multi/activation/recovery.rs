@@ -303,10 +303,10 @@ impl ActivationAuthority {
         ))
     }
 
-    #[cfg(all(unix, feature = "backup-object-holds"))]
-    pub(super) async fn require_abandoned_recovery(
+    #[cfg(unix)]
+    pub(super) async fn object_release_installation(
         &self, name: &str, operation: Operation, candidate: Uuid,
-    ) -> Result<()> {
+    ) -> Result<Option<Installation>> {
         let (_, state) = self.read(self.stream_id(name)?).await?;
         let state = state.ok_or_else(unavailable)?;
         let superseded = state.binding == operation.predecessor
@@ -318,12 +318,17 @@ impl ActivationAuthority {
                     && publication.recovery.is_some()
             });
         if state.binding.incarnation != candidate && (superseded || replaced) {
-            return Ok(());
+            return Ok(None);
+        }
+        if let Some(Status::Published { binding, installation, .. }) = state.publication_status(operation)?
+            && binding.incarnation == candidate
+        {
+            return Ok(Some(installation));
         }
         Err(Anomaly::new(
             rtdb_types::AnomalyCategory::Conflict,
             "rtdb/activation-object-custody",
-            "The retained activation decision must prove this candidate was abandoned",
+            "The retained activation decision must settle this exact candidate",
         ))
     }
 

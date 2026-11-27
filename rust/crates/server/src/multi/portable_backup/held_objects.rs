@@ -503,10 +503,10 @@ mod tests {
         if broker.is_finished() {
             panic!("broker startup failed: {:?}", broker.await);
         }
-        let record = |path: &Path| ActivationOptions::parse([
+        let record = |operation: Uuid, path: &Path| ActivationOptions::parse([
             "record-install".into(), DEVELOPMENT_DATABASE.into(),
             "--authority-socket".into(), socket.display().to_string(),
-            "--operation-id".into(), operation_id.to_string(),
+            "--operation-id".into(), operation.to_string(),
             "--expected-incarnation".into(), predecessor.incarnation.to_string(),
             "--expected-revision".into(), predecessor.revision.to_string(),
             "--cell-id".into(), cell.to_string(),
@@ -517,10 +517,10 @@ mod tests {
         let mut altered = proof_json.clone();
         altered["evidence"]["objects_sha256"][0] = json!(1 ^ verified_readback.digest().unwrap()[0]);
         fs::write(&altered_proof, serde_json::to_vec(&altered).unwrap()).unwrap();
-        assert!(record(&altered_proof).await.is_err());
-        let recorded = record(&proof_path).await.unwrap();
+        assert!(record(operation_id, &altered_proof).await.is_err());
+        let recorded = record(operation_id, &proof_path).await.unwrap();
         assert_eq!(recorded["installation"]["objects_sha256"], json!(verified_readback.digest().unwrap()));
-        assert_eq!(record(&proof_path).await.unwrap(), recorded);
+        assert_eq!(record(operation_id, &proof_path).await.unwrap(), recorded);
         assert_eq!(attest(&readback).await.unwrap(), proof_json);
         let release_objects = |readback: &Path, proof: &Path| MultiBackupOptions::parse([
             "release-object-holds".into(), "--readback".into(), readback.display().to_string(),
@@ -604,6 +604,77 @@ mod tests {
         release().await.unwrap();
         assert!(verify(Some(&readback), &receipt_path).await.is_err());
         assert_eq!(journal.head(stream).await.unwrap(), head);
+        let operation = replacement_intent.operation;
+        let Status::Pending { candidate, .. } = activation.recovery_status(DEVELOPMENT_DATABASE, operation).await.unwrap()
+        else { panic!("expected the replacement recovery"); };
+        let next_receipt = stage(operation.operation_id).await.unwrap();
+        let receipt = home.path().join("serving-stage.json");
+        fs::write(&receipt, serde_json::to_vec(&next_receipt).unwrap()).unwrap();
+        let prefix = format!("db/{candidate}/");
+        let token_prefix = format!("~rtdb-v1/{}/keys/", candidate.simple());
+        for entry in store.list(None).await.unwrap().iter().filter(|entry| {
+            entry.key.as_str().starts_with(&prefix) || entry.key.as_str().starts_with(&token_prefix)
+        }) {
+            hold(&store.observe_head(&entry.key).await.unwrap().version.unwrap());
+        }
+        let BackupCommand::VerifyObjects(mut verifier) = hosted_options("verify-object-holds", None, &receipt, None).0
+        else { panic!("expected a hosted verifier"); };
+        verifier.incarnation = candidate;
+        let report = verifier.run().await.unwrap();
+        let serving_readback = home.path().join("serving-readback.json");
+        fs::write(&serving_readback, serde_json::to_vec(&report).unwrap()).unwrap();
+        let BackupCommand::AttestObjects(mut attester) = hosted_options("attest", Some(&serving_readback), &receipt, Some(&signing_key)).0
+        else { panic!("expected a hosted attestor"); };
+        attester.verifier.incarnation = candidate;
+        let document = attester.run_with_authority(&authority_reader).await.unwrap();
+        let serving_proof = home.path().join("serving-proof.json");
+        fs::write(&serving_proof, serde_json::to_vec(&document).unwrap()).unwrap();
+        record(operation.operation_id, &serving_proof).await.unwrap();
+
+        for action in ["freeze-recovery", "publish-recovery"] {
+            ActivationOptions::parse([
+                action.into(), DEVELOPMENT_DATABASE.into(),
+                "--authority-socket".into(), socket.display().to_string(),
+                "--expected-incarnation".into(), predecessor.incarnation.to_string(),
+                "--expected-revision".into(), predecessor.revision.to_string(),
+                "--operation-id".into(), operation.operation_id.to_string(),
+            ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap();
+        }
+        let release_pending = || release_objects(&serving_readback, &serving_proof);
+        let release_key = || ActivationOptions::parse([
+            "release-recovery-key".into(), DEVELOPMENT_DATABASE.into(),
+            "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
+            "--authority-tls-dir".into(), authority_tls.display().to_string(),
+            "--installation-proof".into(), serving_proof.display().to_string(),
+            "--key-vault".into(), vault.display().to_string(),
+            "--journal-url".into(), journal_url.clone(), "--journal-reader-tls-dir".into(), tls.display().to_string(),
+        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
+        assert_eq!(release_pending().await.unwrap_err().code, "rtdb/activation-custody-replacement");
+        assert_eq!(release_key().await.unwrap_err().code, "rtdb/activation-custody-replacement");
+        ActivationOptions::parse([
+            "release-recovery-journal".into(), DEVELOPMENT_DATABASE.into(),
+            "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
+            "--authority-tls-dir".into(), authority_tls.display().to_string(),
+            "--installation-proof".into(), serving_proof.display().to_string(),
+            "--journal-url".into(), journal_url.clone(),
+            "--journal-custodian-tls-dir".into(), tls.display().to_string(),
+        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap();
+        assert_eq!(release_pending().await.unwrap_err().code, "rtdb/activation-custody-replacement");
+        assert_eq!(release_key().await.unwrap_err().code, "rtdb/activation-custody-replacement");
+
+        let serving_keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
+        let mut serving = MultiDatabase::new(
+            options(candidate), journal.clone(), store.clone(), serving_keys, Arc::new(|| SystemClock.now()),
+        ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap();
+        assert!(matches!(serving.tick(&live).await.unwrap(), Role::Writer(_)));
+        serving.checkpoint(Vec::new()).await.unwrap();
+        serving.shutdown_writer().await.unwrap();
+        let released = release_pending().await.unwrap();
+        assert_eq!(released["incarnation"], candidate.to_string());
+        assert_eq!(release_pending().await.unwrap(), released);
+        let released_key = release_key().await.unwrap();
+        assert_eq!(released_key["released"]["operation"], operation.operation_id.to_string());
+        assert_eq!(release_key().await.unwrap(), released_key);
         broker.abort();
         assert!(broker.await.unwrap_err().is_cancelled());
         let completion = format!("multi/recovery-custody/{authority}/{incarnation}/released");

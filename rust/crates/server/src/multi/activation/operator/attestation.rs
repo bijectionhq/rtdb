@@ -276,6 +276,11 @@ impl Attestation {
     }
 
     #[cfg(unix)]
+    pub(super) fn objects_sha256(&self) -> Option<[u8; 32]> {
+        self.evidence.objects_sha256
+    }
+
+    #[cfg(unix)]
     pub(in crate::multi) fn held_key(&self) -> Result<(&Intent, RecoveryKeyHold)> {
         if self.evidence.candidate != self.evidence.intent.candidate()? {
             return Err(invalid());

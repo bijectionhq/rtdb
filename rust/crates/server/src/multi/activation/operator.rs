@@ -37,7 +37,7 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
                  --cell-id UUID --attestation-signing-key PKCS8 --manifest-sha256 HEX
                  [--authority-url URL --authority-tls-dir DIR [--journal-custodian-tls-dir DIR]]
        rtdb multi-activation release-recovery-key DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
-                 --installation-proof FILE --key-vault DIR
+                 --installation-proof FILE --key-vault DIR [--journal-url URL --journal-reader-tls-dir DIR]
        rtdb multi-activation release-recovery-journal DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
                  --installation-proof FILE --journal-url URL --journal-custodian-tls-dir DIR
        rtdb multi-activation serve --authority-socket PATH --broker-config PATH
@@ -236,6 +236,7 @@ enum Command {
         tls: PathBuf,
         proof: PathBuf,
         vault: PathBuf,
+        journal_reader: Option<(String, PathBuf)>,
     },
     #[cfg(unix)]
     ReleaseRecoveryJournal {
@@ -310,7 +311,12 @@ impl Options {
             let proof = take(&mut fields, "--installation-proof")?.into();
             let release = if operation == "release-recovery-key" {
                 let vault = take(&mut fields, "--key-vault")?.into();
-                Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault }
+                let journal_reader = match (fields.remove("--journal-url"), fields.remove("--journal-reader-tls-dir")) {
+                    (Some(url), Some(tls)) => Some((url, tls.into())),
+                    (None, None) => None,
+                    _ => return Err(arguments_error()),
+                };
+                Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault, journal_reader }
             } else {
                 let journal_url = take(&mut fields, "--journal-url")?;
                 let journal_tls = take(&mut fields, "--journal-custodian-tls-dir")?.into();
@@ -515,11 +521,27 @@ impl Options {
                 Ok(json!(proof))
             }
             #[cfg(unix)]
-            Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault } => {
+            Command::ReleaseRecoveryKey { database, identity, url, tls, proof, vault, journal_reader } => {
                 let proof = Attestation::read(&proof)?;
                 let authority = ActivationAuthority::connect(
                     &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusReader,
                 ).await?;
+                if let Some(objects_sha256) = proof.objects_sha256() {
+                    let (intent, key) = proof.held_key()?;
+                    require_hold_release(&authority, &database, intent, key).await?;
+                    let operation = recovery::Operation { predecessor: intent.expected, operation_id: intent.operation_id };
+                    if let Some(installed) = authority.object_release_installation(&database, operation, key.generation.database).await? {
+                        let (_, _, retained) = proof.held_journal()?;
+                        if installed.objects_sha256 != Some(objects_sha256)
+                            || installed.key_hold != Some(key) || installed.journal_hold != Some(retained)
+                        {
+                            return Err(super::conflict());
+                        }
+                        let (url, tls) = journal_reader.as_ref().ok_or_else(arguments_error)?;
+                        KeeperJournal::connect(url, &crate::cli::journal_credentials(tls)?)?
+                            .require_replacement(key.generation.database, retained).await?;
+                    }
+                }
                 let kms = rtdb_crypt::FileKms::open(&vault, || {
                     use rtdb_node::Clock;
                     rtdb_node::SystemClock.now().0
@@ -569,12 +591,27 @@ impl Request {
                 {
                     return Err(super::conflict());
                 }
-                proof.verify(intent, manifest_sha256, attestors)?;
+                let verified = proof.verify(intent, manifest_sha256, attestors)?;
                 let operation = recovery::Operation {
                     predecessor: intent.expected,
                     operation_id: intent.operation_id,
                 };
-                authority.require_abandoned_recovery(&database, operation, hold.generation.database).await?;
+                if let Some(installed) = authority
+                    .object_release_installation(&database, operation, hold.generation.database)
+                    .await?
+                {
+                    let retained = verified.journal_hold.ok_or_else(super::conflict)?;
+                    let reader = journals.get(&intent.cell.ok_or_else(super::conflict)?)
+                        .ok_or_else(super::configuration)?;
+                    if installed.manifest_digest != manifest_sha256
+                        || installed.objects_sha256 != Some(objects_sha256)
+                        || installed.journal_hold != Some(retained)
+                        || installed.key_hold != Some(hold)
+                    {
+                        return Err(super::conflict());
+                    }
+                    reader.connect()?.require_replacement(verified.successor, retained).await?;
+                }
                 return Ok(Value::Null);
             }
             Action::Bootstrap { incarnation } => {

@@ -179,7 +179,11 @@ impl KeeperJournal {
         })
     }
 
-    pub(in crate::multi) async fn retain(&self, candidate: Uuid, retained: RetainedJournal) -> Result<()> {
+    pub(in crate::multi) async fn retain(
+        &self,
+        candidate: Uuid,
+        retained: RetainedJournal,
+    ) -> Result<()> {
         let hold = self.require_connection(retained)?;
         let observed = self
             .journal
@@ -237,12 +241,50 @@ impl KeeperJournal {
         Ok(())
     }
 
+    #[cfg(unix)]
+    pub(super) async fn require_replacement(
+        &self,
+        candidate: Uuid,
+        retained: RetainedJournal,
+    ) -> Result<()> {
+        let hold = self.require_connection(retained)?;
+        let observed = self
+            .journal
+            .checkpoint_custody(StreamId(candidate.as_u128()))
+            .await
+            .map_err(journal_error)?;
+        if observed
+            != Some(CheckpointCustody {
+                hold,
+                released: true,
+            })
+        {
+            return Err(replacement_pending());
+        }
+        let selected = self.selected(candidate).await?;
+        if selected.anchor.announced_at <= hold.anchor.announced_at
+            || selected.anchor.covered_through < hold.anchor.announced_at
+        {
+            return Err(replacement_pending());
+        }
+        Ok(())
+    }
+
     fn require_connection(&self, retained: RetainedJournal) -> Result<CheckpointHold> {
         if retained.connection_sha256 == self.connection_sha256 {
             return Ok(retained.hold);
         }
         Err(conflict())
     }
+}
+
+#[cfg(unix)]
+fn replacement_pending() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::new(
+        rtdb_types::AnomalyCategory::Conflict,
+        "rtdb/activation-custody-replacement",
+        "The published successor has not selected a replacement checkpoint",
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -331,8 +373,28 @@ mod tests {
                 .await
                 .is_err()
         );
+        #[cfg(feature = "backup-object-holds")]
+        assert!(journal.require_replacement(candidate, hold).await.is_err());
         journal.release(candidate, hold).await.unwrap();
         assert!(journal.require_retained(candidate, hold).await.is_err());
+        #[cfg(feature = "backup-object-holds")]
+        {
+            assert!(journal.require_replacement(candidate, hold).await.is_err());
+            journal
+                .journal
+                .install_checkpoint(
+                    sealed.fence,
+                    CheckpointInstallation {
+                        operation_id: 9,
+                        checkpoint_lsn: Lsn(2),
+                        covered_through_lsn: Lsn(1),
+                        record: Bytes::from_static(b"serving checkpoint"),
+                    },
+                )
+                .await
+                .unwrap();
+            journal.require_replacement(candidate, hold).await.unwrap();
+        }
         journal.release(candidate, hold).await.unwrap();
     }
 }

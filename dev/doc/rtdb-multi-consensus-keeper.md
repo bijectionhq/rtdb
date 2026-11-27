@@ -326,7 +326,12 @@ In the loopback MinIO qualification, the version reader could also read the curr
 The pinned verifier always supplies the recorded version ID.
 Journal retention, hosted provider enrollment and permission to publish require their own authority.
 
-For an abandoned candidate with operation-exclusive holds, use `rtdb multi-backup release-object-holds` with the saved readback, signed installation proof, protected activation broker socket and original S3 settings.
+For operation-exclusive holds, use `rtdb multi-backup release-object-holds` with the saved readback, signed installation proof, protected activation broker socket and original S3 settings.
+A published candidate can release its staged object holds after the original journal quorum confirms that its staged hold was released and a later serving checkpoint covers the staged announcement.
+Release the journal hold first and let the successor commit that checkpoint through its ordinary checkpoint path.
+The broker checks the published installation digests and the replacement checkpoint through the registered journal reader before authorizing removal of the temporary object holds.
+For a published hosted recovery, give `release-recovery-key` the same original journal through `--journal-url` and `--journal-reader-tls-dir`.
+The vault releases the staged key hold only after confirming the same replacement checkpoint.
 The broker matches the cell signature and the activation connection and requires the retained decision to prove supersession or publication of a different recovery from the same binding.
 Run the first authorization while that decision remains available to the broker.
 The custodian records this authorization under `multi/recovery-custody/` before changing any legal hold.

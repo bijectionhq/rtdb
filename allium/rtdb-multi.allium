@@ -1188,6 +1188,7 @@ contract PortableApplicationBackup {
         -- An independent destination verifier checks its scoped committed install and dependency closure before signing the authority, database, predecessor binding, operation, destination cell, candidate, archive digest and exact source cut.
         -- Verification at the authority uses the registered destination public key and the selected recovery intent. It can complete without reading destination resources.
         -- Destination custody retains the staged journal, objects and keys until activation or an authority decision that supersedes the recovery intent.
+        -- An active hosted candidate keeps its temporary object and generation holds until its original journal selects a later serving checkpoint covering the staged announcement.
 
     @invariant HostedStaging
         -- The independent activation journal supplies the pending recovery and its destination cell and incarnation.
