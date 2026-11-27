@@ -348,15 +348,18 @@ async fn borrowed_join_list_keys_keep_typed_matches_and_null_semantics_across_sp
 }
 
 #[test]
-fn borrowed_join_list_hash_preserves_composite_order_and_zero_policy_under_the_decode_budget() {
-    use crate::{columnar::Column, join_key::hash_join_row, join_storage::hash_values, set_keys::JoinHash};
+fn mixed_join_hash_borrows_list_and_timestamp_under_the_decode_budget() {
+    use crate::{columnar::Column, join_key::hash_join_row, join_storage::hash_values, set_keys::{JoinHash, Key}};
+    use rtdb_types::TimeUnit;
 
     let execution = execution(32, 0);
     let context = &execution.context;
     let memory = &context.memory;
     let list = Value::list(vec![Value::Utf8("key".repeat(32 * 1024)), Value::Null]);
+    let timestamp = Value::Timestamp { value: -3400, unit: TimeUnit::Millisecond, timezone: Some("America/New_York".into()) };
+    let fallback = Value::IntervalYearMonth(3);
     let zero = Value::F64(-0.0);
-    let columns = [&list, &zero].map(|value| {
+    let columns = [&list, &zero, &timestamp, &fallback].map(|value| {
         let logical = value.logical_type();
         let field = Arc::new(rtdb_columnar::to_field("key", &logical).unwrap());
         let array = rtdb_columnar::build_array_refs(&logical, &[value]).unwrap();
@@ -364,11 +367,64 @@ fn borrowed_join_list_hash_preserves_composite_order_and_zero_policy_under_the_d
     });
     let batch = ColumnBatch::settled(Vec::from(columns), 1, memory.reserve(1 << 20).unwrap()).unwrap();
     let _held = memory.reserve(memory.available_bytes() - (4 << 10)).unwrap();
+    let before = memory.used_bytes();
     assert!(batch.columns[0].bound(0).unwrap() > memory.available_bytes());
 
-    let raw = hash_values([&zero, &list]).unwrap();
-    let canonical = hash_values([&Value::F64(0.0), &list]).unwrap();
+    let raw = hash_values([&timestamp, &zero, &fallback, &list]).unwrap();
+    let canonical = hash_values([&timestamp, &Value::F64(0.0), &fallback, &list]).unwrap();
     assert_ne!(raw, canonical);
-    assert_eq!(hash_join_row(&batch, 0, &[1, 0], false, JoinHash::Vector, context).unwrap(), raw);
-    assert_eq!(hash_join_row(&batch, 0, &[1, 0], false, JoinHash::CanonicalZero, context).unwrap(), canonical);
+    let positions = [2, 1, 3, 0];
+    assert_eq!(hash_join_row(&batch, 0, &positions, false, JoinHash::Vector, context).unwrap(), raw);
+    assert_eq!(hash_join_row(&batch, 0, &positions, false, JoinHash::CanonicalZero, context).unwrap(), canonical);
+
+    let key = Key::for_columns(&batch, 0, false, &positions, context).unwrap();
+    assert!(key.cached(0).is_none());
+    assert_eq!(key.cached(2), Some(&fallback));
+    assert!(key.cached(3).is_none());
+    assert_eq!(key.equal_at(&key, 0, false, context, None).unwrap(), Some(true));
+    assert_eq!(key.equal_at(&key, 3, false, context, None).unwrap(), None);
+    let bloom = crate::set_keys::direct_bloom_hashes(&batch.columns[2], 0).unwrap();
+    assert_eq!(bloom.hashes, (rtdb_columnar::hash_value(&timestamp, 0).unwrap(), rtdb_columnar::hash_value_murmur3(&timestamp, 0).unwrap()));
+    drop(key);
+    assert_eq!(memory.used_bytes(), before);
+}
+
+#[test]
+fn mixed_join_hash_reports_a_later_read_error_before_an_earlier_hash_error() {
+    use crate::{columnar::Column, join_key::hash_join_row, set_keys::JoinHash};
+
+    let execution = execution(32, 0);
+    let context = &execution.context;
+    let batch = ColumnBatch::settled(
+        vec![Column::Values(vec![Value::F16(0)]), Column::Values(Vec::new())],
+        1, context.memory.reserve(4096).unwrap(),
+    ).unwrap();
+    let hash = |positions: &[usize]| hash_join_row(&batch, 0, positions, false, JoinHash::Vector, context);
+    assert_eq!(hash(&[0]).unwrap_err().code, "rtdb/jvm-half-float");
+    assert_eq!(hash(&[0, 1]).unwrap_err().code, "rtdb.query/column-row");
+}
+
+#[test]
+fn mixed_list_hash_collision_compares_children_without_decoding_either_list() {
+    use crate::{columnar::Column, set_keys::Key};
+
+    let execution = execution(32, 0);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let floats = Value::list(vec![Value::F64(1.0); 4096]);
+    let bytes = Value::list(vec![Value::Binary(1.0f64.to_bits().to_be_bytes().to_vec()); 4096]);
+    let page = |value: &Value| {
+        let logical = value.logical_type();
+        let array = rtdb_columnar::build_array_refs(&logical, &[value]).unwrap();
+        let field = Arc::new(rtdb_columnar::to_field("key", &logical).unwrap());
+        ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(logical) }],
+            1, memory.reserve(1 << 20).unwrap()).unwrap()
+    };
+    let floats = page(&floats);
+    let bytes = page(&bytes);
+    let _held = memory.reserve(memory.available_bytes() - 4096).unwrap();
+    let left = Key::for_columns(&floats, 0, false, &[0], context).unwrap();
+    let right = Key::for_columns(&bytes, 0, false, &[0], context).unwrap();
+    assert_eq!(left.vector_hash().unwrap(), right.vector_hash().unwrap());
+    assert_eq!(left.equal_at(&right, 0, false, context, None).unwrap(), Some(false));
 }

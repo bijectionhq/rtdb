@@ -2436,7 +2436,8 @@ surface QueryAccess {
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- DISTINCT holds its seen keys in memory and fails when the memory budget cannot hold them.
-        -- Their key index retains Arrow batches and hashes and compares compatible scalar and floating-point vector cells at their indexed positions.
+        -- Their key index retains Arrow batches and hashes and compares compatible scalar and list cells at their indexed positions.
+        -- Two plain list keys of the same shape are equal when every child compares true, and a child comparison that is unknown leaves the list equality unknown unless another child compares false.
         -- Each hash bucket stores the position of its collision chain's tail.
         -- Probes visit retained candidates in insertion order.
         -- A grouping batch with bound scalar columns hashes each column in turn and compares same-batch key candidates through those readers.
@@ -2497,8 +2498,9 @@ surface QueryAccess {
         -- This search keeps a probe row when any of its key cells is NULL or every candidate fails to match.
         -- Other batch anti joins visit the build rows available to the probe in build order, including rows with different hashes, and stop at the first true result or reached error.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
-        -- Equijoin shuffle and build indexing hash admitted scalar and plain scalar-list keys from their Arrow positions in equality-pair order.
-        -- Other key layouts use ordered row hashing.
+        -- Equijoin shuffle, build indexing and probe search hash admitted scalar, timestamp and plain scalar-list components from their Arrow positions.
+        -- Each component can use its Arrow representation in a tuple with other components that require a scalar read.
+        -- A tuple completes its fallible key reads before combining its hashes in equality-pair order.
         -- Equijoins over compatible primitive scalar key types hash either floating zero sign as positive zero in the join index and both shuffles.
         -- Anti joins with fallible predicates or keys keep their raw partition routing and ordered comparison of the reached build rows.
         -- A hash join cursor span reports bytes written in completed spill files, including frame overhead, for its input spools and shuffles.

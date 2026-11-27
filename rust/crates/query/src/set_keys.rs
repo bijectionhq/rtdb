@@ -1,10 +1,10 @@
-use std::{borrow::Cow, collections::HashMap, mem::size_of, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, mem::size_of, ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, types::{TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType}};
+use arrow_array::{Array, FixedSizeListArray, ListArray, cast::AsArray, types::{TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType}};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
-use rtdb_types::{LogicalType, Result, ScalarType, TimeUnit, Value};
+use rtdb_types::{ListKind, LogicalType, Result, ScalarType, TimeUnit, Value};
 
 use crate::{
     QueryContext,
@@ -193,8 +193,73 @@ impl JoinHash {
 }
 
 #[derive(Clone)]
+struct PlainListKey<'a> {
+    fixed: bool,
+    children: ScalarColumn<'a>,
+    rows: Range<usize>,
+}
+
+impl<'a> PlainListKey<'a> {
+    fn arrow(cell: ArrowCell<'a>, logical: &LogicalType) -> Option<Self> {
+        let ArrowCell { array, field, row } = cell;
+        if row >= array.len() || field.data_type() != array.data_type() || !field.metadata().is_empty() || array.is_null(row) {
+            return None;
+        }
+        let LogicalType::List { kind, element } = nonnull(logical) else { return None; };
+        let (children, rows) = match (kind, field.data_type()) {
+            (ListKind::List, DataType::List(child)) => {
+                let list = array.as_any().downcast_ref::<ListArray>()?;
+                let offsets = list.value_offsets();
+                let children = ScalarColumn::bind(list.values().as_ref(), child, Some(element))?;
+                (children, offsets[row] as usize..offsets[row + 1] as usize)
+            }
+            (ListKind::FixedSizeList(width), DataType::FixedSizeList(child, physical)) if width == physical => {
+                let list = array.as_any().downcast_ref::<FixedSizeListArray>()?;
+                let start = list.value_offset(row) as usize;
+                let children = ScalarColumn::bind(list.values().as_ref(), child, Some(element))?;
+                (children, start..start + *physical as usize)
+            }
+            _ => return None,
+        };
+        if matches!(children, ScalarColumn::Null | ScalarColumn::F32(_) | ScalarColumn::F64(_)) {
+            return None;
+        }
+        Some(Self { fixed: matches!(kind, ListKind::FixedSizeList(_)), children, rows })
+    }
+
+    fn hash(&self, hash_key: fn(ScalarKey<'a>) -> u32) -> i32 {
+        let mut hash = 0i32;
+        self.children.visit(self.rows.clone().map(Some), |key| {
+            hash = hash.wrapping_mul(31).wrapping_add(hash_key(key) as i32);
+            Ok::<_, Infallible>(())
+        }).unwrap();
+        hash
+    }
+
+    fn equal(&self, right: &Self) -> Option<Option<bool>> {
+        self.equal_children(right.fixed, right.rows.clone().map(|row| right.children.read(row)))
+    }
+
+    fn equal_children(&self, fixed: bool, right: impl ExactSizeIterator<Item = ScalarKey<'a>>) -> Option<Option<bool>> {
+        if self.fixed != fixed || self.rows.len() != right.len() {
+            return Some(Some(false));
+        }
+        let mut unknown = false;
+        for (left, right) in self.rows.clone().map(|row| self.children.read(row)).zip(right) {
+            if matches!(left, ScalarKey::Null) || matches!(right, ScalarKey::Null) {
+                unknown = true;
+            } else if left.equal(right) != Some(true) {
+                return Some(Some(false));
+            }
+        }
+        Some((!unknown).then_some(true))
+    }
+}
+
+#[derive(Clone)]
 enum DirectKey<'a> {
     Scalar(ScalarKey<'a>),
+    ScalarList(PlainListKey<'a>),
     FloatList(FloatVector<'a>),
     Timestamp(TimestampKey),
 }
@@ -208,12 +273,12 @@ struct TimestampKey {
 
 impl TimestampKey {
     fn arrow(cell: ArrowCell<'_>, logical: &LogicalType) -> Option<DirectKey<'static>> {
-        let LogicalType::Scalar(ScalarType::Timestamp { unit, timezone }) = nonnull(logical) else {
+        let LogicalType::Scalar(scalar @ ScalarType::Timestamp { unit, timezone }) = nonnull(logical) else {
             return None;
         };
         use arrow_schema::TimeUnit as ArrowUnit;
         let ArrowCell { array, field, row } = cell;
-        if field.data_type() != array.data_type() || row >= array.len() {
+        if field.data_type() != array.data_type() || row >= array.len() || !cell.has_scalar_storage(scalar) {
             return None;
         }
         let DataType::Timestamp(physical_unit, _) = array.data_type() else { return None; };
@@ -239,10 +304,6 @@ impl TimestampKey {
 }
 
 impl<'a> DirectKey<'a> {
-    fn read(column: &'a Column, row: usize) -> Option<Self> {
-        Self::read_with_timestamps(column, row, false)
-    }
-
     fn read_with_timestamps(column: &'a Column, row: usize, index_timestamps: bool) -> Option<Self> {
         if let Column::Values(values) = column {
             let value = values.get(row)?;
@@ -258,8 +319,13 @@ impl<'a> DirectKey<'a> {
             return Some(Self::Scalar(scalar.read(row)));
         }
         let cell = ArrowCell { array, field, row };
-        if index_timestamps && let Some(key) = logical.and_then(|logical| TimestampKey::arrow(cell, logical)) {
-            return Some(key);
+        if let Some(logical) = logical {
+            if index_timestamps && let Some(key) = TimestampKey::arrow(cell, logical) {
+                return Some(key);
+            }
+            if let Some(list) = PlainListKey::arrow(cell, logical) {
+                return Some(Self::ScalarList(list));
+            }
         }
         let (cell, logical) = cell.logical_position(logical).ok()?;
         if logical == LogicalType::Null || cell.array.is_null(cell.row) {
@@ -268,6 +334,9 @@ impl<'a> DirectKey<'a> {
         if let Some(key) = ScalarKey::read_resolved(cell, &logical) { return Some(Self::Scalar(key)); }
         if index_timestamps && let Some(key) = TimestampKey::arrow(cell, &logical) {
             return Some(key);
+        }
+        if let Some(list) = PlainListKey::arrow(cell, &logical) {
+            return Some(Self::ScalarList(list));
         }
         FloatVector::arrow(cell, &logical).map(Self::FloatList)
     }
@@ -284,6 +353,12 @@ impl<'a> DirectKey<'a> {
             (Self::Scalar(ScalarKey::Null), _) | (_, Self::Scalar(ScalarKey::Null)) =>
                 Some(nulls_equal.then_some(false)),
             (Self::Scalar(left), Self::Scalar(right)) => left.equal(right).map(Some),
+            (Self::ScalarList(left), Self::ScalarList(right)) => left.equal(&right),
+            (Self::ScalarList(list), Self::FloatList(vector)) | (Self::FloatList(vector), Self::ScalarList(list)) =>
+                list.equal_children(vector.width.is_some(), vector.range.clone().map(|row| {
+                    vector.float_component(row).map_or(ScalarKey::Null, ScalarKey::Float)
+                })),
+            (Self::ScalarList(_), _) | (_, Self::ScalarList(_)) => None,
             (Self::Timestamp(left), Self::Timestamp(right)) if left.unit == right.unit && left.zoned == right.zoned =>
                 Some(Some(left.value == right.value)),
             (Self::Timestamp(_), Self::FloatList(_)) | (Self::FloatList(_), Self::Timestamp(_)) => Some(Some(false)),
@@ -347,6 +422,7 @@ impl<'a> DirectKey<'a> {
         match self {
             Self::Scalar(key) => hash_key(key) as i32,
             Self::Timestamp(key) => hash_key(ScalarKey::Float(key.value as f64 / key.unit.units_per_second() as f64)) as i32,
+            Self::ScalarList(list) => list.hash(hash_key),
             Self::FloatList(vector) => rtdb_columnar::hash_float_components(
                 vector.range.clone().map(|index| vector.float_component(index)), 0, hash_bytes,
             ),
@@ -355,13 +431,21 @@ impl<'a> DirectKey<'a> {
 }
 
 pub(crate) fn direct_key_equal(left: &Column, l: usize, right: &Column, r: usize, nulls_equal: bool) -> Option<Option<bool>> {
-    DirectKey::read(left, l)?.equal(DirectKey::read(right, r)?, nulls_equal)
+    DirectKey::read_with_timestamps(left, l, true)?.equal(DirectKey::read_with_timestamps(right, r, true)?, nulls_equal)
 }
 
-pub(crate) fn direct_bloom_hashes(column: &Column, row: usize) -> Option<((i32, i32), Option<ScalarKey<'_>>)> {
-    let key = DirectKey::read(column, row)?;
+pub(crate) struct BloomKey<'a> {
+    pub hashes: (i32, i32),
+    pub scalar: Option<ScalarKey<'a>>,
+    pub retain_iid_limit: bool,
+}
+
+pub(crate) fn direct_bloom_hashes(column: &Column, row: usize) -> Option<BloomKey<'_>> {
+    let key = DirectKey::read_with_timestamps(column, row, true)?;
     let scalar = match key { DirectKey::Scalar(scalar) => Some(scalar), _ => None };
-    Some(((key.clone().hash(), key.hash_with(ScalarKey::murmur3, rtdb_columnar::murmur3_32)), scalar))
+    let retain_iid_limit = matches!(key, DirectKey::ScalarList(_) | DirectKey::Timestamp(_));
+    let hashes = (key.clone().hash(), key.hash_with(ScalarKey::murmur3, rtdb_columnar::murmur3_32));
+    Some(BloomKey { hashes, scalar, retain_iid_limit })
 }
 
 impl<'a> Key<'a> {
@@ -390,7 +474,7 @@ impl<'a> Key<'a> {
 
     pub(crate) fn for_columns(batch: &'a ColumnBatch, row: usize, projected: bool, positions: &'a [usize],
         context: &QueryContext) -> Result<Self> {
-        Self::read(ArrowKey { columns: &batch.columns, row, projected }, Some(positions), false, context)
+        Self::read(ArrowKey { columns: &batch.columns, row, projected }, Some(positions), true, context)
     }
 
     fn len(&self) -> usize {
@@ -662,7 +746,7 @@ impl OwnedScalar {
                 ScalarKey::Reference(value) => Self::Reference(value),
                 ScalarKey::Uri(_) => unreachable!("URI keys require preflight"),
             },
-            DirectKey::FloatList(_) => unreachable!("Float vectors retain their Arrow positions"),
+            DirectKey::ScalarList(_) | DirectKey::FloatList(_) => unreachable!("List keys retain their Arrow positions"),
         }
     }
 
@@ -686,7 +770,7 @@ impl OwnedScalar {
         Some(match key {
             DirectKey::Scalar(ScalarKey::Text(value) | ScalarKey::Keyword(value)) => value.len(),
             DirectKey::Scalar(ScalarKey::Bytes(value) | ScalarKey::FixedBytes(value)) => value.len(),
-            DirectKey::Scalar(ScalarKey::Uri(_)) | DirectKey::FloatList(_) => return None,
+            DirectKey::Scalar(ScalarKey::Uri(_)) | DirectKey::ScalarList(_) | DirectKey::FloatList(_) => return None,
             _ => 0,
         })
     }
@@ -738,7 +822,7 @@ fn decoded_equal<'a>(probe: impl ExactSizeIterator<Item = Option<DirectKey<'a>>>
     if probe.len() != stored.len() { return None; }
     for (left, right) in probe.zip(stored) {
         let left = left?;
-        if matches!(left, DirectKey::Scalar(ScalarKey::Uri(_)) | DirectKey::FloatList(_)) { return None; }
+        if matches!(left, DirectKey::Scalar(ScalarKey::Uri(_)) | DirectKey::ScalarList(_) | DirectKey::FloatList(_)) { return None; }
         if left.equal(right.key(), true)? != Some(true) { return Some(false); }
     }
     Some(true)
@@ -1426,7 +1510,7 @@ mod tests {
                 let cell = direct.clone().hash();
                 assert_eq!(cell, rtdb_columnar::hash_value(&value, 0).unwrap(), "direct and vector cell hash of {value:?}");
                 assert_eq!(cell as u32, crate::operators::equality_cell_hash(&value, &context.timezone), "direct and set cell hash of {value:?}");
-                assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).map(|(hashes, _)| hashes.0), Some(cell), "Bloom hash of {value:?}");
+                assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).map(|key| key.hashes.0), Some(cell), "Bloom hash of {value:?}");
             }
         }
     }
@@ -1788,7 +1872,7 @@ mod tests {
         assert_eq!(first.vector_hash().unwrap(), crate::join_storage::hash_values(&expected).unwrap());
         assert_eq!(first.equal_at(&second, 0, false, &context, None).unwrap(), Some(true));
         assert!(!first.equals(ArrowKey { columns: &batch.columns, row: 1, projected: false }, None, &context).unwrap());
-        assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).unwrap().0, (
+        assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).unwrap().hashes, (
             rtdb_columnar::hash_value(&expected[0], 0).unwrap(),
             rtdb_columnar::hash_value_murmur3(&expected[0], 0).unwrap(),
         ));

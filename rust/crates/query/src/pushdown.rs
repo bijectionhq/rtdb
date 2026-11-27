@@ -3,7 +3,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{bloom::BloomFilter, transit::{TransitValue, encode_msgpack}};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema};
 use rtdb_types::{EntityId, Iid, LogicalType, Result, ScalarType, Value};
-use crate::{columnar::ColumnBatch, context::Execution, invalid, join_key::BorrowedListKey, scalar_key::ScalarKey};
+use crate::{columnar::ColumnBatch, context::Execution, invalid, scalar_key::ScalarKey, set_keys::{BloomKey, direct_bloom_hashes}};
 
 struct IidEntries {
     values: BTreeSet<Iid>,
@@ -373,7 +373,7 @@ impl PushdownBuilder {
             };
             let column = schema.position(*id).and_then(|position| batch.columns.get(position))
                 .ok_or_else(|| invalid("pushdown-key", "Build key column is outside its batch"))?;
-            if let Some(((xxhash, murmur3), scalar)) = crate::set_keys::direct_bloom_hashes(column, row) {
+            if let Some(BloomKey { hashes: (xxhash, murmur3), scalar, retain_iid_limit }) = direct_bloom_hashes(column, row) {
                 if let Some(ScalarKey::Signed(value)) = scalar && !key.recorded.record((value, xxhash, murmur3), memory)? { continue; }
                 key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
                 let other_zero = match scalar {
@@ -389,18 +389,9 @@ impl PushdownBuilder {
                     let supported = match scalar {
                         Some(ScalarKey::Null) => true,
                         Some(scalar) => iids.insert_scalar(scalar, memory)?,
-                        None => false,
+                        None => retain_iid_limit && matches!(iids, IidCandidates::LimitExceeded(_)),
                     };
                     if !supported { key.filter.iids = None; }
-                }
-                continue;
-            }
-            if let Some(list) = BorrowedListKey::read(column, row) {
-                let (xxhash, murmur3) = list.hashes::<true>();
-                key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
-                if matches!(list, BorrowedListKey::Values { .. })
-                    && !matches!(key.filter.iids, Some(IidCandidates::LimitExceeded(_))) {
-                    key.filter.iids = None;
                 }
                 continue;
             }

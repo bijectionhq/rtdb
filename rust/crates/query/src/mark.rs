@@ -565,7 +565,7 @@ mod facts_tests {
         let value = Value::List(rtdb_types::ListValue::from_f32(values));
 
         assert_eq!(membership_hash(&batch, 0, 0, &context).unwrap(), hash_values([&value]).unwrap());
-        let (actual, scalar) = crate::set_keys::direct_bloom_hashes(&batch.columns[0], 0).unwrap();
+        let crate::set_keys::BloomKey { hashes: actual, scalar, .. } = crate::set_keys::direct_bloom_hashes(&batch.columns[0], 0).unwrap();
         assert_eq!(actual, (rtdb_columnar::hash_value(&value, 0).unwrap(), rtdb_columnar::hash_value_murmur3(&value, 0).unwrap()));
         assert!(scalar.is_none());
     }
