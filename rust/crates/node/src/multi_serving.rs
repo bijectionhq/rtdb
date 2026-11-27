@@ -8,7 +8,7 @@ use rtdb_tx::transact::{
     CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, MemoryBudget, Result, TableRef, Timestamp,
+    Anomaly, AnomalyCategory, AnomalyKind, EntityId, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{
         At, Basis, ClaimEvidence, ClaimScope, Layer, ManagedCheckpointReservation, ManagedCheckpointTarget,
         NativeCheckpointCustody, NativeCheckpointMember, NativeCustodyFence, NativeDependentCustodyDisposition,
@@ -144,7 +144,7 @@ impl MultiFollower {
                 _ => return Err(Anomaly::unsupported("rtdb/follower-source", "The follower selects Latest, AtLeast or Exactly")),
             }
             let view = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now).map_err(|error| {
-                if error.code == "rtdb/unknown-basis" {
+                if error.is(AnomalyKind::UnknownBasis) {
                     Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired", "The replica has no retained exact cut at this basis")
                 } else { error }
             })?;
@@ -601,7 +601,7 @@ impl ServingDriver for MultiServing {
                         view.key_generation = Some(generation);
                         return Ok(view);
                     }
-                    Err(error) if error.code == "rtdb/basis-ahead" && Instant::now() < deadline => {
+                    Err(error) if error.is(AnomalyKind::BasisAhead) && Instant::now() < deadline => {
                         applied.changed(deadline).await?;
                     }
                     Err(error) => return Err(error),
@@ -614,7 +614,7 @@ impl ServingDriver for MultiServing {
                               cancellation: &CancellationToken) -> Result<workload::Reply> {
         cancellation.run_until_cancelled(async {
             let local = self.managed_workload_local(request.clone()).await;
-            if local.as_ref().err().is_some_and(|error| error.code == "rtdb/no-writer")
+            if local.as_ref().err().is_some_and(|error| error.is(AnomalyKind::NoWriter))
                 && let Some(route) = &self.route
             {
                 return route.forward_workload(self.incarnation, request).await;
@@ -839,7 +839,7 @@ impl ServingDriver for MultiServing {
                 At::AtLeast(basis) if basis.incarnation() == self.incarnation && basis <= cut.basis => cut.basis,
                 At::Linearizable => cut.basis,
                 _ => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/basis-ahead",
-                    "The requested basis is outside the admitted writer cut")),
+                    "The requested basis is outside the admitted writer cut").with_kind(AnomalyKind::BasisAhead)),
             };
             let view = index.view(&source.branch, At::Exactly(basis), source.layer, now)?;
             let snapshot = if let Some(groups) = &cut.custody_groups {

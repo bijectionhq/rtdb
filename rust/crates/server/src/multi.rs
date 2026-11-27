@@ -27,7 +27,7 @@ use rtdb_node::{
 };
 use rtdb_storage::{IoRegion, LocalStore, ObjectStore};
 use rtdb_stream_journal::{CONSENSUS_SCHEME, ConsensusJournal, Credentials, JournalConfig, StreamJournal};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp,
+use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, Result, Timestamp,
     rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity},
 };
 use sha2::{Digest, Sha256};
@@ -991,13 +991,13 @@ impl MultiRuntime {
                 }
                 for driver in databases {
                     match driver.maintain_journal_bound().await {
-                        Err(error) if !matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/interrupted") => {
+                        Err(error) if !error.is(AnomalyKind::NoWriter) && error.category != AnomalyCategory::Interrupted => {
                             ::tracing::warn!("Multi journal checkpoint deferred: {error}");
                         }
                         _ => (),
                     }
                     match driver.maintain_ranked_catalog(&maintenance).await {
-                        Err(error) if !matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/interrupted") => {
+                        Err(error) if !error.is(AnomalyKind::NoWriter) && error.category != AnomalyCategory::Interrupted => {
                             ::tracing::warn!("Multi ranked catalogue publication deferred: {error}");
                         }
                         _ => (),

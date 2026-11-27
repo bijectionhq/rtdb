@@ -450,7 +450,7 @@ impl BranchIndex {
             At::AtLeast(basis) => {
                 self.require_incarnation(basis)?;
                 if basis > self.head.basis {
-                    return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/basis-ahead", "The requested basis has not applied"));
+                    return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/basis-ahead", "The requested basis has not applied").with_kind(rtdb_types::AnomalyKind::BasisAhead));
                 }
                 Ok(self.head)
             }
@@ -469,7 +469,7 @@ impl BranchIndex {
         self.require_incarnation(basis)?;
         if self.classic_checkpoint.is_some_and(|checkpoint| basis < checkpoint) { return Err(classic_cut_expired()); }
         let system_time = self.times.get(&basis.position()).copied().ok_or_else(|| {
-            Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-basis", "The database has no transaction at this basis")
+            Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-basis", "The database has no transaction at this basis").with_kind(rtdb_types::AnomalyKind::UnknownBasis)
         })?;
         Ok(BranchCut { basis, system_time })
     }

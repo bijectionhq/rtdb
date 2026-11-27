@@ -164,7 +164,10 @@ fn status(error: Status) -> Anomaly {
         .and_then(|encoded| encoded.to_bytes().ok())
         .and_then(|bytes| data::Error::decode(bytes).ok())
     {
-        return Anomaly::new(category, detail.code, detail.message);
+        let kind = rtdb_types::AnomalyKind::from_wire_code(&detail.code);
+        let mut anomaly = Anomaly::new(category, detail.code, detail.message);
+        anomaly.kind = kind;
+        return anomaly;
     }
     Anomaly::new(category, "rtdb.admin/request", error.message())
 }

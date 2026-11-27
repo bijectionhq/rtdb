@@ -150,7 +150,7 @@ impl MultiServing {
                 let cut = index
                     .view(&source.branch, source.at, source.layer, now)
                     .map_err(|error| {
-                        if follower.is_some() && error.code == "rtdb/unknown-basis" {
+                        if follower.is_some() && error.is(rtdb_types::AnomalyKind::UnknownBasis) {
                             Anomaly::new(
                                 rtdb_types::AnomalyCategory::NotFound,
                                 "rtdb/cursor-expired",

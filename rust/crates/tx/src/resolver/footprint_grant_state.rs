@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use rtdb_columnar::read_value;
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, Result, StructFields, TableRef, Timestamp, Value,
+    Anomaly, AnomalyCategory, AnomalyKind, EntityId, Result, StructFields, TableRef, Timestamp, Value,
 };
 use sha2::{Digest, Sha256};
 
@@ -43,17 +43,20 @@ pub(crate) fn work_key_id(work_key: &str) -> u64 {
 /// XTDB's code for a failed `ASSERT`, the conflict a transaction raises against data that changed under it.
 pub(crate) const ASSERT_FAILED: &str = "xtdb/assert-failed";
 
+/// A failed `ASSERT`: XTDB's conflict for data that changed under the transaction.
+pub(crate) fn assert_failed(message: String) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, ASSERT_FAILED, message).with_kind(AnomalyKind::OptimisticConflict)
+}
+
 fn footprint_grant_fenced() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/footprint-grant-fenced", "Target footprint is fenced by a live durable SS8 grant")
+        .with_kind(AnomalyKind::OptimisticConflict)
 }
 
 /// Whether an abort is one of the optimistic conflicts a work key's durable grant debits: a failed assertion, or a write
-/// fenced by another work key's grant. These are the only conflicts the resolver raises for data that changed under a
-/// transaction; its other conflicts (expired deadlines, existing declarations, stale owned observations) are not debited.
-pub(crate) fn is_definite_occ_conflict(error: &Anomaly) -> bool {
-    error.category == AnomalyCategory::Conflict
-        && (error.code == ASSERT_FAILED || error.code == footprint_grant_fenced().code)
-}
+/// fenced by another work key's grant. These are the only conflicts raised with the optimistic-conflict kind; the resolver's
+/// other conflicts (expired deadlines, existing declarations, stale owned observations) are not debited.
+pub(crate) fn is_definite_occ_conflict(error: &Anomaly) -> bool { error.is(AnomalyKind::OptimisticConflict) }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DurableGrantRow {
@@ -519,8 +522,11 @@ mod tests {
     #[test]
     fn a_grant_debits_only_the_conflicts_the_resolver_raises_for_changed_data() {
         assert!(is_definite_occ_conflict(&footprint_grant_fenced()));
-        assert!(is_definite_occ_conflict(&Anomaly::new(AnomalyCategory::Conflict, ASSERT_FAILED, "Assert failed")));
+        assert!(is_definite_occ_conflict(&assert_failed("Assert failed".into())));
         assert!(!is_definite_occ_conflict(&Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "deadline")));
-        assert!(!is_definite_occ_conflict(&Anomaly::incorrect(ASSERT_FAILED, "not a conflict")));
+        assert!(!is_definite_occ_conflict(&Anomaly::new(AnomalyCategory::Conflict, ASSERT_FAILED, "a code alone is not the kind")));
+        for error in [footprint_grant_fenced(), assert_failed("Assert failed".into())] {
+            assert_eq!(AnomalyKind::from_wire_code(&error.code), error.kind, "{error}");
+        }
     }
 }

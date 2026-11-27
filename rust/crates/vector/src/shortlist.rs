@@ -487,8 +487,8 @@ fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, bounds: Temp
 
 /// The approximate route is optional: a refused budget or an unreadable generation hands the read to the exact route.
 pub fn declined(error: &Anomaly) -> bool {
-    error.category != AnomalyCategory::Interrupted && (error.is(AnomalyKind::ResourceExhausted)
-        || matches!(error.code.as_str(), "rtdb.storage/missing-object" | "rtdb.vector/corrupt-generation"))
+    error.category != AnomalyCategory::Interrupted
+        && matches!(error.kind, Some(AnomalyKind::ResourceExhausted | AnomalyKind::MissingObject | AnomalyKind::CorruptObject))
 }
 
 #[cfg(test)]

@@ -170,6 +170,7 @@ pub fn map_status(status: Status) -> Status {
     {
         let mut decoded = Anomaly::new_nullable(native.category, native.code.unwrap_or_default(), native.message);
         decoded.context = native.data;
+        decoded.kind = rtdb_types::AnomalyKind::from_wire_code(&decoded.code);
         return anomaly(decoded);
     }
     let category = match status.code() {

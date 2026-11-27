@@ -4252,7 +4252,7 @@ impl NativeSession {
         let owner = self.state.user().filter(|owner| !owner.is_empty()).map(str::to_owned)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal"))?;
         let charge = self.service.memory.reserve(database.capacity().checked_add(owner.capacity()).and_then(|bytes| bytes.checked_add(2048))
-            .ok_or_else(|| Anomaly::incorrect("rtdb.owned/read-size", "Retained read allocation overflow"))?)?;
+            .ok_or_else(|| Anomaly::incorrect("rtdb.owned/read-size", "Retained read allocation overflow").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded))?)?;
         let attached = node.attached_database(&database, self.service.placement.as_ref())?;
         let attached_scope = match &attached.await_authority {
             AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
@@ -4404,7 +4404,7 @@ impl NativeSession {
     pub async fn query_ra(&mut self, source: &str, arguments: StructFields<Value>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let database = self.state.database().to_owned();
         let context = self.query_context_for(&database, cancellation).await?;
-        let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory");
+        let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
         let per_name = std::mem::size_of::<(String, (usize, LogicalType))>() * 16 + 256;
         let metadata_bytes = arguments.iter().try_fold(4096usize, |total, (name, value)| {
             let names = name.len().checked_mul(4).ok_or_else(overflow)?;
@@ -4432,7 +4432,7 @@ impl NativeSession {
             .ok_or_else(|| Anomaly::incorrect("rtdb.query/parameter-row", "Logical relation arguments require one Arrow row"))?;
         let database = self.state.database().to_owned();
         let context = self.query_context_for(&database, cancellation).await?;
-        let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory");
+        let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded);
         let per_name = std::mem::size_of::<(String, (usize, LogicalType))>() * 16 + 256;
         let metadata_bytes = names.iter().zip(arguments.types()).try_fold(4096usize, |total, (name, ty)| {
             let names = name.len().checked_mul(4).ok_or_else(overflow)?;
@@ -4787,7 +4787,7 @@ fn historical_guard_sample(error: &Anomaly) -> Option<Timestamp> {
 }
 
 fn is_historical_guard_abort(error: &Anomaly) -> bool {
-    error.code == "xtdb/assert-failed" && historical_guard_sample(error).is_some()
+    error.is(AnomalyKind::OptimisticConflict) && historical_guard_sample(error).is_some()
 }
 
 /// The code a placed node refuses a command with when it no longer holds the command's database.

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_plan::*;
-use rtdb_types::{Anomaly, LogicalType, MemoryBudget, Result, ScalarType, TableRef, Value};
+use rtdb_types::{Anomaly, AnomalyKind, LogicalType, MemoryBudget, Result, ScalarType, TableRef, Value};
 use sqlparser::ast as ast;
 
 use crate::parse::{ParsedStatement, Syntax, TemporalClause, TemporalExtent};
@@ -252,7 +252,7 @@ impl Context<'_> {
     }
 
     fn check_diagnostics(&mut self, terminal: Option<&Anomaly>) -> Result<()> {
-        if terminal.is_some_and(|error| !error.is_caller_error() || error.code.starts_with("rtdb/") || is_grammar_rejection(error)) {
+        if terminal.is_some_and(|error| !error.is_caller_error() || stands_alone(error)) {
             return Ok(());
         }
         let mut errors = std::mem::take(&mut self.diagnostics).into_iter();
@@ -1560,6 +1560,7 @@ const GRAMMAR_REJECTION: &str = "Errors parsing SQL statement:\n  - ";
 /// A construct the vendor parser admits but the reference `Sql.g4` grammar has no production for.
 pub(crate) fn grammar_rejected(construct: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("xtdb/sql-error", format!("{GRAMMAR_REJECTION}{construct} is not part of the XTDB SQL grammar"))
+        .with_kind(AnomalyKind::GrammarRejected)
 }
 
 /// `Sql.g4`'s `identifier` admits an unquoted keyword only when it is non-reserved, whereas the vendor parser reads any word as a table name.
@@ -1570,9 +1571,12 @@ fn grammar_table_name(name: &ast::ObjectName) -> Result<()> {
     }
 }
 
-fn is_grammar_rejection(error: &Anomaly) -> bool {
-    error.code == "xtdb/sql-error" && error.message.as_deref().is_some_and(|message| message.starts_with(GRAMMAR_REJECTION))
-}
+fn is_grammar_rejection(error: &Anomaly) -> bool { error.is(AnomalyKind::GrammarRejected) }
+
+/// Whether a terminal error is reported on its own rather than after the planning errors gathered before it: a grammar
+/// rejection, which upstream raises while parsing, or a limit, exhaustion or out-of-range value, which is no planning error.
+/// A missing table is a planning error upstream, so it joins the report.
+fn stands_alone(error: &Anomaly) -> bool { error.kind.is_some_and(|kind| kind != AnomalyKind::TableNotFound) }
 
 fn scan_target(input: &Relation) -> Result<(QualifiedTable, TemporalFilter)> {
     match input.node() {
@@ -1658,4 +1662,23 @@ fn alias_projection<'a>(expr: &ast::Expr, projection: &'a [ast::SelectItem], inp
         ast::SelectItem::ExprWithAlias { expr, alias } if identifier(alias).normalized() == name.normalized() => Some(expr),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_grammar_rejection_is_known_by_its_kind_not_its_message() {
+        let rejected = grammar_rejected("LIMIT BY");
+        assert!(is_grammar_rejection(&rejected) && stands_alone(&rejected));
+        let worded_alike = error(format!("{GRAMMAR_REJECTION}LIMIT BY is not part of the XTDB SQL grammar"));
+        assert!(!is_grammar_rejection(&worded_alike) && !stands_alone(&worded_alike));
+    }
+
+    #[test]
+    fn limits_stand_alone_but_a_missing_table_joins_the_planning_report() {
+        assert!(stands_alone(&Anomaly::incorrect("rtdb/type-size", "too big").with_kind(AnomalyKind::ProgramLimitExceeded)));
+        assert!(!stands_alone(&rtdb_plan::table_not_found("Table not found: t")));
+    }
 }

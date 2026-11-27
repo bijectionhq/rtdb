@@ -505,12 +505,22 @@ impl FileError {
     pub fn needs_repair(&self) -> bool { !matches!(self, Self::Unavailable(_)) }
 
     pub(crate) fn from_anomaly(error: rtdb_types::Anomaly) -> Self {
-        match error.code.as_str() {
-            "rtdb.storage/missing-object" => Self::Missing,
-            "rtdb.search/file" | "rtdb.search/corrupt-file" | "rtdb.storage/invalid-range" => Self::Corrupt(error),
+        match error.kind {
+            Some(rtdb_types::AnomalyKind::MissingObject) => Self::Missing,
+            Some(rtdb_types::AnomalyKind::CorruptObject) => Self::Corrupt(error),
             _ => Self::Unavailable(error),
         }
     }
+}
+
+/// A recorded search file that is gone from the object store, reported as the object store reports it.
+pub(crate) fn missing_object(key: &str) -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::fault("rtdb.storage/missing-object", rtdb_storage::Error::MissingObject(key.to_owned()).to_string())
+        .with_kind(rtdb_types::AnomalyKind::MissingObject)
+}
+
+pub(crate) fn corrupt_file(message: &str) -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::fault("rtdb.search/corrupt-file", message).with_kind(rtdb_types::AnomalyKind::CorruptObject)
 }
 
 /// An opened file, and the buffer pool it was read through: a pool is one database's storage for as long as it is open.
@@ -754,11 +764,11 @@ impl SearchRuntime {
         let key = ObjectKey::new(run.object_key(slug)?)?;
         let (locator, inline) = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode_route_with_inline)
             .filter(|(locator, _)| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64)
-            .ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.search/corrupt-file", "Search run has no matching root locator"))?;
+            .ok_or_else(|| corrupt_file("Search run has no matching root locator"))?;
         let identity = crate::lane::run_identity(slug, run.definition_id(), run.definition_version(), &run.blocks, run.rebuild(), run.allocation());
         if fresh { storage.invalidate(&key).await?; }
         self.open_tree(storage, &key, &locator, columns, &identity, run.definition_version(), fresh, inline).await.map_err(|error| match error {
-            FileError::Missing => rtdb_types::Anomaly::fault("rtdb.storage/missing-object", key.as_str()),
+            FileError::Missing => missing_object(key.as_str()),
             FileError::Corrupt(error) | FileError::Unavailable(error) => error,
         })
     }
@@ -839,7 +849,7 @@ impl SearchRuntime {
         }
         if let Some(locator) = ranged {
             let opened = match SearchFile::open_remote(storage, key, locator, columns).await {
-                Err(error) if error.code == "rtdb.storage/memory-limit" && self.files.lock().weight > 0 => {
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) && self.files.lock().weight > 0 => {
                     self.release_file_cache();
                     SearchFile::open_remote(storage, key, locator, columns).await
                 }
@@ -1135,6 +1145,17 @@ impl SearchRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_error_follows_the_anomaly_kind_not_its_code() {
+        let missing = missing_object("tables/public$docs/search/f.arrow");
+        assert_eq!(missing.message.as_deref(), Some("Object tables/public$docs/search/f.arrow doesn't exist."));
+        assert!(matches!(FileError::from_anomaly(missing), FileError::Missing));
+        assert!(matches!(FileError::from_anomaly(rtdb_storage::Error::MissingObject("k".into()).into()), FileError::Missing));
+        assert!(matches!(FileError::from_anomaly(corrupt_file("bad root")), FileError::Corrupt(_)));
+        let worded_alike = rtdb_types::Anomaly::fault("rtdb.storage/missing-object", "k");
+        assert!(matches!(FileError::from_anomaly(worded_alike), FileError::Unavailable(_)));
+    }
 
     #[test]
     fn arrow_build_live_pages_keep_the_delta_slice_and_its_charge() {

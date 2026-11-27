@@ -187,8 +187,8 @@ impl From<rtdb_types::EventHeader> for KeyedEvent {
     }
 }
 
-fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()) }
-fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file", message.to_string()) }
+fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()).with_kind(rtdb_types::AnomalyKind::CorruptObject) }
+fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file", message.to_string()).with_kind(rtdb_types::AnomalyKind::CorruptObject) }
 
 fn op_code(op: EventOp) -> u8 { match op { EventOp::Put => 0, EventOp::Delete => 1, EventOp::Erase => 2, EventOp::Redacted => 3 } }
 fn op_of(code: u8) -> Result<EventOp> { match code { 0 => Ok(EventOp::Put), 1 => Ok(EventOp::Delete), 2 => Ok(EventOp::Erase), 3 => Ok(EventOp::Redacted), _ => Err(corrupt("Search file key has no such operation")) } }

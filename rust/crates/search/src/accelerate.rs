@@ -68,7 +68,7 @@ fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, recency: i64
 }
 
 fn optional_build_refused(error: &Anomaly) -> bool {
-    error.is(AnomalyKind::ResourceExhausted) || error.code == "rtdb.search/input-order"
+    error.is(AnomalyKind::ResourceExhausted) || error.is(AnomalyKind::InputOutOfOrder)
 }
 
 #[async_trait]
@@ -416,9 +416,9 @@ impl SearchAccelerator {
         if recorded.format >= crate::file::TREE_FORMAT_VERSION {
             use crate::runtime::FileError;
             let locator = recorded.tree.as_ref().ok_or_else(|| FileError::Corrupt(
-                Anomaly::fault("rtdb.search/corrupt-file", "Recorded search tree has no matching root locator")))?;
+                crate::runtime::corrupt_file("Recorded search tree has no matching root locator")))?;
             let field = definition.columns.iter().position(|indexed| indexed == column).ok_or_else(|| FileError::Corrupt(
-                Anomaly::fault("rtdb.search/corrupt-file", "Recorded search definition omits its indexed column")))?;
+                crate::runtime::corrupt_file("Recorded search definition omits its indexed column")))?;
             return Box::pin(runtime.exact_tree(storage, &recorded.key, &definition.columns, identity, definition.version,
                 locator, field, queries, load.needs_all_runs())).await;
         }
@@ -1293,7 +1293,7 @@ impl SearchAccelerator {
                 let pending = match next {
                     Err((index, error)) if optional_build_refused(&error) || error.code.starts_with("rtdb.search/")
                         || error.code.starts_with("rtdb.storage/") => {
-                        if error.code == "rtdb.storage/memory-limit" { self.runtime.release_file_cache(); }
+                        if error.is(AnomalyKind::ResourceExhausted) { self.runtime.release_file_cache(); }
                         if crate::runtime::FileError::from_anomaly(error).needs_repair()
                             && let Some(file) = index.and_then(|index| files.get(index)) {
                             let table = &request.scan.table.name.table;

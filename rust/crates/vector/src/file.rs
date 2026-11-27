@@ -567,7 +567,7 @@ impl Block {
 
 fn io(error: std::io::Error) -> Anomaly { Anomaly::fault("rtdb.vector/io", error.to_string()) }
 fn arrow(error: arrow_schema::ArrowError) -> Anomaly { Anomaly::fault("rtdb.vector/arrow", error.to_string()) }
-pub(crate) fn corrupt(detail: &str) -> Anomaly { Anomaly::fault("rtdb.vector/corrupt-generation", format!("Corrupt vector generation: {detail}")) }
+pub(crate) fn corrupt(detail: &str) -> Anomaly { Anomaly::fault("rtdb.vector/corrupt-generation", format!("Corrupt vector generation: {detail}")).with_kind(rtdb_types::AnomalyKind::CorruptObject) }
 
 #[cfg(test)]
 mod tests {

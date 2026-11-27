@@ -648,7 +648,7 @@ impl SearchBuilder {
                 let key = ObjectKey::new(entry.slug.data_key(&trie.key))?;
                 let input = match download(self.store.as_ref(), &self.memory, &key, &directory.path().join("source.arrow"), cancellation).await {
                     Ok(file) => file,
-                    Err(error) if error.code == "rtdb.storage/missing-object" => {
+                    Err(error) if error.is(AnomalyKind::MissingObject) => {
                         let blocks = vec![trie.key.block_index().0];
                         let recovered = self.recover_from_history(&index, &definition.columns, &snapshot, &blocks, None, cancellation).await;
                         let RecoveredRun { contents, charge, receipt } = match recovered {

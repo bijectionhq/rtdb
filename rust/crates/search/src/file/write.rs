@@ -552,11 +552,11 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
                 let row = page.row(index, columns)?;
                 let iid = row.header.iid;
                 if member_iid.is_none() && previous_member_iid.is_some_and(|previous| previous >= iid) {
-                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));
+                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
                 }
                 if let Some(previous) = member_iid {
                     if previous > iid {
-                        return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID order"));
+                        return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
                     }
                     if previous != iid {
                         for (key, entity) in std::mem::take(&mut entities) {
@@ -566,7 +566,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
                     }
                 }
                 if previous_time.is_some_and(|previous| previous < row.header.precedence()) {
-                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order"));
+                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
                 }
                 previous_time = Some(row.header.precedence());
                 member_iid = Some(iid);

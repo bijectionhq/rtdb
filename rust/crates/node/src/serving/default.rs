@@ -314,7 +314,7 @@ impl ServingDriver for DefaultServing {
                     }
                     return Ok(view);
                 }
-                Err(error) if matches!(source.at, At::AtLeast(_)) && error.code == "rtdb/basis-ahead" => {
+                Err(error) if matches!(source.at, At::AtLeast(_)) && error.is(rtdb_types::AnomalyKind::BasisAhead) => {
                     let wait = self.handle.after(snapshot.index.head().basis, cancellation);
                     tokio::time::timeout_at(deadline, wait).await.map_err(|_| error)??;
                     snapshot = self.handle.view(At::Latest, cancellation).await?;

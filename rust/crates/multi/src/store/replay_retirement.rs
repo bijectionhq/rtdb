@@ -177,7 +177,7 @@ impl<'a> ObservedPack<'a> {
         let Some(publication) = retirement.observe_readable(key).await? else { return Ok(None); };
         let read = |range| retirement.read_observed_range(key, &publication, range);
         let index = match read_pack_index_with(key, publication.size(), MAXIMUM_MEMBER_BYTES as usize, read).await {
-            Err(error) if error.code == "rtdb.storage/message-too-large" => return Ok(None),
+            Err(error) if error.is(rtdb_types::AnomalyKind::ConfigurationLimitExceeded) => return Ok(None),
             result => result?,
         };
         Ok(Some(Self { key, index, storage: PackStorage::Terminal { retirement, publication } }))

@@ -256,7 +256,7 @@ impl NativeServingHandle {
                         )),
                         At::Exactly(requested) if requested > basis => return Err(Anomaly::new(
                             AnomalyCategory::NotFound, "rtdb/unknown-basis", "The Classic catalog has not installed the requested replica cut",
-                        )),
+                        ).with_kind(rtdb_types::AnomalyKind::UnknownBasis)),
                         At::AtLeast(requested) => requested <= basis,
                         At::AsOf(time) if time < system_time => return Err(Anomaly::unsupported(
                             "rtdb/classic-historical-basis", "The Classic catalog has no retained replica cut for the requested time",
@@ -1164,7 +1164,7 @@ pub(crate) fn interrupted() -> Anomaly {
     Anomaly::new(AnomalyCategory::Interrupted, "rtdb/transaction-outcome-unknown", "Recover the transaction outcome by key")
 }
 fn foreign_basis() -> Anomaly {
-    Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-basis", "The basis belongs to another database incarnation")
+    Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-basis", "The basis belongs to another database incarnation").with_kind(rtdb_types::AnomalyKind::UnknownBasis)
 }
 fn invalid() -> Anomaly {
     Anomaly::fault("rtdb/default-serving-record", "The serving record does not extend the applied prefix")

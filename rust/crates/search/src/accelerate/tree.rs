@@ -38,7 +38,7 @@ impl RecordedTree {
             let identity = crate::file::artefact_identity(entry.slug.as_str(), &self.pack.owner, &self.pack.definition_id, definition.version);
             match runtime.tree_file(request.storage, &self.pack.key, &self.pack.locator, &definition.columns, &identity, definition.version, false).await {
                 Ok(file) => Ok(file),
-                Err(crate::runtime::FileError::Missing) => Err(Anomaly::fault("rtdb.storage/missing-object", self.pack.key.as_str())),
+                Err(crate::runtime::FileError::Missing) => Err(crate::runtime::missing_object(self.pack.key.as_str())),
                 Err(crate::runtime::FileError::Corrupt(error) | crate::runtime::FileError::Unavailable(error)) => Err(error),
             }
         }).await.cloned()

@@ -118,8 +118,8 @@ fn schema(columns: &[String]) -> (Schema, Vec<Field>) {
     (builder.build(), fields)
 }
 
-fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()) }
-fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file", message.to_string()) }
+fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()).with_kind(rtdb_types::AnomalyKind::CorruptObject) }
+fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file", message.to_string()).with_kind(rtdb_types::AnomalyKind::CorruptObject) }
 
 fn op_code(op: EventOp) -> u8 { match op { EventOp::Put => 0, EventOp::Delete => 1, EventOp::Erase => 2, EventOp::Redacted => 3 } }
 fn op_of(code: u8) -> Result<EventOp> { match code { 0 => Ok(EventOp::Put), 1 => Ok(EventOp::Delete), 2 => Ok(EventOp::Erase), 3 => Ok(EventOp::Redacted), _ => Err(corrupt("Search file key has no such operation")) } }
@@ -212,11 +212,11 @@ where
                 let system = (header.system_from.0, header.position);
                 if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the file's columns")); }
                 if previous.is_none() && previous_member_iid.is_some_and(|previous| previous >= iid) {
-                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));
+                    return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
                 }
                 if let Some((previous_iid, previous_system)) = previous {
                     if previous_iid > iid || (previous_iid == iid && previous_system < system) {
-                        return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID and descending system-time order"));
+                        return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID and descending system-time order").with_kind(rtdb_types::AnomalyKind::InputOutOfOrder));
                     }
                     if previous_iid != iid {
                         for (identity, entity) in std::mem::take(&mut entities) {

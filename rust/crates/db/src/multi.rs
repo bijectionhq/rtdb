@@ -1164,7 +1164,7 @@ fn no_writer() -> Anomaly {
         AnomalyCategory::Unavailable,
         "rtdb/no-writer",
         "This node has no active writer lease",
-    )
+    ).with_kind(rtdb_types::AnomalyKind::NoWriter)
 }
 
 fn follower_unavailable() -> Anomaly {
