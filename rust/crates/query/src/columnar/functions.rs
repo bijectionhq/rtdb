@@ -11,7 +11,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray, new_null_array};
+use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray, PrimitiveArray, StringArray,
+    TimestampMicrosecondArray, builder::{BooleanBuilder, PrimitiveBuilder}, new_null_array, types::{ArrowPrimitiveType, Float64Type, Int32Type}};
 use arrow_schema::{DataType, Field as ArrowField, TimeUnit as ArrowUnit};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_expr::kernels::{self, Function, LikeMatcher, Selection};
@@ -288,7 +289,7 @@ enum Kind {
     Round { value: Box<Node>, scale: Option<i64> },
     Abs(Box<Node>),
     TextCase { text: Box<Node>, upper: bool },
-    Length(Box<Node>),
+    Length { operand: Box<Node>, octets: bool },
     Substring { text: Box<Node>, position: Box<Node>, length: Option<Box<Node>> },
     /// A function of one double, reading an integer argument as the double nearest it.
     Double(fn(f64) -> f64, Box<Node>),
@@ -305,7 +306,10 @@ enum Kind {
     /// IS NULL or IS UNKNOWN, or IS NOT NULL where `negated`.
     IsNull { operand: Box<Node>, negated: bool },
     /// LIKE over a literal or bound pattern.
-    Like { input: Box<Node>, pattern: Box<Node>, escape: Option<char>, case_insensitive: bool, negated: bool },
+    Like {
+        input: Box<Node>, pattern: Box<Node>, escape: Option<char>, case_insensitive: bool, negated: bool,
+        compiled: Option<Arc<LikeMatcher>>,
+    },
     /// BETWEEN, not symmetric.
     Between { operand: Box<Node>, low: Box<Node>, high: Box<Node> },
     /// AND, or OR where not `and`.
@@ -319,10 +323,11 @@ impl Kind {
     /// them; `None` for a leaf, a CASE or a predicate answered as truths.
     fn arguments(&self) -> Option<Vec<&Node>> {
         Some(match self {
-            Self::Column(_) | Self::Literal(_) | Self::Parameter(_) | Self::Case { .. } | Self::Compare { .. } | Self::Identical { .. }
+            Self::Column(_) | Self::Literal(_) | Self::Parameter(_) | Self::Case { .. } | Self::Length { .. } | Self::Double(..)
+                | Self::Compare { .. } | Self::Identical { .. }
                 | Self::IsNull { .. } | Self::Like { .. } | Self::Between { .. } | Self::Logical { .. } => return None,
             Self::Extract { source: argument, .. } | Self::Round { value: argument, .. } | Self::Abs(argument) | Self::TextCase { text: argument, .. }
-                | Self::Length(argument) | Self::Double(_, argument) | Self::Negate(argument) | Self::Cast(argument) | Self::Not(argument) => vec![argument.as_ref()],
+                | Self::Negate(argument) | Self::Cast(argument) | Self::Not(argument) => vec![argument.as_ref()],
             Self::Substring { text, position, length } => [Some(text), Some(position), length.as_ref()].into_iter().flatten().map(|argument| argument.as_ref()).collect(),
             Self::Arithmetic { left, right, .. } => vec![left.as_ref(), right.as_ref()],
         })
@@ -693,15 +698,14 @@ impl Node {
                     };
                     (Kind::TextCase { text: Box::new(text), upper: false }, ty)
                 }
-                (Function::Length, [text]) => {
-                    let (text, t_ty) = Self::bind_vector(text, schema, params)?;
-                    if !strict_args_settle(&[&text]) { return None; }
-                    let ty = match t_ty {
-                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
-                        VectorType::Text if result_ty == VectorType::I32 => VectorType::I32,
+                (function @ (Function::Length | Function::OctetLength), [text]) => {
+                    let (operand, kinds) = Self::bind_operand(text, schema, params)?;
+                    let ty = match kinds.as_slice() {
+                        [] if declared.nullable() => VectorType::Null,
+                        [predicate::CellKind::Text] if result_ty == VectorType::I32 => VectorType::I32,
                         _ => return None,
                     };
-                    (Kind::Length(Box::new(text)), ty)
+                    (Kind::Length { operand: Box::new(operand), octets: function == Function::OctetLength }, ty)
                 }
                 (Function::Substring, [text, position]) => {
                     let (text, t_ty) = Self::bind_vector(text, schema, params)?;
@@ -742,12 +746,13 @@ impl Node {
                 (Function::Mod, [left, right]) => Self::bind_arithmetic(BinaryOp::Modulo, left, right, &declared, &result_ty, schema, params)?,
                 (function, [value]) => {
                     let function = function.double()?;
-                    let (value, v_ty) = Self::bind_vector(value, schema, params)?;
-                    if !strict_args_settle(&[&value]) { return None; }
-                    let ty = match v_ty {
-                        VectorType::Null => { if !declared.nullable() { return None; } VectorType::Null }
-                        VectorType::F64 | VectorType::I64 | VectorType::I32 if result_ty == VectorType::F64 => VectorType::F64,
-                        _ => return None,
+                    let (value, kinds) = Self::bind_operand(value, schema, params)?;
+                    let ty = if kinds.is_empty() && declared.nullable() {
+                        VectorType::Null
+                    } else if result_ty == VectorType::F64 && kinds.iter().all(|kind| matches!(kind, predicate::CellKind::Int | predicate::CellKind::Float)) {
+                        VectorType::F64
+                    } else {
+                        return None;
                     };
                     (Kind::Double(function, Box::new(value)), ty)
                 }
@@ -837,12 +842,22 @@ impl Node {
                     if result_ty != VectorType::Bool { return None; }
                     VectorType::Bool
                 };
+                let compiled = match &pattern_node.kind {
+                    Kind::Literal(Value::Utf8(pattern)) =>
+                        LikeMatcher::compile(pattern, *escape, *case_insensitive, *negated).ok().map(Arc::new),
+                    _ => None,
+                };
+                // Scalar LIKE compiles a reached pattern before demanding a deferred input payload.
+                if compiled.is_none() && !matches!(&pattern_node.kind, Kind::Literal(Value::Null)) && !input_node.infallible() {
+                    return None;
+                }
                 (Kind::Like {
                     input: Box::new(input_node),
                     pattern: Box::new(pattern_node),
                     escape: *escape,
                     case_insensitive: *case_insensitive,
                     negated: *negated,
+                    compiled,
                 }, ty)
             }
             Expr::Between { operand, low, high, symmetric: false } => {
@@ -943,7 +958,7 @@ impl Node {
                     bytes = add(bytes, source.retained_bytes()?)?;
                 }
                 Kind::Round { value: child, .. } | Kind::Abs(child) | Kind::TextCase { text: child, .. }
-                | Kind::Length(child) | Kind::Double(_, child) | Kind::Negate(child) | Kind::Cast(child)
+                | Kind::Length { operand: child, .. } | Kind::Double(_, child) | Kind::Negate(child) | Kind::Cast(child)
                 | Kind::Not(child) | Kind::IsNull { operand: child, .. } => {
                     bytes = add(bytes, child.retained_bytes()?)?;
                 }
@@ -957,9 +972,13 @@ impl Node {
                     bytes = add(bytes, left.retained_bytes()?)?;
                     bytes = add(bytes, right.retained_bytes()?)?;
                 }
-                Kind::Like { input, pattern, .. } => {
+                Kind::Like { input, pattern, compiled, .. } => {
                     bytes = add(bytes, input.retained_bytes()?)?;
                     bytes = add(bytes, pattern.retained_bytes()?)?;
+                    if let Some(compiled) = compiled {
+                        bytes = add(bytes, size_of::<LikeMatcher>() + 2 * size_of::<usize>())?;
+                        bytes = add(bytes, compiled.retained_bytes())?;
+                    }
                 }
                 Kind::Between { operand, low, high } => {
                     bytes = add(bytes, operand.retained_bytes()?)?;
@@ -984,6 +1003,7 @@ impl Node {
             Kind::Column(_) | Kind::Literal(_) | Kind::Parameter(_) => true,
             Kind::Compare { left, right, .. } | Kind::Identical { left, right } => left.prepares() && right.prepares(),
             Kind::Like { input, pattern, .. } => input.prepares() && pattern.prepares(),
+            Kind::Length { operand, .. } | Kind::Double(_, operand) => operand.prepares(),
             Kind::IsNull { operand, .. } => operand.prepares(),
             // AND and OR answer as they are prepared where they may be null, and are deferred where they can't be.
             Kind::Logical { .. } => !self.declared.nullable() || self.infallible(),
@@ -1006,11 +1026,8 @@ impl Node {
             Kind::Not(operand) | Kind::IsNull { operand, .. } => operand.infallible(),
             Kind::Compare { left, right, .. } | Kind::Identical { left, right } | Kind::Logical { left, right, .. } => left.infallible() && right.infallible(),
             Kind::Between { operand, low, high } => operand.infallible() && low.infallible() && high.infallible(),
-            Kind::Like { input, pattern, escape, case_insensitive, negated } => input.infallible() && match &pattern.kind {
-                Kind::Literal(Value::Utf8(pattern)) => LikeMatcher::compile(pattern, *escape, *case_insensitive, *negated).is_ok(),
-                Kind::Literal(Value::Null) => true,
-                _ => false,
-            },
+            Kind::Like { input, pattern, compiled, .. } =>
+                input.infallible() && (compiled.is_some() || matches!(&pattern.kind, Kind::Literal(Value::Null))),
             Kind::Case { conditions, values } => conditions.iter().chain(values).all(Self::infallible),
             _ => false,
         })
@@ -1068,7 +1085,7 @@ impl Argument for Operand<'_> {
 }
 
 /// A predicate's answers: null at every row, as where a strict argument is, or a truth for each row.
-enum Truths { Null, Rows(Vec<Option<bool>>) }
+enum Truths { Null, Bits(BooleanArray, Arc<MemoryReservation>), Rows(Vec<Option<bool>>) }
 
 fn reads(rows: Selection<'_>, row: usize) -> bool { rows.is_none_or(|rows| rows[row]) }
 
@@ -1176,13 +1193,13 @@ impl Evaluation<'_> {
                     _ => None,
                 }
             }
-            Kind::Length(_) => {
-                let text = argument();
-                match &text.vector {
-                    Vector::Null => return null(),
-                    Vector::Text(values) => self.built(Some(Vector::I32(kernels::text_lengths(values))))?,
+            Kind::Length { operand, octets } => {
+                if len == 0 { return null(); }
+                let Some(operand) = self.operand(operand, selection)? else { return Ok(None) };
+                self.map_operand::<Int32Type>(&operand, selection, Vector::I32, |cell| match cell {
+                    Cell::Text(text) => i32::try_from(if *octets { text.len() } else { text.chars().count() }).ok(),
                     _ => None,
-                }
+                })?
             }
             Kind::Substring { length, .. } => {
                 let (text, position) = (argument(), argument());
@@ -1195,10 +1212,24 @@ impl Evaluation<'_> {
                 };
                 self.built(kernels::text_substrings(values, &positions.0, lengths.as_ref().map(|lengths| &lengths.0), selection)?.map(Vector::Text))?
             }
-            Kind::Double(function, _) => {
-                let argument = argument();
-                let Some(values) = self.doubles(&argument.vector)? else { return Ok(None) };
-                self.built(Some(Vector::F64(kernels::doubles(*function, &values.0))))?
+            Kind::Double(function, operand) => {
+                if len == 0 { return null(); }
+                let Some(operand) = self.operand(operand, selection)? else { return Ok(None) };
+                let flat_doubles = match &operand {
+                    Operand::Cells(Cells::Float(values)) => Some(*values),
+                    Operand::Computed(Charged { vector: Vector::F64(values), .. }) => Some(values),
+                    _ => None,
+                };
+                if selection.is_none() && let Some(values) = flat_doubles {
+                    if values.null_count() == len { return null(); }
+                    self.built(Some(Vector::F64(kernels::doubles(*function, values))))?
+                } else {
+                    self.map_operand::<Float64Type>(&operand, selection, Vector::F64, |cell| match cell {
+                        Cell::Float(value) => Some(function(value)),
+                        Cell::Int(value) => Some(function(value as f64)),
+                        _ => None,
+                    })?
+                }
             }
             Kind::Arithmetic { op, .. } => {
                 let (left, right) = (argument(), argument());
@@ -1333,13 +1364,52 @@ impl Evaluation<'_> {
         })
     }
 
+    fn map_operand<T: ArrowPrimitiveType>(&self, operand: &Operand<'_>, selection: Selection<'_>,
+        vector: impl FnOnce(PrimitiveArray<T>) -> Vector, value: impl Fn(Cell<'_>) -> Option<T::Native>,
+    ) -> Result<Option<Charged>> {
+        if matches!(operand, Operand::Constant(None) | Operand::Cells(Cells::Null) | Operand::Computed(Charged { vector: Vector::Null, .. })) {
+            return Ok(Some(Charged::shared(Vector::Null)));
+        }
+        let mut cells = (0..self.len).map(|row| {
+            if !reads(selection, row) { return Ok(None); }
+            operand.get(row)?.map(|cell| value(cell).ok_or(())).transpose()
+        }).enumerate();
+        let Some((first, cell)) = cells.find(|(_, cell)| !matches!(cell, Ok(None))) else {
+            return Ok(Some(Charged::shared(Vector::Null)));
+        };
+        let Ok(Some(cell)) = cell else { return Ok(None) };
+        let bytes = self.len.checked_mul(size_of::<T::Native>())
+            .and_then(|bytes| bytes.checked_add(PredicateSelection::bitmap_bound(self.len)))
+            .ok_or_else(super::size_error)?;
+        let charge = self.memory.reserve(bytes)?;
+        let mut output = PrimitiveBuilder::<T>::with_capacity(self.len);
+        output.append_nulls(first);
+        output.append_value(cell);
+        for (_, cell) in cells {
+            let Ok(cell) = cell else { return Ok(None) };
+            output.append_option(cell);
+        }
+        Ok(Some(Charged { vector: vector(output.finish()), _charge: Some(charge) }))
+    }
+
+    fn truth_bits(&self, mut read: impl FnMut(usize) -> std::result::Result<Option<bool>, ()>) -> Result<Option<Truths>> {
+        let charge = self.memory.reserve(PredicateSelection::bitmap_bound(self.len) * 2)?;
+        let mut output = BooleanBuilder::with_capacity(self.len);
+        for row in 0..self.len {
+            let Ok(value) = read(row) else { return Ok(None) };
+            output.append_option(value);
+        }
+        Ok(Some(Truths::Bits(output.finish(), charge)))
+    }
+
     /// A predicate's truths over the rows `selection` picks, as a vector of truths of its declared type.
     fn predicate(&self, node: &Node, selection: Selection<'_>) -> Result<Option<Charged>> {
         let truths = match &node.kind {
             Kind::Compare { op, left, right } => self.compare(*op, left, right, selection)?,
             Kind::Identical { left, right } => self.identical(left, right, selection)?,
             Kind::IsNull { operand, negated } => self.is_null(operand, *negated, selection)?,
-            Kind::Like { input, pattern, escape, case_insensitive, negated } => self.like(input, pattern, (*escape, *case_insensitive, *negated), selection)?,
+            Kind::Like { input, pattern, escape, case_insensitive, negated, compiled } =>
+                self.like(input, pattern, (*escape, *case_insensitive, *negated), compiled.as_deref(), selection)?,
             Kind::Between { operand, low, high } => self.between(operand, low, high, selection)?,
             Kind::Logical { and, left, right } => self.logical(*and, left, right, selection)?,
             _ => unreachable!("only predicates are answered as truths"),
@@ -1347,6 +1417,10 @@ impl Evaluation<'_> {
         match truths {
             None => Ok(None),
             Some(Truths::Null) => Ok(Some(Charged::shared(Vector::Null))),
+            Some(Truths::Bits(values, charge)) if plain_scalar(&node.declared) == Some(&ScalarType::Bool) =>
+                Ok(Some(Charged { vector: Vector::Bool(values), _charge: Some(charge) })),
+            Some(Truths::Bits(values, _)) =>
+                Ok((node.declared.nullable() && values.null_count() == self.len).then(|| Charged::shared(Vector::Null))),
             Some(Truths::Rows(truths)) if plain_scalar(&node.declared) == Some(&ScalarType::Bool) =>
                 Charged::built(Vector::Bool(BooleanArray::from(truths)), self.memory).map(Some),
             // A predicate typed null answers null at every row.
@@ -1370,29 +1444,20 @@ impl Evaluation<'_> {
         let Prepared::Live { rows, arguments } = prepared else { return Ok(Some(Truths::Null)) };
         let [left, right] = arguments.as_slice() else { unreachable!("a comparison has two operands") };
         let live = |row: usize| reads(rows.as_deref(), row);
-        let len = self.len;
-        let _scratch = self.truth_scratch()?;
-        // An integer column against an integer constant compares the values in place.
         match (left, right) {
             (Operand::Cells(Cells::Int(array)), Operand::Constant(Some(Cell::Int(constant)))) =>
-                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(Some(array.value(row).cmp(constant))))).collect()))),
+                return self.truth_bits(|row| Ok((live(row) && array.is_valid(row)).then(|| accept(Some(array.value(row).cmp(constant)))))),
             (Operand::Constant(Some(Cell::Int(constant))), Operand::Cells(Cells::Int(array))) =>
-                return Ok(Some(Truths::Rows((0..len).map(|row| (live(row) && array.is_valid(row)).then(|| accept(Some(constant.cmp(&array.value(row)))))).collect()))),
+                return self.truth_bits(|row| Ok((live(row) && array.is_valid(row)).then(|| accept(Some(constant.cmp(&array.value(row))))))),
             _ => {}
         }
-        let mut truths = Vec::with_capacity(len);
-        for row in 0..len {
-            if !live(row) { truths.push(None); continue; }
-            let (Ok(a), Ok(b)) = (left.get(row), right.get(row)) else { return Ok(None) };
-            truths.push(match (a, b) {
-                (Some(a), Some(b)) => match predicate::order(a, b, equality_only) {
-                    Ok(ordering) => Some(accept(ordering)),
-                    Err(()) => return Ok(None),
-                },
-                _ => None,
-            });
-        }
-        Ok(Some(Truths::Rows(truths)))
+        self.truth_bits(|row| {
+            if !live(row) { return Ok(None); }
+            match (left.get(row)?, right.get(row)?) {
+                (Some(a), Some(b)) => predicate::order(a, b, equality_only).map(|order| Some(accept(order))),
+                _ => Ok(None),
+            }
+        })
     }
 
     /// `left === right`, both read at every row.
@@ -1439,29 +1504,44 @@ impl Evaluation<'_> {
     }
 
     /// LIKE, strict in its input and pattern; an invalid pattern raises the scalar LIKE's error where both are present.
-    fn like(&self, input: &Node, pattern: &Node, (escape, case_insensitive, negated): (Option<char>, bool, bool), selection: Selection<'_>) -> Result<Option<Truths>> {
+    fn like(&self, input: &Node, pattern: &Node, (escape, case_insensitive, negated): (Option<char>, bool, bool),
+        compiled: Option<&LikeMatcher>, selection: Selection<'_>,
+    ) -> Result<Option<Truths>> {
+        if self.len == 0 { return Ok(Some(Truths::Null)); }
         let Some(prepared) = self.prepared(&[input, pattern], selection, |operand, rows| self.operand(operand, rows))? else { return Ok(None) };
         let Prepared::Live { rows, arguments } = prepared else { return Ok(Some(Truths::Null)) };
         let [input, pattern] = arguments.as_slice() else { unreachable!("LIKE has an input and a pattern") };
-        let pattern = match pattern {
-            Operand::Constant(Some(Cell::Text(pattern))) => *pattern,
-            // A pattern bound one row at a time is that row's.
-            pattern if self.len == 1 => match pattern.get(0) { Ok(Some(Cell::Text(pattern))) => pattern, _ => return Ok(None) },
-            _ => return Ok(None),
+        let read_text = |row| {
+            if !reads(rows.as_deref(), row) { return Ok(None); }
+            match input.get(row)? { Some(Cell::Text(text)) => Ok(Some(text)), None => Ok(None), _ => Err(()) }
         };
-        let like = LikeMatcher::compile(pattern, escape, case_insensitive, negated)?;
+        let _runtime_charge;
+        let runtime;
+        let like = match compiled {
+            Some(like) => like,
+            None => {
+                let first = (0..self.len).map(&read_text).find(|text| !matches!(text, Ok(None)));
+                match first {
+                    Some(Ok(Some(_))) => {}
+                    None => return Ok(Some(Truths::Null)),
+                    _ => return Ok(None),
+                }
+                let pattern = match pattern {
+                    Operand::Constant(Some(Cell::Text(pattern))) => *pattern,
+                    pattern if self.len == 1 => match pattern.get(0) {
+                        Ok(Some(Cell::Text(pattern))) => pattern,
+                        _ => return Ok(None),
+                    },
+                    _ => return Ok(None),
+                };
+                _runtime_charge = self.memory.reserve(LikeMatcher::compilation_bytes(pattern))?;
+                runtime = LikeMatcher::compile(pattern, escape, case_insensitive, negated)?;
+                &runtime
+            }
+        };
+        let _scratch = self.memory.reserve(like.scratch_bytes())?;
         let mut matches = like.matcher();
-        let _scratch = self.truth_scratch()?;
-        let mut truths = Vec::with_capacity(self.len);
-        for row in 0..self.len {
-            if !reads(rows.as_deref(), row) { truths.push(None); continue; }
-            truths.push(match input.get(row) {
-                Ok(None) => None,
-                Ok(Some(Cell::Text(text))) => Some(matches(text)),
-                _ => return Ok(None),
-            });
-        }
-        Ok(Some(Truths::Rows(truths)))
+        self.truth_bits(|row| read_text(row).map(|text| text.map(&mut matches)))
     }
 
     /// `operand BETWEEN low AND high`: the operand is demanded first, the low bound only where it is present, and the
@@ -1853,6 +1933,178 @@ mod tests {
         assert!(Projection::bind(&spelled("char_length"), &schema).is_some());
         assert!(Projection::bind(&spelled("reverse"), &schema).is_none());
         assert!(Projection::bind(&column(3), &schema).is_none(), "a bare column is no call");
+    }
+
+    #[test]
+    fn character_and_octet_lengths_read_selected_run_end_text() {
+        use arrow_array::{RunArray, types::Int32Type};
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::RunEndEncoded {
+            width: rtdb_types::RunEndWidth::I32,
+            value: Box::new(LogicalType::Scalar(ScalarType::Utf8).maybe()),
+        };
+        let input = Field { data_type: logical.clone(), ..field(0) };
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let encoded = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![2, 3, 5]),
+            &StringArray::from(vec![Some("é🙂"), None, Some("e\u{301}")]),
+        ).unwrap();
+        let sources = vec![
+            Some((Arc::new(encoded) as ArrayRef, Arc::new(rtdb_columnar::to_field("c0", &logical).unwrap()), Some(logical), None)),
+            None,
+        ];
+        let positions = Arc::new(vec![(0, 4), (0, 1), (1, 0), (0, 2), (0, 0)]);
+        let batch = ColumnBatch::settled(
+            vec![Column::Selected(SelectedColumn::new(sources, positions))],
+            5,
+            memory.reserve(0).unwrap(),
+        ).unwrap();
+        for (name, expected) in [
+            ("length", [Some(2), Some(2), None, None, Some(2)]),
+            ("character_length", [Some(2), Some(2), None, None, Some(2)]),
+            ("octet_length", [Some(3), Some(6), None, None, Some(6)]),
+        ] {
+            let expr = call(name, vec![input.expression()]);
+            let Some(Column::Arrow { array, .. }) = project(&expr, &schema, &batch, &memory).unwrap() else {
+                panic!("{name} can read the selected text")
+            };
+            let actual = array.as_any().downcast_ref::<Int32Array>().unwrap().iter().collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+
+        let binary = call("octet_length", vec![Expr::Literal(Value::Binary(vec![0, 255]))]);
+        assert!(Projection::bind(&binary, &schema).is_none());
+        assert_eq!(rtdb_expr::evaluate(&binary, &schema, &[], &rtdb_expr::EvalContext::default()).unwrap(), Value::I32(2));
+    }
+
+    #[test]
+    fn selected_float32_math_keeps_null_and_binary64_results() {
+        use arrow_array::Float32Array;
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::Scalar(ScalarType::F32).maybe();
+        let input = Field { data_type: logical.clone(), ..field(0) };
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let source = Arc::new(Float32Array::from(vec![Some(-0.0), Some(0.2), None, Some(f32::NAN)])) as ArrayRef;
+        let arrow_field = Arc::new(rtdb_columnar::to_field("c0", &logical).unwrap());
+        let selected = SelectedColumn::new(
+            vec![Some((source, arrow_field, Some(logical), None)), None],
+            Arc::new(vec![(0, 1), (1, 0), (0, 0), (0, 2), (0, 3)]),
+        );
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 5, memory.reserve(0).unwrap()).unwrap();
+        let expr = call("sqrt", vec![input.expression()]);
+        let Some(Column::Arrow { array, .. }) = project(&expr, &schema, &batch, &memory).unwrap() else {
+            panic!("SQRT can read selected Float32 cells")
+        };
+        let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(values.value(0).to_bits(), f64::from(0.2_f32).sqrt().to_bits());
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2).to_bits(), (-0.0_f64).to_bits());
+        assert!(values.is_null(3));
+        assert!(values.value(4).is_nan());
+    }
+
+    #[test]
+    fn all_null_unary_input_needs_no_fixed_width_output_buffer() {
+        let fields = [field(3), field(2)];
+        let schema = Schema::new(fields.to_vec()).unwrap();
+        let len = 1024;
+        let columns = fields.iter().map(|input| {
+            let field = Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap());
+            let array = new_null_array(field.data_type(), len);
+            Column::Arrow { array, field, logical: Some(input.data_type.clone()) }
+        }).collect();
+        let input_memory = MemoryBudget::new(1 << 20);
+        let batch = ColumnBatch::settled(columns, len, input_memory.reserve(0).unwrap()).unwrap();
+        let memory = MemoryBudget::new(0);
+        for (name, input) in ["length", "sqrt"].into_iter().zip(fields) {
+            let expr = call(name, vec![input.expression()]);
+            let Some(Column::Arrow { array, .. }) = project(&expr, &schema, &batch, &memory).unwrap() else {
+                panic!("the unary kernel accepts all-null input")
+            };
+            assert_eq!((array.len(), array.data_type()), (len, &DataType::Null));
+        }
+    }
+
+    #[test]
+    fn like_preserves_strict_nulls_and_reached_error_order() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::default();
+        let batch = ColumnBatch::settled(vec![], 1, memory.reserve(0).unwrap()).unwrap();
+        let empty = ColumnBatch::settled(vec![], 0, memory.reserve(0).unwrap()).unwrap();
+        let text = || Expr::Literal(Value::Utf8("é".into()));
+        let invalid = || Expr::Literal(Value::Utf8("!".into()));
+        let substring = || call("substring", vec![text(), Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(-1))]);
+        let like = |input, pattern| Expr::Like {
+            expr: Box::new(input), pattern: Box::new(pattern), escape: Some('!'), case_insensitive: false, negated: false,
+        };
+        let no_arguments = rtdb_expr::Parameters::Values(&[]);
+        for (expr, expected) in [
+            (Expr::binary(BinaryOp::And, Expr::Literal(Value::Bool(false)), like(text(), invalid())), Some(false)),
+            (like(Expr::Literal(Value::Null), invalid()), None),
+            (like(substring(), Expr::Literal(Value::Null)), None),
+        ] {
+            let bound = Predicate::bind(&expr, &schema).expect("LIKE binds without demanding its inputs");
+            assert_eq!(bound.truth(&batch, no_arguments).unwrap(), Some(vec![expected]));
+        }
+        let expr = like(text(), invalid());
+        let bound = Predicate::bind(&expr, &schema).unwrap();
+        assert_eq!(bound.truth(&empty, no_arguments).unwrap(), Some(vec![]));
+        assert_eq!(bound.truth(&batch, no_arguments).unwrap_err().code, "xtdb/invalid-like-pattern");
+
+        let expr = like(substring(), invalid());
+        assert!(Predicate::bind(&expr, &schema).is_none());
+        let expected = rtdb_expr::evaluate(&expr, &schema, &[], &rtdb_expr::EvalContext::default()).unwrap_err();
+        assert_eq!(expected.code, "xtdb/invalid-like-pattern");
+    }
+
+    #[test]
+    fn bound_like_reads_each_executions_pattern() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::default();
+        let batch = ColumnBatch::settled(vec![], 1, memory.reserve(0).unwrap()).unwrap();
+        let expr = Expr::Like {
+            expr: Box::new(Expr::Literal(Value::Utf8("éclair".into()))),
+            pattern: Box::new(Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8).maybe() }),
+            escape: Some('!'),
+            case_insensitive: false,
+            negated: false,
+        };
+        let bound = Predicate::bind(&expr, &schema).unwrap();
+        for (pattern, expected) in [
+            (Value::Null, None),
+            (Value::Utf8("é%".into()), Some(true)),
+            (Value::Utf8("z%".into()), Some(false)),
+        ] {
+            let arguments = [pattern];
+            assert_eq!(bound.truth(&batch, rtdb_expr::Parameters::Values(&arguments)).unwrap(), Some(vec![expected]));
+        }
+        let invalid = [Value::Utf8("!".into())];
+        assert_eq!(bound.truth(&batch, rtdb_expr::Parameters::Values(&invalid)).unwrap_err().code, "xtdb/invalid-like-pattern");
+    }
+
+    #[test]
+    fn comparison_projection_writes_nullable_bits_within_its_bitmap_budget() {
+        let len = 8192;
+        let memory = MemoryBudget::new(4096);
+        let input_memory = MemoryBudget::new(1 << 20);
+        let input = field(3);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let text = StringArray::from_iter((0..len).map(|row| match row % 3 {
+            0 => Some("é"),
+            1 => None,
+            _ => Some("z"),
+        }));
+        let field = Arc::new(rtdb_columnar::to_field("c3", &input.data_type).unwrap());
+        let source = Column::Arrow { array: Arc::new(text), field, logical: Some(input.data_type.clone()) };
+        let batch = ColumnBatch::settled(vec![source], len, input_memory.reserve(0).unwrap()).unwrap();
+        let expr = Expr::binary(BinaryOp::Eq, input.expression(), Expr::Literal(Value::Utf8("é".into())));
+        let Some(Column::Arrow { array, .. }) = project(&expr, &schema, &batch, &memory).unwrap() else {
+            panic!("a text equality comparison writes Boolean bits")
+        };
+        let values = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(values.true_count(), len.div_ceil(3));
+        assert_eq!(values.null_count(), (len + 1) / 3);
+        assert!(!values.value(2));
     }
 
     #[test]

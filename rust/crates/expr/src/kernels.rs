@@ -33,7 +33,7 @@ pub use crate::functions::FloatMath;
 
 /// A scalar function with a column-at-a-time form, resolved once from its call's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Function { Extract, Round, Abs, Upper, Lower, Length, Substring, Floor, Ceil, Mod, Float(FloatMath) }
+pub enum Function { Extract, Round, Abs, Upper, Lower, Length, OctetLength, Substring, Floor, Ceil, Mod, Float(FloatMath) }
 
 impl Function {
     /// The function a call of `name`, in any case and with hyphens or underscores, runs here.
@@ -46,6 +46,7 @@ impl Function {
             "upper" => Self::Upper,
             "lower" => Self::Lower,
             "length" | "character_length" | "char_length" => Self::Length,
+            "octet_length" => Self::OctetLength,
             "substring" => Self::Substring,
             "floor" => Self::Floor,
             "ceil" | "ceiling" => Self::Ceil,
@@ -62,7 +63,7 @@ impl Function {
             Self::Ceil => Some(f64::ceil),
             Self::Abs => Some(f64::abs),
             Self::Float(math) => math.unary(),
-            Self::Extract | Self::Round | Self::Upper | Self::Lower | Self::Length | Self::Substring | Self::Mod => None,
+            Self::Extract | Self::Round | Self::Upper | Self::Lower | Self::Length | Self::OctetLength | Self::Substring | Self::Mod => None,
         }
     }
 }
@@ -157,15 +158,24 @@ pub fn text_lengths(values: &StringArray) -> Int32Array {
 }
 
 /// A LIKE pattern compiled once for many inputs.
+#[derive(Debug)]
 pub struct LikeMatcher { pattern: crate::string::pattern::LikePattern, negated: bool }
 
 impl LikeMatcher {
+    /// Token allocation bound before compiling a text pattern.
+    pub fn compilation_bytes(pattern: &str) -> usize { crate::string::pattern::LikePattern::compilation_bytes(pattern) }
+
     /// The scalar LIKE's error where it rejects the pattern.
     pub fn compile(pattern: &str, escape: Option<char>, case_insensitive: bool, negated: bool) -> Result<Self> {
-        let pattern = rtdb_types::Value::Utf8(pattern.to_owned());
-        let pattern = crate::string::pattern::compile_like(&pattern, escape, case_insensitive, &crate::EvalContext::default())?;
+        let pattern = crate::string::pattern::LikePattern::compile(pattern, escape, case_insensitive, false)?;
         Ok(Self { pattern, negated })
     }
+
+    /// Heap bytes retained by the compiled pattern, excluding this value.
+    pub fn retained_bytes(&self) -> usize { self.pattern.token_storage_bytes() }
+
+    /// Working allocation bound for one active matcher.
+    pub fn scratch_bytes(&self) -> usize { self.pattern.matcher_scratch_bytes() }
 
     /// The truth of `text LIKE pattern` (or NOT LIKE) for each text in turn; the states are reused across calls.
     pub fn matcher(&self) -> impl FnMut(&str) -> bool + '_ {

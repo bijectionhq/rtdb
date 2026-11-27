@@ -26,8 +26,9 @@ struct Translator<'a> { source: &'a PatternInput<'a>, position: usize, flags: Fl
 pub(crate) struct Pattern { regex: Regex, names: Vec<Option<String>> }
 /// A LIKE pattern matched as its reference translation `^...\z` matches under Java's Pattern, without compiling a regex:
 /// `_` and `%` match one or any number of characters other than line terminators.
+#[derive(Debug)]
 pub(crate) struct LikePattern { tokens: Vec<LikeToken>, insensitive: bool, binary: bool }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum LikeToken { Literal(char), One, Any }
 
 /// Compiled Java Pattern for independent whole-region matches on exact UTF-16 text.
@@ -586,19 +587,33 @@ pub(crate) fn compile_like(needle: &Value,escape: Option<char>,insensitive: bool
         }
         _ => return Err(crate::numeric::inapplicable(if insensitive { "ilike" } else { "like" },&[needle])),
     };
-    if needle.len() > PATTERN_BYTES { return Err(limit("Pattern exceeds 64 KiB")); }
-    let mut tokens = Vec::with_capacity(needle.len());
-    let mut chars = needle.chars();
-    while let Some(character) = chars.next() {
-        if Some(character) == escape {
-            let escaped = chars.next().ok_or_else(|| Anomaly::incorrect("xtdb/invalid-like-pattern","LIKE pattern ends with its escape character"))?;
-            tokens.push(LikeToken::Literal(escaped));
-        } else { tokens.push(match character { '%' => LikeToken::Any,'_' => LikeToken::One,_ => LikeToken::Literal(character) }); }
-    }
-    Ok(LikePattern { tokens,insensitive,binary })
+    LikePattern::compile(needle, escape, insensitive, binary)
 }
 
 impl LikePattern {
+    pub(crate) fn compilation_bytes(needle: &str) -> usize {
+        if needle.len() > PATTERN_BYTES { 0 } else { needle.len() * size_of::<LikeToken>() }
+    }
+
+    pub(crate) fn compile(needle: &str, escape: Option<char>, insensitive: bool, binary: bool) -> Result<Self> {
+        if needle.len() > PATTERN_BYTES { return Err(limit("Pattern exceeds 64 KiB")); }
+        let mut tokens = Vec::with_capacity(needle.len());
+        let mut chars = needle.chars();
+        while let Some(character) = chars.next() {
+            if Some(character) == escape {
+                let escaped = chars.next().ok_or_else(|| Anomaly::incorrect("xtdb/invalid-like-pattern", "LIKE pattern ends with its escape character"))?;
+                tokens.push(LikeToken::Literal(escaped));
+            } else {
+                tokens.push(match character { '%' => LikeToken::Any, '_' => LikeToken::One, _ => LikeToken::Literal(character) });
+            }
+        }
+        Ok(Self { tokens, insensitive, binary })
+    }
+
+    pub(crate) fn token_storage_bytes(&self) -> usize { self.tokens.capacity() * size_of::<LikeToken>() }
+
+    pub(crate) fn matcher_scratch_bytes(&self) -> usize { 2 * (self.tokens.len() + 1).max(8) }
+
     pub(crate) fn search(&self,value: &Value,negated: bool,context: &EvalContext<'_>) -> Result<Value> {
         context.reserve(value.retained_bytes()?.checked_mul(16).ok_or_else(overflow)?)?;
         let source_hex;

@@ -2415,6 +2415,9 @@ surface QueryAccess {
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
+        -- Character and octet lengths and supported unary floating-point calls can read the active cells of selected and run-end encoded inputs and write fixed-width Arrow results.
+        -- Eligible comparisons and LIKE write Arrow truth values with validity, preserving the distinction between false and unknown.
+        -- A literal LIKE matcher can be reused across batches, and a pattern error is reported when evaluation reaches the pattern.
         -- A CASE projection with cosine scores, double literals or null as its only results can write Arrow values and validity as each row's selected branch is evaluated.
         -- A CASE projection with provably fixed Boolean, signed integer, Float32 or Float64 results can write them directly to Arrow while evaluating branches in scalar order.
         -- The result uses observed nullability and a NULL vector when every selected result is null.
