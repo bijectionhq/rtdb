@@ -978,24 +978,7 @@ impl Context<'_> {
     fn joined_table(&mut self, table: &ast::TableWithJoins, lateral_start: usize) -> Result<Arc<Relation>> {
         let mut left = self.table_for(&table.relation, TablePurpose::Query, lateral_start)?;
         for joined in &table.joins {
-            if joined.global { return Err(grammar_rejected("GLOBAL JOIN")); }
-            let (kind, constraint) = match &joined.join_operator {
-                ast::JoinOperator::Inner(constraint) | ast::JoinOperator::Join(constraint) => (JoinKind::Inner, Some(constraint)),
-                ast::JoinOperator::LeftOuter(constraint) | ast::JoinOperator::Left(constraint) => (JoinKind::Left, Some(constraint)),
-                ast::JoinOperator::RightOuter(constraint) | ast::JoinOperator::Right(constraint) => (JoinKind::Right, Some(constraint)),
-                ast::JoinOperator::FullOuter(constraint) => (JoinKind::Full, Some(constraint)),
-                ast::JoinOperator::CrossJoin(ast::JoinConstraint::None) => (JoinKind::Cross, None),
-                _ => return Err(grammar_rejected("A dialect-specific join operator")),
-            };
-            let using = match constraint {
-                Some(ast::JoinConstraint::Using(names)) if !names.is_empty() => {
-                    Some(names.iter().map(|name| grammar_column_name(name, "USING column"))
-                        .collect::<Result<BTreeSet<_>>>()?)
-                }
-                Some(ast::JoinConstraint::Using(_)) => return Err(grammar_rejected("An empty USING clause")),
-                Some(ast::JoinConstraint::None) => return Err(grammar_rejected("A JOIN without ON or USING")),
-                _ => None,
-            };
+            let (kind, constraint) = grammar_join(joined)?;
             let (right, mut arguments) = self.from_scope(left.schema().clone(), |context, start| {
                 let start = if kind == JoinKind::Cross || matches!(constraint, Some(ast::JoinConstraint::Natural)) { start } else { lateral_start };
                 context.table_for(&joined.relation, TablePurpose::Query, start)
@@ -1003,11 +986,14 @@ impl Context<'_> {
             if !arguments.is_empty() && matches!(kind, JoinKind::Right | JoinKind::Full) { return Err(unsupported("Correlated LATERAL in RIGHT or FULL OUTER JOIN")); }
             let schema = left.schema().concat(right.schema())?;
             let common = match constraint {
+                Some(ast::JoinConstraint::Using(names)) => Some(names.iter()
+                    .filter_map(|name| name.0.first().and_then(ast::ObjectNamePart::as_ident))
+                    .map(|name| identifier(name).normalized()).collect::<BTreeSet<_>>()),
                 Some(ast::JoinConstraint::Natural) => {
                     let names = |input: &Relation| input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id)).map(|field| field.name.clone()).collect::<BTreeSet<_>>();
                     Some(names(&left).intersection(&names(&right)).cloned().collect())
                 }
-                _ => using,
+                _ => None,
             };
             if let Some(common) = common {
                 let predicates = common.iter().map(|name| {
@@ -1659,25 +1645,49 @@ pub(crate) fn grammar_identifier(name: &ast::Ident, position: &str) -> Result<()
     }
 }
 
-fn grammar_table_name(name: &ast::ObjectName) -> Result<()> {
+pub(crate) fn grammar_table_name(name: &ast::ObjectName) -> Result<()> {
     name.0.iter().filter_map(ast::ObjectNamePart::as_ident)
         .try_for_each(|part| grammar_identifier(part, "table name"))
 }
 
 fn grammar_column_name(name: &ast::ObjectName, position: &str) -> Result<String> {
+    Ok(identifier(grammar_column_ident(name, position)?).normalized())
+}
+
+fn grammar_column_ident<'a>(name: &'a ast::ObjectName, position: &str) -> Result<&'a ast::Ident> {
     let [part] = name.0.as_slice() else { return Err(grammar_rejected(format!("A qualified {position}"))); };
     let name = part.as_ident().ok_or_else(|| grammar_rejected(format!("A computed {position}")))?;
     grammar_identifier(name, position)?;
-    Ok(identifier(name).normalized())
+    Ok(name)
 }
 
-fn grammar_table_alias(alias: &ast::TableAlias) -> Result<()> {
+pub(crate) fn grammar_table_alias(alias: &ast::TableAlias) -> Result<()> {
     grammar_identifier(&alias.name, "table alias")?;
     for column in &alias.columns {
         if column.data_type.is_some() { return Err(grammar_rejected("Typed table alias columns")); }
         grammar_identifier(&column.name, "table alias column")?;
     }
     Ok(())
+}
+
+pub(crate) fn grammar_join(joined: &ast::Join) -> Result<(JoinKind, Option<&ast::JoinConstraint>)> {
+    use ast::{JoinConstraint as C, JoinOperator as J};
+    if joined.global { return Err(grammar_rejected("GLOBAL JOIN")); }
+    let (kind, constraint) = match &joined.join_operator {
+        J::Inner(constraint) | J::Join(constraint) => (JoinKind::Inner, constraint),
+        J::LeftOuter(constraint) | J::Left(constraint) => (JoinKind::Left, constraint),
+        J::RightOuter(constraint) | J::Right(constraint) => (JoinKind::Right, constraint),
+        J::FullOuter(constraint) => (JoinKind::Full, constraint),
+        J::CrossJoin(C::None) => return Ok((JoinKind::Cross, None)),
+        _ => return Err(grammar_rejected("A dialect-specific join operator")),
+    };
+    match constraint {
+        C::None => return Err(grammar_rejected("A JOIN without ON or USING")),
+        C::Using(names) if names.is_empty() => return Err(grammar_rejected("An empty USING clause")),
+        C::Using(names) => for name in names { grammar_column_ident(name, "USING column")?; },
+        _ => (),
+    }
+    Ok((kind, Some(constraint)))
 }
 
 fn is_grammar_rejection(error: &Anomaly) -> bool { error.is(AnomalyKind::GrammarRejected) }

@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, ops::ControlFlow};
 use rtdb_types::{Anomaly, AnomalyKind, Result};
 use sqlparser::{ast, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan}};
 use sqlparser::ast::Visit;
-use crate::{bind::grammar_rejected, dialect::{CustomStringLiteral, SqlDialect}, parse::{TemporalExtent, sql_error, word}};
+use crate::{bind::{grammar_join, grammar_rejected, grammar_table_alias, grammar_table_name}, dialect::{CustomStringLiteral, SqlDialect}, parse::{TemporalExtent, sql_error, word}};
 
 pub(crate) struct ReturningClause<'a> { keyword: Span, items: &'a [TokenWithSpan] }
 
@@ -127,14 +127,56 @@ impl ReturningSyntax {
     }
 }
 
+fn validate_joins(table: &ast::TableWithJoins) -> ControlFlow<Anomaly> {
+    for join in &table.joins {
+        if let Err(error) = grammar_join(join) { return ControlFlow::Break(error); }
+    }
+    ControlFlow::Continue(())
+}
+
+fn validate_query_joins(body: &ast::SetExpr) -> ControlFlow<Anomaly> {
+    match body {
+        ast::SetExpr::FromPipeline(pipeline) => for table in &pipeline.from { validate_joins(table)?; },
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            validate_query_joins(left)?;
+            validate_query_joins(right)?;
+        }
+        _ => (),
+    }
+    ControlFlow::Continue(())
+}
+
 impl ast::Visitor for ReturningSyntax {
     type Break = Anomaly;
 
+    fn pre_visit_query(&mut self, query: &ast::Query) -> ControlFlow<Anomaly> {
+        validate_query_joins(&query.body)
+    }
+
+    fn pre_visit_select(&mut self, select: &ast::Select) -> ControlFlow<Anomaly> {
+        for table in &select.from { validate_joins(table)?; }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_table_factor(&mut self, table: &ast::TableFactor) -> ControlFlow<Anomaly> {
-        if let ast::TableFactor::Table { name, args: None, .. } = table
-            && let Some(name) = name.0.last().and_then(ast::ObjectNamePart::as_ident)
-        {
-            self.table_ends.insert(name.span.end);
+        let alias = match table {
+            ast::TableFactor::Table { name, args, alias, .. } => {
+                if let Err(error) = grammar_table_name(name) { return ControlFlow::Break(error); }
+                if args.is_none() && let Some(name) = name.0.last().and_then(ast::ObjectNamePart::as_ident) {
+                    self.table_ends.insert(name.span.end);
+                }
+                alias
+            }
+            ast::TableFactor::Derived { alias, .. } | ast::TableFactor::ExpressionDerived { alias, .. }
+            | ast::TableFactor::UNNEST { alias, .. } => alias,
+            ast::TableFactor::NestedJoin { table_with_joins, alias } => {
+                if alias.is_some() { return ControlFlow::Break(grammar_rejected("An alias on a parenthesised table reference")); }
+                return validate_joins(table_with_joins);
+            }
+            _ => return ControlFlow::Continue(()),
+        };
+        if let Some(alias) = alias && let Err(error) = grammar_table_alias(alias) {
+            return ControlFlow::Break(error);
         }
         ControlFlow::Continue(())
     }
