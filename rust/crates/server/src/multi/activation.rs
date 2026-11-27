@@ -519,7 +519,9 @@ mod tests {
 
     async fn guarded_client() {
         use rtdb_columnar::MemoryBudget;
-        use rtdb_tx::transact::{Outcome, Transact};
+        use rtdb_crypt::Generation;
+        use rtdb_db::DeploymentRetirement;
+        use rtdb_tx::transact::{Outcome, PHYSICAL_ERASURE, ROW_CUSTODY, Transact};
         use tokio_util::sync::CancellationToken;
 
         let data = tempfile::tempdir().unwrap();
@@ -568,13 +570,25 @@ mod tests {
             otherwise: vec![],
             ops: vec![],
         };
+        let receipt = retained.transact(transaction(21), &stop).await.unwrap();
+        assert_eq!(receipt.outcome, Outcome::Then);
+        assert!(!retained.features().contains(&ROW_CUSTODY));
+        assert!(!retained.features().contains(&PHYSICAL_ERASURE));
+        assert!(!retained.supports_funded_transact().await);
+        assert!(!retained.supports_funded_appointment().await);
         assert_eq!(
-            retained
-                .transact(transaction(21), &stop)
-                .await
-                .unwrap()
-                .outcome,
-            Outcome::Then
+            retained.export_checkpoint(Uuid::new_v4(), receipt.basis, None, &stop)
+                .await.unwrap_err().code,
+            "rtdb/activation-effects",
+        );
+        assert_eq!(
+            retained.reconcile_custody(&stop).await.unwrap_err().code,
+            "rtdb/activation-effects",
+        );
+        assert_eq!(
+            runtime.ready_driver("xtdb", incumbent).await.unwrap()
+                .retire_deployment().await.unwrap_err().code,
+            "rtdb/activation-effects",
         );
         retained
             .check_read_delivery(None, &BTreeSet::new(), &stop)
@@ -624,6 +638,17 @@ mod tests {
             "rtdb/activation-fenced",
         );
         drop(attached);
+        let generation = Generation { database: incumbent, number: 1 };
+        runtime.kms.check_readable(generation).await.unwrap();
+        let retiring = runtime.catalog.mark_retiring("xtdb", DeploymentRetirement {
+            incarnation: incumbent,
+            terminal: Lsn(1),
+            generation: generation.number,
+            lease_until: 0,
+        }, Timestamp(0)).await.unwrap();
+        runtime.tick(handle.node()).await.unwrap();
+        runtime.kms.check_readable(generation).await.unwrap();
+        assert!(runtime.catalog.read().await.unwrap()["xtdb"].status == retiring.status);
         handle.shutdown();
         server.await.unwrap().unwrap();
         drop(handle);

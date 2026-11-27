@@ -6,7 +6,7 @@ use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, ServingAuthority, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
-    CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
+    CustodyGroupId, CustodyWriterFence, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, AnomalyKind, EntityId, MemoryBudget, Result, TableRef, Timestamp,
@@ -437,6 +437,9 @@ impl MultiServing {
         let serving_authority = database.serving_authority();
         let tokens = database.token_authority();
         let mut features = database.write_features().to_vec();
+        if serving_authority.is_some() {
+            features.retain(|&feature| feature != PHYSICAL_ERASURE && feature != ROW_CUSTODY);
+        }
         features.extend([
             "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
             "query.linearizable", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status",
@@ -593,6 +596,7 @@ impl MultiServing {
     }
 
     pub async fn retire_deployment(&self) -> Result<rtdb_db::DeploymentRetirement> {
+        self.require_unmanaged_effects()?;
         self.writes.retire_deployment().await
     }
 
@@ -625,24 +629,28 @@ impl ServingDriver for MultiServing {
     }
 
     async fn export_checkpoint(&self, pin: uuid::Uuid, basis: Basis, until: Option<Timestamp>, cancellation: &CancellationToken) -> Result<Vec<u8>> {
+        self.require_unmanaged_effects()?;
         self.serve(async {
             cancellation.run_until_cancelled(self.writes.export(pin, basis, until)).await.ok_or_else(interrupted)?
         }).await
     }
 
     async fn open_checkpoint_export(&self, ticket: Vec<u8>, cancellation: &CancellationToken) -> Result<rtdb_db::PinnedExport> {
+        self.require_unmanaged_effects()?;
         self.serve(async {
             cancellation.run_until_cancelled(self.writes.open_export(ticket)).await.ok_or_else(interrupted)?
         }).await
     }
 
     async fn release_checkpoint_export(&self, ticket: Vec<u8>, cancellation: &CancellationToken) -> Result<()> {
+        self.require_unmanaged_effects()?;
         self.serve(async {
             cancellation.run_until_cancelled(self.writes.release_export(ticket)).await.ok_or_else(interrupted)?
         }).await
     }
 
     async fn restore_checkpoint(&self, export: rtdb_db::PinnedExport, cancellation: &CancellationToken) -> Result<BranchCut> {
+        self.require_unmanaged_effects()?;
         self.serve(async {
             cancellation.run_until_cancelled(self.writes.restore(export)).await.ok_or_else(interrupted)?
         }).await
@@ -786,14 +794,17 @@ impl ServingDriver for MultiServing {
     }
 
     async fn supports_funded_transact(&self) -> bool {
-        self.database.lock().await.supports_funded_transact()
+        self.serving_authority.is_none() && self.database.lock().await.supports_funded_transact()
     }
 
     async fn supports_funded_appointment(&self) -> bool {
-        self.classic_workload_fence.is_none() && self.database.lock().await.supports_funded_appointment()
+        self.serving_authority.is_none()
+            && self.classic_workload_fence.is_none()
+            && self.database.lock().await.supports_funded_appointment()
     }
 
     async fn managed_appointment_ready(&self, appointment: &workload::ManagedAppointment) -> Result<bool> {
+        self.require_unmanaged_effects()?;
         self.check_appointment_origin(appointment)?;
         self.database.lock().await.managed_appointment_ready(appointment).await
     }
@@ -1029,6 +1040,9 @@ impl ServingDriver for MultiServing {
     }
 
     async fn check_read_delivery(&self, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
+        if !groups.is_empty() {
+            self.require_unmanaged_effects()?;
+        }
         self.serve(async {
             if generation.is_none() && groups.is_empty() { return Ok(()); }
             cancellation.run_until_cancelled(async {
@@ -1045,6 +1059,7 @@ impl ServingDriver for MultiServing {
     }
 
     async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
+        self.require_unmanaged_effects()?;
         self.serve(async {
             cancellation.run_until_cancelled(async {
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
@@ -1074,6 +1089,7 @@ impl ServingDriver for MultiServing {
 
     async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,
                                             generation: Option<u64>, cancellation: &CancellationToken) -> Result<()> {
+        self.require_unmanaged_effects()?;
         self.serve(async {
             cancellation.run_until_cancelled(async {
                 let vault = self.tokens.custody_vault();
@@ -1092,6 +1108,7 @@ impl ServingDriver for MultiServing {
     }
 
     async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {
+        self.require_unmanaged_effects()?;
         cancellation.run_until_cancelled(async {
             let (index, _) = self.database.lock().await.fresh_view().await?;
             index.require_local_custody()?;

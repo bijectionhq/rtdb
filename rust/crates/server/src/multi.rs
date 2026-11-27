@@ -558,6 +558,7 @@ impl MultiRuntime {
         until: Option<Timestamp>,
         cancellation: &CancellationToken,
     ) -> Result<Vec<u8>> {
+        self.require_local_lifecycle()?;
         let entry = self
             .catalog
             .read()
@@ -1011,7 +1012,8 @@ impl MultiRuntime {
                 if self.classic_opening_ingress.is_some() => result,
             result = async { self.native_dependent_ingress.as_ref().expect("Native dependent custody ingress enabled").serve(self, node, stop).await },
                 if self.native_dependent_ingress.is_some() => result,
-            result = self.drive_managed_transfers(stop), if self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty() => result,
+            result = self.drive_managed_transfers(stop),
+                if self.backends.activation.is_none() && (self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty()) => result,
             result = async { self.peer.as_ref().expect("peer enabled").serve(self, node, stop).await },
                 if self.peer.is_some() => result,
         }
@@ -1267,8 +1269,10 @@ impl MultiRuntime {
         writer: bool,
         schedule: &mut TickSchedule,
     ) -> Result<()> {
+        let local_lifecycle = self.backends.activation.is_none();
         match &entry.status {
             Status::Reserved if !writer => return Ok(()),
+            Status::ClassicCandidate { .. } | Status::TransferPending(_) if !local_lifecycle => return Ok(()),
             Status::ClassicCandidate { opening: Some(record), .. } => {
                 if let classic_opening::Phase::Opened { profile, workload_fence } = &record.phase
                     && self.require_opening_profile(profile).is_ok()
@@ -1318,7 +1322,7 @@ impl MultiRuntime {
                 if node.catalog().database(name).is_ok() {
                     node.detach_local(name.to_owned()).await?;
                 }
-                if writer {
+                if writer && local_lifecycle {
                     let destroy_after = match entry.status {
                         Status::Retiring(retirement) => Some(retirement.destroy_after),
                         _ => None,
@@ -1344,7 +1348,7 @@ impl MultiRuntime {
         }
         let driver = self.ensure_driver(name, entry.database).await?;
         if let Some(event) = driver.deployment_retirement().await? {
-            if writer {
+            if writer && local_lifecycle {
                 self.record_retirement(name, event).await?;
             }
             return Ok(());
