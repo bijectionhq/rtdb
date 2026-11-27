@@ -92,12 +92,12 @@ def diagnostics(error):
             "fields": {key: value for key in fields if (value := getattr(diag, key, None)) is not None}}
 
 
-def observe(connection, process, sql, timeout):
+def observe(connection, process, sql, timeout, *, parameters=None, prepare=False):
     outcome = {"sql": sql}
     with connection.cursor() as cursor, deadline(connection, process, timeout) as expired:
         start = time.perf_counter_ns()
         try:
-            cursor.execute(sql, prepare=False)
+            cursor.execute(sql, parameters, prepare=prepare)
             actual = cursor.fetchall()
         except Exception as error:
             outcome["error"] = diagnostics(error)
@@ -318,9 +318,12 @@ def execute_cases(connection, process, engine, cases, spill, report):
     report["follow_up"] = observe(connection, process, READY_SQL, 5)
 
 
-def invocation(args, engine, scale, cases, directory, config):
+def invocation(args, engine, scale, cases, directory, config, *, seed_data=seed, execute=execute_cases,
+               plan_sha256=None):
     directory.mkdir()
     report = {"engine": engine, "scale": scale, "cases": {p["id"]: {"warmups": [], "samples": []} for p in cases}}
+    if plan_sha256 is not None:
+        report["plan_sha256"] = plan_sha256
     process, stage = None, "start"
     with owned_cancellation(deferred=True) as owner:
         data = Path(tempfile.mkdtemp(dir=directory, prefix="data-"))
@@ -348,11 +351,11 @@ def invocation(args, engine, scale, cases, directory, config):
                 if expired.is_set():
                     raise TimeoutError("time zone setup timed out")
                 report["version"] = observe(connection, process, "SELECT version()", 5)
-                report[stage] = seed(connection, process, scale)
+                report[stage] = seed_data(connection, process, scale)
                 if any(check["actual"] != check["expected"] for check in report[stage].values()):
                     raise ValueError("seeded rows differ from the reference fixture")
                 stage = "queries"
-                execute_cases(connection, process, engine, cases, spill, report)
+                execute(connection, process, engine, cases, spill, report)
                 stage = "allocator_after"
                 report[stage] = allocator_limits(engine, directory / "allocator-after.prom")
                 status = Path(f"/proc/{process.pid}/status").read_text()
@@ -445,7 +448,8 @@ def clean_checkout(path, expected):
         raise ValueError(f"expected clean checkout at {expected}: {path}")
 
 
-def run(args):
+@contextmanager
+def matched_inputs(args, plan, sources):
     require_phase_two(REPOSITORY, args.phase_two)
     clean_checkout(REPOSITORY, args.revision)
     clean_checkout(args.reference, REFERENCE)
@@ -473,7 +477,7 @@ def run(args):
     args.output.mkdir(parents=True, mode=0o700)
     args.output_created = True
     with owned_cancellation():
-        retained = [Path(__file__), Path(__file__).with_name("budget_fixture.py")]
+        retained = [Path(__file__), Path(__file__).with_name("budget_fixture.py"), *sources]
         configurations = {}
         for engine in ENGINES:
             path = args.output / f"{engine}.yaml"
@@ -494,10 +498,21 @@ def run(args):
             "python": sys.version, "psycopg": psycopg.__version__, "libpq": psycopg.pq.version(),
             "engine_budget_bytes": ENGINE_BYTES, "jvm_heap_bytes": JVM_DIRECT_BYTES,
             "jvm_direct_bytes": JVM_DIRECT_BYTES, "engine_allocation_ceilings": {e: expected_limits(e) for e in ENGINES},
-            "repetitions_per_engine": REPETITIONS, "samples_per_invocation": SAMPLES,
-            "warmups_per_invocation": WARMUPS, "cases": CASES, "scope_exclusions": EXCLUSIONS,
+            "repetitions_per_engine": REPETITIONS, **plan,
         })
         plan_sha256 = digest(plan_path)
+        yield configurations, plan_sha256
+        verify_inputs(inputs)
+        if digest(plan_path) != plan_sha256:
+            raise ValueError("the retained benchmark plan changed during execution")
+        clean_checkout(REPOSITORY, args.revision)
+        clean_checkout(args.reference, REFERENCE)
+
+
+def run(args):
+    plan = {"samples_per_invocation": SAMPLES, "warmups_per_invocation": WARMUPS, "cases": CASES,
+            "scope_exclusions": EXCLUSIONS}
+    with matched_inputs(args, plan, ()) as (configurations, plan_sha256):
         comparison = {case["id"]: {engine: [] for engine in ENGINES} for case in CASES}
         for repetition in range(REPETITIONS):
             for engine in ENGINES if repetition % 2 == 0 else reversed(ENGINES):
@@ -506,19 +521,14 @@ def run(args):
                     report = invocation(args, engine, scale, cases, args.output / name, configurations[engine])
                     for case in cases:
                         comparison[case["id"]][engine].append({"invocation": name, **result_summary(case, report)})
-        verify_inputs(inputs)
-        if digest(plan_path) != plan_sha256:
-            raise ValueError("the retained benchmark plan changed during execution")
-        clean_checkout(REPOSITORY, args.revision)
-        clean_checkout(args.reference, REFERENCE)
-        cases = compare_repetitions(comparison)
-        write_json(args.output / "comparison.json", {"cases": cases, "scope_exclusions": EXCLUSIONS,
-                                                     "plan_sha256": plan_sha256})
-        return 0 if all(case["qualifies"] for case in cases.values()) else 1
+    cases = compare_repetitions(comparison)
+    write_json(args.output / "comparison.json", {"cases": cases, "scope_exclusions": EXCLUSIONS,
+                                                 "plan_sha256": plan_sha256})
+    return 0 if all(case["qualifies"] for case in cases.values()) else 1
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def benchmark_cli(description, run_benchmark):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--phase-two", action="store_true")
     parser.add_argument("--revision", required=True, help="Full clean RTDB revision used to compile the binary")
     parser.add_argument("--reference", type=Path, required=True, help="Clean XTDB inventory checkout containing the built standalone JAR")
@@ -532,11 +542,15 @@ def main():
         setattr(args, name, getattr(args, name).resolve())
     args.output_created = False
     try:
-        return run(args)
+        return run_benchmark(args)
     except BaseException as error:
         if args.output_created:
             write_json(args.output / "failure.json", diagnostics(error))
         raise
+
+
+def main():
+    return benchmark_cli(__doc__, run)
 
 
 if __name__ == "__main__":

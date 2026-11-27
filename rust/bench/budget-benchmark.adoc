@@ -124,3 +124,77 @@ The fixture and receipt regression tests can run without server artifacts.
 cd "$RTDB_CHECKOUT"
 python3 -B -m unittest discover -s rust/bench -p test_budget_benchmark.py
 ----
+
+== Post-fix SQL query matrix
+
+Use `query_matrix_benchmark.py` for a new evidence run of the SQL execution inventory.
+It uses the same artifact checks, configured and effective memory budgets, process ownership, UTC defaults and one-active-engine policy as the pressure probes above.
+The E1–E4 and L12 invocations above retain their fixture and reporting contract.
+Keep historical SSD and differential results in their original directories with their original revisions and conditions.
+The matrix uses the near-tie benchmark's read shapes and seeded accounts and customers, with a fixed temporal cut and fixed operation counts for the new comparison.
+The historical SSD runs used a different host, process budget and timing schedule.
+
+[cols="2,4",options="header"]
+|===
+|Workload |Checked outcome at both 10,000 and 100,000 accounts
+|Temporal diff join |The same IID is joined across system-time versions, and exactly 10% of the accounts have different balances.
+|Join plus GROUP BY and standalone grouping |Counts and double sums by customer tier, and count, sum and average by region and status.
+|Selective ranges |A half-open ID interval of width 100, including truncated tail results, and a double BETWEEN interval with a 100-unit span.
+|Prepared and unnamed point reads |The same changing int8 arguments and projected rows on fresh connections, with explicit named or unnamed extended execution.
+|Top 100 |All 100 ordered account IDs and balances, with ID as the tie breaker.
+|Filtered left lateral UNNEST |A real null element with its original ordinal, one retained non-null element, and null extension for filtered-out, empty and null lists.
+|Correlated left lateral aggregate |The count of parent rows and the count and sum of matched customer IDs from gold-tier customers.
+|Partitioned ROW_NUMBER |The first ten account IDs in each of eight regions, with balance and ID as the window keys, on both ordinary and explicitly ordered input.
+|===
+
+Each engine receives a new local store for each scale and repetition.
+Customer and account batches use explicit monotonic system times, and both engines update the same 10% of accounts at the same valid and system times before timing.
+The runner verifies full ordered account readback at the before and after cuts, customer readback and the lateral parent count.
+Read SQL carries identical default valid and system time bases.
+Driver binds and independent expected rows and pgwire column names and OIDs are retained in the plan.
+Each phase checks every returned row with exact typed equality apart from the declared order-sensitive double reductions.
+The declared SUM and AVG columns use relative tolerance `1e-11` and absolute tolerance `1e-9` to allow binary64 accumulation-order differences.
+Queries with an SQL order clause must return rows in that order.
+Other queries compare rows as multisets.
+
+The matrix uses two fresh-store repetitions, alternating which engine runs first at each scale.
+Each case uses ten warmups and 100 timed pgwire execute/fetch operations, with 500 timed operations for each point-read mode.
+The first failed warmup or sample stops that case while the full declared sample count remains in the denominator.
+The measured operations exclude connection setup, client conversion to the evidence format, and diagnostic SQL.
+Each repetition reports nearest-rank p50 and p99 in milliseconds and process user-plus-system CPU milliseconds per measured operation.
+CPU comes from the Linux process tick delta across the sample phase, including any server background work in that interval.
+A zero CPU delta records a tick-resolution observation and excludes a ratio with a zero denominator.
+
+The separate `EXPLAIN` and `EXPLAIN ANALYZE` phases use the first sample's SQL, arguments and basis and retain complete operator and allocation rows.
+`query_peak_bytes` is the reported analyzed execution peak.
+`process_lifetime_peak_rss_bytes` is the kernel high-water RSS through the full invocation, including seeding and diagnostics.
+The spill observer records newly seen nonempty temp files and their maximum sampled sizes during `EXPLAIN ANALYZE`.
+An empty observation leaves spill occurrence undetermined.
+Total bytes written and spill-region quota high water require their own instrumentation.
+The plan and execution records share a SHA-256 link, and the comparison records the SHA-256 of each execution it summarizes.
+An untimed prepared read checks that a reached division by zero returns SQLSTATE `08P01` and that the same statement returns the expected bigint result on the connection afterward.
+Unexpected SQLSTATEs, diagnostics, wrong rows, missing attempts and resource evidence remain in the execution receipt.
+Ratios require both invocations for both engines to qualify, including direct checks of corresponding typed results.
+Per-repetition statistics stay visible for qualifying individual invocations.
+
+For a later authorized run, build or obtain artifacts for the clean post-fix RTDB revision and pinned XTDB reference described above.
+Choose a new output directory outside both checkouts.
+
+[source,sh]
+----
+QUERY_EVIDENCE=/path/to/new-post-fix-query-evidence
+/path/to/budget-venv/bin/python -B "$RTDB_CHECKOUT/rust/bench/query_matrix_benchmark.py" \
+  --phase-two --revision "$RTDB_REVISION" --reference "$XTDB_CHECKOUT" \
+  --native "$NATIVE" --native-sha256 "$NATIVE_SHA256" --jvm-sha256 "$JVM_SHA256" \
+  --java "$JDK25/bin/java" --output "$QUERY_EVIDENCE"
+----
+
+Exit 0 qualifies all 24 case/scale pairs.
+Exit 1 with a comparison indicates at least one unqualified pair.
+Fixture and evidence regression tests need no server artifacts.
+
+[source,sh]
+----
+cd "$RTDB_CHECKOUT"
+python3 -B -m unittest discover -s rust/bench -p test_query_matrix_benchmark.py
+----
