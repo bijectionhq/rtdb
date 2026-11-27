@@ -129,6 +129,7 @@ impl<'a> ScanRequest<'a> {
         let iids = CandidateIids::build(scores.iids.len(), scores.iter().map(|(iid, _)| iid), self.memory)?;
         let rows = match self.verifier.gather_ranked(rows).await {
             Ok(rows) => rows,
+            // Rows the budget cannot hold here are read by the scan XTDB runs, which these scores only narrow.
             Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => BTreeMap::new(),
             Err(error) => return Err(error),
         };
@@ -543,6 +544,7 @@ pub trait ScanAccelerator: Send + Sync {
         let Some(iids) = self.candidate_iids(request).await? else { return Ok(None); };
         match CandidateIids::from_set(iids, request.memory) {
             Ok(iids) => Ok(Some(ScanSelection { iids, scores: None })),
+            // An accelerator is an index over the scan XTDB runs; a candidate set the budget cannot hold leaves the query to it.
             Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
             Err(error) => Err(error),
         }

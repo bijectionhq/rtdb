@@ -50,19 +50,16 @@ struct BufferedReplay {
 }
 
 impl BufferedReplay {
-    fn try_push(&mut self, page: ColumnBatch) -> Result<Option<ColumnBatch>> {
+    fn push(&mut self, page: ColumnBatch) -> Result<()> {
         if self.pages.len() == self.pages.capacity() {
             let capacity = self.pages.capacity().checked_mul(2).map(|n| n.max(1))
                 .and_then(|n| n.checked_mul(std::mem::size_of::<ColumnBatch>())).ok_or_else(materialized_size)?;
             let lease = Arc::get_mut(&mut self.reservation).expect("Unpublished materialization owns its page reservation");
-            match lease.grow_to(capacity) {
-                Ok(()) => self.pages.reserve_exact(capacity / std::mem::size_of::<ColumnBatch>() - self.pages.len()),
-                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(Some(page)),
-                Err(error) => return Err(error),
-            }
+            lease.grow_to(capacity)?;
+            self.pages.reserve_exact(capacity / std::mem::size_of::<ColumnBatch>() - self.pages.len());
         }
         self.pages.push(page);
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -103,16 +100,14 @@ impl ReplayBinding {
         let mut bytes = 0usize;
         while let Some(batch) = self.next_batch(&mut input).await? {
             rows = rows.saturating_add(batch.len);
-            let retained = match batch.working_set_bytes(memory) {
-                Ok(bytes) => bytes,
-                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => usize::MAX,
-                Err(error) => return Err(error),
-            };
+            let retained = batch.working_set_bytes(memory)?;
             bytes = bytes.saturating_add(retained).saturating_add(std::mem::size_of::<ColumnBatch>());
+            // XTDB's let spills past a row threshold alone; a budget that cannot hold the buffered pages fails the query.
             let spill = if rows > options.materialized_spill_rows || bytes > options.materialized_memory_bytes {
                 Some(batch)
             } else {
-                buffered.try_push(batch)?
+                buffered.push(batch)?;
+                None
             };
             if let Some(batch) = spill {
                 let mut writer = self.context.spill.create()?;

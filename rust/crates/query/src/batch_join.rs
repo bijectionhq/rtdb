@@ -554,12 +554,7 @@ impl Spec {
         let _columns = memory.reserve(width.checked_mul(std::mem::size_of::<usize>()).ok_or_else(size_error)?)?;
         let columns = (0..width).collect::<Vec<_>>();
         if selected.rows.is_empty() {
-            match probe.take_sorted_span(span.clone(), &columns, memory) {
-                Ok(Some(output)) => return Ok(Some(output)),
-                Ok(None) => {}
-                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {}
-                Err(error) => return Err(error),
-            }
+            if let Some(output) = probe.take_sorted_span(span.clone(), &columns, memory)? { return Ok(Some(output)); }
             for row in span {
                 context.check_cancelled_at(row)?;
                 selected.push((0, row), memory)?;

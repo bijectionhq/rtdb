@@ -466,7 +466,7 @@ impl Block {
             ObjectSort::LegacyMergeSort => legacy::scratch_bytes(len)?,
         };
         let _temporary = context.memory.reserve(bytes)?;
-        let mut keys = (!self.native).then(|| BlockKeys::new(len, &context.memory)).flatten();
+        let mut keys = if self.native { None } else { Some(BlockKeys::new(len, &context.memory)?) };
         let mut comparisons = 0usize;
         let compare = |left_index, right_index| {
             context.check_cancelled_at(comparisons)?;
@@ -662,10 +662,12 @@ struct BlockKeys {
 }
 
 impl BlockKeys {
-    fn new(rows: usize, memory: &Arc<MemoryBudget>) -> Option<Self> {
-        let reservation = memory.reserve(rows.checked_mul(size_of::<Option<Key>>())?).ok()?;
+    /// The keys of a block of `rows`, charged as part of the sort's memory: a budget that cannot hold them fails the sort.
+    fn new(rows: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bytes = rows.checked_mul(size_of::<Option<Key>>()).ok_or_else(size_error)?;
+        let reservation = memory.reserve(bytes)?;
         let keys = std::iter::repeat_with(|| None).take(rows).collect();
-        Some(Self { keys, _reservation: reservation })
+        Ok(Self { keys, _reservation: reservation })
     }
 
     fn load(&mut self, index: usize, read: &impl Fn(usize) -> Result<Key>) -> Result<()> {
@@ -691,14 +693,10 @@ fn compare_scalar_keys(
     cache: &mut Option<BlockKeys>, left: usize, right: usize, plan: &SortPlan,
     read: impl Fn(usize) -> Result<Key>,
 ) -> Result<std::cmp::Ordering> {
-    if let Some(keys) = cache {
-        match keys.compare(left, right, plan, &read) {
-            // The cache must not consume the memory the two-key comparator needs to run.
-            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => *cache = None,
-            result => return result,
-        }
+    match cache {
+        Some(keys) => keys.compare(left, right, plan, &read),
+        None => plan.compare(&read(left)?.values, &read(right)?.values),
     }
-    plan.compare(&read(left)?.values, &read(right)?.values)
 }
 
 struct Run {

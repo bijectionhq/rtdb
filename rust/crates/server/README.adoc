@@ -192,4 +192,4 @@ Flight SQL defaults to `XTDB Flight SQL`, and Clojure queries opened on a native
 The OTLP exporter emits numeric and Boolean attributes with their corresponding wire types.
 
 Native materialized CTEs reuse small results in memory.
-When the result grows beyond the row threshold or its memory allowance (`materialized_memory_bytes`, 64 MiB by default), or the budget refuses a page, the binding writes one spill file, which counts against the query spill limit.
+When the result grows beyond the row threshold or its memory allowance (`materialized_memory_bytes`, 64 MiB by default), the binding writes one spill file, which counts against the query spill limit.

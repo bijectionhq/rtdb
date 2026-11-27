@@ -1027,7 +1027,7 @@ impl ScanCursor {
             drop(workers);
             Ok::<_, Anomaly>(ranking.winners())
         }).await;
-        // Storage's memory limit reaches here with the ResourceExhausted kind its conversion gives it.
+        // The search accelerators are RTDB's indexes over the scan XTDB runs; one the budget cannot afford leaves the query to that scan.
         let mut winners = match query_winners {
             Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => None,
             result => result?,
@@ -1058,6 +1058,7 @@ impl ScanCursor {
                             else { verified = selection.scores; }
                         }
                         Ok(None) => {}
+                        // An unaffordable ranked selection leaves the query to the plain scan, as above.
                         Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {}
                         Err(error) => return Err(error),
                     }
@@ -1091,6 +1092,7 @@ impl ScanCursor {
                                         || scan.iids.as_ref().is_none_or(|existing| existing.contains(&iid)),
                                         |existing: &crate::CandidateIids| existing.contains(iid))
                             }, &execution.context.memory) {
+                                // An unaffordable candidate set leaves the query to the plain scan, as above.
                                 Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => continue,
                                 result => result?,
                             };
@@ -1117,6 +1119,7 @@ impl ScanCursor {
                             return Ok::<_, Anomaly>((parts, verified_counts));
                         }
                         Ok(None) => {}
+                        // Unaffordable ranked rows leave the query to the plain scan, as above.
                         Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {
                             if let Some(rank) = &mut ranking && let Some(scores) = &mut rank.verified { scores.release_rows(); }
                             drop(verified.take());

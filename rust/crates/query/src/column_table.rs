@@ -128,11 +128,7 @@ async fn assemble_flat_pages(
         .and_then(|bytes| bytes.checked_add(logical_bytes))
         .and_then(|bytes| bytes.checked_add(4096))
         .ok_or_else(size_error)?;
-    let reservation = match context.memory.reserve(bound) {
-        Ok(reservation) => reservation,
-        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(None),
-        Err(error) => return Err(error),
-    };
+    let reservation = context.memory.reserve(bound)?;
     let arrow_error = |error| invalid("column-gather", error);
     macro_rules! bytes {
         ($ty:ty) => {

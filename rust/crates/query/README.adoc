@@ -227,6 +227,7 @@ Keyless joins, anti-join candidate scans, spill-backed membership checks, and re
 Sort spills its record backing when its block and the scratch to order it reach `sort_memory_bytes`; semantic run and output-page boundaries remain determined by complete input callbacks.
 Spill decisions read only the operator's configured share in `QueryOptions` (`sort_memory_bytes`, `materialized_memory_bytes`, `materialized_spill_rows`, `join_build_rows`, `top_k_rows`), never the budget's free bytes.
 Grouping, aggregates and DISTINCT never spill, as in XTDB.
+A refused allocation fails the query, as an Arrow allocation failure does in XTDB, rather than choosing another strategy; the exceptions are cache admissions (a compiled plan the keeper refuses runs unkept) and the search accelerators, which leave the query to the plain scan XTDB runs.
 There is no parallel partition scheduling or coordinated scan-page spilling.
 A single large output row, aggregate array, or set of overlapping active pages can exhaust the configured memory budget and return an error.
 

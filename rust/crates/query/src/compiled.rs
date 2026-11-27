@@ -72,7 +72,8 @@ impl CompiledQuery {
         let Some(keeper) = &self.keeper else { return unkept(); };
         let Some(emitted) = self.plans.admit(|| match EmittedRelation::emit(Arc::clone(relation), catalog, parameters, keeper, mode) {
             Ok(emitted) => Ok(Some(emitted)),
-            // Emission charges only the keeper, so running out of memory here is the keeper refusing the plan.
+            // Emission charges only the keeper, so running out of memory here is the keeper refusing the plan: a cache
+            // admission, which, as in XTDB's plan cache, never fails the query that compiles the plan.
             Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
             Err(error) => Err(error),
         })? else {
