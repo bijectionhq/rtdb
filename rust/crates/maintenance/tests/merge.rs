@@ -3,13 +3,63 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{data::{StoredEvent, StoredOperation, EventBatch, build_event_batch}, ipc::{ArrowFile, write_file}, keys::{TableSlug, TrieKey}, metadata::{MetadataBuilder, MetadataFile, MetadataNode}};
+use rtdb_format::{catalog::{BlockCatalog, TableBlock}, data::{StoredEvent, StoredOperation, EventBatch, build_event_batch}, ipc::{ArrowFile, write_file}, keys::{TableSlug, TrieKey}, metadata::{MetadataBuilder, MetadataFile, MetadataNode}};
 use rtdb_index::{PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_maintenance::{CompactionExecutor, CompactionJob, MergeConfig, RecencyMode, SegmentCompactor, RecencyPartition, recency_partition};
 use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{BlockIndex, Iid, Interval, LogicalType, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn compaction_of_a_jvm_checkpoint_matches_the_jvm_output_events() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../src/test/resources/xtdb/compactor-reset-node/objects/v06");
+    let root = BlockCatalog::decode(&std::fs::read(fixture.join("blocks/b00.binpb")).unwrap()).unwrap();
+    let table_blocks: BTreeMap<_, _> = root.table_entries().unwrap().into_iter().map(|entry| {
+        let path = entry.slug.block_key(root.block_index()).unwrap();
+        let block = TableBlock::decode(&std::fs::read(fixture.join(path)).unwrap()).unwrap();
+        (entry.table, block)
+    }).collect();
+    let system_time = root.latest_completed_tx().unwrap().system_time;
+    let catalog = TrieCatalog::load(&table_blocks, 100 * 1024 * 1024, system_time).unwrap();
+    let tables = TableCatalog::load(Some(root), &table_blocks).unwrap();
+    let table = TableRef::new("public", "bar");
+    let slug = tables.entry(&table).unwrap().slug.clone();
+    let jobs = rtdb_maintenance::available_jobs(&catalog).unwrap();
+    let job = jobs.iter().find(|job| job.table == table).unwrap();
+    let input = TrieKey::l0(BlockIndex(0)).unwrap();
+    assert_eq!(job.inputs, [input.clone()]);
+    assert_eq!(job.output.to_string(), "l01-rc-b00");
+
+    let store = Arc::new(MemoryStore::default());
+    for path in [slug.data_key(&input), slug.metadata_key(&input)] {
+        let bytes = std::fs::read(fixture.join(&path)).unwrap();
+        store.put(&ObjectKey::new(path).unwrap(), Bytes::from(bytes)).await.unwrap();
+    }
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let temporary = tempfile::tempdir().unwrap();
+    let compactor = SegmentCompactor::new(store.clone(), state, MemoryBudget::new(64 * 1024 * 1024),
+        StorageVersion(6), StorageEpoch(0), MergeConfig { temporary_directory: temporary.path().into(), ..Default::default() }).unwrap();
+    let notice = compactor.execute(job, &CancellationToken::new()).await.unwrap();
+    let [trie] = notice.tries.as_slice() else { panic!("expected one current output"); };
+    let path = slug.data_key(&job.output);
+    let bytes = store.get(&ObjectKey::new(path.clone()).unwrap()).await.unwrap();
+    assert_eq!(trie.data_file_size, Some(bytes.len() as i64));
+
+    let read_events = |bytes: &[u8]| {
+        let mut reader = ArrowFile::open(Arc::from(bytes), None).unwrap();
+        let mut events = Vec::new();
+        for page in 0..reader.page_count() {
+            let batch = EventBatch::new(reader.read_page(page).unwrap()).unwrap();
+            events.extend((0..batch.len()).map(|row| batch.read_event(row).unwrap()));
+        }
+        events
+    };
+    let expected = read_events(&std::fs::read(fixture.join(path)).unwrap());
+    assert!(!expected.is_empty());
+    assert_eq!(read_events(&bytes), expected);
+}
 
 #[tokio::test]
 async fn receipt_compaction_removes_an_older_payload_and_keeps_its_surviving_peer() {

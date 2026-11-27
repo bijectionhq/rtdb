@@ -9,6 +9,8 @@ It opens immutable inputs, merges pages by IID and descending system position, r
 Small uncompressed primary files without dictionaries can supply Arrow buffers directly from admitted object bytes, including local read-only mappings and authenticated remote reads.
 Encoded primary bytes shared by a job use at most 1 MiB or one eighth of the shared memory limit, whichever is smaller.
 File-backed inputs use the job's temporary directory, and compaction can retry preparation and merge with file-backed primary inputs under the same catalog hold after memory pressure.
+Temporary files use the filesystem's available space by default.
+An explicit `MergeConfig::temporary_byte_limit` bounds a job's temporary work.
 Entity history and directory builds use the same retained reader for stored primary files, release it after each source, and keep using the file reader for staged local inputs.
 An artefact read that runs into memory pressure can spill its admitted bytes and restart that source before artefact publication.
 The system position pairs the commit time with the assertion's position inside a hosted Proposal landing.

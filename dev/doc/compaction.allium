@@ -7,8 +7,9 @@
 -- A compaction job reads its captured catalog without registering with collection.
 -- Where a hosted journal grants per-read custody, the job admits its captured catalog through that custody before opening its inputs, and that custody follows admitted provider requests through cancellation.
 -- Native compaction reserves the temporary buffers for each authenticated input range or for a whole-object input before downloading it.
--- Native compaction charges each input pair's admitted lengths against the job's cumulative temporary input allowance before reading it.
--- An input object already on the node's disk is read in place and charges nothing against that allowance.
+-- Native compaction spools to the filesystem by default.
+-- With an explicit temporary byte limit, each input pair's admitted lengths count against the job's cumulative temporary input allowance before reading it.
+-- An input object already on the node's disk is read in place.
 -- The open file keeps the object's contents readable through a concurrent deletion for the rest of the job.
 -- Small uncompressed metadata can be decoded from its original reserved object bytes.
 -- Its retained input allocations share a per-job ceiling of 1 MiB or one eighth of the memory budget, whichever is smaller.

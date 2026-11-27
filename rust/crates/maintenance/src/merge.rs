@@ -33,13 +33,14 @@ pub struct MergeConfig {
     pub within_file_recency_branching: bool,
     pub recency_partition: RecencyPartition,
     pub temporary_directory: PathBuf,
+    /// Upper bound on temporary work per job. `u64::MAX` leaves it to the filesystem.
     pub temporary_byte_limit: u64,
     pub scan_tie_order_from_naming_epoch: Option<NonZeroU64>,
 }
 
 impl Default for MergeConfig {
     fn default() -> Self { Self { page_size: 1024, run_end_encoded_iids: false, within_file_recency_branching: false,
-        recency_partition: RecencyPartition::Week, temporary_directory: std::env::temp_dir(), temporary_byte_limit: 16 * 1024 * 1024 * 1024,
+        recency_partition: RecencyPartition::Week, temporary_directory: std::env::temp_dir(), temporary_byte_limit: u64::MAX,
         scan_tie_order_from_naming_epoch: None } }
 }
 
@@ -213,15 +214,18 @@ fn disk_usage(directory: &Path) -> Result<u64> {
 }
 
 fn check_disk(directory: &Path, limit: u64, additional: u64) -> Result<()> {
+    if limit == u64::MAX { return Ok(()); }
     if disk_usage(directory)?.checked_add(additional).is_none_or(|size| size > limit) { return Err(crate::invalid("Compaction temporary disk budget exceeded")); }
     Ok(())
 }
 
 fn disk_remaining(directory: &Path, limit: u64) -> Result<u64> {
+    if limit == u64::MAX { return Ok(limit); }
     limit.checked_sub(disk_usage(directory)?).ok_or_else(|| crate::invalid("Compaction temporary disk budget exceeded"))
 }
 
 fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> Result<()> {
+    if limit == u64::MAX { return Ok(()); }
     let allowance = writer.bytes_written().checked_add(disk_remaining(directory, limit)?).ok_or_else(|| crate::invalid("Compaction temporary disk budget overflow"))?;
     writer.set_byte_limit(allowance)
 }
@@ -649,10 +653,12 @@ impl SegmentCompactor {
             let metadata_local = self.store.cached_local_file(&meta_key).await.map_err(crate::invalid)?;
             let data_size = if data_local.is_some() { 0 } else { self.store.head(&data_key).await.map_err(crate::invalid)?.size };
             let metadata_size = if metadata_local.is_some() { 0 } else { self.store.head(&meta_key).await.map_err(crate::invalid)?.size };
-            input_bytes = input_bytes.checked_add(data_size).and_then(|bytes| bytes.checked_add(metadata_size))
-                .ok_or_else(|| crate::invalid("Input file size overflow"))?;
-            if input_bytes > self.config.temporary_byte_limit {
-                return Err(crate::invalid("Compaction temporary disk budget exceeded"));
+            if self.config.temporary_byte_limit != u64::MAX {
+                input_bytes = input_bytes.checked_add(data_size).and_then(|bytes| bytes.checked_add(metadata_size))
+                    .ok_or_else(|| crate::invalid("Input file size overflow"))?;
+                if input_bytes > self.config.temporary_byte_limit {
+                    return Err(crate::invalid("Compaction temporary disk budget exceeded"));
+                }
             }
             let data = match data_local {
                 Some(local) => PrimaryData::Local(local),
@@ -912,6 +918,16 @@ mod tests {
     use rtdb_format::data::StoredOperation;
     use rtdb_format::data::{StoredEvent, build_event_batch};
     use rtdb_types::{Iid, Value};
+
+    #[test]
+    fn default_compaction_spill_has_no_fixed_disk_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let previous_limit = 16 * 1024 * 1024 * 1024;
+        let file = create_file(&directory.path().join("spilled.arrow")).unwrap();
+        file.set_len(previous_limit + 1).unwrap();
+        assert!(check_disk(directory.path(), MergeConfig::default().temporary_byte_limit, 1).is_ok());
+        assert!(check_disk(directory.path(), previous_limit, 0).is_err());
+    }
 
     #[test]
     fn a_memory_refusal_is_recognised_by_its_kind_not_its_code() {
