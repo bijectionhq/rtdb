@@ -38,6 +38,13 @@ final class NativeAbi {
         register(library, linker, "close", I64, PTR);
         register(library, linker, "error_field", I64, I32, PTR, PTR);
         register(library, linker, "session_open", I64, PTR, I64, I32, PTR, I64, PTR, I64, PTR, PTR);
+        registerOptional(library, linker, "database_authenticate", I64, I32, PTR, I64, PTR, I64, PTR, PTR);
+        registerOptional(library, linker, "principal_user_id", I64, PTR, PTR);
+        registerOptional(library, linker, "session_open_as", I64, PTR, I64, I64, PTR, PTR);
+        registerOptional(library, linker, "session_user_id", I64, PTR, PTR);
+        registerOptional(library, linker, "database_start_device_auth", I64, PTR, I64, PTR, PTR);
+        registerOptional(library, linker, "device_auth_url", I64, PTR, PTR);
+        registerOptional(library, linker, "device_auth_wait", I64, PTR, PTR);
         register(library, linker, "operation_new", I64, PTR, PTR);
         register(library, linker, "cancel", I64, PTR);
         register(library, linker, "session_action", I64, I64, I32, PTR);
@@ -129,6 +136,11 @@ final class NativeAbi {
             call("bytes", handle, slice);
             return copySlice(slice);
         }
+    }
+    String ownedText(long handle) throws AdbcException {
+        if (handle == 0) return null;
+        try { return new String(copiedBytes(handle), StandardCharsets.UTF_8); }
+        finally { dispose(handle, false); }
     }
     NativeException diagnostic(long handle) throws AdbcException {
         try (Arena arena = Arena.ofConfined()) {

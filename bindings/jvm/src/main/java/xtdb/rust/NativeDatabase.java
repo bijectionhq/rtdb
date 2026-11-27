@@ -10,6 +10,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -30,6 +31,26 @@ import xtdb.api.TransactionKey;
 /** A native database region. The supplied Arrow allocator remains caller-owned until all imported batches close. */
 public final class NativeDatabase extends NativeResource implements AdbcDatabase, xtdb.api.DataSource {
     public enum AuthMethod { TRUST, PASSWORD, CLIENT_CREDENTIALS, DEVICE_AUTH }
+
+    /** A native principal usable on the database that authenticated it. */
+    public static final class Principal extends NativeResource {
+        private Principal(NativeAbi abi, long handle) { super(abi, handle); }
+        public String getUserId() throws AdbcException { return abi.ownedText(abi.handle("principal_user_id", handle())); }
+        @Override public void close() throws AdbcException { dispose(false); }
+    }
+
+    /** A single-use native device authorization. Closing it cancels a pending await. */
+    public static final class DeviceAuth extends NativeResource {
+        private final URI url;
+
+        private DeviceAuth(NativeAbi abi, long handle, URI url) {
+            super(abi, handle);
+            this.url = url;
+        }
+
+        public URI getUrl() { return url; }
+        public Principal await() throws AdbcException { return new Principal(abi, abi.handle("device_auth_wait", handle())); }
+    }
 
     private final BufferAllocator allocator;
     private final java.util.concurrent.atomic.AtomicReference<String> awaitToken = new java.util.concurrent.atomic.AtomicReference<>();
@@ -218,6 +239,42 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
     public NativeConnection connectTrusted(String database, String user) throws AdbcException { return connect(database, 1, user, ""); }
     public NativeConnection connectWithPassword(String database, String user, String password) throws AdbcException { return connect(database, 2, user, password); }
     public NativeConnection connectWithClientCredentials(String database, String clientId, String clientSecret) throws AdbcException { return connect(database, 3, clientId, clientSecret); }
+
+    public NativeConnection connect(String database, Principal principal) throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            var name = NativeAbi.text(arena, database);
+            long connection = abi.handle("session_open_as", handle(), name, name.byteSize(), principal.handle());
+            return new NativeConnection(abi, connection, allocator, database);
+        }
+    }
+
+    /** Explicit host trust. The configured credential verifier is bypassed. */
+    public Principal authenticateTrusted(String user) throws AdbcException { return authenticate(1, user, ""); }
+    public Principal authenticateWithPassword(String user, String password) throws AdbcException { return authenticate(2, user, password); }
+    public Principal authenticateWithClientCredentials(String clientId, String clientSecret) throws AdbcException { return authenticate(3, clientId, clientSecret); }
+
+    private Principal authenticate(int mode, String user, String secret) throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            var name = NativeAbi.text(arena, user);
+            var credential = NativeAbi.text(arena, secret);
+            long principal = abi.handle("database_authenticate", handle(), mode, name, name.byteSize(), credential, credential.byteSize());
+            return new Principal(abi, principal);
+        }
+    }
+
+    public DeviceAuth startDeviceAuth(String user) throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            var name = NativeAbi.text(arena, user);
+            long challenge = abi.handle("database_start_device_auth", handle(), name, name.byteSize());
+            try {
+                var url = URI.create(abi.ownedText(abi.handle("device_auth_url", challenge)));
+                return new DeviceAuth(abi, challenge, url);
+            } catch (AdbcException | RuntimeException | Error failure) {
+                try { abi.dispose(challenge, true); } catch (AdbcException close) { failure.addSuppressed(close); }
+                throw failure;
+            }
+        }
+    }
 
     /** Returns the configured method for the claimed user and remote address, or null when no rule matches. */
     public AuthMethod authMethodFor(String user, String remoteAddress) throws AdbcException {

@@ -14,5 +14,6 @@ abstract class NativeResource implements AutoCloseable {
         return value;
     }
     final long retainedHandle() throws AdbcException { return abi.handle("retain", handle()); }
-    @Override public void close() throws AdbcException { abi.dispose(handle.getAndSet(0), true); }
+    final void dispose(boolean close) throws AdbcException { abi.dispose(handle.getAndSet(0), close); }
+    @Override public void close() throws AdbcException { dispose(true); }
 }

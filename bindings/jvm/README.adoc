@@ -45,6 +45,10 @@ The JDBC connection builder uses the read-write PostgreSQL listener when present
 `getDatabaseNames()` and `latestCompletedTxs()` read the native catalog's open databases.
 `latestCompletedTxs()` retains a null entry for each partition that has yet to complete a transaction.
 `authMethodFor(user, remoteAddress)` inspects native authentication rules without opening a connection or authenticating the caller.
+Use `authenticateWithPassword`, `authenticateWithClientCredentials`, or explicit host `authenticateTrusted` to create a reusable principal.
+For device authorization, open `startDeviceAuth(user)`, show its verification URL, and call `await()` to obtain the principal.
+Use `connect(databaseName, principal)` to open a session on the node that issued it.
+Close the principal after opening the sessions that need it and close a pending device authorization to cancel its wait.
 Only `CREATE_APPEND` bulk ingest is supported, matching the pinned embedded API.
 Arrow binds are copied, including duplicate or unnamed parameter columns, so an external source allocator may close immediately after `bind` returns.
 Metadata includes `getInfo`, `getObjects`, `getTableTypes` and `getTableSchema` with the standard ADBC schemas.

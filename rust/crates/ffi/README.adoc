@@ -11,6 +11,9 @@ For an embedded node without network listeners, set `server: null` and `flightSq
 The listener port functions return `-1` for unconfigured read-write PostgreSQL, read-only PostgreSQL, Flight SQL and health endpoints.
 The PostgreSQL client-host functions write the reached address into caller-owned storage and report `localhost` for wildcard bindings.
 `rtdb_v1_database_catalog_status` returns catalog membership and completed keys as an owned Transit JSON byte handle.
+The embedded authenticator exposes native principal and device authorization handles.
+An authenticated principal opens sessions only on its originating node and can be released after a session retains it.
+Device authorization polling has a single consumer and is cancelled by challenge close, last release, or originating node shutdown.
 
 `rtdb_v1_database_open` selects the default TimSort object sorter.
 The additive `rtdb_v1_database_open_with_properties` entry accepts a borrowed UTF-8 JSON object of string values, limited to 4096 bytes, under the startup allocation budget.

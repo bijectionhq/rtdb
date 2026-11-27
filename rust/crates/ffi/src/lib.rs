@@ -1,5 +1,6 @@
 //! Versioned blocking C ABI; ownership and thread-safety requirements are in `include/rtdb.h`.
 mod arrow;
+mod auth;
 mod handles;
 mod region;
 mod statement;
@@ -126,7 +127,8 @@ pub unsafe extern "C" fn rtdb_v1_close(handle: u64, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         match handles::get(handle)? {
             Handle::Database(value) => value.0.close()?, Handle::Session(value) => value.close(), Handle::Statement(value) => value.close(),
-            Handle::Cursor(value) => value.close(), Handle::Cancellation(value) => value.token.cancel(), Handle::Error(_) | Handle::Bytes(_) => return Err(invalid("Immutable values are released, not closed")),
+            Handle::Cursor(value) => value.close(), Handle::Cancellation(value) => value.token.cancel(), Handle::Device(value) => value.close(),
+            Handle::Error(_) | Handle::Bytes(_) | Handle::Principal(_) => return Err(invalid("Immutable values are released, not closed")),
         } Ok(())
     }) }
 }
@@ -161,20 +163,7 @@ pub unsafe extern "C" fn rtdb_v1_session_open(database: u64, name: *const u8, na
         let out = output(out)?; *out = 0;
         let database = handles::database(database)?;
         let _admitted = database.0.enter()?;
-        let principal = match authentication {
-            0 => { region::blocking_caller()?; database.0.server.authenticator().unauthenticated()? }
-            1 => { region::blocking_caller()?; database.0.server.authenticator().authenticate_trusted(text(user, user_length)?)? }
-            2 | 3 => {
-                let auth = Arc::clone(database.0.server.authenticator());
-                let user = text(user, user_length)?.to_owned();
-                let secret = text(secret, secret_length)?.to_owned();
-                database.0.run(move || async move {
-                    if authentication == 2 { auth.verify_password(&user, &secret).await }
-                    else { auth.verify_client_credentials(&user, &secret).await }
-                })?
-            }
-            _ => { region::blocking_caller()?; return Err(invalid("Unknown embedded authentication mode")); }
-        };
+        let principal = auth::authenticate(&database.0, authentication, user, user_length, secret, secret_length)?;
         let session = database.0.server.node().session(text(name, name_length)?, principal)?;
         *out = handles::insert(Handle::Session(statement::SessionHandle::new(Arc::clone(&database.0), session)?))?; Ok(())
     }) }

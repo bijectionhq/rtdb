@@ -77,6 +77,7 @@
 -- Embedded callers can open a read-only or write-only transaction with typed settings in a single session operation.
 -- Embedded callers can shape an open transaction before its first query or write, including a read-only await floor and a transaction-local time zone.
 -- The structured embedded outcome carries the submitted position or the indexed transaction key and abort diagnostic.
+-- An embedded session opened with a native principal uses that identity for authorization and transaction attribution.
 -- Embedded ADBC metadata builds its catalog, schema, table, and column arrays with the declared ADBC field order and list validity.
 -- JSON Bind preserves the spelling of numeric tokens through native type inference.
 -- The decoder borrows tokens while visiting nested input.

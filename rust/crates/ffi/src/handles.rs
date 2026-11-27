@@ -4,7 +4,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_tx::{RetainedAnomaly, RetainedBytes};
 use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
-use crate::{region::DatabaseHandle, statement::{CursorHandle, SessionHandle, StatementHandle}};
+use crate::{auth::{DeviceHandle, PrincipalHandle}, region::DatabaseHandle, statement::{CursorHandle, SessionHandle, StatementHandle}};
 
 pub(crate) struct Diagnostic { pub error: RetainedAnomaly, pub wire: RetainedBytes }
 pub(crate) struct NativeBytes { pub value: RetainedBytes, pub memory: Arc<MemoryBudget> }
@@ -15,6 +15,7 @@ impl Drop for OperationToken { fn drop(&mut self) { self.token.cancel(); } }
 pub(crate) enum Handle {
     Database(Arc<DatabaseHandle>), Session(Arc<SessionHandle>), Statement(Arc<StatementHandle>),
     Cursor(Arc<CursorHandle>), Cancellation(Arc<OperationToken>), Error(Arc<Diagnostic>), Bytes(Arc<NativeBytes>),
+    Principal(Arc<PrincipalHandle>), Device(Arc<DeviceHandle>),
 }
 impl Handle {
     pub fn memory(&self) -> &Arc<MemoryBudget> {
@@ -22,6 +23,7 @@ impl Handle {
             Self::Database(value) => value.0.memory(), Self::Session(value) => value.region.memory(),
             Self::Statement(value) => value.session.region.memory(), Self::Cursor(value) => value.region.memory(),
             Self::Cancellation(value) => value.session.region.memory(), Self::Error(_) => &ERROR_MEMORY, Self::Bytes(value) => &value.memory,
+            Self::Principal(value) => &value.memory, Self::Device(value) => &value.memory,
         }
     }
 }

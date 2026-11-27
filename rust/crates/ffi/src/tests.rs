@@ -134,6 +134,32 @@ fn structured_commit_keeps_the_abort_after_the_session_closes() {
 }
 
 #[test]
+fn a_principal_is_bound_to_its_region_and_a_session_retains_it() {
+    let native = Native::open();
+    let other = Native::open();
+    let mut error = 0;
+    let mut principal = 0;
+    let user = b"embedded user";
+    ok(unsafe { auth::rtdb_v1_database_authenticate(native.database, 1, user.as_ptr(), user.len(), std::ptr::null(), 0, &mut principal, &mut error) }, error);
+    let name = b"xtdb";
+    let mut session = 0;
+    let status = unsafe { auth::rtdb_v1_session_open_as(other.database, name.as_ptr(), name.len(), principal, &mut session, &mut error) };
+    incorrect(status, error, "rtdb.ffi/invalid-argument");
+    assert_eq!(session, 0);
+    ok(unsafe { auth::rtdb_v1_session_open_as(native.database, name.as_ptr(), name.len(), principal, &mut session, &mut error) }, error);
+    ok(unsafe { rtdb_v1_release(principal, &mut error) }, error);
+
+    let mut identity = 0;
+    ok(unsafe { auth::rtdb_v1_session_user_id(session, &mut identity, &mut error) }, error);
+    let mut value = RtdbSlice { data: std::ptr::null(), length: 0 };
+    ok(unsafe { rtdb_v1_bytes(identity, &mut value, &mut error) }, error);
+    assert_eq!(unsafe { std::slice::from_raw_parts(value.data, value.length) }, user);
+    ok(unsafe { rtdb_v1_release(identity, &mut error) }, error);
+    ok(unsafe { rtdb_v1_close(session, &mut error) }, error);
+    ok(unsafe { rtdb_v1_release(session, &mut error) }, error);
+}
+
+#[test]
 fn diagnostic_slices_distinguish_absent_empty_and_present_messages_through_retain() {
     for message in [None, Some(String::new()), Some("échec".into())] {
         let original = handles::diagnostic(Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone()));

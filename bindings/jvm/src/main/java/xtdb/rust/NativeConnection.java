@@ -62,6 +62,7 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
         super(abi, handle); this.allocator = allocator; this.catalog = catalog;
     }
     public BufferAllocator getAllocator() { return allocator; }
+    public String getUser() throws AdbcException { return abi.ownedText(abi.handle("session_user_id", handle())); }
     final class Operation implements AutoCloseable {
         private final AtomicLong id;
         Operation(long id) { this.id = new AtomicLong(id); operations.add(this); }
@@ -182,9 +183,7 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
         return Instant.ofEpochSecond(Math.floorDiv(micros, 1_000_000L), Math.floorMod(micros, 1_000_000L) * 1_000L);
     }
     public String getAwaitToken() throws AdbcException {
-        long token = abi.handle("session_await_token", handle());
-        if (token == 0) return null;
-        try { return new String(abi.copiedBytes(token), java.nio.charset.StandardCharsets.UTF_8); } finally { abi.dispose(token, false); }
+        return abi.ownedText(abi.handle("session_await_token", handle()));
     }
     public boolean supportsTypedAwaitToken() { return abi.supports("session_set_await_token"); }
     public boolean supportsTypedReadSettings() { return abi.supports("session_set_read_settings"); }

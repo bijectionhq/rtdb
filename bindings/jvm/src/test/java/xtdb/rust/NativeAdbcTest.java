@@ -76,6 +76,29 @@ final class NativeAdbcTest {
         }
     }
 
+    @Test void authenticatesReusablePrincipalsThatStayBoundToTheirNativeNode() throws Exception {
+        String yaml = YAML + "authn: !SingleRootUser { password: example }\n";
+        try (var allocator = new RootAllocator(); var database = NativeDatabase.open(allocator, yaml, 512L * 1024 * 1024);
+             var other = open(allocator)) {
+            var badPassword = assertThrows(NativeException.class, () -> database.authenticateWithPassword("xtdb", "bad"));
+            assertEquals("forbidden", badPassword.category());
+            var unsupported = assertThrows(NativeException.class, () -> database.startDeviceAuth("xtdb"));
+            assertEquals("unsupported", unsupported.category());
+            try (var principal = database.authenticateWithPassword("xtdb", "example")) {
+                assertEquals("xtdb", principal.getUserId());
+                assertThrows(NativeException.class, () -> other.connect("xtdb", principal));
+                try (var first = database.connect("xtdb", principal); var second = database.connect("xtdb", principal)) {
+                    principal.close();
+                    assertEquals("xtdb", first.getUser());
+                    assertEquals("xtdb", second.getUser());
+                }
+            }
+            try (var trusted = database.authenticateTrusted("embedded user"); var connection = database.connect("xtdb", trusted)) {
+                assertEquals("embedded user", connection.getUser());
+            }
+        }
+    }
+
     @Test void beginsWithAReadBasisAndLeavesTheSessionUsableAfterARejectedBegin() throws Exception {
         try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
             assertThrows(NativeException.class, () -> connection.beginReadOnly(ZoneOffset.UTC, null, Instant.MAX, null));

@@ -123,6 +123,21 @@ int32_t rtdb_v1_error_field(RtdbHandle handle, uint32_t field, RtdbSlice *out, R
 int32_t rtdb_v1_session_open(RtdbHandle database, const uint8_t *name, size_t name_length, uint32_t authentication,
                            const uint8_t *user, size_t user_length, const uint8_t *secret, size_t secret_length,
                            RtdbHandle *out, RtdbHandle *error);
+/* Authenticate with mode 1, 2 or 3. Release the returned immutable principal with rtdb_v1_release.
+ * A principal opens sessions only on its originating node. Sessions retain their own reference.
+ * User ID calls return owned UTF-8 byte handles or 0 when the caller has no user ID.
+ */
+int32_t rtdb_v1_database_authenticate(RtdbHandle database, uint32_t mode, const uint8_t *user, size_t user_length, const uint8_t *secret, size_t secret_length, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_principal_user_id(RtdbHandle principal, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_session_open_as(RtdbHandle database, const uint8_t *name, size_t name_length, RtdbHandle principal, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_session_user_id(RtdbHandle session, RtdbHandle *out, RtdbHandle *error);
+
+/* Read the owned verification URL byte handle before waiting. The challenge is single-use.
+ * Waiting returns an immutable principal. Close the challenge to cancel a wait and release it when done.
+ */
+int32_t rtdb_v1_database_start_device_auth(RtdbHandle database, const uint8_t *user, size_t user_length, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_device_auth_url(RtdbHandle challenge, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_device_auth_wait(RtdbHandle challenge, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_session_set_catalog(RtdbHandle session, const uint8_t *name, size_t name_length, RtdbHandle *error);
 int32_t rtdb_v1_session_set_application_name(RtdbHandle session, const uint8_t *name, size_t name_length, RtdbHandle *error);
 int32_t rtdb_v1_session_await_token(RtdbHandle session, RtdbHandle *out, RtdbHandle *error);
