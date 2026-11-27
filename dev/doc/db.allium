@@ -2161,9 +2161,16 @@ contract XtdbRefusesRtdbExtensionRecords {
         -- is stored with XTDB_REFUSAL_PREFIX before its protobuf, so XTDB's Block.parseFrom and TableBlock.parseFrom fail with the same invalid-tag error when a node opens the store or follows a block upload.
         -- An RTDB reader strips a leading zero byte, which no encoded protobuf message starts with; digests cover the stored bytes, prefix included.
 
+    @invariant LegacyTableBlockSchema
+        -- Each new table block carries an XTDB-layout Arrow schema frame in addition to its per-column metadata.
+        -- The frame retains the supplied column and union-leg order.
+        -- Readers of table blocks without per-column metadata use the Arrow schema and the separate column HLL map.
+
     @invariant PlainArrowLayouts
         -- Every Arrow stream RTDB writes into a log record, transaction operations and SQL arguments included, is in the layouts XTDB writes:
         -- a dictionary, view, list-view or run-end column is written in the plain layout holding the same values, so no layout frames a record.
+        -- Both list-view widths become ordinary Arrow lists.
+        -- A view whose expanded offsets exceed the plain layout's range is rejected.
         -- Flight SQL ingest refuses dictionary and view columns before they reach the log.
 
     @invariant UnparseableTrieKeys

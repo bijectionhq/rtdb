@@ -365,6 +365,56 @@ fn layouts_xtdb_does_not_write_are_written_in_their_plain_layout() {
 }
 
 #[test]
+fn large_list_view_expands_small_run_ends_into_an_ordinary_list() {
+    use arrow_array::{Int16Array, Int64Array, LargeListViewArray, ListArray, RunArray, cast::AsArray, types::Int16Type};
+    use arrow_buffer::ScalarBuffer;
+
+    let run = RunArray::<Int16Type>::try_new(
+        &Int16Array::from(vec![20_000]),
+        &Int64Array::from(vec![42]),
+    ).unwrap();
+    let child = Arc::new(Field::new("$data$", run.data_type().clone(), false));
+    let view = LargeListViewArray::try_new(
+        child,
+        ScalarBuffer::from(vec![0i64, 0, 0]),
+        ScalarBuffer::from(vec![20_000i64, 0, 20_000]),
+        Arc::new(run),
+        Some(vec![true, false, true].into()),
+    ).unwrap();
+    let page = RecordBatch::try_from_iter([("v", Arc::new(view) as ArrayRef)]).unwrap();
+    let encoded = write_stream_to(page.schema_ref(), [&page], Vec::new()).unwrap();
+    let mut stream = ArrowStream::open(encoded.into(), None).unwrap();
+    let decoded = stream.next().unwrap().unwrap();
+    assert!(stream.next().is_none());
+    let list = decoded.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(list.value_offsets(), [0, 20_000, 20_000, 40_000]);
+    assert!(list.is_null(1));
+    let values = list.values().as_primitive::<arrow_array::types::Int64Type>();
+    assert_eq!(values.len(), 40_000);
+    assert_eq!(values.null_count(), 0);
+    assert!(values.values().iter().all(|value| *value == 42));
+}
+
+#[test]
+fn list_view_that_overflows_plain_offsets_fails_before_expansion() {
+    use arrow_array::{LargeListViewArray, NullArray};
+    use arrow_buffer::ScalarBuffer;
+
+    let values = Arc::new(NullArray::new(i32::MAX as usize));
+    let child = Arc::new(Field::new("$data$", DataType::Null, true));
+    let view = LargeListViewArray::try_new(
+        child,
+        ScalarBuffer::from(vec![0i64, 0]),
+        ScalarBuffer::from(vec![i64::from(i32::MAX), 1]),
+        values,
+        None,
+    ).unwrap();
+    let page = RecordBatch::try_from_iter([("v", Arc::new(view) as ArrayRef)]).unwrap();
+    let error = write_stream_to(page.schema_ref(), [&page], Vec::new()).unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Arrow list offsets overflow"));
+}
+
+#[test]
 fn native_files_write_run_end_encoded_columns_in_java_layout() {
     use arrow_array::{
         Int16Array, Int32Array, Int64Array, RunArray,

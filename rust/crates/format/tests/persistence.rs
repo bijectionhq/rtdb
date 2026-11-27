@@ -174,6 +174,80 @@ fn legacy_block_names_allocate_oids_in_name_order() {
 }
 
 #[test]
+fn reads_xtdb_legacy_catalogs_and_writes_the_same_fallback_schema() {
+    let samples: [(&[u8], &[u8], Option<i32>); 2] = [
+        (
+            include_bytes!("../../../../src/test/resources/xtdb/trie-catalog-test/node-2.0.0/objects/v06/blocks/b04.binpb"),
+            include_bytes!("../../../../src/test/resources/xtdb/trie-catalog-test/node-2.0.0/objects/v06/tables/public$docs/blocks/b04.binpb"),
+            None,
+        ),
+        (
+            include_bytes!("../../../../src/test/resources/xtdb/trie-catalog-test/node-fcb7714ea/objects/v06/blocks/b04.binpb"),
+            include_bytes!("../../../../src/test/resources/xtdb/trie-catalog-test/node-fcb7714ea/objects/v06/tables/public$docs/blocks/b04.binpb"),
+            Some(pb::TrieState::Garbage as i32),
+        ),
+    ];
+    for (block_bytes, table_bytes, l0_state) in samples {
+        let block = BlockCatalog::decode(block_bytes).unwrap();
+        assert_eq!(block.block_index(), BlockIndex(4));
+        assert_eq!(block.encode(), block_bytes);
+        let entries = block.table_entries().unwrap();
+        let docs = &entries[0];
+        assert_eq!(docs.oid, FIRST_TABLE_OID);
+        assert_eq!(docs.table, TableRef::new("public", "docs"));
+        assert_eq!(docs.slug.block_key(block.block_index()).unwrap(), "tables/public$docs/blocks/b04.binpb");
+
+        let table = TableBlock::decode(table_bytes).unwrap();
+        assert!(table.partitions().is_empty());
+        assert_eq!(table.row_count(), 8000);
+        assert_eq!(table.trie_details().count(), 24);
+        let first = table.trie_details().next().unwrap();
+        assert_eq!(first.trie_key.as_deref(), Some("l00-rc-b00"));
+        assert_eq!(first.trie_state, l0_state);
+        let types = table.column_types().unwrap();
+        assert_eq!(types.keys().map(String::as_str).collect::<Vec<_>>(), ["foo", "_id"]);
+        let hlls = table.column_hlls();
+        assert_eq!(hlls.len(), 2);
+        let columns = types.iter().map(|(name, ty)| {
+            (name.clone(), columns::column_from_type(ty, Some(hlls[name].to_vec())).unwrap())
+        }).collect();
+        let written = TableBlock::from_parts(columns, &types, table.row_count(), vec![]).unwrap();
+        assert_eq!(written.as_proto().arrow_schema, table.as_proto().arrow_schema);
+        assert_eq!(written.column_types().unwrap(), types);
+        assert_eq!(written.column_hlls(), hlls);
+        assert_eq!(written.encode()[0], 0x0a);
+
+        let mut earlier_rtdb = table.as_proto().clone();
+        let schema = ipc::read_schema_message(table.as_proto().arrow_schema.as_deref().unwrap()).unwrap();
+        earlier_rtdb.arrow_schema = Some(ipc::write_schema_message(&schema).unwrap());
+        let earlier_rtdb = TableBlock::decode(&earlier_rtdb.encode_to_vec()).unwrap();
+        assert_eq!(earlier_rtdb.column_types().unwrap(), types);
+        assert_eq!(earlier_rtdb.column_hlls(), hlls);
+    }
+}
+
+#[test]
+fn reads_a_legacy_arrow_transaction_from_the_xtdb_local_log_fixture() {
+    let log = include_bytes!("../../../../src/test/resources/xtdb/compactor-reset-node/log/LOG");
+    const FIRST_PAYLOAD: std::ops::Range<usize> = 13..13 + 0x85c;
+    assert_eq!(&log[..5], &[0x1e, 0, 0, 0x08, 0x5c]);
+    assert_eq!(&log[FIRST_PAYLOAD.end..FIRST_PAYLOAD.end + 8], &[0; 8]);
+    let payload = &log[FIRST_PAYLOAD];
+    let message = SourceMessage::decode_wire(payload).unwrap().unwrap();
+    let SourceMessage::LegacyTransaction(bytes) = &message else {
+        panic!("expected an XTDB legacy transaction");
+    };
+    assert_eq!(message.encode().unwrap(), payload);
+    let (schema, pages) = ipc::read_stream(Arc::from(bytes.as_ref())).unwrap();
+    assert_eq!(
+        schema.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(),
+        ["tx-ops", "system-time", "default-tz", "user"],
+    );
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].num_rows(), 1);
+}
+
+#[test]
 fn await_tokens_keep_partition_order() {
     let tx = TxBasis { databases: BTreeMap::from([("xtdb".into(), vec![TxId(0), TxId(42)])]) };
     assert_eq!(basis::decode_tx_basis(&basis::encode_tx_basis(&tx)).unwrap(), tx);
@@ -241,6 +315,36 @@ fn committed_jvm_data_files_are_read_through_the_event_schema() {
     let page = projected.read_page(0).unwrap();
     assert_eq!(page.num_columns(), 1);
     page.column(0).to_data().validate_full().unwrap();
+}
+
+#[test]
+fn compacted_xtdb_data_and_metadata_survive_file_exchange() {
+    use rtdb_format::metadata::{MetadataFile, MetadataNode};
+
+    let data = include_bytes!("../../../../src/test/resources/xtdb/compactor-reset-node/objects/v06/tables/public$foo/data/l01-rc-b01.arrow");
+    let metadata = include_bytes!("../../../../src/test/resources/xtdb/compactor-reset-node/objects/v06/tables/public$foo/meta/l01-rc-b01.arrow");
+    let mut source = ipc::ArrowFile::open(Arc::from(data.as_slice()), None).unwrap();
+    assert_eq!(source.page_count(), 1);
+    let page = source.read_page(0).unwrap();
+    let original = EventBatch::new(page.clone()).unwrap();
+    assert_eq!(original.len(), 2);
+    let bytes = ipc::write_file(source.schema().as_ref(), &[page]).unwrap();
+    let mut file = ipc::ArrowFile::open(bytes.into(), None).unwrap();
+    assert_eq!(file.schema(), source.schema());
+    assert_eq!(file.page_count(), 1);
+    let copied = EventBatch::new(file.read_page(0).unwrap()).unwrap();
+    assert_eq!(copied.len(), original.len());
+    for row in 0..original.len() {
+        assert_eq!(copied.read_event(row).unwrap(), original.read_event(row).unwrap());
+    }
+
+    let original = MetadataFile::read(Arc::from(metadata.as_slice())).unwrap();
+    assert!(matches!(original.nodes(), [MetadataNode::Leaf { data_page_index: 0, .. }]));
+    let mut source = ipc::ArrowFile::open(Arc::from(metadata.as_slice()), None).unwrap();
+    assert_eq!(source.page_count(), 1);
+    let page = source.read_page(0).unwrap();
+    let bytes = ipc::write_file(source.schema().as_ref(), &[page]).unwrap();
+    assert_eq!(MetadataFile::read(bytes.into()).unwrap().nodes(), original.nodes());
 }
 
 fn uuid_fields(field: &arrow_schema::Field) -> Vec<arrow_schema::Field> {

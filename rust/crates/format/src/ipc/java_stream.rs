@@ -5,6 +5,7 @@
 //! Streams leave out dictionaries, views, list views and run-end encoding (`supports` sends those to `plain_layout`); files also
 //! write run-end encoded columns natively as XTDB's `RunEndEncodedVector` does.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
@@ -46,21 +47,29 @@ pub(super) fn supports(schema: &Schema) -> bool {
 
 /// Writes the schema, each page and the reference's end marker to `sink`; the caller has checked `supports(schema)`.
 /// A page whose schema differs from `schema` is rejected before any of its bytes are written.
-pub(super) fn write_stream<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, mut sink: W) -> Result<W> {
+pub(super) fn write_stream<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
+    write_pages(schema, pages.into_iter().map(Ok), sink)
+}
+
+pub(super) fn write_pages<W: Write, P: Borrow<RecordBatch>>(
+    schema: &Schema, pages: impl IntoIterator<Item = Result<P>>, mut sink: W,
+) -> Result<W> {
     let metadata = schema_message(schema)?;
     frame(&mut sink, &metadata, true).map_err(io_error)?;
     let mut body = Body::default();
     for page in pages {
+        let page = page?;
+        let page: &RecordBatch = page.borrow();
         if page.schema_ref().as_ref() != schema {
             return Err(Anomaly::incorrect("rtdb.format/arrow-schema", "Arrow page schema differs from its declared stream schema"));
         }
-        body.clear();
         for (field, column) in schema.fields().iter().zip(page.columns()) {
             body.column(field, &column.to_data(), column.null_count())?;
         }
         let metadata = body.message(page.num_rows())?;
         frame(&mut sink, &metadata, true).map_err(io_error)?;
         body.write(&mut sink).map_err(io_error)?;
+        body.clear();
     }
     sink.write_all(&[0; 4]).map_err(invalid)?;
     sink.flush().map_err(invalid)?;

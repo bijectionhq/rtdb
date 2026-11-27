@@ -6,15 +6,15 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, GenericListArray, GenericListViewArray, OffsetSizeTrait, RecordBatch, RecordBatchOptions,
+    Array, ArrayRef, BinaryArray, GenericListViewArray, ListArray, OffsetSizeTrait, RecordBatch, RecordBatchOptions,
     RunArray, StringArray, UInt64Array, make_array,
 };
-use arrow_buffer::{ArrowNativeType, OffsetBuffer};
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field, FieldRef, Schema, UnionFields};
 use arrow_select::take::take;
 use rtdb_types::Result;
 
-use super::invalid;
+use super::{allocation_add, invalid};
 
 /// Whether `data_type` holds a layout only at its leaves and in nesting XTDB writes.
 pub(super) fn is_plain(data_type: &DataType) -> bool {
@@ -57,8 +57,8 @@ fn plain_type(data_type: &DataType) -> DataType {
         DataType::Utf8View => DataType::Utf8,
         DataType::BinaryView => DataType::Binary,
         DataType::RunEndEncoded(_, values) => plain_type(values.data_type()),
-        DataType::List(child) | DataType::ListView(child) => DataType::List(plain_child(child)),
-        DataType::LargeList(child) | DataType::LargeListView(child) => DataType::LargeList(plain_child(child)),
+        DataType::List(child) | DataType::ListView(child) | DataType::LargeListView(child) => DataType::List(plain_child(child)),
+        DataType::LargeList(child) => DataType::LargeList(plain_child(child)),
         DataType::FixedSizeList(child, width) => DataType::FixedSizeList(plain_child(child), *width),
         DataType::Map(entries, sorted) => DataType::Map(plain_child(entries), *sorted),
         DataType::Struct(fields) => DataType::Struct(fields.iter().map(plain_child).collect()),
@@ -77,14 +77,17 @@ fn plain_array(array: &ArrayRef) -> Result<ArrayRef> {
             let dictionary = array.as_any_dictionary();
             take(dictionary.values().as_ref(), dictionary.keys(), None).map_err(invalid)?
         }
-        DataType::Utf8View => Arc::new(array.as_string_view().iter().collect::<StringArray>()) as ArrayRef,
-        DataType::BinaryView => Arc::new(array.as_binary_view().iter().collect::<BinaryArray>()) as ArrayRef,
-        DataType::RunEndEncoded(ends, _) => match ends.data_type() {
-            DataType::Int16 => expand_runs(array.as_run::<Int16Type>())?,
-            DataType::Int32 => expand_runs(array.as_run::<Int32Type>())?,
-            DataType::Int64 => expand_runs(array.as_run::<Int64Type>())?,
-            other => return Err(invalid(format!("Unsupported run-end type {other}"))),
-        },
+        DataType::Utf8View => {
+            let views = array.as_string_view();
+            check_byte_offsets(views.iter().flatten().map(str::len))?;
+            Arc::new(views.iter().collect::<StringArray>()) as ArrayRef
+        }
+        DataType::BinaryView => {
+            let views = array.as_binary_view();
+            check_byte_offsets(views.iter().flatten().map(<[u8]>::len))?;
+            Arc::new(views.iter().collect::<BinaryArray>()) as ArrayRef
+        }
+        DataType::RunEndEncoded(..) => take_run_values(array, 0..array.len())?,
         DataType::ListView(child) => return list_from_view(array.as_list_view::<i32>(), child),
         DataType::LargeListView(child) => return list_from_view(array.as_list_view::<i64>(), child),
         nested => {
@@ -100,24 +103,51 @@ fn plain_array(array: &ArrayRef) -> Result<ArrayRef> {
     plain_array(&plain)
 }
 
-fn expand_runs<R: RunEndIndexType>(array: &RunArray<R>) -> Result<ArrayRef> {
-    let indices = UInt64Array::from_iter_values((0..array.len()).map(|row| array.get_physical_index(row) as u64));
-    take(array.values().as_ref(), &indices, None).map_err(invalid)
+fn take_run_values(array: &ArrayRef, rows: impl Iterator<Item = usize>) -> Result<ArrayRef> {
+    fn gather<R: RunEndIndexType>(array: &RunArray<R>, rows: impl Iterator<Item = usize>) -> Result<ArrayRef> {
+        let indices = UInt64Array::from_iter_values(rows.map(|row| array.get_physical_index(row) as u64));
+        take(array.values().as_ref(), &indices, None).map_err(invalid)
+    }
+
+    let DataType::RunEndEncoded(ends, _) = array.data_type() else {
+        return Err(invalid("Arrow column has no run ends"));
+    };
+    match ends.data_type() {
+        DataType::Int16 => gather(array.as_run::<Int16Type>(), rows),
+        DataType::Int32 => gather(array.as_run::<Int32Type>(), rows),
+        DataType::Int64 => gather(array.as_run::<Int64Type>(), rows),
+        other => Err(invalid(format!("Unsupported run-end type {other}"))),
+    }
+}
+
+fn check_byte_offsets(mut lengths: impl Iterator<Item = usize>) -> Result<()> {
+    let length = lengths.try_fold(0, allocation_add)?;
+    i32::try_from(length).map_err(|_| invalid("Arrow byte offsets overflow"))?;
+    Ok(())
 }
 
 fn list_from_view<O: OffsetSizeTrait>(array: &GenericListViewArray<O>, child: &FieldRef) -> Result<ArrayRef> {
-    let mut indices = Vec::new();
-    let mut offsets = Vec::with_capacity(array.len() + 1);
-    offsets.push(O::usize_as(0));
+    let mut offsets = Vec::with_capacity(allocation_add(array.len(), 1)?);
+    offsets.push(0i32);
+    let mut length = 0;
     for row in 0..array.len() {
         if array.is_valid(row) {
-            let start = array.value_offsets()[row].as_usize();
-            indices.extend((start..start + array.value_sizes()[row].as_usize()).map(|index| index as u64));
+            length = allocation_add(length, array.value_sizes()[row].as_usize())?;
         }
-        offsets.push(O::from_usize(indices.len()).ok_or_else(|| invalid("Arrow list offsets overflow"))?);
+        offsets.push(i32::try_from(length).map_err(|_| invalid("Arrow list offsets overflow"))?);
     }
-    let values = plain_array(&take(array.values().as_ref(), &UInt64Array::from(indices), None).map_err(invalid)?)?;
-    let list = GenericListArray::<O>::try_new(plain_child(child), OffsetBuffer::new(offsets.into()), values, array.nulls().cloned())
+    let rows = (0..array.len()).filter(|&row| array.is_valid(row)).flat_map(|row| {
+        let start = array.value_offsets()[row].as_usize();
+        start..start + array.value_sizes()[row].as_usize()
+    });
+    let values = array.values();
+    let selected = if matches!(values.data_type(), DataType::RunEndEncoded(..)) {
+        take_run_values(values, rows)?
+    } else {
+        let indices = UInt64Array::from_iter_values(rows.map(|row| row as u64));
+        take(values.as_ref(), &indices, None).map_err(invalid)?
+    };
+    let list = ListArray::try_new(plain_child(child), OffsetBuffer::new(offsets.into()), plain_array(&selected)?, array.nulls().cloned())
         .map_err(invalid)?;
     Ok(Arc::new(list))
 }

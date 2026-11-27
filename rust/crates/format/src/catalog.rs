@@ -259,8 +259,8 @@ impl TableBlock {
 
     pub fn retain_charge(&self) -> Option<Arc<MemoryReservation>> { self.charge.clone() }
 
-    /// `types` supplies the Arrow schema's field types in their first-seen leg order, as the reference's block schema keeps them;
-    /// the column metadata orders union legs by name. A column absent from `types` takes its metadata's type.
+    /// `types` supplies the legacy Arrow schema's field and union-leg order.
+    /// A column absent from `types` is appended with its metadata type in name order.
     pub fn from_parts(columns: BTreeMap<String, cpb::ColumnMeta>, types: &rtdb_types::StructFields<rtdb_types::LogicalType>, row_count: i64, partitions: Vec<pb::Partition>) -> Result<Self> {
         Self::with_declarations(columns, types, &Default::default(), row_count, partitions)
     }
@@ -273,11 +273,15 @@ impl TableBlock {
         partitions: Vec<pb::Partition>,
     ) -> Result<Self> {
         if row_count < 0 { return Err(invalid("Table row count is negative")); }
-        let schema = Schema::new(columns.iter().map(|(name, column)| {
-            let ty = match types.get(name) { Some(ty) => ty.clone(), None => crate::columns::logical_type(column)? };
-            rtdb_columnar::to_field(name, &ty)
-        }).collect::<Result<Vec<_>>>()?);
-        let arrow_schema = crate::ipc::write_schema_message(&schema_with_declarations(schema, declarations)?)?;
+        let mut fields = Vec::with_capacity(columns.len());
+        for (name, ty) in types.iter().filter(|(name, _)| columns.contains_key(*name)) {
+            fields.push(rtdb_columnar::to_field(name, ty)?);
+        }
+        for (name, column) in columns.iter().filter(|(name, _)| !types.contains_key(*name)) {
+            fields.push(rtdb_columnar::to_field(name, &crate::columns::logical_type(column)?)?);
+        }
+        let schema = schema_with_declarations(Schema::new(fields), declarations)?;
+        let arrow_schema = crate::ipc::write_java_schema_message(&schema)?;
         let column_name_to_hll = columns.iter().filter_map(|(name, column)| column.hll.as_ref().map(|hll| (name.clone(), hll.clone()))).collect();
         Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns, ..Default::default() }), charge: None })
     }

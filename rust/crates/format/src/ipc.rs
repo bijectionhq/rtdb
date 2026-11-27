@@ -2109,8 +2109,8 @@ pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<I
             return Err(Anomaly::incorrect("rtdb.format/arrow-schema", "Arrow page schema differs from its declared stream schema"));
         }
         plain_layout::plain_page(&plain, page)
-    }).collect::<Result<Vec<_>>>()?;
-    java_stream::write_stream(&plain, &pages, sink)
+    });
+    java_stream::write_pages(&plain, pages, sink)
 }
 
 pub fn read_schema_message(bytes: &[u8]) -> Result<Schema> {
@@ -2144,6 +2144,13 @@ fn schema_message_metadata(bytes: &[u8]) -> Result<arrow_ipc::Schema<'_>> {
 
 pub fn write_schema_message(schema: &Schema) -> Result<Vec<u8>> {
     write_schema_message_with_options(schema, &write_options()?)
+}
+
+pub(crate) fn write_java_schema_message(schema: &Schema) -> Result<Vec<u8>> {
+    let metadata = java_stream::schema_message(schema)?;
+    let mut bytes = Vec::new();
+    java_layout::frame(&mut bytes, &metadata, true).map_err(invalid)?;
+    Ok(bytes)
 }
 
 /// Encodes a framed schema using the caller's Arrow alignment and legacy framing options.
