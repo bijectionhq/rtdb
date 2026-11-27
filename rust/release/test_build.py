@@ -330,8 +330,18 @@ class DefaultImageConfigurationTests(unittest.TestCase):
             self.assertEqual(["-f", str(root / "upstream.yaml")], run(default, default, "-f", "config.yaml", workdir=workdir))
             self.assertEqual(["-f", str(root / "upstream.yaml")], run("mounted: true\n", default, "-f", "config.yaml", workdir=workdir))
             self.assertEqual(["-f", str(root / "earlier.yaml")], run(default, "mounted: true\n", "-f", "config.yaml", workdir=workdir))
-            self.assertEqual(["-f", str(root / "earlier.yaml")], run(default, "mounted: true\n", "node", "--file", str(root / "earlier.yaml"), workdir=workdir))
+            self.assertEqual(["-f", str(root / "upstream.yaml")], run("mounted: new\n", "mounted: earlier\n", "-f", "config.yaml", workdir=workdir))
+            legacy_command = ["node", "--file", str(root / "earlier.yaml")]
+            self.assertEqual(legacy_command, run(default, "mounted: earlier\n", *legacy_command, workdir=workdir))
+            self.assertEqual(legacy_command, run("mounted: new\n", "mounted: earlier\n", *legacy_command, workdir=workdir))
             self.assertEqual(["node", "--file", "other.yaml"], run("mounted: true\n", default, "node", "--file", "other.yaml", workdir=workdir))
+            (root / "var" / "rtdb" / "storage").mkdir(parents=True)
+            fallback = ["-f", "/etc/rtdb/config-var-lib-rtdb.yaml"]
+            self.assertEqual(fallback, run(default, default, "-f", "config.yaml", workdir=workdir))
+            self.assertEqual(["-f", str(root / "upstream.yaml")], run("mounted: new\n", default, "-f", "config.yaml", workdir=workdir))
+            self.assertEqual(fallback, run("mounted: new\n", default, *legacy_command, workdir=workdir))
+            (root / "var" / "xtdb" / "buffers").mkdir(parents=True)
+            self.assertEqual(legacy_command, run("mounted: new\n", default, *legacy_command, workdir=workdir))
 
 
 if __name__ == "__main__":

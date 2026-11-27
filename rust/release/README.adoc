@@ -61,6 +61,7 @@ Reproducibility requires rerunning the same selection and comparing artifacts; a
 The default native image starts a local persistent node using `/var/lib/xtdb/log` and `/var/lib/xtdb/buffers`, upstream's standalone paths.
 As in upstream's image, the working directory is `/usr/local/lib/xtdb` and the default command is `-f config.yaml`, so a configuration mounted at `/usr/local/lib/xtdb/config.yaml` is the one served.
 A configuration mounted at `/etc/rtdb/config.yaml`, where earlier RTDB images read it, is still served when the upstream path holds the bundled default; the entrypoint says so on stderr.
+An explicit `node --file /etc/rtdb/config.yaml` selects the legacy path even when both locations have mounted configurations.
 Mount persistent storage at `/var/lib/xtdb` with ownership for UID/GID 20000; the image declares it as a volume, as upstream's does, so a deployment written for upstream's image keeps its data.
 Earlier RTDB images used `/var/lib/rtdb/log` and `/var/lib/rtdb/storage`: when the default command finds either and neither of the new paths, the `rtdb-entrypoint` script serves them from there (with `/etc/rtdb/config-var-lib-rtdb.yaml`) and says so on stderr; move the data to the new paths to drop that fallback.
 The image is built on Debian Bookworm (upstream's is Alpine) and runs as the user `rtdb` (upstream's is `xtdb`) with the same UID/GID 20000; that changes the shell, package tools and user name inside the container, not the node's behaviour.
