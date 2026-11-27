@@ -3,6 +3,7 @@
 package xtdb.tx
 
 import com.google.protobuf.ByteString
+import com.google.protobuf.UnsafeByteOperations
 import org.apache.arrow.memory.BufferAllocator
 import xtdb.arrow.*
 import xtdb.arrow.IID_TYPE
@@ -285,12 +286,59 @@ fun serializeUserMetadata(al: BufferAllocator, metadata: Map<*, *>): ByteString 
         rel.toArrowStream()
     }
 
-fun deserializeUserMetadata(al: BufferAllocator, bytes: ByteString): Any? =
-    Channels.newChannel(bytes.newInput()).use { ch ->
+internal fun <T> withUserMetadata(al: BufferAllocator, bytes: ByteString?, useMetadata: (Vector?) -> T): T {
+    if (bytes == null) return useMetadata(null)
+
+    return Channels.newChannel(bytes.newInput()).use { ch ->
         Relation.StreamLoader(al, ch).use { loader ->
             Relation(al, loader.schema).use { rel ->
                 loader.loadNextPage(rel)
-                rel["user-metadata"].getObject(0)
+                useMetadata(rel["user-metadata"])
             }
         }
     }
+}
+
+fun deserializeUserMetadata(al: BufferAllocator, bytes: ByteString): Any? =
+    withUserMetadata(al, bytes) { it!!.getObject(0) }
+
+private fun Vector.isDirectMetadata(): Boolean {
+    if (valueCount == 0) return this is NullVector
+
+    return when (this) {
+        is StructVector -> vectors.all { !it.nullable && it.isDirectMetadata() }
+        is ListVector -> listElements.let { elements ->
+            getListStartIndex(0) == 0 && getListEndIndex(valueCount - 1) == elements.valueCount &&
+                (!elements.nullable || elements.valueCount == 0) && elements.isDirectMetadata()
+        }
+        is Utf8Vector -> (0 until valueCount).all { UnsafeByteOperations.unsafeWrap(getBytes(it)).isValidUtf8 }
+        is BitVector, is ByteVector, is ShortVector, is IntVector, is LongVector,
+        is FloatVector, is DoubleVector, is VarBinaryVector, is UuidVector -> true
+        else -> false
+    }
+}
+
+private fun Vector.matchesMetadataDestination(dest: VectorWriter?): Boolean {
+    if (dest == null) return true
+    if (dest.arrowType != arrowType) return false
+
+    return when (this) {
+        is StructVector -> dest is StructVector && vectors.all { it.matchesMetadataDestination(dest.vectorForOrNull(it.name)) }
+        is ListVector -> dest is ListVector && dest.listElements.let { elements ->
+            (elements is NullVector && elements.valueCount == 0) || listElements.matchesMetadataDestination(elements)
+        }
+        else -> true
+    }
+}
+
+internal fun sourceUserMetadataWriter(source: Vector?): (VectorWriter) -> Unit {
+    if (source is StructVector && source.valueCount == 1 && !source.isNull(0) && source.isDirectMetadata()) {
+        return { dest ->
+            if (source.matchesMetadataDestination(dest)) dest.appendRange(source, 0, 1)
+            else dest.writeObject(source.getObject(0))
+        }
+    }
+
+    val metadata = source?.getObject(0) as? Map<*, *>
+    return { it.writeObject(metadata) }
+}

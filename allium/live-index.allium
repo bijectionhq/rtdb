@@ -257,6 +257,8 @@ entity StagedTx {
 entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
     -- Staging retains the completed rows and their schema.
+    -- JVM replay can copy a compatible current or legacy transaction's Arrow metadata into its transaction row while the source page is open.
+    -- The staged row owns its metadata after the page closes, including when resolution records an abort.
     -- The native replica transaction carries each table delta as one Arrow record batch.
     -- Ordinary document operations and SQL put mutations stage document vectors with the event headers for their selected positions.
     -- When an Arrow document supplies the identity, staging derives its IID from that typed cell.

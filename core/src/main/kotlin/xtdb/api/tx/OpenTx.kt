@@ -134,7 +134,10 @@ class OpenTx
         resolvedTxs.asReversed().firstNotNullOfOrNull { it.liveTable(ref) }?.openTx(systemTimeMicros)
             ?: partitionState.openTable(ref, systemTimeMicros)
 
-    internal fun writeTxRow(error: Throwable?, userMetadata: Map<*, *>?) {
+    internal fun writeTxRow(error: Throwable?, userMetadata: Map<*, *>?) =
+        writeTxRowWithMetadata(error) { it.writeObject(userMetadata) }
+
+    internal fun writeTxRowWithMetadata(error: Throwable?, writeMetadata: (VectorWriter) -> Unit) {
         val txId = txKey.txId
         val systemTimeMicros = txKey.systemTime.asMicros
 
@@ -147,7 +150,7 @@ class OpenTx
         docWriter.vectorFor("_id", I64.arrowType, false).writeLong(txId)
         docWriter.vectorFor("system_time", INSTANT.arrowType, false).writeLong(systemTimeMicros)
         docWriter.vectorFor("committed", BOOL.arrowType, false).writeBoolean(error == null)
-        docWriter.vectorFor("user_metadata", VectorType.structOf().arrowType, true).writeObject(userMetadata)
+        writeMetadata(docWriter.vectorFor("user_metadata", VectorType.structOf().arrowType, true))
 
         val errorWriter = docWriter.vectorFor("error", TRANSIT.arrowType, true)
 

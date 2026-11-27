@@ -22,12 +22,14 @@ import xtdb.api.tx.OpenTx
 import xtdb.api.tx.TxIndexer.TxResult
 import xtdb.arrow.Relation
 import xtdb.arrow.VectorReader
+import xtdb.arrow.VectorWriter
 import xtdb.arrow.asChannel
 import xtdb.database.PartitionState
 import xtdb.database.PartitionStorage
 import xtdb.time.InstantUtil.asMicros
 import xtdb.time.InstantUtil.fromMicros
-import xtdb.tx.deserializeUserMetadata
+import xtdb.tx.sourceUserMetadataWriter
+import xtdb.tx.withUserMetadata
 import xtdb.types.MessageId
 import xtdb.util.StringUtil.asLexDec
 import xtdb.util.asPath
@@ -179,12 +181,12 @@ internal class TxResolver(
     // Stage a fresh tx committing a single skip / abort / invalid-system-time row. `countError` mirrors the
     // pre-staging behaviour: skipped txs don't count as errors.
     private fun stageStandaloneTx(
-        msgId: MessageId, txKey: TransactionKey, error: Throwable, userMetadata: Map<*, *>?, countError: Boolean,
+        msgId: MessageId, txKey: TransactionKey, error: Throwable, writeMetadata: (VectorWriter) -> Unit, countError: Boolean,
     ): ResolvedTx {
         if (countError) txErrorCounter?.increment()
 
         return openTx(txKey, null).use { openTx ->
-            openTx.writeTxRow(error, userMetadata)
+            openTx.writeTxRowWithMetadata(error, writeMetadata)
             stage(openTx, msgId, Aborted(txKey, error), dbOp = null, pending = null)
         }
     }
@@ -196,10 +198,9 @@ internal class TxResolver(
         systemTime: Instant?,
         defaultTz: ZoneId?,
         user: String?,
-        userMetadata: Any?,
+        writeMetadata: (VectorWriter) -> Unit,
     ): ResolvedTx = tracer.withSpan("xtdb.transaction") { span ->
         span?.tag("operations.count", (txOps?.valueCount ?: 0).toLong())
-        val userMetadataMap = userMetadata as? Map<*, *>
         // The RESOLVED head (the queue), not the durable head: a tx must system-time-smooth against the
         // queued predecessors it resolves behind, which lead the durable index.
         val lcTx = latestCompletedTx
@@ -226,7 +227,7 @@ internal class TxResolver(
             LOG.warn { "specified system-time '$systemTime' not later than current tx '$lcTx'" }
 
             return@withSpan stageStandaloneTx(
-                msgId, TransactionKey(msgId, defaultSystemTime), err, userMetadataMap, countError = true
+                msgId, TransactionKey(msgId, defaultSystemTime), err, writeMetadata, countError = true
             )
         }
 
@@ -234,7 +235,7 @@ internal class TxResolver(
         val txKey = TransactionKey(msgId, effectiveSystemTime)
 
         if (txOps == null)
-            return@withSpan stageStandaloneTx(msgId, txKey, SKIPPED_EXN, userMetadataMap, countError = false)
+            return@withSpan stageStandaloneTx(msgId, txKey, SKIPPED_EXN, writeMetadata, countError = false)
 
         val openTx = openTx(txKey, null)
         val result = try {
@@ -253,7 +254,7 @@ internal class TxResolver(
         when (result) {
             is TxResult.Committed ->
                 openTx.use {
-                    it.writeTxRow(null, userMetadataMap)
+                    it.writeTxRowWithMetadata(null, writeMetadata)
                     stage(it, msgId, Committed(txKey), dbOp = null, pending = null)
                 }
 
@@ -261,7 +262,7 @@ internal class TxResolver(
                 LOG.debug(result.error) { "aborted tx" }
                 // fresh tx for the abort row — the original openTx may hold partial writes
                 openTx.close()
-                stageStandaloneTx(msgId, txKey, result.error, userMetadataMap, countError = true)
+                stageStandaloneTx(msgId, txKey, result.error, writeMetadata, countError = true)
             }
         }
     }
@@ -273,7 +274,7 @@ internal class TxResolver(
 
         bufferPool.putObjectSync("skipped-txs/${msgId.asLexDec}".asPath, ByteBuffer.wrap(payload))
 
-        return indexSourceLogTx(msgId, msgTimestamp, null, null, null, null, null)
+        return indexSourceLogTx(msgId, msgTimestamp, null, null, null, null, sourceUserMetadataWriter(null))
     }
 
     fun indexTx(msgId: MessageId, msgTimestamp: Instant, msg: SourceMessage.Tx): ResolvedTx {
@@ -284,13 +285,13 @@ internal class TxResolver(
                 Relation(allocator, loader.schema).use { rel ->
                     loader.loadNextPage(rel)
 
-                    val userMetadata = msg.userMetadata?.let { deserializeUserMetadata(allocator, it) }
-
-                    indexSourceLogTx(
-                        msgId, msgTimestamp,
-                        rel["tx-ops"],
-                        msg.systemTime, msg.defaultTz, msg.user, userMetadata
-                    )
+                    withUserMetadata(allocator, msg.userMetadata) { userMetadata ->
+                        indexSourceLogTx(
+                            msgId, msgTimestamp,
+                            rel["tx-ops"],
+                            msg.systemTime, msg.defaultTz, msg.user, sourceUserMetadataWriter(userMetadata)
+                        )
+                    }
                 }
             }
         }
@@ -306,13 +307,13 @@ internal class TxResolver(
 
                     val systemTime = (rel.vectorForOrNull("system-time")?.getObject(0) as ZonedDateTime?)?.toInstant()
                     val defaultTz = (rel["default-tz"].getObject(0) as String?).let { ZoneId.of(it) }
-                    val userMetadata = rel.vectorForOrNull("user-metadata")?.getObject(0)
+                    val writeMetadata = sourceUserMetadataWriter(rel.vectorForOrNull("user-metadata"))
                     val user = rel.vectorForOrNull("user")?.getObject(0) as String?
 
                     indexSourceLogTx(
                         msgId, msgTimestamp,
                         rel["tx-ops"].listElements,
-                        systemTime, defaultTz, user, userMetadata
+                        systemTime, defaultTz, user, writeMetadata
                     )
                 }
             }

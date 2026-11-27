@@ -19,8 +19,9 @@
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
   (:import [java.nio.file Path]
-           [java.time ZoneId ZonedDateTime]
+           [java.time Duration ZoneId ZonedDateTime]
            [xtdb.api ServerConfig Xtdb$Config Xtdb$Connection]
+           xtdb.api.log.SourceMessage$LegacyTx
            xtdb.api.query.QueryOpts
            xtdb.types.RegClass))
 
@@ -1372,3 +1373,28 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
                :committed true,
                :user-metadata {:source "clojure-api", :tags ["api-test"], :request-id "req-12345"}}]
              (xt/q conn ["SELECT * FROM xt.txs ORDER BY _id"])))))
+
+(t/deftest legacy-and-aborted-source-transactions-keep-user-metadata
+  (let [legacy (array-map :tags ["first" "second"] :details (array-map :name "legacy" :attempt 1))
+        aborted (array-map :details (array-map :name "aborted" :attempt 2) :tags ["third"])
+        fallback (array-map :details {:name nil, :attempt 3} :tags [nil "fourth"])
+        changed-type (array-map :details {:name "changed", :attempt 4} :tags [42 43])
+        payload (tu/serialize-tx-ops tu/*allocator* [{:op :put-docs, :table-name :docs, :docs [{:xt/id 1}]}]
+                                     {:default-tz #xt/zone "UTC", :user-metadata legacy})
+        database (db/primary-db tu/*node*)
+        receipt (.appendMessageBlocking (.getSourceLog database) (SourceMessage$LegacyTx. payload) 0)]
+    (xt-log/await-source database (.getMsgId receipt) (Duration/ofSeconds 5))
+
+    (t/is (anomalous? [:conflict :xtdb/assert-failed]
+                      (xt/execute-tx tu/*node* ["ASSERT 1 = 2"] {:metadata aborted})))
+    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 2}]] {:metadata fallback})
+    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 3}]] {:metadata changed-type})
+
+    (let [rows (xt/q tu/*node* "SELECT committed, user_metadata FROM xt.txs ORDER BY _id")]
+      (t/is (= [{:committed true, :user-metadata legacy}
+                {:committed false, :user-metadata aborted}
+                {:committed true, :user-metadata {:details {:attempt 3}, :tags [nil "fourth"]}}
+                {:committed true, :user-metadata changed-type}]
+               rows))
+      (t/is (= (repeat 4 [:tags :details])
+               (mapv (comp vec keys :user-metadata) rows))))))
