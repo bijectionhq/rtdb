@@ -389,7 +389,7 @@ fn replica_records_framed_before_the_extension_header_still_decode() {
         let stamped = envelope(message);
         let mut legacy = vec![PROTOBUF_LOG_HEADER];
         pb::ReplicaLogMessage { term_id: Some(3), term_seq: Some(5), message: Some(stamped.message.clone()) }.encode(&mut legacy).unwrap();
-        if field == Some(("BlockBoundary", 1000)) {
+        if matches!(field, Some(("BlockBoundary", 1000 | 1001))) {
             assert!(ReplicaEnvelope::decode(&legacy).is_err());
         } else {
             assert_eq!(ReplicaEnvelope::decode(&legacy).unwrap(), Some(stamped));
