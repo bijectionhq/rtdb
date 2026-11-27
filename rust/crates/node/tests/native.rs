@@ -255,6 +255,37 @@ async fn database_metric_provider_uses_current_catalog_without_retaining_node_li
     assert!(provider.metrics().unwrap().rows().is_empty());
     assert!(!snapshot.rows().is_empty());
 }
+
+#[tokio::test]
+async fn prepared_read_cache_metrics_count_repeat_preparations_and_charge_bytes() {
+    let (node, driver) = running(options(), services()).await;
+    let provider = node.metrics_provider().unwrap();
+    let source = "SELECT 1 AS one";
+    for _ in 0..2 {
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let cancellation = session.state().cancellation().child_token();
+        let context = session.prepare_context(&cancellation).await.unwrap();
+        PreparedSql::prepare(source, &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    }
+    let snapshot = provider.metrics().unwrap();
+    let counter = |expected| snapshot.rows().iter().find_map(|metric| match metric {
+        CatalogMetric::Counter { name, tags, count } if name == expected && tags.is_empty() => Some(*count),
+        _ => None,
+    });
+    let bytes = |expected| snapshot.rows().iter().find_map(|metric| match metric {
+        CatalogMetric::Gauge { name, tags, unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value }
+            if name == expected && tags.is_empty() => Some(*value),
+        _ => None,
+    });
+    assert_eq!(counter("rtdb.query.cache.read.preparations"), Some(2.0));
+    assert_eq!(counter("rtdb.query.cache.plan.misses"), Some(1.0));
+    assert_eq!(counter("rtdb.query.cache.syntax.hits"), Some(1.0));
+    assert_eq!(counter("rtdb.query.cache.syntax.misses"), Some(1.0));
+    assert!(bytes("rtdb.query.cache.plan.charged.bytes").unwrap() > 0.0);
+    assert!(bytes("rtdb.query.cache.syntax.retained.bytes").unwrap() > 0.0);
+    stop(&node, driver).await;
+}
+
 async fn stop(node: &Node, driver: tokio::task::JoinHandle<Result<()>>) {
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();

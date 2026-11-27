@@ -47,7 +47,7 @@ mod trace;
 mod settings;
 mod shared_plans;
 mod shared_plan_entries;
-pub use shared_plans::{SharedPlan, SharedPlanKey, SharedPlans};
+pub use shared_plans::{SharedPlan, SharedPlanCacheStats, SharedPlanKey, SharedPlans};
 pub use settings::{SnapshotAdmission, SnapshotTokenIssuer, SqlSnapshotView};
 mod pages;
 mod analysis;

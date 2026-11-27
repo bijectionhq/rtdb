@@ -254,7 +254,9 @@ const OWNED_READ_LIFETIME: Duration = Duration::from_secs(60);
 impl Node {
     /// The provider observes current catalog generations and keeps no node or database alive between samples.
     pub fn metrics_provider(&self) -> Result<Arc<dyn CatalogMetrics>> {
-        Ok(Arc::new(crate::metrics::NodeMetrics::new(Arc::downgrade(&self.catalog), Arc::downgrade(&self.factory), Arc::clone(self.memory()))?))
+        Ok(Arc::new(crate::metrics::NodeMetrics::new(
+            Arc::downgrade(&self.catalog), Arc::downgrade(&self.factory), Arc::downgrade(&self.shared_plans), Arc::clone(self.memory()),
+        )?))
     }
     pub fn execution_observer(&self) -> Option<Arc<dyn rtdb_plan::ExecutionObserver>> { self.factory.execution_observer.clone() }
     pub fn tracer(&self) -> Option<Arc<dyn rtdb_plan::Tracer>> { self.factory.tracer.clone() }

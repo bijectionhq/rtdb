@@ -55,20 +55,33 @@ mod stack_tests {
 impl PreparedSql {
     pub fn prepare(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
         let source_reservation = admit_source(source, context, &mut options)?;
-        let syntax = admit_sql_syntax(source, &context.memory)?;
-        let parsed = match one_statement(source, &context.memory) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                drop((syntax, source_reservation));
-                return Err(statement_syntax_error(source, error, &context.memory));
+        let mut syntax = Some(admit_sql_syntax(source, &context.memory)?);
+        with_read_syntax(source, context, || one_statement(source, &context.memory), |parsed| {
+            match parsed {
+                Ok(parsed) => deep(source, || Self::prepare_parsed(parsed, context, options, &[], policy, false, false, source_reservation)),
+                Err(error) => {
+                    drop((syntax.take(), source_reservation));
+                    Err(statement_syntax_error(source, error, &context.memory))
+                }
             }
-        };
-        deep(source, || Self::prepare_parsed(parsed, context, options, &[], policy, false, false, source_reservation))
+        })
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
-        let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)?;
-        Self::prepare_postgres_syntax(syntax, context, search_path, parameter_oids)
+        Self::prepare_postgres_with_syntax_error(source, context, search_path, parameter_oids, |error| error)
+    }
+
+    /// Applies the frontend diagnostic mapper to failures from the surrounding SQL parser.
+    /// Operand resolution and binding retain their own diagnostic paths.
+    pub fn prepare_postgres_with_syntax_error(
+        source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32],
+        syntax_error: impl FnOnce(Anomaly) -> Anomaly,
+    ) -> Result<Self> {
+        let parse = || {
+            let syntax = rtdb_sql::parse_syntax_in(source, &context.memory).map_err(syntax_error)?;
+            exactly_one_statement(syntax.resolve_in(&context.memory)?)
+        };
+        with_read_syntax(source, context, parse, |parsed| Self::prepare_postgres_parsed(parsed?, context, search_path, parameter_oids))
     }
 
     /// Requires syntax parsed with the same budget as the context.
@@ -143,6 +156,7 @@ impl PreparedSql {
             }
             StatementKind::Query => {
                 let shared = if sharable {
+                    if let Some(plans) = context.shared_plans() { plans.record_read_preparation(); }
                     shared_plan(source, context, &options, |catalog, budget| parsed.bind_in(catalog, &options, budget))?
                 } else { None };
                 let (query, inferred, kept) = match shared {
@@ -428,8 +442,16 @@ impl PreparedSql {
         }
         let options = self.bound_options(&context.timezone, argument_types, execution);
         let source = self.source();
+        let syntax = std::cell::OnceCell::new();
+        let prepare = |catalog: &dyn Catalog, memory: &Arc<MemoryBudget>| {
+            let cached = syntax.get_or_init(|| context.shared_plans().filter(|_| self.0.sharable).and_then(|plans| plans.read_syntax(source)));
+            match cached {
+                Some(syntax) => syntax.parsed_in(memory).bind(catalog, &options),
+                None => rtdb_sql::prepare_in(source, catalog, &options, memory),
+            }
+        };
         let shared = if self.0.sharable {
-            shared_plan(source, context, &options, |catalog, budget| rtdb_sql::prepare_in(source, catalog, &options, budget))?
+            shared_plan(source, context, &options, &prepare)?
         } else { None };
         if let Some(shared) = shared {
             let query = shared.query.recharged(&context.memory)?;
@@ -438,9 +460,9 @@ impl PreparedSql {
         }
         let _syntax = admit_sql_syntax(&self.0.source, &context.memory)?;
         let budget = self.0._reservation.budget();
-        let plan_in = |memory| {
+        let plan_in = |memory: &Arc<MemoryBudget>| {
             let recording = RecordingCatalog::new(&context.catalog);
-            let prepared = rtdb_sql::prepare_in(&self.0.source, &recording, &options, memory)?;
+            let prepared = prepare(&recording, memory)?;
             let query = PreparedQuery::from_prepared_in(prepared, &context.catalog, memory)?;
             Ok::<_, Anomaly>((query, recording.finish()))
         };
@@ -513,6 +535,22 @@ impl KeptPlan {
             Self::Shared(plan) => plan.upgrade().map(|shared| (Arc::clone(&shared.lookups), shared.query.clone())),
         }
     }
+}
+
+fn with_read_syntax<'input, T>(
+    source: &'input str, context: &QueryContext,
+    parse: impl FnOnce() -> Result<ParsedStatement<'input>>,
+    prepare: impl for<'a> FnOnce(Result<ParsedStatement<'a>>) -> Result<T>,
+) -> Result<T> {
+    let Some(plans) = context.shared_plans() else { return prepare(parse()); };
+    if let Some(syntax) = plans.read_syntax(source) {
+        return prepare(Ok(syntax.parsed_in(&context.memory)));
+    }
+    let parsed = parse();
+    let candidate = parsed.as_ref().ok().filter(|parsed| plans.can_keep_read_syntax(parsed)).cloned();
+    let prepared = prepare(parsed)?;
+    if let Some(candidate) = candidate { plans.remember_read_syntax(&candidate); }
+    Ok(prepared)
 }
 
 /// The node's shared plan for `source`, planning it into the node's cache on a miss.
@@ -763,6 +801,82 @@ mod shared_plan_tests {
         Arc::clone(statement.bind(context, &[], true).unwrap().relation())
     }
 
+    #[test]
+    fn repeated_postgres_prepare_reuses_syntax_and_only_matching_plan_options() {
+        let node = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&node));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let source = "/* é */\nSELECT ? AS value; ";
+
+        let prepare = |oid| {
+            let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+            PreparedSql::prepare_postgres(source, &context, vec!["public".into()], &[oid]).unwrap()
+        };
+        let first = prepare(23);
+        let cold = plans.stats();
+        assert_eq!((cold.read_preparations, cold.plan_misses, cold.syntax_hits, cold.syntax_misses), (1, 1, 0, 1));
+        assert!(cold.plan_charged_bytes > 0);
+        assert!(cold.syntax_retained_bytes > 0);
+        assert_eq!(node.used_bytes(), cold.plan_charged_bytes + cold.syntax_retained_bytes);
+
+        let repeated = prepare(23);
+        assert_eq!(repeated.source(), source);
+        assert_eq!(repeated.postgres_types().unwrap(), &[PgType::Int4]);
+        let warm = plans.stats();
+        assert_eq!((warm.read_preparations, warm.plan_misses, warm.syntax_hits, warm.syntax_misses), (2, 1, 1, 1));
+        assert_eq!(warm.plan_charged_bytes, cold.plan_charged_bytes);
+        assert_eq!(warm.syntax_retained_bytes, cold.syntax_retained_bytes);
+
+        let bigint = prepare(20);
+        assert_eq!(bigint.postgres_types().unwrap(), &[PgType::Int8]);
+        assert_eq!(first.postgres_types().unwrap(), &[PgType::Int4]);
+        let changed = plans.stats();
+        assert_eq!((changed.read_preparations, changed.plan_misses, changed.syntax_hits, changed.syntax_misses), (3, 2, 2, 1));
+        assert_eq!(changed.syntax_retained_bytes, cold.syntax_retained_bytes);
+    }
+
+    #[test]
+    fn syntax_hit_preserves_the_catalog_diagnostic_and_original_source() {
+        let memory = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&memory));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        put(&state, 1, "public", Value::I64(1), &memory);
+        let initial = session(&[("xtdb", &state), ("other", &state)], "xtdb", "UTC", &plans);
+        let source = "/* é */\nSELECT v FROM other.public.docs; ";
+        let prepare = |context| PreparedSql::prepare(source, context, Default::default(), ResultSignaturePolicy::Dynamic);
+        assert_eq!(prepare(&initial).unwrap().source(), source);
+
+        let missing = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let error = prepare(&missing).err().expect("a disappeared catalog must invalidate the plan");
+        let uncached = session(&[("xtdb", &state)], "xtdb", "UTC", &Arc::new(SharedPlans::new(&MemoryBudget::new(0))));
+        assert_eq!(prepare(&uncached).err().unwrap(), error);
+        assert_eq!(plans.stats().syntax_hits, 1);
+        assert_eq!(plans.stats().plan_misses, 2);
+    }
+
+    #[test]
+    fn evicted_read_syntax_stays_charged_until_its_last_reader_releases_it() {
+        let node = MemoryBudget::new(1 << 26);
+        let plans = Arc::new(SharedPlans::new(&node));
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let source = "SELECT 1 AS one";
+        plan_of(source, &context);
+        let reader = plans.read_syntax(source).unwrap();
+        let charge = plans.stats().syntax_retained_bytes;
+        for n in 0..32 {
+            plan_of(&format!("SELECT {n} AS other"), &context);
+            assert!(plans.stats().syntax_retained_bytes <= (1 << 17));
+        }
+        assert!(plans.read_syntax(source).is_none());
+        drop((context, plans));
+
+        assert_eq!(reader.source(), source);
+        assert_eq!(node.used_bytes(), charge);
+        drop(reader);
+        assert_eq!(node.used_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn a_session_on_another_default_database_reads_its_own_table() {
         let memory = MemoryBudget::new(1 << 26);
@@ -859,9 +973,14 @@ mod shared_plan_tests {
         put(&state, 4, "public", Value::I64(1), &memory);
         put(&state, 5, "public", Value::I64(1), &memory);
         let after = session(&databases, "xtdb", "UTC", &plans);
+        let before_rebind = plans.stats();
+        let reused = query.bind(&after, &[], true).unwrap();
+        let after_rebind = plans.stats();
+        assert_eq!(after_rebind.plan_misses, before_rebind.plan_misses + 1);
+        assert_eq!(after_rebind.syntax_hits, before_rebind.syntax_hits + 1);
+        assert_eq!(after_rebind.read_preparations, before_rebind.read_preparations);
         let new_session = prepare(sql, &after).bind(&after, &[], true).unwrap();
         assert_eq!(first_scan(new_session.relation()), Some("alt"));
-        let reused = query.bind(&after, &[], true).unwrap();
         assert!(Arc::ptr_eq(reused.relation(), new_session.relation()));
         let rebound = explained.bind(&after, &[], true).unwrap();
         assert_eq!(rebound.relation(), reused.relation());
@@ -897,6 +1016,19 @@ mod shared_plan_tests {
         assert_eq!(node.peak_bytes(), 0);
         PreparedSql::prepare("SELECT 1 AS one", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
         assert!(node.used_bytes() > 0, "a plain query is shared");
+    }
+
+    #[test]
+    fn inline_xtql_and_over_budget_syntax_can_prepare_without_syntax_retention() {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
+        let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let large = format!("SELECT 1 AS n /* {} */", "x".repeat(1024));
+        for source in [r#"XTQL $$(rel [{:n 1}] [n])$$"#, &large] {
+            let prepared = PreparedSql::prepare(source, &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+            assert_eq!(prepared.prepared_schema().unwrap().fields()[0].name, "n");
+            assert_eq!(plans.stats().syntax_retained_bytes, 0);
+        }
     }
 
 
@@ -987,6 +1119,7 @@ mod shared_plan_tests {
         let local = PreparedSql::prepare("SELECT regexp_replace('abc', 'a', 'x') AS v", &tiny_context, options, ResultSignaturePolicy::Dynamic).unwrap();
         assert!(matches!(&local.0.plan.lock().as_ref().unwrap().plan, KeptPlan::Own { .. }));
         assert_eq!(tiny_node.used_bytes(), 0);
+        assert_eq!(tiny_plans.stats().syntax_retained_bytes, 0);
         drop(local);
         assert_eq!(tiny_context.memory.used_bytes(), 0);
     }

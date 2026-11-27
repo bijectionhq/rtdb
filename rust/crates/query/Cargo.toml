@@ -21,6 +21,7 @@ rtdb-storage.workspace = true
 rtdb-index.workspace = true
 rtdb-plan.workspace = true
 rtdb-expr.workspace = true
+rtdb-sql.workspace = true
 rtdb-text.workspace = true
 parking_lot.workspace = true
 arrow-array.workspace = true

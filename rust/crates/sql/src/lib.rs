@@ -24,7 +24,7 @@ mod lexer;
 mod parser;
 mod batch;
 
-pub use parse::{DeferredStatementSyntax, ParsedStatement, StatementKind, StatementSyntax, StatementSyntaxBatch, parse, parse_in, parse_syntax_in};
+pub use parse::{CachedReadSyntax, DeferredStatementSyntax, ParsedStatement, StatementKind, StatementSyntax, StatementSyntaxBatch, parse, parse_in, parse_syntax_in};
 pub use mutation::{Mutation, StaticMutation, StaticMutationKind, prepare_tx, prepare_tx_in, prepare_patch, prepare_static, prepare_static_in};
 pub use control::{AdmittedControl, ParsedControl, parse_admitted_control_in, parse_control, parse_control_in, parse_control_syntax_in};
 pub use parser::{ContextualStatementDiagnostic, StatementSyntaxDiagnostic, batch_syntax_diagnostic, statement_syntax_diagnostic};

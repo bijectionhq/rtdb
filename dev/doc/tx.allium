@@ -99,6 +99,10 @@
 -- Query statements other than EXPLAIN prepared in any session of a node share a plan, charged to the node, when their source, planning options, observed catalog lookups and observed join estimates agree.
 -- Initial query preparation binds the statement's resolved syntax on a shared-plan miss and uses the same syntax if the cache declines admission.
 -- Initial preparation diagnostics use the source coordinates from the parser.
+-- Repeated preparation of identical complete read SQL may reuse resolved syntax from a node cache with bounded admission.
+-- A preparation that uses cached syntax keeps the original source coordinates and binds against its own planning options and catalog when it needs a new plan.
+-- The syntax charge follows its last reader after eviction.
+-- Node metrics report read preparations, shared plan misses, syntax cache hits and misses, and the bytes charged to the two caches.
 -- The cache entry owns raw metadata retained by its shared plan.
 -- Rebinding charges execution to the query budget while the statement retains its plan charge.
 -- Compatible list and struct parameters stay in Arrow through that projection.

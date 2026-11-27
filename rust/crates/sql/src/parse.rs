@@ -1,5 +1,5 @@
 use rtdb_plan::{Identifier, SourceSpan};
-use rtdb_types::{Anomaly, MemoryBudget, Result};
+use rtdb_types::{Anomaly, MemoryBudget, MemoryReservation, Result};
 use std::{ops::ControlFlow, sync::Arc};
 use sqlparser::ast::VisitMut;
 use sqlparser::{ast as ast, parser::{Parser, ParserError}, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
@@ -8,10 +8,36 @@ use crate::dialect::SqlDialect;
 #[derive(Clone, Debug)]
 pub struct ParsedStatement<'input> {
     pub span: SourceSpan,
-    pub(crate) tree: StatementTree<StatementSource<'input>>,
+    pub(crate) source: StatementSource<'input>,
+    pub(crate) tree: Arc<StatementTree<()>>,
     pub(crate) forms: crate::bind::FormAllocation<'input>,
     parameter_count: usize,
     pub(crate) inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
+}
+
+/// Resolved read syntax for a complete SQL input with its original coordinates.
+pub struct CachedReadSyntax {
+    source: String,
+    span: SourceSpan,
+    tree: Arc<StatementTree<()>>,
+    parameter_count: usize,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl CachedReadSyntax {
+    pub fn source(&self) -> &str { &self.source }
+
+    /// Borrows cached syntax while binding metadata is charged to the reached budget.
+    pub fn parsed_in<'a>(&'a self, memory: &'a Arc<MemoryBudget>) -> ParsedStatement<'a> {
+        ParsedStatement {
+            span: self.span,
+            source: StatementSource::full(&self.source),
+            tree: Arc::clone(&self.tree),
+            forms: crate::bind::FormAllocation::Tracked(memory),
+            parameter_count: self.parameter_count,
+            inline_xtql: Vec::new(),
+        }
+    }
 }
 
 /// A complete SQL syntax tree with pending argument assignments and embedded XTQL text.
@@ -94,7 +120,8 @@ impl<'input> DeferredStatementSyntax<'input> {
         if !dynamic.is_empty() && let ControlFlow::Break(span) = self.tree.visit(&mut AssignParameters(&dynamic)) {
             return Err(sql_error("Invalid anonymous parameter occurrence", self.tree.source.input, span));
         }
-        Ok(ParsedStatement { span: self.span, tree: self.tree, forms, parameter_count: count, inline_xtql: inline })
+        let source = self.tree.source;
+        Ok(ParsedStatement { span: self.span, source, tree: Arc::new(self.tree.with_source(())), forms, parameter_count: count, inline_xtql: inline })
     }
 }
 
@@ -207,7 +234,30 @@ impl<'input> ParsedStatement<'input> {
 
     /// Returns the original text for preparation and execution.
     /// The span refers to the complete input supplied to the parser.
-    pub fn source(&self) -> &'input str { self.tree.source.text() }
+    pub fn source(&self) -> &'input str { self.source.text() }
+
+    /// Estimates the cache charge for a complete read whose syntax is independent of its parser's budget.
+    pub fn cacheable_read_bytes(&self) -> Option<usize> {
+        if self.kind() != StatementKind::Query || self.is_explain() || !self.inline_xtql.is_empty()
+            || self.source.span().start != 0 || self.source.span().end != self.source.input.len()
+        {
+            return None;
+        }
+        let len = self.source().len();
+        crate::statement_syntax_estimate(len)?.checked_add(len)?.checked_add(256)
+    }
+
+    /// Retains eligible syntax for the lifetime of the cache owner, if its budget can fund it.
+    pub fn retain_read_syntax(&self, memory: &Arc<MemoryBudget>) -> Option<CachedReadSyntax> {
+        let reservation = memory.try_reserve(self.cacheable_read_bytes()?)?;
+        Some(CachedReadSyntax {
+            source: self.source().to_owned(),
+            span: self.span,
+            tree: Arc::clone(&self.tree),
+            parameter_count: self.parameter_count,
+            _reservation: reservation,
+        })
+    }
 
     pub fn parameter_count(&self) -> usize { self.parameter_count }
     pub fn ordered_index_command_tag(&self) -> Option<&'static str> {

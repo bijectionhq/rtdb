@@ -181,7 +181,7 @@ fn bind_using<'input, T>(
     bind: impl FnOnce(&mut Context<'_>, &Syntax, QuerySettings) -> Result<T>,
 ) -> Result<T> {
     let syntax = parsed.borrow();
-    let (input, span) = (syntax.tree.source.input, syntax.span);
+    let (input, span) = (syntax.source.input, syntax.span);
     let result = bind_parsed(syntax, catalog, options, forms, bind);
     // Consuming binds release inline syntax charges before admitting a grammar report.
     drop(parsed);
@@ -214,10 +214,10 @@ fn bind_parsed<T>(
     bind: impl FnOnce(&mut Context<'_>, &Syntax, QuerySettings) -> Result<T>,
 ) -> Result<T> {
     let next_parameter = parsed.parameter_count();
-    let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = &parsed.tree;
+    let crate::parse::StatementTree { statement, temporal, period_columns, settings, wildcard_renames, .. } = parsed.tree.as_ref();
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
-    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, used_temporal: BTreeSet::new(), inline_xtql: &parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source: parsed.source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, used_temporal: BTreeSet::new(), inline_xtql: &parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;

@@ -572,9 +572,9 @@ impl ProtocolSession {
         } else {
             let context = self.session.prepare_context_with_timezone(settings.map(|settings| settings.timezone), &self.token()).await?;
             let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
-            let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)
-                .map_err(|error| extended_syntax_error(source, original, error, &context.memory))?;
-            sql_shape(PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?, oids.len())
+            let prepared = PreparedSql::prepare_postgres_with_syntax_error(source, &context, options.search_path, &oids,
+                |error| extended_syntax_error(source, original, error, &context.memory))?;
+            sql_shape(prepared, oids.len())
         };
         self.retain_prepared(source, oids, shape)
         }).await
