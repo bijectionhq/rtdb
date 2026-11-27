@@ -1264,6 +1264,96 @@ async fn multi_followers_rebuild_their_state_across_a_journal_recovery() {
     assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 1);
 }
 
+/// The end-to-end operator recovery on real keepers: five keepers in three
+/// domains plus the catalog keeper. Voter 1 stops after the first commit, the
+/// other two voters acknowledge two more and are then lost, and the operator
+/// runs `recover-stream` on voter 1. The next writer acknowledges the
+/// recovery and records it; the old writer and both followers rebuild; none
+/// of them mixes the lost commits with the commits written after recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
+    use stream_logkeeper::stream::consensus::testing::LocalCluster;
+    const NODE_4_IDENTITY: Identity = Identity::from_static("urn:rtdb:test:4");
+    let principals = [NODE_1_IDENTITY, NODE_2_IDENTITY, NODE_3_IDENTITY, NODE_4_IDENTITY].map(|identity| keeper_principal(&identity));
+    let principals = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut keepers = LocalCluster::start_spared(&principals).await.unwrap();
+    let config = keepers.journal_config(8 << 30, 4 << 20);
+    let handle = |keepers: &LocalCluster, identity: Identity| -> Arc<dyn Journal> {
+        Arc::new(keepers.journal(&keeper_principal(&identity), &config).unwrap())
+    };
+    let [survivor, lost_b, lost_c] = keepers.voters();
+
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, handle(&keepers, NODE_1_IDENTITY));
+    let mut ahead = cluster.node(2, handle(&keepers, NODE_2_IDENTITY));
+    let mut behind = cluster.node(4, handle(&keepers, NODE_4_IDENTITY));
+    writer.create().await.unwrap();
+    assert_eq!(writer.tick(&live(1)).await.unwrap(), Role::Writer(Epoch(1)));
+    writer.transact(&put(1, 1, "kept")).await.unwrap();
+    let kept = writer.stream.head().await.unwrap();
+    assert_eq!(text_at(&mut behind, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
+    let stream = writer.journal_stream();
+    // Voter 1 holds every record through `kept` before it stops: a follower
+    // keeper applies a committed entry within a heartbeat.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    keepers.stop(survivor).await.unwrap();
+
+    // The other two voters acknowledge two more commits, then both are lost.
+    writer.transact(&put(2, 2, "lost")).await.unwrap();
+    let receipt = writer.transact(&put(3, 3, "lost")).await.unwrap();
+    cluster.at(receipt.system_time.0);
+    let lost = writer.stream.head().await.unwrap();
+    assert!(lost > kept);
+    assert_eq!(text_at(&mut ahead, MAIN_BRANCH, 3).await, Some(Value::Utf8("lost".into())));
+    keepers.stop(lost_b).await.unwrap();
+    keepers.stop(lost_c).await.unwrap();
+
+    let report = keepers.recover_stream(survivor, stream, [lost_b, lost_c]).await.unwrap();
+    assert!(report.written);
+    assert_eq!(report.head, kept);
+    assert!(report.voters.contains(&survivor) && !report.voters.contains(&lost_b) && !report.voters.contains(&lost_c));
+    keepers.restart(survivor).await.unwrap();
+
+    // A new writer meets the recovery, acknowledges it, seals above its fence
+    // and records the loss before it commits past the lost positions.
+    let recoveries = journal_recoveries_acknowledged();
+    let faults = crate::journal::journal_recovery_faults();
+    let mut successor = cluster.node(3, handle(&keepers, NODE_3_IDENTITY));
+    cluster.at(10 + LEASE + DRIFT + 1);
+    let role = successor.tick(&live(3)).await.unwrap();
+    assert_eq!(role, Role::Writer(Epoch(report.epoch.0 + 1)));
+    assert!(journal_recoveries_acknowledged() > recoveries);
+    let recovery = successor.journal_recovery().unwrap();
+    assert_eq!((recovery.head, recovery.epoch), (kept, Epoch(report.epoch.0 + 1)));
+    for id in 10..16 {
+        let receipt = successor.transact(&put(id as u8, id, "new")).await.unwrap();
+        cluster.at(receipt.system_time.0);
+    }
+    assert!(successor.stream.head().await.unwrap() > lost);
+
+    // The old writer and both followers rebuild from the journal: the kept
+    // commit and the new ones, never the lost ones.
+    for node in [&mut ahead, &mut behind, &mut writer, &mut successor] {
+        assert_eq!(text_at(node, MAIN_BRANCH, 1).await, Some(Value::Utf8("kept".into())));
+        assert_eq!(text_at(node, MAIN_BRANCH, 2).await, None);
+        assert_eq!(text_at(node, MAIN_BRANCH, 3).await, None);
+        assert_eq!(text_at(node, MAIN_BRANCH, 15).await, Some(Value::Utf8("new".into())));
+        assert_eq!(node.journal_recovery(), Some(recovery));
+    }
+    for node in [&ahead, &behind, &writer] {
+        assert_eq!(node.role(), Role::Follower);
+    }
+    let rebuilt = crate::journal::journal_recovery_faults();
+    assert!(rebuilt[1].1 + rebuilt[2].1 > faults[1].1 + faults[2].1, "no follower reported the replaced history");
+
+    // A reader opened after the recovery replays the same history.
+    let mut reader = cluster.node(5, handle(&keepers, NODE_4_IDENTITY));
+    assert_eq!(text_at(&mut reader, MAIN_BRANCH, 2).await, None);
+    assert_eq!(text_at(&mut reader, MAIN_BRANCH, 15).await, Some(Value::Utf8("new".into())));
+    assert_eq!(reader.journal_recovery(), Some(recovery));
+    keepers.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn multi_writers_racing_to_acknowledge_a_journal_recovery_record_it_once() {
     let cluster = Cluster::new();
