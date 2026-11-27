@@ -84,7 +84,7 @@
        (mapcat (fn [{:keys [tags rows timestamp]}]
                  (concat (for [tags (->> tags
                                          (partition-all batch-size))]
-                           {:ops [(into [:put-docs {:into metadata-table, :valid-from timestamp}] tags)]
+                           {:ops [(into [:put-docs metadata-table] tags)]
                             :timestamp timestamp})
 
                          ;; group by entity to simulate all the data for one entity coming in at once
@@ -95,7 +95,18 @@
                                                     {:ops (for [[table rows] (->> (into [] cat batch)
                                                                                   (group-by :table))]
                                                             (into [:put-docs table] (map :doc) rows))
-                                                     :timestamp timestamp}))))))))))
+                                                     :timestamp timestamp}))))))))
+
+       ((fn with-increasing-sys-time
+          ([txs] (with-increasing-sys-time nil txs))
+          ([^Instant last-sys-time txs]
+           (lazy-seq
+            (when-let [[{:keys [ops timestamp]} & more-txs] txs]
+              (let [sys-time (if (or (nil? last-sys-time) (neg? (compare last-sys-time timestamp)))
+                               timestamp
+                               (.plusMillis last-sys-time 1))]
+                (cons {:ops ops, :system-time sys-time}
+                      (with-increasing-sys-time sys-time more-txs))))))))))
 
 (def ^:private ^Duration reading-ttl #xt/duration "PT10M")
 

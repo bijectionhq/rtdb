@@ -13,9 +13,8 @@
    - issuer            — static reference (cik, entity name). No period.
    - income_statement  — duration facts (flows: revenue, net income). A figure
                          is fixed for the period it reports (start..end); a
-                         restatement is a new report of it, so valid-from is
-                         `filed` and a correction supersedes the prior figure
-                         from its own filing date.
+                         restatement is a new *belief* about it, so valid-from is
+                         `filed` and corrections show on the system-time axis.
    - balance_sheet     — instant facts (balances: assets, shares outstanding).
                          A value is as-of a date (`end`), so a later as-of date
                          supersedes the earlier *in valid-time* — valid-from is

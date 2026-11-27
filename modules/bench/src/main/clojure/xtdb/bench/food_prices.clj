@@ -10,7 +10,7 @@
     and keep only the rows whose price actually moved;
   - resolve the place / product / unit foreign keys the same way, inserting any the dimension
     tables don't hold yet;
-  - write the survivors back as one read-write transaction, valid from the batch's basis,
+  - write the survivors back as one read-write transaction at the batch's system-time,
     optionally closing out the rows the batch no longer mentions.
 
   So what this measures is the keyed temporal join against a growing fact table, and the cost of a
@@ -136,11 +136,23 @@
          (.bind stmt ^RelationReader rel)))
      (.executeUpdate stmt))))
 
+(defn- tick!
+  "The next system time to write at: the batch's own basis, or a microsecond past the last write if
+  we're already there. XTDB requires system times to ascend and these are historic, so every write
+  in the run — the dimension inserts and the DDL included — comes off this one clock rather than the
+  wall. The library reaches the same place from the other end, reading `xt.txs` for the last system
+  time and bumping past it."
+  ^Instant [!clock ^Instant basis]
+  (swap! !clock (fn [^Instant prev]
+                  (if (and prev (not (.isBefore prev basis)))
+                    (.plusNanos prev 1000)
+                    basis))))
+
 (defn- with-tx!
-  "Runs `f` as one write transaction. Writes inside an open transaction buffer until the commit, so
-  an ingest and its DML land together."
-  [^Xtdb$Connection conn f]
-  (.beginWriteOnly conn)
+  "Runs `f` as one write transaction at the next system time. Writes inside an open transaction
+  buffer until the commit, so an ingest and its DML land together."
+  [^Xtdb$Connection conn !clock basis f]
+  (.beginWriteOnly conn (tick! !clock basis))
   (try
     (let [res (f)
           executed (.commitSync conn)]
@@ -162,10 +174,9 @@
     (execute! conn (format "CREATE TABLE %s (_id, id, name)" table))))
 
 (defn- bulk-ingest!
-  "The library's `adbc_ingest` — Arrow straight into the table, chunked as it chunks, each row valid
-  from the batch's basis."
-  [^Xtdb$Connection conn ^String table ^Instant basis rows]
-  (doseq [chunk (partition-all chunk-size (map #(assoc % "_valid_from" basis) rows))]
+  "The library's `adbc_ingest` — Arrow straight into the table, chunked as it chunks."
+  [^Xtdb$Connection conn ^String table rows]
+  (doseq [chunk (partition-all chunk-size rows)]
     (with-open [rel (Relation/openFromRows (.getAllocator conn) (vec chunk))
                 stmt (.bulkIngest conn table BulkIngestMode/CREATE_APPEND)]
       (.bind ^Xtdb$Statement stmt ^RelationReader rel)
@@ -185,7 +196,7 @@
   [conn ^String sql ids ^Instant basis]
   (into {}
         (comp (mapcat (fn [chunk]
-                        (xt/q conn (cond-> [sql] basis (conj basis) :always (conj (vec chunk)))
+                        (xt/q conn (cond-> [sql] basis (conj basis basis) :always (conj (vec chunk)))
                               {:key-fn :snake-case-string})))
               (map (juxt #(get % "_id") identity)))
         (partition-all chunk-size ids)))
@@ -195,7 +206,7 @@
   [conn ids ^Instant basis]
   (held-by-id conn
               (format "SELECT t._id, t.price, t.price_usd
-                       FROM %s FOR VALID_TIME AS OF ? AS t
+                       FROM %s FOR VALID_TIME AS OF ? FOR SYSTEM_TIME AS OF ? AS t
                        WHERE t._id IN (SELECT k.x FROM UNNEST(?) AS k(x))"
                       prices-table)
               ids basis))
@@ -217,7 +228,7 @@
   Scoped to the keys the batch actually carries, as the library's foreign-key deduction is — the
   dimension files hold every key in the dataset, and resolving all of them every partition would
   bill the read against rows that partition never mentions."
-  [conn timers basis {:keys [table fk rows]} batch]
+  [conn timers !clock basis {:keys [table fk rows]} batch]
   (let [referenced (into #{} (map #(get % fk)) batch)
         rows (filterv #(referenced (get % "id")) rows)]
     (when (seq rows)
@@ -230,8 +241,8 @@
             missing (remove #(held (get % "id")) rows)]
         (when (seq missing)
           (timed timers :dim-insert
-                 (with-tx! conn
-                   #(bulk-ingest! conn table basis (map (fn [row] (assoc row "_id" (get row "id"))) missing)))))))))
+                 (with-tx! conn !clock basis
+                   #(bulk-ingest! conn table (map (fn [row] (assoc row "_id" (get row "id"))) missing)))))))))
 
 (defn- close-out-missing!
   "The library's `dropout` finality: rows the batch no longer mentions stop being true as of the
@@ -246,8 +257,8 @@
             [basis (vec ids)]))
 
 (defn- ->basis
-  "A batch is published a month after the period it describes, and that publication is — since
-  nothing in the batch carries one — the valid-from of its rows."
+  "A batch is published a month after the period it describes, and that publication is both its
+  system time and — since nothing in the batch carries one — the valid-from of its rows."
   ^Instant [rows]
   (-> ^LocalDate (get (first rows) "month")
       (.plusMonths 1)
@@ -256,7 +267,7 @@
 
 (defn- ingest-partition!
   "One month of restatements, end to end. Returns the number of rows actually written."
-  [conn timers dims rows {:keys [dropout?]}]
+  [conn timers !clock dims rows {:keys [dropout?]}]
   (let [rows (mapv #(assoc % "_id" (->pk %)) rows)
         ids (mapv #(get % "_id") rows)
         basis (->basis rows)
@@ -264,14 +275,14 @@
         writes (changed rows current)]
 
     (doseq [dim dims]
-      (resolve-dimension! conn timers basis dim rows))
+      (resolve-dimension! conn timers !clock basis dim rows))
 
-    (with-tx! conn
+    (with-tx! conn !clock basis
       (fn []
         (when dropout?
           (timed timers :dropout (close-out-missing! conn ids basis)))
         (timed timers :ingest
-               (bulk-ingest! conn prices-table basis
+               (bulk-ingest! conn prices-table
                              (map #(select-keys % (cons "_id" price-columns)) writes)))))
 
     (count writes)))
@@ -280,17 +291,22 @@
   "Ingests `partitions` — a reducible of row-map batches in ascending month order — resolving the
   foreign keys of each against `dims`. Returns `{:partitions n, :written m}`."
   [conn dims opts partitions]
-  (let [timers (->timers)]
+  (let [timers (->timers)
+        !clock (atom nil)]
     (reduce (fn [{:keys [partitions written]} rows]
               (when (Thread/interrupted) (throw (InterruptedException.)))
-              (when (zero? partitions)
-                (with-tx! conn #(create-tables! conn)))
+              (let [basis (->basis rows)]
+                ;; the DDL is the run's first write, so it comes off the clock too — an
+                ;; auto-committed CREATE TABLE would stamp wall-clock now and fence out the
+                ;; back-dated writes that follow it
+                (when (zero? partitions)
+                  (with-tx! conn !clock basis #(create-tables! conn)))
 
-              (let [written (+ written (ingest-partition! conn timers dims rows opts))
-                    partitions (inc partitions)]
-                (when (zero? (mod partitions 10))
-                  (log/debugf "partition %d, %d rows written" partitions written))
-                {:partitions partitions, :written written}))
+                (let [written (+ written (ingest-partition! conn timers !clock dims rows opts))
+                      partitions (inc partitions)]
+                  (when (zero? (mod partitions 10))
+                    (log/debugf "partition %d, %d rows written" partitions written))
+                  {:partitions partitions, :written written})))
             {:partitions 0, :written 0}
             partitions)))
 

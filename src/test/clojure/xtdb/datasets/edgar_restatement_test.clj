@@ -1,7 +1,7 @@
 (ns xtdb.datasets.edgar-restatement-test
   "The committed TSV fixture is a single filing, so it can't show a restatement.
    Here we craft two minimal quarters where a later filing re-states an earlier
-   period's net income, and assert the correction lands on the valid-time axis —
+   period's net income, and assert the correction lands on the system-time axis —
    the demo's centrepiece, end-to-end through mirror → transit → load."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
@@ -70,18 +70,18 @@
           (f))))))
 
 (defn- net-income-as-of [t]
-  (-> (xt/q *node* [edgar/q-income-as-of-valid-time t cik fy2023-end])
+  (-> (xt/q *node* [edgar/q-income-as-of-system-time t cik fy2023-end])
       first :net-income-loss))
 
-(t/deftest test-restatement-on-valid-time
+(t/deftest test-restatement-on-system-time
   ;; before the restatement was filed: the original $1000; after: $1200; and the
-  ;; earlier instant still yields the original once the restatement has landed.
+  ;; earlier basis stays immutable when re-queried.
   (let [before (Instant/parse "2024-03-01T00:00:00Z")
         after (Instant/parse "2024-09-01T00:00:00Z")]
     (t/is (= 1000M (net-income-as-of before)))
     (t/is (= 1200M (net-income-as-of after)))
     (t/is (= 1000M (net-income-as-of before))
-          "re-running the earlier instant still yields the original")))
+          "re-running the earlier basis still yields the original")))
 
 (t/deftest test-restatement-history
   (t/is (= [{:net-income-loss 1000M :form "10-K" :filed #xt/date "2024-02-02"}
