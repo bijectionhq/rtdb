@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
 use arrow_buffer::{Buffer, NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
+use arrow_schema::{DataType, Field, FieldRef, Schema, UnionFields, UnionMode};
 use bytes::{BufMut, Bytes};
 use prost::{Message, encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len}};
 use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array_refs, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
@@ -446,7 +446,15 @@ impl SourceTransaction {
         let prefix = matches!(self.guard, Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_))).then(|| {
             Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
         });
-        let batch = self.operation_batch(prefix.as_ref(), SourcePurpose::Log)?;
+        // Retry resolution hashes the decoded argument stream, and placed reservations commit to the source bytes.
+        let purpose = if self.guard.is_none() && self.placed_seed.is_none() && self.idempotency_key().is_none()
+            && !self.operations.iter().any(Operation::is_owned)
+        {
+            SourcePurpose::ClassicLog
+        } else {
+            SourcePurpose::Log
+        };
+        let batch = self.operation_batch(prefix.as_ref(), purpose)?;
         let mut output = crate::ipc::Output::new(&self.memory, SOURCE_PREFIX_SPACE)?;
         output.write_stream(batch.batch().schema_ref(), [batch.batch()])?;
         let ops_len = output.len() - SOURCE_PREFIX_SPACE;
@@ -481,8 +489,6 @@ impl SourceTransaction {
             bounded_retry,
             placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec().into()),
         };
-        // `source_uses_extension` classifies these fields. The operations are always in a layout XTDB writes: the stream
-        // writer stores dictionary, view and run-end columns in their plain layouts.
         let extension = rtdb_format::envelope::tx_uses_extension(&tx);
         let tail_len = tx.encoded_len();
         let ops_prefix_len = key_len(TX_OPS_TAG) + encoded_len_varint(ops_len as u64);
@@ -675,7 +681,7 @@ enum SourceOperationBody<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SourcePurpose { Log, Receipt }
+enum SourcePurpose { Log, ClassicLog, Receipt }
 
 #[derive(Clone, Copy)]
 enum SourceDocuments<'a> {
@@ -3113,14 +3119,15 @@ fn write_arguments(
     if arguments.retains_uploaded_source_layout() && let Some(pages) = arguments.uniform_arrow_pages() {
         let first = pages[0];
         let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(first.schema_ref())?)?;
-        let fields = first.schema_ref().fields().iter().enumerate().map(|(index, field)| {
+        let mut fields = first.schema_ref().fields().iter().enumerate().map(|(index, field)| {
             field.as_ref().clone().with_name(format!("?_{index}"))
         }).collect::<Vec<_>>();
-        let schema = Arc::new(Schema::new(fields));
+        let ordinal_unions = purpose == SourcePurpose::ClassicLog
+            && fields.iter().any(|field| has_non_ordinal_union(field.data_type()));
         let mut populated = pages.iter().copied().filter(|page| page.num_rows() != 0);
         let single = if pages.len() == 1 {
             Some(first)
-        } else if purpose == SourcePurpose::Log
+        } else if purpose != SourcePurpose::Receipt
             && let Some(page) = populated.next()
             && populated.next().is_none()
             && page.schema_ref().fields().iter().zip(page.columns()).all(|(field, column)| {
@@ -3131,10 +3138,10 @@ fn write_arguments(
         } else {
             None
         };
-        if single.is_none()
+        if !ordinal_unions && single.is_none()
             && let Some(spans) = rtdb_format::ipc::RecordSpans::concat(&pages, 8, memory)?
         {
-            return spans.write_java_stream(&schema, output);
+            return spans.write_java_stream(&Schema::new(fields), output);
         }
         let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
             page.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
@@ -3147,13 +3154,79 @@ fn write_arguments(
             combined = arrow_select::concat::concat_batches(first.schema_ref(), pages).map_err(|error| invalid(error.to_string()))?;
             &combined
         };
+        let mut columns = page.columns().to_vec();
+        if ordinal_unions {
+            for (field, column) in fields.iter_mut().zip(&mut columns) {
+                if has_non_ordinal_union(field.data_type()) {
+                    *column = ordinal_union_column(column)?;
+                    *field = field.clone().with_data_type(column.data_type().clone());
+                }
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.num_rows()));
-        let page = RecordBatch::try_new_with_options(Arc::clone(&schema), page.columns().to_vec(), &options)
+        let page = RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
             .map_err(|error| invalid(error.to_string()))?;
         return output.write_stream(&schema, [&page]);
     }
     let batch = arguments.source_columnar_batch(memory)?;
     output.write_stream(batch.batch().schema_ref(), [batch.batch()])
+}
+
+fn has_non_ordinal_union(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(fields, UnionMode::Dense) => fields.iter().enumerate().any(|(index, (id, field))| {
+            id as usize != index || has_non_ordinal_union(field.data_type())
+        }),
+        DataType::Struct(fields) => fields.iter().any(|field| has_non_ordinal_union(field.data_type())),
+        DataType::List(field) | DataType::FixedSizeList(field, _) | DataType::Map(field, _)
+        | DataType::RunEndEncoded(_, field) => has_non_ordinal_union(field.data_type()),
+        _ => false,
+    }
+}
+
+fn ordinal_union_column(column: &ArrayRef) -> Result<ArrayRef> {
+    let data = column.to_data();
+    let mut children = data.child_data().to_vec();
+    let mut buffers = data.buffers().to_vec();
+    let mut rewrite_child = |index: usize, field: &FieldRef| -> Result<FieldRef> {
+        if !has_non_ordinal_union(field.data_type()) {
+            return Ok(Arc::clone(field));
+        }
+        let child = ordinal_union_column(&arrow_array::make_array(children[index].clone()))?;
+        children[index] = child.to_data();
+        Ok(Arc::new(field.as_ref().clone().with_data_type(child.data_type().clone())))
+    };
+    let data_type = match data.data_type() {
+        DataType::List(field) => DataType::List(rewrite_child(0, field)?),
+        DataType::FixedSizeList(field, size) => DataType::FixedSizeList(rewrite_child(0, field)?, *size),
+        DataType::Map(field, sorted) => DataType::Map(rewrite_child(0, field)?, *sorted),
+        DataType::RunEndEncoded(ends, values) => DataType::RunEndEncoded(Arc::clone(ends), rewrite_child(1, values)?),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().enumerate()
+            .map(|(index, field)| rewrite_child(index, field)).collect::<Result<_>>()?),
+        DataType::Union(fields, UnionMode::Dense) => {
+            let mut ordinals = [None; 128];
+            let mut remap = false;
+            let mut legs = Vec::with_capacity(fields.len());
+            for (index, (id, field)) in fields.iter().enumerate() {
+                let ordinal = i8::try_from(index).map_err(|_| overflow())?;
+                ordinals[id as usize] = Some(ordinal);
+                remap |= id != ordinal;
+                legs.push((ordinal, rewrite_child(index, field)?));
+            }
+            if remap {
+                let tags = column.as_union().type_ids().iter().map(|&id| {
+                    ordinals.get(id as usize).copied().flatten().ok_or_else(|| invalid("Union type ID has no field"))
+                }).collect::<Result<Vec<_>>>()?;
+                buffers[0] = Buffer::from_vec(tags);
+            }
+            DataType::Union(legs.into_iter().collect(), UnionMode::Dense)
+        }
+        _ => unreachable!("only types with non-ordinal dense unions are rewritten"),
+    };
+    let data = data.into_builder().data_type(data_type).buffers(buffers).child_data(children)
+        .build().map_err(|error| invalid(error.to_string()))?;
+    Ok(arrow_array::make_array(data))
 }
 
 pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
@@ -3740,6 +3813,102 @@ mod tests {
             (index, values[0].clone())
         }).collect();
         assert_eq!(rows, [(0, Value::U64(u64::MAX)), (1, Value::Null), (2, Value::U64(5))]);
+    }
+
+    #[test]
+    fn classic_sql_replay_uses_ordinal_tags_without_changing_retry_source_bytes() {
+        use arrow_array::{Int64Array, NullArray, StringArray};
+        use rtdb_types::PlacedAttemptScope;
+
+        let memory = budget();
+        let legs = UnionFields::try_new([42, 3, 17], [
+            Field::new("i64", DataType::Int64, false),
+            Field::new("utf8", DataType::Utf8, false),
+            Field::new("null", DataType::Null, true),
+        ]).unwrap();
+        let items = UnionArray::try_new(legs, vec![42, 3, 17, 42].into(), Some(vec![0, 0, 0, 1].into()), vec![
+            Arc::new(Int64Array::from(vec![7, 9])),
+            Arc::new(StringArray::from(vec!["tag"])),
+            Arc::new(NullArray::new(1)),
+        ]).unwrap();
+        let item = Arc::new(Field::new("item", items.data_type().clone(), true));
+        let list = ListArray::new(item, OffsetBuffer::new(vec![0, 2, 3, 4].into()), Arc::new(items), None);
+        let page = RecordBatch::try_from_iter([
+            ("?_0", Arc::new(list) as ArrayRef),
+            ("?_1", Arc::new(Int64Array::from(vec![1, 2, 3]))),
+        ]).unwrap();
+        let old_ipc = crate::ipc::encode(page.schema_ref(), [&page], &memory).unwrap();
+        let arguments = SqlArguments::from_arrow(OwnedBatch::new(page, &memory).unwrap(), &memory).unwrap();
+        assert_eq!(encode_arguments(&arguments, &memory).unwrap().as_slice(), old_ipc.as_slice());
+
+        let sql = "UPDATE docs SET v = ? WHERE _id = ?";
+        let typed = TxOp::Sql { sql: sql.into(), args: Some(arguments) };
+        let old = TxOp::SqlBytes { sql: sql.into(), arg_bytes: old_ipc };
+        let request = |op, user_metadata| SourceTransaction::new(vec![
+            TxOp::Sql { sql: "ASSERT TRUE".into(), args: None },
+            op,
+        ], SubmitOptions { user_metadata, ..Default::default() }, &memory).unwrap();
+
+        let classic = request(typed.clone(), None);
+        let legacy = request(old.clone(), None);
+        assert_eq!(classic.encode().unwrap().as_slice()[0], PROTOBUF_LOG_HEADER);
+        assert_eq!(classic.body_digest().unwrap(), legacy.body_digest().unwrap());
+
+        let rows = |replayed: SourceTransaction, expected_legs, expected_ids| {
+            let Operation::Public(TxOp::Sql { args: Some(arguments), .. }) = &replayed.operations[1] else {
+                panic!("expected replayed SQL arguments");
+            };
+            let page = arguments.single_arrow_page().unwrap().batch();
+            assert_eq!(page.schema_ref().field(0).name(), "?_0");
+            assert_eq!(page.schema_ref().field(1).name(), "?_1");
+            let items = page.column(0).as_list::<i32>().values().as_union();
+            let DataType::Union(fields, UnionMode::Dense) = items.data_type() else { unreachable!() };
+            assert_eq!(fields.iter().map(|(id, _)| id).collect::<Vec<_>>(), expected_legs);
+            assert_eq!(items.type_ids().as_ref(), expected_ids);
+            assert_eq!(items.offsets().unwrap().as_ref(), &[0, 0, 0, 1]);
+            arguments.indexed_rows().map(|row| {
+                let (index, values) = row.unwrap();
+                (index, values.to_vec())
+            }).collect::<Vec<_>>()
+        };
+        let expected = [
+            (0, vec![Value::list(vec![Value::I64(7), Value::Utf8("tag".into())]), Value::I64(1)]),
+            (1, vec![Value::list(vec![Value::Null]), Value::I64(2)]),
+            (2, vec![Value::list(vec![Value::I64(9)]), Value::I64(3)]),
+        ];
+        assert_eq!(rows(roundtrip(&legacy), [42, 3, 17], &[42, 3, 17, 42][..]), expected);
+        assert_eq!(rows(roundtrip(&classic), [0, 1, 2], &[0, 1, 2, 0][..]), expected);
+        assert_eq!(rows(classic.landing_footprint().unwrap(), [42, 3, 17], &[42, 3, 17, 42][..]), expected);
+
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let key = UserMetadata::new(Value::Struct(StructFields::from([
+            ("idempotency_key".into(), Value::Utf8("previous-receipt".into())),
+        ])), &memory).unwrap();
+        let bounded = UserMetadata::new(Value::Struct(StructFields::from([
+            (BOUNDED_RETRY_METADATA_KEY.into(), Value::Struct(StructFields::from([
+                ("nonce".into(), Value::Utf8(nonce.into())),
+                ("not_after_micros".into(), Value::I64(2)),
+            ]))),
+        ])), &memory).unwrap();
+        let seed = PlacedAttemptScope::new("history", 7).unwrap().issue();
+        let cases = |op: TxOp| {
+            let new = |metadata| request(op.clone(), metadata);
+            [
+                new(Some(key.clone())),
+                new(Some(bounded.clone())),
+                new(None).with_idempotency_guard(Timestamp(1), false),
+                new(None).with_replay_submission(ReplaySubmission::admit(&format!("{nonce}/0"), Timestamp(1), Timestamp(2)).unwrap()),
+                new(None).with_placed_seed(Some(seed)),
+            ]
+        };
+        for (source, legacy) in cases(typed).into_iter().zip(cases(old)) {
+            assert_eq!(source.encode().unwrap().as_slice(), legacy.encode().unwrap().as_slice());
+            let digest = legacy.body_digest().unwrap();
+            assert_eq!(source.body_digest().unwrap(), digest);
+            let replayed = roundtrip(&source);
+            assert_eq!(replayed.body_digest().unwrap(), digest);
+            assert_eq!(rows(replayed, [42, 3, 17], &[42, 3, 17, 42][..]), expected);
+        }
     }
 
     #[test]

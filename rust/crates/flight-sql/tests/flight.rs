@@ -730,6 +730,66 @@ async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads()
 }
 
 #[tokio::test]
+async fn prepared_update_replays_non_ordinal_union_arguments_from_classic_source() {
+    use arrow_array::{Array, ArrayRef, ListArray, UnionArray, cast::AsArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::UnionFields;
+    use rtdb_types::Value;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO docs (_id,v) VALUES (1,NULL),(2,NULL),(3,NULL)", None).await;
+    let sql = "UPDATE docs SET v = ? WHERE _id = ?";
+    let prepared = client.prepare(sql, None).await;
+    let legs = UnionFields::try_new([42, 3], [
+        Field::new("i64", DataType::Int64, false),
+        Field::new("utf8", DataType::Utf8, false),
+    ]).unwrap();
+    let union = UnionArray::try_new(legs, vec![3, 42, 42].into(), Some(vec![0, 0, 1].into()), vec![
+        Arc::new(Int64Array::from(vec![7, 9])),
+        Arc::new(StringArray::from(vec!["tag"])),
+    ]).unwrap();
+    let item = Arc::new(Field::new("item", union.data_type().clone(), true));
+    let values = ListArray::new(item, OffsetBuffer::new(vec![0, 1, 2, 3].into()), Arc::new(union), None);
+    let page = RecordBatch::try_from_iter([
+        ("client", Arc::new(values) as ArrayRef),
+        ("client", Arc::new(Int64Array::from(vec![2, 1, 3]))),
+    ]).unwrap();
+    client.upload(
+        CommandPreparedStatementUpdate { prepared_statement_handle: prepared.prepared_statement_handle },
+        vec![page.slice(0, 1), page.slice(1, 2)],
+    ).await;
+
+    let log = client.query("SELECT tx_ops FROM xt.source_log_msgs WHERE msg_id BETWEEN 0 AND 100 ORDER BY msg_id DESC LIMIT 1").await;
+    let logged = log[0].column(0).as_string::<i32>().value(0);
+    assert!(logged.contains(sql), "{logged}");
+    let (_, args) = logged.split_once(":args #bytes \"").unwrap();
+    let (hex, _) = args.split_once('"').unwrap();
+    let ipc = hex.as_bytes().chunks_exact(2).map(|pair| {
+        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+    }).collect::<Vec<_>>();
+    let (schema, pages) = rtdb_format::ipc::read_stream(ipc.into()).unwrap();
+    assert_eq!(schema.fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["?_0", "?_1"]);
+    assert_eq!(pages.len(), 1);
+    let items = pages[0].column(0).as_list::<i32>().values().as_union();
+    assert_eq!(items.type_ids().as_ref(), &[1, 0, 0]);
+    let DataType::Union(fields, _) = items.data_type() else { unreachable!() };
+    assert_eq!(fields.iter().map(|(id, _)| id).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(pages[0].column(1).as_primitive::<arrow_array::types::Int64Type>().values().as_ref(), &[2, 1, 3]);
+
+    let result = client.query("SELECT v FROM docs ORDER BY _id").await;
+    let rows = result.iter().flat_map(|batch| (0..batch.num_rows()).map(move |row| {
+        rtdb_columnar::read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), row).unwrap()
+    })).collect::<Vec<_>>();
+    assert_eq!(rows, [
+        Value::list(vec![Value::I64(7)]),
+        Value::list(vec![Value::Utf8("tag".into())]),
+        Value::list(vec![Value::I64(9)]),
+    ]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn authenticated_handles_require_the_original_session_but_query_tickets_do_not() {
     let running = Running::start(Some("correct"), FlightConfig::default()).await;
     let mut first = Client::connect(&running.server, Some("xtdb:correct")).await; let mut second = Client::connect(&running.server, Some("xtdb:correct")).await;

@@ -528,6 +528,9 @@ variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
+    -- An unguarded Classic append without a retry key or placed attempt writes dense union tags from a uniform Arrow argument upload as child ordinals, including nested unions.
+    -- Receipt encoding and the source encoding of keyed, guarded and placed transactions preserve the explicit type IDs in uniform Arrow argument uploads.
+    -- Source replay accepts existing argument streams with explicitly declared non-ordinal type IDs.
     -- A uniformly typed upload can reuse its sole populated page of null-free numeric vectors with unannotated fields for a single source IPC batch.
     -- When a source operation leg has one populated cell from typed SQL arguments, the binary column can adopt the encoded stream as its values buffer.
     -- The encoder writes the operation IPC into the retained source record with the same protobuf field order and framing.
