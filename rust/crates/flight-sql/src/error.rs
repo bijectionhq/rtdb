@@ -15,7 +15,7 @@ pub(crate) fn status(error: Anomaly) -> Status { status_ref(&error) }
 fn status_ref(error: &Anomaly) -> Status {
     let code = match error.category {
         AnomalyCategory::Incorrect => Code::InvalidArgument,
-        AnomalyCategory::Forbidden => Code::Unauthenticated,
+        AnomalyCategory::Forbidden => Code::PermissionDenied,
         AnomalyCategory::NotFound => Code::NotFound,
         AnomalyCategory::Conflict => Code::InvalidArgument,
         AnomalyCategory::Busy => Code::ResourceExhausted,
@@ -72,7 +72,12 @@ mod tests {
         let status = status(error); assert_eq!(status.code(), Code::InvalidArgument);
         let bytes = status.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap(); assert_eq!(value["category"], "conflict"); assert_eq!(value["data"]["key"], 42);
-        assert_eq!(super::status(Anomaly::new(AnomalyCategory::Forbidden, "xtdb/auth", "denied")).code(), Code::Unauthenticated);
+        let forbidden = super::status(Anomaly::new(AnomalyCategory::Forbidden, "xtdb/auth", "denied"));
+        assert_eq!(forbidden.code(), Code::PermissionDenied);
+        let forbidden_bytes = forbidden.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+        let forbidden_value: serde_json::Value = serde_json::from_slice(&forbidden_bytes).unwrap();
+        assert_eq!(forbidden_value["category"], "forbidden");
+        assert_eq!(forbidden_value["code"], "xtdb/auth");
         let oversized = Anomaly::incorrect("xtdb/error", "bad request").with_context("large", "x".repeat(4097).into());
         assert!(super::status(oversized).metadata().get_bin("xtdb-anomaly-bin").is_none());
     }

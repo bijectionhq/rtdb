@@ -10,7 +10,7 @@ use rtdb_tx::SqlArguments;
 use rtdb_types::{LogicalType, Timestamp};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Response, Status};
-use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis}, wire};
+use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::{Cut, Inspection, QueryRun, Ticket, TicketBasis, invalid_ticket}, wire};
 
 pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize, pub plan: Option<PreparedSql> }
 
@@ -208,13 +208,13 @@ impl Service {
                 let context = Box::pin(native.query_context_at(&run.basis.query_basis(databases), &token)).await.map_err(status)?;
                 drop(native);
                 let prepared = PreparedSql::prepare(sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
-                if prepared.is_dml() { return Err(invalid("invalid ticket")); }
+                if prepared.is_dml() { return Err(invalid_ticket()); }
                 let params = run.params.as_ref()
                     .map(|bytes| wire::BoundParameters::new(wire::parameter_batch(bytes, self.memory())?, self.memory())).transpose()?;
                 let deadline = context.retention_deadline().map(tokio::time::Instant::from);
                 within(deadline, Box::pin(open_query(&prepared, context, params.as_deref(), self.memory()))).await?
             }
-            _ => return Err(invalid("invalid ticket")),
+            _ => return Err(invalid_ticket()),
         };
         let context = Arc::clone(cursor.context());
         let deadline = context.retention_deadline().map(tokio::time::Instant::from);

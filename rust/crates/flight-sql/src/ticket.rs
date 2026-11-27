@@ -5,7 +5,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use rtdb_columnar::MemoryBudget;
 use rtdb_node::QueryBasis;
-use rtdb_types::{Instant, TimeBasis, Timestamp};
+use rtdb_types::{Anomaly, Instant, TimeBasis, Timestamp};
 use serde_json::{Map, Value};
 use sha2::Sha256;
 use tonic::Status;
@@ -241,7 +241,9 @@ impl Ticket {
 /// The reference's `QueryTicket.Empty`.
 const EMPTY: &str = r#"{"type":"empty"}"#;
 
-fn invalid_ticket() -> Status { invalid("invalid ticket") }
+pub(crate) fn invalid_ticket() -> Status {
+    status(Anomaly::incorrect("xtdb.flight-sql/invalid-ticket", "invalid ticket"))
+}
 
 fn default_search_path() -> Vec<String> { rtdb_sql::PrepareOptions::default().search_path }
 
@@ -350,6 +352,13 @@ mod tests {
         for refused in [&b"RTDBFT\x05\x01"[..], br#"{"type":"run"}"#, br#"{"type":"empty","extra":1}"#, br#"{"type":"other"}"#] {
             let error = Ticket::decode(&Bytes::from_static(refused), &signer).err().unwrap();
             assert_eq!((error.code(), error.message()), (tonic::Code::InvalidArgument, "invalid ticket"), "{refused:?}");
+            let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+            let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(detail, serde_json::json!({
+                "category": "incorrect",
+                "code": "xtdb.flight-sql/invalid-ticket",
+                "message": "invalid ticket",
+            }), "{refused:?}");
         }
     }
 
