@@ -653,7 +653,7 @@ fn covers_history(header: EventHeader, bounds: TemporalBounds) -> bool {
             && header.valid_time.upper() >= bounds.valid_time.upper())
 }
 
-struct AsOfResolver {
+pub(super) struct AsOfResolver {
     bounds: TemporalBounds,
     clamp_valid_time: bool,
     iid: Option<Iid>,
@@ -662,13 +662,13 @@ struct AsOfResolver {
 }
 
 impl AsOfResolver {
-    fn new(bounds: TemporalBounds, clamp_valid_time: bool) -> Option<Self> {
+    pub(super) fn new(bounds: TemporalBounds, clamp_valid_time: bool) -> Option<Self> {
         (bounds.valid_time.is_point() && bounds.system_time.is_point()).then_some(Self {
             bounds, clamp_valid_time, iid: None, left: Timestamp::MIN, right: Timestamp::MAX,
         })
     }
 
-    fn resolve(&mut self, header: EventHeader) -> Result<ControlFlow<Option<TemporalBounds>>> {
+    pub(super) fn resolve(&mut self, header: EventHeader) -> Result<ControlFlow<Option<TemporalBounds>>> {
         if self.iid != Some(header.iid) {
             self.iid = Some(header.iid);
             self.left = Timestamp::MIN;

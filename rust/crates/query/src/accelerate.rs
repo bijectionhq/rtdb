@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeBinaryArray, Float64Array, Int64Array, builder::FixedSizeBinaryBuilder};
@@ -184,10 +185,9 @@ pub struct LocatedHistoryEvent<W> {
 }
 
 pub fn resolve_located_point<W: Copy>(mut history: BTreeMap<Iid, Vec<LocatedHistoryEvent<W>>>, bounds: TemporalBounds,
-    clamp_valid_time: bool, memory: &Arc<MemoryBudget>) -> Result<Option<Vec<(ResolvedSearchRow, Option<W>)>>> {
-    if !bounds.system_time.is_point() || !bounds.valid_time.is_point() { return Ok(None); }
+    clamp_valid_time: bool, _memory: &Arc<MemoryBudget>) -> Result<Option<Vec<(ResolvedSearchRow, Option<W>)>>> {
+    let Some(mut resolver) = crate::scan::AsOfResolver::new(bounds, clamp_valid_time) else { return Ok(None); };
     let mut visible = Vec::new();
-    let mut resolver = rtdb_temporal::HistoryResolver::new_in(bounds, clamp_valid_time, Arc::clone(memory));
     for events in history.values_mut() {
         events.sort_unstable_by_key(|event| (std::cmp::Reverse(event.header.precedence()), event.header.valid_time.lower()));
         if events.windows(2).any(|pair| {
@@ -199,15 +199,18 @@ pub fn resolve_located_point<W: Copy>(mut history: BTreeMap<Iid, Vec<LocatedHist
                 _ => true,
             }
         }) { return Ok(None); }
-        let first = visible.len();
         for event in events {
-            resolver.resolve_fragments(&event.header, |valid_time, system_time| {
-                visible.push((ResolvedSearchRow { version: event.header.version(), origin: event.origin, location: event.location.clone(),
-                    visibility: TemporalBounds { valid_time, system_time } }, event.witness));
-                Ok(())
-            })?;
+            let ControlFlow::Break(winner) = resolver.resolve(event.header)? else { continue; };
+            if let Some(visibility) = winner {
+                visible.push((ResolvedSearchRow {
+                    version: event.header.version(),
+                    origin: event.origin,
+                    location: event.location.clone(),
+                    visibility,
+                }, event.witness));
+            }
+            break;
         }
-        if visible.len() - first > 1 { return Ok(None); }
     }
     Ok(Some(visible))
 }
@@ -617,6 +620,37 @@ impl ConstantEvaluator for ExecutionConstants<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn located_point_preserves_breakpoints_and_witness_without_a_ceiling_allocation() {
+        use rtdb_types::{BlockIndex, EventOp, Interval, Timestamp};
+
+        let iid = Iid([1; 16]);
+        let trie = TrieKey::l0(BlockIndex(0)).unwrap();
+        let events = [(5, 0, 100, EventOp::Redacted), (20, 0, 40, EventOp::Put),
+            (10, 0, 100, EventOp::Put), (20, 60, 100, EventOp::Delete), (30, 40, 60, EventOp::Put)]
+            .into_iter().enumerate().map(|(ordinal, (system, lower, upper, op))| {
+                let row = ordinal as u32;
+                LocatedHistoryEvent {
+                    header: EventHeader { iid, system_from: Timestamp(system), position: None,
+                        commit_position: row, valid_time: Interval::from_micros(lower, upper).unwrap(), op },
+                    origin: None,
+                    location: SearchRowLocation::Persisted { trie: trie.clone(), page: 0, row },
+                    witness: Some(row),
+                }
+            }).collect();
+        let bounds = TemporalBounds {
+            valid_time: Interval::at(Timestamp(50)).unwrap(),
+            system_time: Interval::at(Timestamp(25)).unwrap(),
+        };
+        let rows = resolve_located_point(BTreeMap::from([(iid, events)]), bounds, false,
+            &MemoryBudget::new(0)).unwrap().unwrap();
+        let [(row, witness)] = rows.as_slice() else { panic!("Expected one visible winner"); };
+        assert_eq!(*witness, Some(2));
+        assert_eq!(row.version.system_from, Timestamp(10));
+        assert_eq!(row.visibility.valid_time, Interval::from_micros(40, 60).unwrap());
+        assert_eq!(row.visibility.system_time, Interval::new(Timestamp(10), Timestamp::MAX).unwrap());
+    }
 
     #[test]
     fn ordered_index_candidate_scope_stays_in_sorted_arrow_storage() {
