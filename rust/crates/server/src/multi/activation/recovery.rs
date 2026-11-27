@@ -292,7 +292,8 @@ impl ActivationAuthority {
         if derived != candidate { return Err(conflict()); }
         let (_, state) = self.read(self.stream_id(name)?).await?;
         let state = state.ok_or_else(unavailable)?;
-        if state.version < RECOVERY_INTENT_PROTOCOL {
+        let protocol = state.recovery_protocol();
+        if protocol < RECOVERY_INTENT_PROTOCOL {
             return Err(conflict());
         }
         let selected_revision = operation.predecessor.revision.checked_add(1).ok_or_else(conflict)?;
@@ -302,7 +303,7 @@ impl ActivationAuthority {
             return Ok(CustodySettlement::Abandoned);
         }
         let unrecorded = CustodySettlement::Unrecorded {
-            hosted_custody: state.version >= RECOVERY_HOSTED_CUSTODY_PROTOCOL,
+            hosted_custody: protocol >= RECOVERY_HOSTED_CUSTODY_PROTOCOL,
         };
         if state.binding.revision > selected_revision {
             return Ok(unrecorded);
