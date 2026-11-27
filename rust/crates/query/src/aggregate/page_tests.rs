@@ -1202,6 +1202,59 @@ fn numeric_winner_keeps_nan_bits_and_signed_zero_across_input_routes() {
 }
 
 #[test]
+fn signed_extrema_widen_arrow_operands_and_validate_reached_narrowing() {
+    use crate::columnar::SelectedColumn;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let narrow = LogicalType::Scalar(ScalarType::I16);
+    let wide = LogicalType::Scalar(ScalarType::I64).maybe();
+    let input = narrow.join(&wide);
+    let source = |ty, values: &[Value]| {
+        let field = Arc::new(rtdb_columnar::to_field("c0", &ty).unwrap());
+        let array = rtdb_columnar::copy_array(&ty, values).unwrap();
+        Some((array, field, Some(ty), None))
+    };
+    let selected = SelectedColumn::new(vec![
+        source(narrow.clone(), &[Value::I16(i16::MAX), Value::I16(-9)]),
+        source(wide.clone(), &[Value::I64(i64::MIN), Value::Null]),
+    ], Arc::new(vec![(0, 0), (1, 0), (0, 1), (1, 1)]));
+    let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 4, memory.reserve(4096).unwrap()).unwrap();
+    let page = Rows::columns(&batch, &[0], false, &execution.context).unwrap();
+    let aggregate = |function, ty: LogicalType| AggregateExpr {
+        field: field(1, ty.clone().maybe()), function, argument: Some(field(0, ty).expression()),
+        distinct: false, filter: None, order_by: vec![],
+    };
+    let scope = execution.scope().unwrap();
+    for (function, expected) in [(AggregateFunction::Min, i64::MIN), (AggregateFunction::Max, i64::from(i16::MAX))] {
+        let extrema = aggregate(function, input.clone());
+        let types = AggregateTypes::derive(&extrema, input.clone(), false, EmissionMode::Execution).unwrap();
+        assert_eq!(types.output_type(), &wide);
+        let mut states = ScalarGroups::new(&execution).unwrap();
+        states.ensure(3).unwrap();
+        let pressure = memory.reserve(memory.available_bytes()).unwrap();
+        states.aggregate(page, GroupMapping::Grouped(&[0, 0, 1, 2]), |_| true,
+            3, Some(0), &extrema, &types, &scope, &execution).unwrap();
+        drop(pressure);
+        let (column, _charge) = fixed_scalar_results(&states, &extrema.function, &field(1, wide.clone()), &execution.context)
+            .unwrap().unwrap();
+        assert_eq!(column.value(0).unwrap(), Value::I64(expected));
+        assert_eq!(column.value(1).unwrap(), Value::I64(-9));
+        assert_eq!(column.value(2).unwrap(), Value::Null);
+    }
+
+    let maximum = aggregate(AggregateFunction::Max, narrow);
+    let types = AggregateTypes::derive(&maximum, input, true, EmissionMode::Execution).unwrap();
+    let mut narrowed = ScalarGroups::new(&execution).unwrap();
+    let error = narrowed.aggregate(page, GroupMapping::Global(4), |_| true, 1,
+        Some(0), &maximum, &types, &scope, &execution).unwrap_err();
+    assert_eq!(error.code, "xtdb.expression/overflow-error");
+    drop((narrowed, scope, batch));
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[test]
 fn date64_extremum_keeps_the_first_tick_on_a_calendar_day() {
     let execution = execution(8);
     let output = field(0, LogicalType::Scalar(ScalarType::DateMilli).maybe());

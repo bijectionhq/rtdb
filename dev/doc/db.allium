@@ -2524,6 +2524,7 @@ surface QueryAccess {
         -- Primitive numeric sums retain their state at the declared accumulation width within each group.
         -- Scalar aggregates reduce compatible numeric Arrow operands in input order and write compatible results as Arrow columns.
         -- Fixed-width numeric extrema keep one inline winner per group and retain the first value when candidates compare equal.
+        -- Signed integer extrema can read narrower signed integer operands from Arrow when the result type holds their full range.
         -- Direct writers for fixed-width aggregate results preserve the declared Arrow layout even when every group yields null.
         -- The output page owns the charge for those buffers.
         -- A same-scale Decimal128 sum at non-negative scale accumulates its exact coefficient and checks physical overflow.

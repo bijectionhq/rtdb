@@ -1760,6 +1760,9 @@ struct NumericColumn<'a>(&'a Column);
 
 impl<'a> NumericColumn<'a> {
     fn admits_leaf(field: &ArrowField, logical: Option<&LogicalType>, expected: Option<&LogicalType>) -> bool {
+        use LogicalType::Scalar;
+        use ScalarType::{I16, I32, I64};
+
         if !field.metadata().is_empty() { return false; }
         let physical = match field.data_type() {
             DataType::Null => return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null),
@@ -1775,9 +1778,15 @@ impl<'a> NumericColumn<'a> {
             DataType::Float64 => ScalarType::F64,
             _ => return false,
         };
-        let physical = LogicalType::Scalar(physical);
+        let physical = Scalar(physical);
         logical.is_none_or(|ty| without_nullability(ty) == &physical)
-            && expected.is_none_or(|ty| without_nullability(ty) == &physical)
+            && expected.is_none_or(|ty| {
+                let ty = without_nullability(ty);
+                ty == &physical || matches!((field.data_type(), ty),
+                    (DataType::Int8, Scalar(I16))
+                    | (DataType::Int8 | DataType::Int16, Scalar(I32))
+                    | (DataType::Int8 | DataType::Int16 | DataType::Int32, Scalar(I64)))
+            })
     }
 
     fn bind(column: &'a Column, expected: Option<&LogicalType>) -> Option<Self> {
