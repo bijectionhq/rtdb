@@ -8,6 +8,7 @@ publish.workspace = true
 
 [features]
 remote = ["dep:object_store", "dep:futures", "dep:percent-encoding"]
+remote-cache-http = ["remote", "object_store/cloud"]
 
 [dependencies]
 percent-encoding = { version = "2.3", optional = true }

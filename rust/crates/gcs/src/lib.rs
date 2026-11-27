@@ -4,7 +4,7 @@ use std::sync::Arc;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use rtdb_format::generated::xtdb::gcp::proto::GcsObjectStoreConfig;
 use rtdb_format::keys::StorageRoot;
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::{RemoteStore, cache_http}};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
@@ -35,10 +35,17 @@ impl GcsConfig {
         let credentials = google_cloud_auth::credentials::Builder::default().with_scopes(["https://www.googleapis.com/auth/devstorage.full_control"]).build()
             .map_err(|error| Anomaly::incorrect("xtdb.gcp/credentials", error.to_string()))?;
         let bridge = credential::CredentialBridge::new(credentials);
-        let client = GoogleCloudStorageBuilder::new().with_bucket_name(&self.bucket).with_skip_signature(false)
-            .with_credentials(Arc::new(bridge.clone())).with_http_connector(bridge).build()
+        let builder = GoogleCloudStorageBuilder::new().with_bucket_name(&self.bucket).with_skip_signature(false)
+            .with_credentials(Arc::new(bridge.clone()));
+        let client = builder.clone().with_http_connector(bridge.clone()).build()
             .map_err(|error| Anomaly::incorrect("xtdb.gcp/invalid-config", error.to_string()))?;
-        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io).with_catalog_ledger()?))
+        let downloads = cache_http::open(bridge, |connector, retry| {
+            builder.with_http_connector(connector).with_retry(retry).build()
+        })
+            .map_err(|error| Anomaly::incorrect("xtdb.gcp/invalid-config", error.to_string()))?;
+        let store = RemoteStore::new_in(Arc::new(client), Some(prefix), io).with_catalog_ledger()?
+            .with_cache_downloads(downloads);
+        Ok(Arc::new(store))
     }
 
     pub fn to_proto(&self) -> GcsObjectStoreConfig {

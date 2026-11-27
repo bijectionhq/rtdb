@@ -11,10 +11,10 @@ pub use versions::{CreateAttemptPublication, NeverVersionedObject, NeverVersione
 
 use std::sync::Arc;
 use aws_credential_types::provider::SharedCredentialsProvider;
-use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
+use object_store::{RetryConfig, StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}, client::ReqwestConnector};
 use rtdb_format::generated::xtdb::aws::proto as pb;
 use rtdb_format::keys::StorageRoot;
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::{RemoteStore, cache_http}};
 use rtdb_types::{Anomaly, Result, S3ObjectNamespace};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -211,14 +211,19 @@ impl S3Config {
             endpoint: endpoint.map(|endpoint| endpoint.to_string()),
             region: Some(region.unwrap_or_else(|| "us-east-1".into())),
         };
-        let client = build_client(ordinary)?;
         if !cell {
-            let store = RemoteStore::new_in(client, Some(prefix), io).with_catalog_ledger()?;
+            let client = build_client(ordinary.clone())?;
+            let downloads = cache_http::open(ReqwestConnector::default(), |connector, retry| {
+                ordinary.with_http_connector(connector).with_retry(retry).build()
+            }).map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
+            let store = RemoteStore::new_in(client, Some(prefix), io).with_catalog_ledger()?
+                .with_cache_downloads(downloads);
             #[cfg(feature = "versioning")]
             let store = store.with_s3_versioning(namespace)
                 .with_classic_versions(Arc::new(classic_inventory.expect("Classic inventory")));
             return Ok(Arc::new(store));
         }
+        let client = build_client(ordinary)?;
         #[cfg(feature = "versioning")]
         let store = match uploads {
             Some(uploads) => RemoteStore::new_managed(client, prefix, io, Arc::new(uploads)),

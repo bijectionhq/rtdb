@@ -355,6 +355,14 @@ pub trait ObjectStore: Send + Sync {
     fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { true }
     /// Whether a codec can read bounded, format-aligned ranges through `observe_range`.
     fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool { self.supports_scan_ranges(key) }
+    /// Copies one complete immutable response into a private cache file under the supplied memory budget.
+    /// Returning `None` leaves the file untouched and selects the existing reserved read path.
+    /// Dropping the future stops writing to the destination.
+    async fn try_fill_disk_cache(
+        &self, _key: &ObjectKey, _destination: &mut tempfile::NamedTempFile, _memory: &Arc<rtdb_types::MemoryBudget>,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
     /// Retains the allocation charge during the read and with the returned bytes.
     /// Implementations that offload work beyond this future must move the reservation into that work.
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {

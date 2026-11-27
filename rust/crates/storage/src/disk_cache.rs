@@ -194,38 +194,51 @@ impl DiskCache {
         let lease = DiskLease { cache: Arc::clone(self), entry };
         let guard = self.cancellation.run_until_cancelled(lease.entry.loading.lock()).await.ok_or_else(cache_closed)?;
         if lease.entry.file.get().is_none() {
-            let object = self.cancellation.run_until_cancelled(store.head(remote_key)).await.ok_or_else(cache_closed)??;
             let mut temporary = tempfile::NamedTempFile::new_in(self.root.join(".tmp")).map_err(|error| Error::io(&self.root, error))?;
-            let ranges = store.supports_scan_ranges(remote_key);
-            let chunk_size = if ranges {
-                (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1) as u64
-            } else {
-                object.size.max(1)
+            let streamed = self.cancellation.run_until_cancelled(store.try_fill_disk_cache(remote_key, &mut temporary, &self.memory))
+                .await.ok_or_else(cache_closed)??;
+            let size = match streamed {
+                Some(size) => size,
+                None => self.fill_with_reserved_reads(store, remote_key, &mut temporary).await?,
             };
-            let mut offset = 0;
-            while offset < object.size {
-                let end = object.size.min(offset.saturating_add(chunk_size));
-                let length = usize::try_from(end - offset).map_err(|error| Error::Task(error.to_string()))?;
-                let bytes = self.cancellation.run_until_cancelled(async {
-                    if ranges {
-                        let allocation = store.scan_range_allocation(remote_key, length)?;
-                        let reservation = crate::cache::reserve_read(length, allocation, |bytes| self.reserve(bytes))?;
-                        store.get_reserved_range(remote_key, offset..end, reservation).await
-                    } else {
-                        let allocation = store.whole_object_allocation(remote_key, length)?;
-                        let reservation = crate::cache::reserve_read(length, allocation, |bytes| self.reserve(bytes))?;
-                        store.get_reserved_object(remote_key, reservation).await
-                    }
-                }).await.ok_or_else(cache_closed)??;
-                temporary.write_all(bytes.as_slice()).map_err(|error| Error::io(temporary.path(), error))?;
-                offset = end;
-            }
-            self.publish(cache_key, &lease.entry, temporary, object.size)?;
-            self.missed(object.size);
+            if self.cancellation.is_cancelled() { return Err(cache_closed()); }
+            self.publish(cache_key, &lease.entry, temporary, size)?;
+            self.missed(size);
         }
         drop(guard);
         self.trim(None);
         Ok(lease)
+    }
+
+    async fn fill_with_reserved_reads(
+        &self, store: &dyn ObjectStore, remote_key: &ObjectKey, temporary: &mut tempfile::NamedTempFile,
+    ) -> Result<u64> {
+        let object = self.cancellation.run_until_cancelled(store.head(remote_key)).await.ok_or_else(cache_closed)??;
+        let ranges = store.supports_scan_ranges(remote_key);
+        let chunk_size = if ranges {
+            (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1) as u64
+        } else {
+            object.size.max(1)
+        };
+        let mut offset = 0;
+        while offset < object.size {
+            let end = object.size.min(offset.saturating_add(chunk_size));
+            let length = usize::try_from(end - offset).map_err(|error| Error::Task(error.to_string()))?;
+            let bytes = self.cancellation.run_until_cancelled(async {
+                if ranges {
+                    let allocation = store.scan_range_allocation(remote_key, length)?;
+                    let reservation = crate::cache::reserve_read(length, allocation, |bytes| self.reserve(bytes))?;
+                    store.get_reserved_range(remote_key, offset..end, reservation).await
+                } else {
+                    let allocation = store.whole_object_allocation(remote_key, length)?;
+                    let reservation = crate::cache::reserve_read(length, allocation, |bytes| self.reserve(bytes))?;
+                    store.get_reserved_object(remote_key, reservation).await
+                }
+            }).await.ok_or_else(cache_closed)??;
+            temporary.write_all(bytes.as_slice()).map_err(|error| Error::io(temporary.path(), error))?;
+            offset = end;
+        }
+        Ok(object.size)
     }
 
     fn publish(&self, key: &ObjectKey, entry: &Arc<Entry>, temporary: tempfile::NamedTempFile, size: u64) -> Result<()> {

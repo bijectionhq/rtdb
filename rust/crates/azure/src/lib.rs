@@ -12,7 +12,7 @@ use std::time::Duration;
 use object_store::{ClientOptions, StaticCredentialProvider, azure::{AzureAuthorizer, AzureCredentialProvider, MicrosoftAzure, MicrosoftAzureBuilder}, client::{HttpConnector, HttpRequest, HttpRequestBody, ReqwestConnector}};
 use rtdb_format::generated::xtdb::azure::proto::AzureBlobStorageConfig;
 use rtdb_format::keys::StorageRoot;
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::{RemoteStore, cache_http}};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
@@ -91,13 +91,18 @@ impl AzureConfig {
             Some(credential) => Arc::new(StaticCredentialProvider::new(credential)),
             None => Arc::new(credential::CredentialBridge::new(self.user_managed_identity_client_id.as_deref(), Arc::clone(&io))?),
         };
+        let connector = copy::CopyConnector::new(connection.account.clone(), Arc::clone(&credentials));
         let builder = MicrosoftAzureBuilder::from_env().with_account(&connection.account).with_container_name(&self.container)
-            .with_use_emulator(false).with_skip_signature(false).with_endpoint(connection.endpoint.to_string()).with_allow_http(connection.endpoint.scheme() == "http");
-        let client = builder.with_credentials(Arc::clone(&credentials))
-            .with_http_connector(copy::CopyConnector::new(connection.account.clone(), credentials))
-            .build().map_err(invalid)?;
+            .with_use_emulator(false).with_skip_signature(false).with_endpoint(connection.endpoint.to_string()).with_allow_http(connection.endpoint.scheme() == "http")
+            .with_credentials(credentials);
+        let client = builder.clone().with_http_connector(connector.clone()).build().map_err(invalid)?;
         ensure_container(&client, &connection.account, &connection.endpoint, &self.container).await?;
-        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io).with_catalog_ledger()?))
+        let downloads = cache_http::open(connector, |connector, retry| {
+            builder.with_http_connector(connector).with_retry(retry).build()
+        }).map_err(invalid)?;
+        let store = RemoteStore::new_in(Arc::new(client), Some(prefix), io).with_catalog_ledger()?
+            .with_cache_downloads(downloads);
+        Ok(Arc::new(store))
     }
 
     pub fn to_proto(&self) -> Result<AzureBlobStorageConfig> {

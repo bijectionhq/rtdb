@@ -1,10 +1,10 @@
-use crate::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
+use crate::{Error, HeldView, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{Attribute, GetOptions, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
-use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNamespace, TerminalObjectPublication};
-use std::{ops::Range, sync::Arc};
+use rtdb_types::{MemoryBudget, PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNamespace, TerminalObjectPublication};
+use std::{io::Write, ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub use crate::{object_store::strong_entity_tag, valid_object_version};
@@ -13,8 +13,13 @@ pub use crate::{object_store::strong_entity_tag, valid_object_version};
 mod catalog;
 #[path = "remote_read_drain.rs"]
 mod read_drain;
+#[cfg(feature = "remote-cache-http")]
+pub mod cache_http;
 
 pub const S3_RETIREMENT_ATTRIBUTE: &str = "rtdb-retirement";
+
+// The Reqwest transport uses a 2 MiB HTTP/2 stream window and sub-MiB HTTP/1 read buffers.
+const CACHE_DOWNLOAD_BYTES: usize = 3 * 1024 * 1024;
 
 /// A provider may still be copying when its completion can no longer be established.
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +95,7 @@ pub trait ClassicVersionRetirement: Send + Sync {
 #[derive(Clone)]
 pub struct RemoteStore {
     objects: Arc<RemoteObjects>,
+    cache_downloads: Option<Arc<dyn ProviderStore>>,
     io: Arc<IoRegion>,
     cell: bool,
     version_namespace: Option<Arc<S3ObjectNamespace>>,
@@ -108,13 +114,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false, read_drain: None }), io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false, read_drain: None }), cache_downloads: None, io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true, read_drain: None }), io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true, read_drain: None }), cache_downloads: None, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -125,7 +131,14 @@ impl RemoteStore {
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
         let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true, read_drain: None });
-        Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects, cache_downloads: None, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+    }
+
+    /// Configure the cache GET client with the same namespace and authorization as the ordinary client.
+    /// It must deliver one response without resuming and bound each in-flight body by `CACHE_DOWNLOAD_BYTES`.
+    pub fn with_cache_downloads(mut self, client: Arc<dyn ProviderStore>) -> Self {
+        self.cache_downloads = Some(client);
+        self
     }
 
     pub fn with_catalog_ledger(mut self) -> Result<Self> {
@@ -389,6 +402,38 @@ impl ObjectStore for RemoteStore {
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
         self.io.read_async(self.objects.clone(), (key.clone(), range), move |objects, (key, range)| async move { reservation.finish(objects.get_range(&key, range).await?) }).await
+    }
+    async fn try_fill_disk_cache(
+        &self, key: &ObjectKey, destination: &mut tempfile::NamedTempFile, memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<u64>> {
+        let Some(client) = &self.cache_downloads else { return Ok(None); };
+        if self.cell || self.objects.read_drain.is_some() { return Ok(None); }
+        let Ok(charge) = memory.reserve(CACHE_DOWNLOAD_BYTES) else { return Ok(None); };
+        let selection = Arc::new((Arc::clone(client), self.objects.path(key)));
+        let view = HeldView::recovery(selection.clone());
+        let lease = IoRegion::current_read_lease();
+        let result = IoRegion::reading(view, async {
+            let _admission = self.io.admit()?;
+            let response = selection.0.get_opts(&selection.1, GetOptions::default())
+                .await.map_err(|error| provider_error(key, error))?;
+            let size = response.meta.size;
+            let wrong_size = || Error::Remote { key: key.to_string(), message: "provider returned an incomplete or oversized cache body".into() };
+            if response.range != (0..size) { return Err(wrong_size()); }
+            let mut body = response.into_stream();
+            let mut remaining = size;
+            while let Some(chunk) = body.try_next().await.map_err(|error| provider_error(key, error))? {
+                if chunk.len() > charge.bytes() {
+                    return Err(Error::Remote { key: key.to_string(), message: "cache download chunk exceeded the reserved transport window".into() });
+                }
+                remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(wrong_size)?;
+                destination.write_all(&chunk).map_err(|error| Error::io(destination.path(), error))?;
+                drop(chunk);
+                tokio::task::consume_budget().await;
+            }
+            if remaining != 0 { return Err(wrong_size()); }
+            Ok(Some(size))
+        }).await;
+        match lease { Some(lease) => lease.classify(result), None => result }
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
         self.put_with_publication(key, bytes).await.map(drop)

@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-rtdb-storage = { workspace = true, features = ["remote"] }
+rtdb-storage = { workspace = true, features = ["remote-cache-http"] }
 rtdb-types.workspace = true
 rtdb-format.workspace = true
 object_store = { workspace = true, features = ["azure"] }

@@ -47,6 +47,10 @@ A retained mapping keeps any disk-cache lease alive until the last Arrow buffer 
 
 `DiskCache` is a shared monitor for immutable remote files, with per-entry load exclusion and passive leases that prevent eviction during reads.
 Downloads publish a complete temporary file atomically and charge each in-flight chunk and retained entry to the supplied allocation budget.
+Classic S3, Azure and GCS fills reserve the bounded transport window before issuing one full GET.
+The cache consumes the response in order and publishes only after a successful end of body at the declared size.
+An interrupted response fails the fill so that a later request starts over with its own response.
+Stores without this capability and fills with insufficient memory for the transport window use reserved ranges or the store's reserved whole-object read.
 Cancelled or failed loads release their temporary files and allow a later reader to retry.
 Concurrent readers share successful loads; cancellation of the loading caller permits a waiting reader to restart that load.
 Pinned files can exceed the disk capacity; releasing their final lease evicts idle files until the capacity is met.

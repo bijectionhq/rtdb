@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, memory::InMemory, path::Path};
 use rtdb_columnar::MemoryBudget;
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, remote::{PublicationJournal, PublicationResult, PublicationUploads, RemoteStore}};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, disk_cache::DiskCache, remote::{PublicationJournal, PublicationResult, PublicationUploads, RemoteStore}};
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]
@@ -31,6 +31,7 @@ struct Hooks {
     delete: Option<Arc<Gate>>,
     read: Option<Arc<Gate>>,
     read_body: Option<Arc<Gate>>,
+    cache_body: Option<Arc<CacheBody>>,
     fail_part: Option<usize>,
     fail_abort: bool,
     fail_delete: bool,
@@ -46,6 +47,14 @@ struct Hooks {
     put_etag: Option<&'static str>,
     read_etag: Option<&'static str>,
     head_etag: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct CacheBody {
+    frame_size: usize,
+    pause_after_first_frame: Option<Arc<Gate>>,
+    fail_at_eof: bool,
+    declared_size: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -112,6 +121,12 @@ impl ProviderStore for ControlledStore {
         let version = if options.head { self.hooks.head_version } else { self.hooks.read_version };
         let etag = if options.head { self.hooks.head_etag } else { self.hooks.read_etag };
         let gate = if options.head { None } else { self.hooks.read_body.clone() };
+        let cache_body = self.hooks.cache_body.clone();
+        if cache_body.is_some() {
+            assert!(!options.head);
+            assert!(options.range.is_none());
+            assert!(options.version.is_none());
+        }
         let mut result = self.inner.get_opts(location, options).await?;
         if let Some(gate) = gate {
             let GetResultPayload::Stream(body) = result.payload else { unreachable!("in-memory provider returns a stream") };
@@ -122,6 +137,26 @@ impl ProviderStore for ControlledStore {
         }
         if let Some(version) = version { result.meta.version = Some(version.into()); }
         if let Some(etag) = etag { result.meta.e_tag = Some(etag.into()); }
+        if let Some(shape) = cache_body {
+            let GetResultPayload::Stream(body) = result.payload else { unreachable!("in-memory provider returns a stream") };
+            if let Some(size) = shape.declared_size {
+                result.meta.size = size;
+                result.range = 0..size;
+            }
+            result.payload = GetResultPayload::Stream(body.map_ok(move |bytes| {
+                let shape = Arc::clone(&shape);
+                futures::stream::try_unfold((0, bytes, shape), |(offset, bytes, shape)| async move {
+                    if offset == shape.frame_size {
+                        if let Some(gate) = &shape.pause_after_first_frame { gate.enter().await; }
+                    }
+                    if offset == bytes.len() {
+                        return if shape.fail_at_eof { Err(injected("cache body fault at EOF")) } else { Ok(None) };
+                    }
+                    let end = (offset + shape.frame_size).min(bytes.len());
+                    Ok(Some((bytes.slice(offset..end), (end, bytes, shape))))
+                })
+            }).try_flatten().boxed());
+        }
         Ok(result)
     }
     fn delete_stream(&self, locations: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
@@ -229,6 +264,115 @@ fn injected(message: &'static str) -> object_store::Error {
 
 async fn bounded<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(10), future).await.expect("controlled I/O did not finish")
+}
+
+fn staged_cache_lengths(root: &std::path::Path) -> Vec<u64> {
+    std::fs::read_dir(root.join(".tmp")).unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name() != ".owner-lock")
+        .map(|entry| entry.metadata().unwrap().len())
+        .collect()
+}
+
+#[tokio::test]
+async fn cache_download_streams_an_object_larger_than_its_budget_and_restarts_after_cancellation() {
+    use rtdb_types::S3ObjectNamespace;
+
+    let gate = Gate::new();
+    let frame_size = 256 << 10;
+    let download = ControlledStore::new(Hooks { cache_body: Some(Arc::new(CacheBody {
+        frame_size, pause_after_first_frame: Some(gate.clone()), fail_at_eof: false, declared_size: None,
+    })), ..Default::default() });
+    let ordinary = ControlledStore::new(Hooks { read_version: Some("observed"), ..Default::default() });
+    let object = Path::from("part/trie");
+    let length = 6 << 20;
+    let initial = Bytes::from(vec![11; length]);
+    download.inner.put(&object, initial.into()).await.unwrap();
+    ordinary.inner.put(&object, Bytes::from_static(b"exact grant").into()).await.unwrap();
+    let namespace = S3ObjectNamespace { bucket: "bucket".into(), endpoint: None, region: None };
+    let remote = RemoteStore::new(ordinary.clone(), Some(ObjectKey::new("part").unwrap()))
+        .with_s3_versioning(namespace.clone())
+        .with_cache_downloads(download.clone());
+
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(4 << 20);
+    let cache = DiskCache::open(directory.path(), length as u64, memory.clone()).unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), Arc::new(remote)).unwrap();
+    let key = ObjectKey::new("trie").unwrap();
+    let result = directory.path().join("db/trie");
+    let pending = tokio::spawn({
+        let (store, key) = (store.clone(), key.clone());
+        async move { store.local_file(&key).await.map(drop) }
+    });
+    gate.arrived().await;
+    assert!(memory.used_bytes() >= 3 << 20);
+    assert_eq!(staged_cache_lengths(directory.path()), [frame_size as u64]);
+    assert!(!result.exists());
+    pending.abort();
+    assert!(bounded(pending).await.unwrap_err().is_cancelled());
+    assert!(staged_cache_lengths(directory.path()).is_empty());
+    assert_eq!(memory.used_bytes(), 0);
+
+    let replacement = Bytes::from(vec![29; length]);
+    download.inner.put(&object, replacement.clone().into()).await.unwrap();
+    gate.release();
+    drop(bounded(store.local_file(&key)).await.unwrap().unwrap());
+    assert_eq!(std::fs::read(&result).unwrap().as_slice(), replacement.as_ref());
+    assert!(memory.used_bytes() < frame_size);
+    assert_eq!(cache.traffic().network_read_bytes, length as u64);
+    assert_eq!(cache.traffic().misses, 1);
+    assert_eq!(download.observed.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ordinary.observed.calls.load(Ordering::SeqCst), 0);
+
+    let exact = store.observe_fresh_exact(&key, b"exact grant".len()).await.unwrap();
+    assert_eq!(exact.value.as_ref(), b"exact grant");
+    let version = exact.version.unwrap();
+    assert_eq!(version.namespace, namespace);
+    assert_eq!(version.key, "part/trie");
+    assert_eq!(version.version, "observed");
+}
+
+#[tokio::test]
+async fn cache_download_rejects_out_of_budget_frames_wrong_lengths_and_faulted_eof() {
+    for (frame_size, declared_size, fail_at_eof, expected) in [
+        (4 << 20, None, false, "exceeded the reserved transport window"),
+        (256 << 10, Some((4 << 20) + 1), false, "incomplete or oversized cache body"),
+        (256 << 10, Some((4 << 20) - 1), false, "incomplete or oversized cache body"),
+        (256 << 10, None, true, "cache body fault at EOF"),
+    ] {
+        let provider = ControlledStore::new(Hooks { cache_body: Some(Arc::new(CacheBody {
+            frame_size, pause_after_first_frame: None, fail_at_eof, declared_size,
+        })), ..Default::default() });
+        provider.inner.put(&Path::from("trie"), Bytes::from(vec![9; 4 << 20]).into()).await.unwrap();
+        let remote = RemoteStore::new(Arc::new(InMemory::new()), None)
+            .with_cache_downloads(provider);
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryBudget::new(4 << 20);
+        let cache = DiskCache::open(directory.path(), 8 << 20, memory.clone()).unwrap();
+        let key = ObjectKey::new("trie").unwrap();
+        assert!(matches!(bounded(cache.get(&key, &remote, &key)).await,
+            Err(Error::Remote { message, .. }) if message.contains(expected)));
+        assert!(!directory.path().join("trie").exists());
+        assert!(staged_cache_lengths(directory.path()).is_empty());
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(cache.traffic().misses, 0);
+    }
+}
+
+#[tokio::test]
+async fn an_unfunded_cache_stream_leaves_the_reserved_range_fill_available() {
+    let ordinary = ControlledStore::new(Hooks::default());
+    let download = ControlledStore::new(Hooks::default());
+    let remote = RemoteStore::new(ordinary.clone(), None)
+        .with_cache_downloads(download.clone());
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 4 << 20, MemoryBudget::new(1 << 20)).unwrap();
+    let key = ObjectKey::new("trie").unwrap();
+    let bytes = Bytes::from(vec![7; 2 << 20]);
+    ordinary.inner.put(&Path::from("trie"), bytes.clone().into()).await.unwrap();
+    let lease = bounded(cache.get(&key, &remote, &key)).await.unwrap();
+    assert_eq!(std::fs::read(lease.path()).unwrap().as_slice(), bytes.as_ref());
+    assert_eq!(download.observed.calls.load(Ordering::SeqCst), 0);
 }
 
 #[derive(Default)]
