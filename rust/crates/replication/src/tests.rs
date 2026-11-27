@@ -1128,6 +1128,8 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
 
 #[tokio::test]
 async fn native_deferred_checkpoint_upload_preserves_live_commits_and_recovery() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+
     let store = Arc::new(MemoryStore::default());
     let upload = Arc::new(PendingCheckpointUpload {
         key: ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap(),
@@ -1139,12 +1141,16 @@ async fn native_deferred_checkpoint_upload_preserves_live_commits_and_recovery()
         deferred_checkpoints: true, rows_per_block: u64::MAX, assertion_interval: Duration::from_millis(10),
         idle_heartbeat: false, ..Default::default()
     };
-    let fixture = fixture_over(options, 1 << 27, None, |replica| replica, store, objects).await;
+    let mut fixture = fixture_over(options, 1 << 27, None, |replica| replica, store, objects).await;
+    let authority = NativeServingAuthority { incarnation: [7; 16], checkpoints: None };
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), authority.clone(), false).await.unwrap();
     let partition = Arc::clone(&fixture.driver.partition);
     let resolve = Arc::clone(&fixture.driver.resolve);
     let writer = tokio::spawn(fixture.driver.run());
     let running = CancellationToken::new();
     let table = TableRef::new("public", "docs");
+    let first = serving_source_put(1);
+    let first_receipt = serving.transact(first.clone(), VerifiedClaims::default(), None, &running).await.unwrap();
     let before = submit_recovery_row(&fixture.handle, &fixture.memory, 1, 100).await;
     fixture.handle.await_tx(TxId(before.0), &running).await.unwrap();
     let pinned = partition.snapshot();
@@ -1159,6 +1165,9 @@ async fn native_deferred_checkpoint_upload_preserves_live_commits_and_recovery()
     assert_eq!(fixture.handle.status().open_block, BlockIndex(1));
     assert_eq!(pinned.iter_segments(&table).map(|segment| segment.row_count()).sum::<u32>(), 1);
     assert_eq!(partition.snapshot().iter_segments(&table).map(|segment| segment.row_count()).sum::<u32>(), 2);
+    let second = serving_source_put(2);
+    let second_receipt = tokio::time::timeout(Duration::from_secs(5),
+        serving.transact(second.clone(), VerifiedClaims::default(), None, &running)).await.unwrap().unwrap();
     let later_flush = fixture.handle.flush().await.unwrap();
 
     upload.resume.notify_one();
@@ -1171,6 +1180,11 @@ async fn native_deferred_checkpoint_upload_preserves_live_commits_and_recovery()
     assert!(fixture.handle.progress().current().source_position >= later_flush);
     assert_eq!(partition.value().table_catalog().metadata(&table).unwrap().row_count, 2);
     assert_eq!(partition.snapshot().iter_segments(&table).map(|segment| segment.row_count()).sum::<u32>(), 0);
+    let (first_root, _) = fixture.blocks.load(BlockIndex(0)).await.unwrap();
+    let checkpoint = first_root.as_proto().serving_checkpoint.as_deref().unwrap();
+    let (fold, _, _) = crate::serving::decode_checkpoint_image(checkpoint, authority.incarnation).unwrap();
+    assert_eq!(fold.tx_status(&first.key).unwrap().basis, first_receipt.basis);
+    assert!(fold.tx_status(&second.key).is_err());
     fixture.handle.shutdown();
     writer.await.unwrap().unwrap();
 
@@ -1181,15 +1195,17 @@ async fn native_deferred_checkpoint_upload_preserves_live_commits_and_recovery()
     assert_eq!(recovered.progress.tx_key.unwrap().tx_id, TxId(before.0));
     let recovered_partition = Arc::clone(&recovered.partition);
     let progress = ProgressMonitor::new(recovered.progress.clone());
-    let (reader, follower) = ReplicationDriver::new(ReplicationConfig { may_lead: false, ..Default::default() },
+    let (reader, mut follower) = ReplicationDriver::new(ReplicationConfig { may_lead: false, ..Default::default() },
         fixture.logs, fixture.blocks, recovered, progress, resolve, Arc::new(NoEffects), running.clone()).unwrap();
+    let reopened_serving = follower.attach_native_serving(reader.clone(), authority, false).await.unwrap();
     let follower = tokio::spawn(follower.run());
-    tokio::time::timeout(Duration::from_secs(5), reader.await_tx(TxId(suffix.0), &running))
+    tokio::time::timeout(Duration::from_secs(5), reader.await_source(later_flush, &running))
         .await.unwrap().unwrap();
     let recovered = recovered_partition.value();
-    assert_eq!(recovered.live().latest_completed_tx(), Some(applied.tx_key()));
+    assert!(recovered.live().latest_completed_tx().is_some_and(|head| head.tx_id >= applied.tx_key().tx_id));
     assert_eq!(recovered.table_catalog().metadata(&table).unwrap().row_count
         + recovered.snapshot().iter_segments(&table).map(|segment| i64::from(segment.row_count())).sum::<i64>(), 2);
+    assert_eq!(reopened_serving.tx_status(second.key, None, &running).await.unwrap().basis, second_receipt.basis);
     reader.shutdown();
     follower.await.unwrap().unwrap();
 }

@@ -1639,7 +1639,7 @@ impl ReplicationDriver {
                     None => self.blocks.load(pending.block_index()).await?,
                 };
                 crate::blocks::validate_boundary(&catalog, &pending.prepared, &pending.boundary)?;
-                validate_uploaded_root(&catalog, message, self.logs.requires_checkpoint_digest())?;
+                validate_uploaded_root(&catalog, message, deferred || self.logs.requires_checkpoint_digest())?;
                 let checkpoint = PublishedCheckpoint {
                     block: catalog.block_index(), boundary: pending.boundary.metadata.position,
                     root_sha256: message.catalog_sha256.as_deref().and_then(|digest| digest.try_into().ok()),
