@@ -759,7 +759,8 @@ fn admits_discrete_winners(ty: &LogicalType, batches: &[ColumnBatch]) -> bool {
             | ScalarType::Keyword | ScalarType::FixedSizeBinary(_) | ScalarType::Uuid
             | ScalarType::DateDay | ScalarType::DateMilli | ScalarType::Timestamp { .. }
             | ScalarType::Time { .. } | ScalarType::Duration(_) | ScalarType::Decimal { .. }
-            | ScalarType::Interval(rtdb_types::IntervalUnit::YearMonth)
+            | ScalarType::Interval(rtdb_types::IntervalUnit::YearMonth | rtdb_types::IntervalUnit::MonthDayNano)
+            | ScalarType::IntervalMonthDayMicro
         )) {
             return false;
         }

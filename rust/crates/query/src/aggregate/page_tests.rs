@@ -745,6 +745,63 @@ async fn typed_percentile_ranks_keep_date_peers_and_reach_mixed_timestamp_overfl
     assert_eq!(execution.context.memory.used_bytes(), baseline);
 }
 
+#[tokio::test]
+async fn discrete_percentiles_keep_month_day_peer_fields_and_nullable_layouts() {
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let days = i32::MAX;
+    let wrapped = i64::from(days).wrapping_mul(86_400_000_000_000).wrapping_sub(3);
+    for micro in [false, true] {
+        let interval = |months, days, nanoseconds| if micro {
+            Value::IntervalMonthDayMicro { months, days, nanoseconds }
+        } else {
+            Value::IntervalMonthDayNano { months, days, nanoseconds }
+        };
+        let winner = interval(-1, days, -3);
+        let peer = interval(0, 0, wrapped);
+        let singleton = interval(1, 0, 0);
+        let ty = winner.logical_type();
+        let int = LogicalType::Scalar(ScalarType::I64);
+        let schema = Schema::new(vec![field(0, int.clone()), field(1, ty.clone().maybe())]).unwrap();
+        let groups = vec![NamedExpr { field: field(2, int), expr: schema.fields()[0].expression() }];
+        let function = AggregateFunction::Percentile {
+            kind: PercentileKind::Discrete, fraction: PercentileFraction::Literal(0.5), descending: true,
+        };
+        let aggregate = AggregateExpr {
+            field: field(3, ty.clone().maybe()), function: function.clone(),
+            argument: Some(schema.fields()[1].expression()), distinct: false, filter: None, order_by: vec![],
+        };
+        let pages = vec![
+            vec![vec![Value::I64(1), winner.clone()], vec![Value::I64(2), Value::Null]],
+            vec![vec![Value::I64(1), peer.clone()], vec![Value::I64(3), singleton.clone()]],
+        ];
+        let (mut grouped, _) = cursor(&execution, schema, pages, groups, vec![aggregate], None);
+        let result = grouped.next_batch().await.unwrap().unwrap();
+        drop(grouped);
+        let column = &result.columns[1];
+        let Some(Some((array, field, logical, _))) = column.arrow_cell(0) else {
+            panic!("Expected a selected Arrow interval winner");
+        };
+        let expected = rtdb_columnar::to_field(field.name(), &ty).unwrap();
+        assert_eq!(field, &expected);
+        assert_eq!(array.data_type(), expected.data_type());
+        assert_eq!(logical, Some(&ty));
+        assert!(matches!(column.arrow_cell(1), Some(None)));
+        assert_eq!(batch_row(&result, 0), [Value::I64(1), winner]);
+        assert_eq!(batch_row(&result, 1), [Value::I64(2), Value::Null]);
+        assert_eq!(batch_row(&result, 2), [Value::I64(3), singleton.clone()]);
+        drop(result);
+
+        let mut compared = primitive_cursor(&execution, function, ty.clone(), ty,
+            vec![vec![peer, singleton]], None);
+        assert_eq!(compared.next_batch().await.err().unwrap().code,
+            "xtdb.expression/cannot-compare-mdn-interval-with-months");
+        drop(compared);
+    }
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
 #[test]
 fn typed_percentile_ranks_copy_timestamp_results_with_independent_backing() {
     let memory = MemoryBudget::new(1 << 20);

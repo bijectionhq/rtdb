@@ -2539,6 +2539,7 @@ surface QueryAccess {
         -- Compatible mixed-layout percentile keys can use the shared ordered reader or compare numeric cells in the ordered numeric comparator's precision.
         -- Discrete percentiles can copy compatible fixed-width winners directly to nullable Arrow results, with the selected values' exact types and bits.
         -- A compatible mixed-layout discrete result can retain the selected Arrow positions under their source owners.
+        -- A canonical month-day interval winner can retain the original interval fields and extension at its funded Arrow position.
         -- Decimal precision is checked for the winners of a discrete percentile.
         -- Continuous percentiles interpolate compatible numeric operands into a nullable Arrow result.
         -- JVM discrete percentiles copy compatible selected scalar cells into the result before the sorted page advances.
