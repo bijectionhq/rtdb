@@ -20,9 +20,9 @@
 -- those deletions to the replica log so followers drop them from their
 -- in-memory catalogs at the same logical position.
 --
--- Retention is a window, as in XTDB: the collector deletes a superseded trie only once it was superseded at or before
--- the garbage-as-of horizon, which keeps the newest `blocks_to_keep` blocks (default 10) and anything superseded within
--- `garbage_lifetime` (default 24 hours) of the latest completed transaction of the oldest kept block.
+-- A trie is eligible for collection once its supersession time is at or before the garbage-as-of horizon.
+-- The horizon is the latest completed transaction of the oldest of the newest `blocks_to_keep` checkpoints (default 10), minus `garbage_lifetime` (default 24 hours).
+-- Native collection counts canonical block catalog files through the block installed in the cycle's captured catalog.
 -- Readers register nothing with the collector or with storage. A query, transaction resolution, fragment, compaction or
 -- artefact build reads its captured catalog without a reader list, catalog pin, reader ticket or ledger claim, and a
 -- reader never blocks or delays a collection. A read whose captured catalog is older than the window may find its
@@ -381,10 +381,9 @@ rule GarbageCollectTries {
             GarbageCollectTable(table, as_of)
 }
 
--- Returns the system_time of the block at `blocks_to_keep` positions back from
--- latest, minus `garbage_lifetime`. This window is the grace period during
--- which a superseded trie is still allowed to be referenced by an in-flight
--- query. Returns null if fewer than `blocks_to_keep` blocks exist.
+-- An eligible checkpoint has the canonical root key for its block index.
+-- The selected root's payload identifies that same block.
+-- A cycle whose selected root disappeared has no age-eligible garbage.
 -- See: TrieGarbageCollector.defaultGarbageAsOf
 
 rule GarbageCollectTable {

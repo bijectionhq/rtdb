@@ -29,22 +29,66 @@ fn retention_never_selects_the_current_block() {
 #[tokio::test]
 async fn block_gc_collects_old_metadata_but_preserves_offloaded_replica_payloads() {
     let store = Arc::new(MemoryStore::default());
-    for index in 1..=10 {
+    for index in 1..=16 {
         store.put(&ObjectKey::new(block_key(BlockIndex(index)).unwrap()).unwrap(), Bytes::from(block(index).encode())).await.unwrap();
     }
-    for index in [6, 9] {
+    for index in [12, 15] {
         store.put(&ObjectKey::new(oversized_key(BlockIndex(index), "payload").unwrap()).unwrap(), Bytes::from_static(b"payload")).await.unwrap();
     }
-    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::load(Some(block(10)), &BTreeMap::new()).unwrap(), TrieConfig::default()).unwrap()));
+    let nested = ObjectKey::new("blocks/archive/b01.binpb").unwrap();
+    let alias = ObjectKey::new("blocks/b0A.binpb").unwrap();
+    for key in [&nested, &alias] {
+        store.put(key, Bytes::from_static(b"unrelated")).await.unwrap();
+    }
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::load(Some(block(16)), &BTreeMap::new()).unwrap(), TrieConfig::default()).unwrap()));
     let observer = Arc::new(Observer::default());
     let collector = BlockCollector::new(store.clone(), state, observer.clone(), GarbageConfig { blocks_to_keep: 3, ..Default::default() }).unwrap();
     collector.collect(&CancellationToken::new()).await.unwrap();
-    assert_eq!(store.list(Some(&ObjectKey::new("blocks").unwrap())).await.unwrap().len(), 3);
-    for index in [6, 9] {
+    for index in 1..=16 {
+        let key = ObjectKey::new(block_key(BlockIndex(index)).unwrap()).unwrap();
+        assert_eq!(store.head(&key).await.is_ok(), index >= 14);
+    }
+    for key in [&nested, &alias] {
+        assert_eq!(store.get(key).await.unwrap(), Bytes::from_static(b"unrelated"));
+    }
+    for index in [12, 15] {
         let payload = ObjectKey::new(oversized_key(BlockIndex(index), "payload").unwrap()).unwrap();
         assert_eq!(store.get(&payload).await.unwrap(), Bytes::from_static(b"payload"));
     }
     assert!(observer.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn trie_retention_counts_only_canonical_checkpoints_through_the_installed_block() {
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::load(Some(block(10)), &BTreeMap::new()).unwrap()
+        .with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let publisher = Arc::new(DeletedPublisher {
+        store: Arc::new(MemoryStore::default()),
+        table: tables.entry(&table).unwrap().clone(),
+        commits: Mutex::new(Vec::new()),
+    });
+    let store = Arc::clone(&publisher.store);
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(
+        TrieCatalog::default(), tables, TrieConfig::default(),
+    ).unwrap()));
+    let collector = TrieCollector::new(store.clone(), state, publisher, Arc::new(Observer::default()), GarbageConfig {
+        blocks_to_keep: 2, garbage_lifetime: chrono::TimeDelta::seconds(1), ..Default::default()
+    }).unwrap();
+
+    for (key, index) in [("blocks/b0a.binpb", 10), ("blocks/b0b.binpb", 11),
+        ("blocks/archive/b06.binpb", 6), ("blocks/other.binpb", 5), ("blocks/b0A.binpb", 10)] {
+        store.put(&ObjectKey::new(key).unwrap(), Bytes::from(block(index).encode())).await.unwrap();
+    }
+    assert_eq!(collector.default_garbage_as_of().await.unwrap(), None);
+
+    let preceding = ObjectKey::new(block_key(BlockIndex(8)).unwrap()).unwrap();
+    store.put(&preceding, Bytes::from(block(8).encode())).await.unwrap();
+    assert_eq!(collector.default_garbage_as_of().await.unwrap(), Some(Timestamp(7_000_000)));
+
+    store.delete(&preceding).await.unwrap();
+    store.put(&preceding, Bytes::from(block(9).encode())).await.unwrap();
+    assert!(collector.default_garbage_as_of().await.is_err());
 }
 
 #[tokio::test]

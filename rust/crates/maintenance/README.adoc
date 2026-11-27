@@ -62,11 +62,13 @@ Operation context accepts lowercase ASCII identifiers and object-key context pas
 `TrieCollector` and `BlockCollector` are passive cycle capabilities.
 Trie collection uses one immutable snapshot, bounded table/delete concurrency, and chunks containing at most 1024 trie keys.
 An uncoordinated sweep removes data before metadata, drains started deletes, and publishes one deletion record per completed chunk.
-Coordinated sweeps use a durable intent, an installed replica receipt and a catalog floor that waits for earlier readers.
+Coordinated sweeps use a durable intent, an installed replica receipt and a storage retirement grant.
+Age-based collection uses canonical block roots through the captured catalog's installed block.
 Compactor reset stages its superseded compacted pairs in the same retirement journal, with a required successor checkpoint block and naming epoch.
 Collection can resume those intents after restart even when the age policy selects no new garbage.
 L0 recovery files are excluded.
-Block collection removes expired catalog, table-block, and oversized-message objects without replica publication.
+Block collection removes expired catalog and table-block files without replica publication.
+Installed serving stores can queue expired oversized-message files for journal-checked reclamation.
 Per-table failures are reported through `CollectionObserver` and isolated from other tables.
 Each deleted trie's deletion duration is reported through `CollectionObserver::trie_deleted` (`xtdb.gc.tries.delete.timer`).
 An administrative awaiter receives a cycle started after its request; automatic signals alone are subject to the enabled flag.

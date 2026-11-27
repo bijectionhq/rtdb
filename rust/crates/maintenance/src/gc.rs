@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use rtdb_format::{
     catalog::{BlockCatalog, TableEntry},
-    keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key, oversized_block_index},
+    keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key, block_key, oversized_block_index},
     log::proto::{ArtefactEntry, ArtefactsAdded, ArtefactsRemoved, PublishedObjectVersion, SearchRunChange},
 };
-use rtdb_index::{PartitionState, TrieCatalog};
+use rtdb_index::{PartitionState, TrieCatalog, TrieCollection};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, TableRef, Timestamp};
 use tokio::sync::{OnceCell, Semaphore};
@@ -67,6 +67,16 @@ pub fn block_is_garbage(block: BlockIndex, latest: BlockIndex, keep: usize) -> b
     crate::retention::block_is_eligible(block.0, latest.0, keep)
 }
 
+fn direct_child<'a>(key: &'a str, directory: &str) -> Option<&'a str> {
+    let name = key.strip_prefix(directory)?.strip_prefix('/')?;
+    (!name.contains('/')).then_some(name)
+}
+
+fn checkpoint_index(name: &str) -> Option<BlockIndex> {
+    let index = block_index_from_key(name).ok()?;
+    (block_key(index).ok()?.strip_prefix("blocks/")? == name).then_some(index)
+}
+
 pub struct TrieCollector {
     directory: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
@@ -112,11 +122,26 @@ impl TrieCollector {
     }
 
     pub async fn default_garbage_as_of(&self) -> Result<Option<Timestamp>> {
+        self.garbage_as_of_through(self.partition.value().table_catalog().block_index()).await
+    }
+
+    async fn garbage_as_of_through(&self, latest: Option<BlockIndex>) -> Result<Option<Timestamp>> {
+        let Some(latest) = latest else { return Ok(None); };
         IoRegion::reading_recovery(self.store.as_ref(), async {
-            let prefix = ObjectKey::new("blocks").map_err(crate::invalid)?;
-            let blocks: Vec<_> = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?.into_iter().filter(|block| block.key.as_str().ends_with(".binpb")).collect();
-            let Some(index) = blocks.len().checked_sub(self.config.blocks_to_keep) else { return Ok(None); };
-            let block = BlockCatalog::decode(&self.store.get(&blocks[index].key).await.map_err(crate::invalid)?)?;
+            let directory = ObjectKey::new("blocks")?;
+            let mut blocks: Vec<_> = self.store.list(Some(&directory)).await?.into_iter().filter_map(|object| {
+                let index = checkpoint_index(direct_child(object.key.as_str(), directory.as_str())?)?;
+                (index <= latest).then_some((index, object.key))
+            }).collect();
+            let Some(distance) = blocks.len().checked_sub(self.config.blocks_to_keep) else { return Ok(None); };
+            let (index, key) = blocks.select_nth_unstable_by_key(distance, |(index, _)| *index).1;
+            let bytes = match self.store.get_fresh(key).await {
+                Ok(bytes) => bytes,
+                Err(rtdb_storage::Error::MissingObject(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let block = BlockCatalog::decode(&bytes)?;
+            if block.block_index() != *index { return Err(crate::invalid("Block filename and payload index differ")); }
             let Some(tx) = block.latest_completed_tx() else { return Ok(None); };
             let duration = lifetime_micros(self.config.garbage_lifetime).ok_or_else(|| crate::invalid("Garbage lifetime exceeds timestamp range"))?;
             Ok(Some(Timestamp(tx.system_time.0.checked_sub(duration).ok_or_else(|| crate::invalid("Garbage lifetime exceeds timestamp range"))?)))
@@ -124,12 +149,11 @@ impl TrieCollector {
     }
 
     pub async fn collect_as_of(&self, as_of: Timestamp, cancellation: &CancellationToken) -> Result<()> {
-        self.collect_cycle(Some(as_of), cancellation).await
+        self.collect_cycle(Arc::new(self.partition.trie_collection()), Some(as_of), cancellation).await
     }
 
-    async fn collect_cycle(&self, as_of: Option<Timestamp>, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_cycle(&self, collection: Arc<TrieCollection>, as_of: Option<Timestamp>, cancellation: &CancellationToken) -> Result<()> {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
-        let collection = Arc::new(self.partition.trie_collection());
         let cut = collection.current().snapshot().catalog_cut();
         if self.store.defers_trie_releases() && cut.is_none() { return Ok(()); }
         let release = FileRelease {
@@ -204,7 +228,8 @@ impl TrieCollector {
             let directory = ObjectKey::new(format!("{}/blocks", entry.slug.table_prefix()))?;
             for checkpoint in self.store.list(Some(&directory)).await? {
                 if cancellation.is_cancelled() { return Err(crate::closed()); }
-                let Ok(block) = block_index_from_key(checkpoint.key.as_str()) else { continue; };
+                let Some(block) = direct_child(checkpoint.key.as_str(), directory.as_str()).and_then(checkpoint_index)
+                    else { continue; };
                 if block >= latest { continue; }
                 let size = usize::try_from(checkpoint.size).map_err(crate::invalid)?;
                 let bytes = match self.store.get_fresh_exact(&checkpoint.key, size).await {
@@ -273,7 +298,8 @@ impl TrieCollector {
             let directory = ObjectKey::new(format!("{}/blocks", entry.slug.table_prefix()))?;
             for checkpoint in self.store.list(Some(&directory)).await? {
                 if cancellation.is_cancelled() { return Err(crate::closed()); }
-                let Ok(block) = block_index_from_key(checkpoint.key.as_str()) else { continue; };
+                let Some(block) = direct_child(checkpoint.key.as_str(), directory.as_str()).and_then(checkpoint_index)
+                    else { continue; };
                 if block >= latest { continue; }
                 let size = usize::try_from(checkpoint.size).map_err(crate::invalid)?;
                 let bytes = match self.store.get_fresh_exact(&checkpoint.key, size).await {
@@ -424,7 +450,7 @@ impl TrieCollector {
         IoRegion::reading_recovery(self.store.as_ref(), async {
             let directory = ObjectKey::new("blocks")?;
             let oldest = self.store.list(Some(&directory)).await?.into_iter().filter_map(|object| {
-                let block = block_index_from_key(object.key.as_str()).ok()?;
+                let block = checkpoint_index(direct_child(object.key.as_str(), directory.as_str())?)?;
                 (block <= latest).then_some((block, object.key))
             }).min_by_key(|(block, _)| *block);
             let Some((oldest, key)) = oldest else { return Ok(None); };
@@ -617,7 +643,9 @@ fn finished_groups(catalog: &TrieCatalog, table: &TableRef, keys: &[TrieKey]) ->
 impl CycleWorker for TrieCollector {
     async fn collect(&self, cancellation: &CancellationToken) -> Result<()> {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
-        self.collect_cycle(self.default_garbage_as_of().await?, cancellation).await
+        let collection = Arc::new(self.partition.trie_collection());
+        let as_of = self.garbage_as_of_through(collection.current().table_catalog().block_index()).await?;
+        self.collect_cycle(collection, as_of, cancellation).await
     }
 }
 
@@ -641,7 +669,8 @@ impl BlockCollector {
         let prefix = ObjectKey::new(prefix).map_err(crate::invalid)?;
         let objects = self.store.list(Some(&prefix)).await.map_err(crate::invalid)?;
         let objects = objects.into_iter().filter(|object| {
-            block_index(object.key.as_str()).is_some_and(|index| block_is_garbage(index, latest, self.config.blocks_to_keep))
+            direct_child(object.key.as_str(), prefix.as_str()).and_then(block_index)
+                .is_some_and(|index| block_is_garbage(index, latest, self.config.blocks_to_keep))
         });
         let results = stream::iter(objects).map(|object| async move {
             let _permit = deletes.acquire().await.map_err(crate::invalid)?;
@@ -663,8 +692,7 @@ impl CycleWorker for BlockCollector {
         let snapshot = self.snapshots.snapshot();
         let Some(latest) = snapshot.table_catalog().block_index() else { return Ok(()); };
         let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
-        let catalog_block = |key: &str| block_index_from_key(key).ok();
-        if let Err(error) = self.sweep("blocks", catalog_block, latest, cancellation, &deletes, |observer, elapsed| observer.block_file_deleted(elapsed)).await {
+        if let Err(error) = self.sweep("blocks", checkpoint_index, latest, cancellation, &deletes, |observer, elapsed| observer.block_file_deleted(elapsed)).await {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
         }
@@ -678,7 +706,7 @@ impl CycleWorker for BlockCollector {
         stream::iter(entries).map(|entry| {
             let deletes = Arc::clone(&deletes);
             async move {
-            if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), catalog_block, latest, cancellation, &deletes, |observer, elapsed| observer.table_block_file_deleted(elapsed)).await
+            if let Err(error) = self.sweep(&format!("{}/blocks", entry.slug.table_prefix()), checkpoint_index, latest, cancellation, &deletes, |observer, elapsed| observer.table_block_file_deleted(elapsed)).await
                     && !cancellation.is_cancelled() {
                     self.observer.table_failed(Some(&entry.table), &error);
                 }

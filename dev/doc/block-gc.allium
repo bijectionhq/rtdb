@@ -70,6 +70,7 @@ given {
 -- `tables/{table}/blocks/b{idx}.binpb`; deletes are idempotent) is reached
 -- via the ObjectStoreDelete deferred specification.
 -- Storage listings expose objects published at their final keys.
+-- Native collection selects canonical block filenames directly under each checkpoint directory.
 
 
 entity BlockGarbageCollector {
@@ -118,6 +119,7 @@ config {
 rule LeaderOpensBlockGc {
     -- See: indexer/LeaderLogProcessor.kt (init)
     when: lp: db/LogProcessor.mode becomes Leader
+    requires: config.blocks_to_keep >= 1
 
     ensures:
         BlockGarbageCollector.created(
@@ -218,12 +220,6 @@ rule GarbageCollectBlocks {
     -- The currently active block (table_catalog.current_block_index) is never
     -- deleted — preserved by `is_garbage`'s `it != latestBlockIndex` clause.
     --
-    -- A `blocks_to_keep = 0` configuration is treated as a programming error.
-    -- The implementation deliberately runs the top-level sweep BEFORE the
-    -- check so even in that case every non-current block gets deleted from
-    -- top-level — a behaviour `BlockGarbageCollectorTest` exercises — and
-    -- THEN the check fires before doing the per-table sweep, surfacing the
-    -- misconfig.
     when: GarbageCollectBlocks()
 
     -- If the leader has never produced a block, there's nothing to GC.
@@ -231,9 +227,6 @@ rule GarbageCollectBlocks {
 
     ensures:
         DeleteGarbage(top_level_block_files())
-
-        -- Misconfig surface. The top-level sweep above has already run.
-        require_or_fail(config.blocks_to_keep >= 1)
 
         for table in table_catalog.all_tables:
             DeleteGarbage(table_block_files(table))
@@ -276,7 +269,7 @@ contract BlockGcLeaderOnly {
 
     @invariant CurrentBlockNeverDeleted
         -- The block at table_catalog.current_block_index is never DELETEd by
-        -- this collector, even if `blocks_to_keep` is misconfigured.
+        -- this collector.
 
     @invariant EveryTableBlockAtCurrentIndex
         -- Every table in table_catalog.all_tables has a per-table block file
@@ -348,7 +341,6 @@ surface BlockGcAdmin {
 --   table_block_files(table)      — enumerate `tables/{table}/blocks/b*.binpb`
 --                                   (BlockGarbageCollector.kt)
 --   parse_block_index(path)       — decode the lex-hex block index from a checkpoint metadata path
---   require_or_fail(cond)         — assertion that throws on false
 --   ObjectStoreDelete(path)       — DELETE one key (storage/ObjectStore.kt)
 
 ------------------------------------------------------------
@@ -358,8 +350,3 @@ surface BlockGcAdmin {
 open question "Per-table sweep enumerates ObjectStore directories per table. On a database with thousands of tables this scales linearly with table count per cycle. Earlier versions sampled at most 100 tables per cycle (randomised) — that cap is gone in the current implementation. Fine for now; revisit if table counts grow."
 
 open question "Block GC has no replica-log coordination on the assumption that block files are consumed only at startup/catch-up. If a future feature ever causes a follower to read a block file online (e.g. for cross-block range scans, or for some new replication mode), this assumption breaks silently. Worth marking the assumption load-bearing in TableCatalog/BufferPool so a future change can spot it."
-
-open question "At which lifecycle boundary must invalid block retention be rejected?"
-    -- GarbageCollectBlocks describes a top-level deletion pass before rejecting zero retention.
-    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, BlockGarbageCollector rejects blocksToKeep below one during construction.
-    -- The native collector validates retention before opening a collection cycle.
