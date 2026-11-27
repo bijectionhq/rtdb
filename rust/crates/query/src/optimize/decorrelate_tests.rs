@@ -584,6 +584,45 @@ async fn document_apply_reuses_only_completed_keys_in_the_current_page() {
 }
 
 #[tokio::test]
+async fn document_apply_reuses_recent_keys_after_capacity_and_reopens_on_the_next_page() {
+    let first_page: Vec<i64> = (0..16).chain([16, 17, 16]).chain(18..=32).chain([16, 17, 16]).collect();
+    let second_page = [16, 16, 17, 17];
+    let pages = [first_page.as_slice(), second_page.as_slice()].into_iter()
+        .map(|keys| keys.iter().map(|&key| vec![literal(key)]).collect()).collect();
+    let probes = Arc::new(Relation::new(Schema::new(vec![customer_id()]).unwrap(), RelationNode::LiteralPages { pages }).unwrap());
+    let orders = values(vec![order_customer(), order_amount()], &[
+        &[Some(16), Some(150)], &[Some(16), Some(100)], &[Some(16), Some(150)],
+    ]);
+    let relation = materialized(orders, |reference| {
+        let selected = select(reference, equals(order_customer().expression(), parameter(0, &customer_id())));
+        let dependent = keep(selected, &[order_amount()]);
+        let document = LogicalType::Struct([("amount".into(), order_amount().data_type)].into_iter().collect());
+        let output = typed(87, "orders", LogicalType::list(document).maybe());
+        apply(&probes, dependent, by_customer(), ApplyKind::PullMany, Some(output))
+    });
+    let prepared = PreparedQuery::new(relation).unwrap();
+    let context = context();
+    let (tracer, mut spans) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 256, true, true).unwrap();
+    let rows = run_with_context(&prepared, context.with_tracer(Some(tracer.clone()), None)).await.unwrap();
+    let documents = Value::list([150, 100, 150].into_iter().map(|amount| {
+        Value::Struct(rtdb_types::StructFields::from([("amount".into(), Value::I64(amount))]))
+    }).collect());
+    let expected: Vec<_> = first_page.into_iter().chain(second_page).map(|key| {
+        let result = if key == 16 { documents.clone() } else { Value::Null };
+        format!("{:?}", [Value::I64(key), result])
+    }).collect();
+    assert_eq!(rows, expected);
+    tracer.close();
+    let mut opens = Vec::new();
+    while let Some(span) = spans.next().await {
+        for (name, value) in span.attributes() {
+            if name == "cursor.apply.inner_executions" { opens.push(value.parse::<u64>().unwrap()); }
+        }
+    }
+    assert_eq!(opens, [36]);
+}
+
+#[tokio::test]
 async fn document_reuse_still_reaches_the_first_multirow_single_document_key() {
     let probes = values(vec![customer_id()], &[&[Some(2)], &[Some(2)], &[Some(1)]]);
     let relation = materialized(orders(), |reference| {

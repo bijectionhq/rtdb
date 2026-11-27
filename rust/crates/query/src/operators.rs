@@ -1363,6 +1363,8 @@ impl BatchApplyPlan {
     }
 
     async fn documents(&self, batch: Arc<crate::columnar::ColumnBatch>, output: &rtdb_plan::Field, reuse: Option<DocumentReuse>) -> Result<crate::columnar::ColumnBatch> {
+        use std::collections::VecDeque;
+
         use crate::columnar::{apply::ApplyPages, poll_nested_batch};
 
         let context = &self.execution.context;
@@ -1385,20 +1387,22 @@ impl BatchApplyPlan {
         } else {
             None
         };
-        // The cache borrows completed spans from this outer page; a later page still opens its own dependent.
         const REUSE_KEYS: usize = 16;
         let reuse = reuse.filter(|_| batch.len > 1);
         let cache_charge = reuse.and_then(|_| memory.reserve(1024).ok());
-        let mut completed: Vec<(Option<i64>, std::ops::Range<usize>)> =
-            Vec::with_capacity(if cache_charge.is_some() { REUSE_KEYS } else { 0 });
+        let mut completed: VecDeque<(Option<i64>, std::ops::Range<usize>)> =
+            VecDeque::with_capacity(if cache_charge.is_some() { REUSE_KEYS } else { 0 });
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
             let bound = self.bind(&batch, row).await?;
             let key = reuse.filter(|_| cache_charge.is_some()).and_then(|reuse| reuse.key(&batch, row));
             let before = pages.len();
-            if let Some((_, spans)) = completed.iter().find(|(previous, _)| Some(*previous) == key) {
+            let hit = key.and_then(|key| completed.iter().rposition(|(previous, _)| *previous == key))
+                .and_then(|index| completed.remove(index));
+            if let Some((key, spans)) = hit {
                 drop(bound);
                 pages.repeat(row, spans.clone(), context)?;
+                completed.push_back((key, spans));
             } else {
                 let mut input = self.open_dependent(bound).await?;
                 let first = pages.span_count();
@@ -1410,8 +1414,11 @@ impl BatchApplyPlan {
                     let doc = page.apply_document(&positions, &schema, memory)?;
                     pages.push(row, Some(doc))?;
                 }
-                if let Some(key) = key && completed.len() < REUSE_KEYS {
-                    completed.push((key, first..pages.span_count()));
+                if let Some(key) = key {
+                    if completed.len() == REUSE_KEYS {
+                        completed.pop_front();
+                    }
+                    completed.push_back((key, first..pages.span_count()));
                 }
             }
             let found = before < pages.len();

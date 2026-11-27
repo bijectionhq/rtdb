@@ -406,7 +406,8 @@ The lookup preserves duplicate outer rows and real null elements, with null for 
 PULL and PULL_MANY (`NEST_ONE` / `NEST_MANY`) retain their document Apply.
 Within one outer page, a plain snapshot scan or lexical reference can reuse a completed result for a direct signed 64-bit equality capture, or for a dependent with no captures.
 Direct column projections and column-only sorts can retain this reuse.
-The cache holds at most 16 completed keys and preserves the original argument binding, document construction, and cardinality check on the first use.
+The cache holds at most 16 completed keys per page and evicts the least recently used key when a new result needs its slot.
+Each reached row binds its arguments, and each cache miss opens the dependent and performs the original document construction and cardinality check.
 These shapes retain per-row evaluation:
 
 * a dependent plan with a volatile call, or an outer reference to an enclosing apply;

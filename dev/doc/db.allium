@@ -2418,6 +2418,7 @@ surface QueryAccess {
         -- The dependent Apply evaluates fallible predicates and bindings and handles input layouts outside the batch admission.
         -- Apply builds its document from funded child arrays when their physical fields are admitted.
         -- A document Apply can replay a completed dependent result within its current outer page when the captured scan key or lexical reference is the same.
+        -- At the page's reuse limit, a newly completed key takes the place of the least recently used key.
         -- Reuse binds each reached outer row and preserves dependent document order, duplicates, null results and the single-document cardinality check.
         -- A bounded literal outer-join rewrite preserves one null-extended row per unmatched outer occurrence when the dependent preserved side has one row.
         -- Keyed collection over bounded literal relations groups real dependent rows and retains an outer result for each occurrence.
