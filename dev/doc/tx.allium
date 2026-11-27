@@ -219,7 +219,8 @@
 -- Its Bloom and bounded entity ID filters use those same build-side vectors.
 -- Join Bloom preparation reads the children of compatible scalar lists from their Arrow positions.
 -- Descriptive list and child field metadata leaves the key's hash and equality unchanged.
--- A query-generated join Bloom covers both persisted floating zero encodings for a numeric zero build key.
+-- A query-generated join Bloom covers both persisted floating zero encodings for an admitted primitive numeric zero build key.
+-- A compatible decimal build cell contributes the raw hashes of its coefficient converted at its logical scale, preserving the sign of binary64 zero.
 -- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
 -- Supported computed join keys retain the payload positions through match selection.
 -- A hash join binds plain numeric, text, Boolean, and same-type date, timestamp, time, duration, and year-month interval comparisons once and evaluates them at the candidate positions.

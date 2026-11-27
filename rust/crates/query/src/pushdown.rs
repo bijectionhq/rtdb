@@ -1,9 +1,10 @@
 use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use arrow_array::{Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_format::{bloom::BloomFilter, transit::{TransitValue, encode_msgpack}};
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema};
 use rtdb_types::{EntityId, Iid, LogicalType, Result, ScalarType, Value};
-use crate::{columnar::ColumnBatch, context::Execution, invalid, scalar_key::ScalarKey, set_keys::{BloomKey, borrowed_key_value, direct_bloom_hashes}};
+use crate::{columnar::{Column, ColumnBatch, float_vector::nonnull}, context::Execution, invalid, scalar_key::ScalarKey, set_keys::{BloomKey, borrowed_key_value, direct_bloom_hashes}};
 
 struct IidEntries {
     values: BTreeSet<Iid>,
@@ -396,6 +397,11 @@ impl PushdownBuilder {
                 continue;
             }
             let scope = rtdb_expr::EvaluationScope::new(memory)?;
+            if let Some((xxhash, murmur3)) = decimal_bloom_hashes(column, row, &scope)? {
+                key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
+                key.filter.iids = key.filter.iids.take().filter(|iids| matches!(iids, IidCandidates::LimitExceeded(_)));
+                continue;
+            }
             let value = match borrowed_key_value(column, row, true) {
                 Some(value) => {
                     scope.reserve(column.bound(row)?)?;
@@ -427,6 +433,30 @@ impl PushdownBuilder {
         }
         Ok(Some(Arc::new(Pushdowns { columns, _reservation: reservation })))
     }
+}
+
+fn decimal_bloom_hashes(column: &Column, row: usize, scope: &rtdb_expr::EvaluationScope) -> Result<Option<(i32, i32)>> {
+    let Some(Some((array, field, logical, offset))) = column.arrow_cell(row) else { return Ok(None); };
+    if !field.data_type().is_decimal() || field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) {
+        return Ok(None);
+    }
+    let Ok((cell, logical)) = (ArrowCell { array, field, row: offset }).logical_position(logical) else { return Ok(None); };
+    let LogicalType::Scalar(scalar @ ScalarType::Decimal { bit_width, scale, .. }) = nonnull(&logical) else { return Ok(None); };
+    if !cell.has_scalar_storage(scalar) { return Ok(None); }
+    let array = cell.array.as_any();
+    let concrete_storage = match bit_width {
+        32 => array.is::<Decimal32Array>(),
+        64 => array.is::<Decimal64Array>(),
+        128 => array.is::<Decimal128Array>(),
+        256 => array.is::<Decimal256Array>(),
+        _ => false,
+    };
+    if !concrete_storage { return Ok(None); }
+    let Ok(Some((_, bytes))) = cell.decimal_coefficient() else { return Ok(None); };
+    scope.reserve(column.bound(row)?)?;
+    let width = usize::from(*bit_width / 8);
+    let key = ScalarKey::Float(rtdb_types::jvm_number::decimal_bytes_to_f64(&bytes[bytes.len() - width..], *scale));
+    Ok(Some((key.hash() as i32, key.murmur3() as i32)))
 }
 
 fn probe_rows(mut relation: &Relation, catalog: &crate::CatalogSnapshot) -> Option<u64> {
@@ -556,6 +586,53 @@ mod tests {
             assert!(bloom.contains_positions(&positive));
             assert!(bloom.contains_positions(&negative));
             assert!(bloom.intersects(&persisted));
+        }
+    }
+
+    #[test]
+    fn decimal_join_bloom_uses_the_logical_scale_and_keeps_only_exceeded_iid_candidates() {
+        use arrow_array::Decimal128Array;
+        use crate::columnar::Column;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let ty = |scale| LogicalType::Scalar(ScalarType::Decimal { precision: 38, scale, bit_width: 128 });
+        let array = Arc::new(Decimal128Array::from(vec![-1_i128]).with_precision_and_scale(38, 1).unwrap());
+        let arrow = Arc::new(rtdb_columnar::to_field("_iid", &ty(400)).unwrap());
+        for (logical, scale) in [(None, 400), (Some(ty(0)), 0)] {
+            let input = Field { id: ColumnId(0), name: "_iid".into(), qualifier: None, qualified_only: false,
+                unnamed: false, data_type: ty(scale) };
+            let schema = Schema::new(vec![input.clone()]).unwrap();
+            let batch = ColumnBatch::settled(vec![Column::Arrow { array: array.clone(), field: arrow.clone(), logical }],
+                1, memory.reserve(4096).unwrap()).unwrap();
+            let value = batch.columns[0].value(0).unwrap();
+            let mut expected = BloomFilter::default();
+            expected.insert_value(&value).unwrap();
+            let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+            assert_eq!(super::decimal_bloom_hashes(&batch.columns[0], 0, &scope).unwrap(), Some((
+                rtdb_columnar::hash_value(&value, 0).unwrap(), rtdb_columnar::hash_value_murmur3(&value, 0).unwrap(),
+            )));
+
+            for iids in [IidCandidates::Raw(IidEntries::new(1)), IidCandidates::LimitExceeded(2)] {
+                let exceeded = matches!(&iids, IidCandidates::LimitExceeded(2));
+                let mut builder = PushdownBuilder {
+                    keys: vec![Key {
+                        expression: input.expression(), probe: input.id,
+                        filter: ColumnFilter { bloom: Some(BloomFilter::default()), iids: Some(iids),
+                            _reservation: memory.reserve(1024).unwrap() },
+                        pending: Pending::Sorted(Vec::new()), recorded: RecordedIntegers::default(),
+                    }],
+                    _reservation: memory.reserve(1024).unwrap(),
+                };
+                builder.insert_arrow(&schema, &batch, 0, &memory).unwrap();
+                let filters = builder.finish(&memory).unwrap().unwrap();
+                let filter = &filters.columns[0].1;
+                assert_eq!(filter.bloom.as_ref(), Some(&expected));
+                if exceeded {
+                    assert!(matches!(filter.iids.as_ref(), Some(IidCandidates::LimitExceeded(2))));
+                } else {
+                    assert!(filter.iids.is_none());
+                }
+            }
         }
     }
 
