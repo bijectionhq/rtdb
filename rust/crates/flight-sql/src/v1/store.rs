@@ -30,7 +30,7 @@ use rtdb_index::branches::store::{
     DERIVE_DIGEST, KeyRange, MAX_PAGE_ENTRIES, Projection, StoreBound, StorePage, StoreRead, StoreWrite, ValueFilter, check_bounds,
     check_derives, check_placeholders, store_table,
 };
-use rtdb_node::{DatabaseAccess, serving::{ChangeImages, ChangeOrder, Changes}};
+use rtdb_node::{DatabaseAccess, SessionIdentity, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{
     Guard, Op, Outcome, STORE_BOUND, STORE_CLAIM, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
 };
