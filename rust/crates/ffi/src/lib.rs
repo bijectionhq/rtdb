@@ -218,6 +218,64 @@ pub unsafe extern "C" fn rtdb_v1_session_action(handle: u64, operation: u64, act
         })
     }) }
 }
+
+#[repr(C)]
+#[derive(Default)]
+pub struct RtdbCommitResult {
+    pub tx_id: i64,
+    pub system_time_micros: i64,
+    pub diagnostic: u64,
+    pub kind: u32,
+    pub reserved: u32,
+}
+
+impl From<rtdb_node::CommitResult> for RtdbCommitResult {
+    fn from(result: rtdb_node::CommitResult) -> Self {
+        use rtdb_node::CommitResult;
+
+        match result {
+            CommitResult::NoTransaction => Self::default(),
+            CommitResult::Submitted(tx) => Self { tx_id: tx.tx_id.0, kind: 1, ..Self::default() },
+            CommitResult::Executed(tx) => {
+                let key = tx.tx_key();
+                Self {
+                    tx_id: key.tx_id.0,
+                    system_time_micros: key.system_time.0,
+                    diagnostic: tx.error().map_or(0, |error| handles::diagnostic(error.clone())),
+                    kind: if tx.committed() { 2 } else { 3 },
+                    reserved: 0,
+                }
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_commit_result(
+    handle: u64, operation: u64, asynchronous: u32, out: *mut RtdbCommitResult, error: *mut u64,
+) -> i32 {
+    use rtdb_node::CommitMode;
+
+    unsafe { call(error, || {
+        let out = output(out)?;
+        *out = RtdbCommitResult::default();
+        let mode = match asynchronous {
+            0 => CommitMode::Sync,
+            1 => CommitMode::Async,
+            _ => return Err(invalid("Commit mode must be 0 (sync) or 1 (async)")),
+        };
+        let session = handles::session(handle)?;
+        let _admitted = session.region.enter()?;
+        let token = handles::cancellation(operation, &session)?;
+        let session_handle = Arc::clone(&session);
+        let result = session.region.run(move || async move {
+            let mut state = session_handle.state.lock().await;
+            token.run_until_cancelled(state.state_mut().commit_tx(Some(mode))).await.ok_or_else(cancelled)?
+        })?;
+        *out = result.into();
+        Ok(())
+    }) }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_set_catalog(handle: u64, name: *const u8, length: usize, error: *mut u64) -> i32 {
     unsafe { call(error, || { let session = handles::session(handle)?; let _admitted = session.region.enter()?; session.state.blocking_lock().state_mut().set_database(text(name, length)?)?; Ok(()) }) }
@@ -336,6 +394,20 @@ impl OwnedReadTime {
 pub unsafe extern "C" fn rtdb_v1_session_set_read_settings(handle: u64, operation: u64, timezone: *const u8, timezone_length: usize,
     snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime, clock_time: *const RtdbReadTime, error: *mut u64,
 ) -> i32 {
+    unsafe { change_read_settings(handle, operation, timezone, timezone_length, snapshot, snapshot_length, snapshot_time, clock_time, false, error) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_begin_read_only(handle: u64, operation: u64, timezone: *const u8, timezone_length: usize,
+    snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime, clock_time: *const RtdbReadTime, error: *mut u64,
+) -> i32 {
+    unsafe { change_read_settings(handle, operation, timezone, timezone_length, snapshot, snapshot_length, snapshot_time, clock_time, true, error) }
+}
+
+unsafe fn change_read_settings(handle: u64, operation: u64, timezone: *const u8, timezone_length: usize,
+    snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime, clock_time: *const RtdbReadTime,
+    begin: bool, error: *mut u64,
+) -> i32 {
     use rtdb_node::{AccessSettings, OptionUpdate, ReadOnlySettings, TransactionSettings};
     unsafe { call(error, || {
         let session = handles::session(handle)?;
@@ -367,10 +439,61 @@ pub unsafe extern "C" fn rtdb_v1_session_set_read_settings(handle: u64, operatio
                 clock_time: clock_time.map(|time| time.clock(&effective_timezone)).transpose()?.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
                 ..Default::default()
             };
-            state.state_mut().set_transaction(TransactionSettings {
+            let settings = TransactionSettings {
                 access: Some(AccessSettings::ReadOnly(settings)),
                 timezone: timezone.map_or(OptionUpdate::Unchanged, |_| OptionUpdate::Set(effective_timezone)),
-            })
+            };
+            if begin { state.state_mut().begin_with(settings) }
+            else { state.state_mut().set_transaction(settings) }
+        })
+    }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_begin_write_only(
+    handle: u64, operation: u64, timezone: *const u8, timezone_length: usize, system_time: *const RtdbReadTime,
+    metadata: *const u8, metadata_length: usize, asynchronous: u32, error: *mut u64,
+) -> i32 {
+    use rtdb_node::{AccessSettings, OptionUpdate, ReadWriteSettings, TransactionSettings};
+
+    unsafe { call(error, || {
+        let asynchronous = match asynchronous {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Asynchronous must be 0 or 1")),
+        };
+        let session = handles::session(handle)?;
+        let _admitted = session.region.enter()?;
+        let token = handles::cancellation(operation, &session)?;
+        let timezone = optional_text(timezone, timezone_length)?;
+        let system_time = ReadTime::parse(system_time)?;
+        let text_bytes = add(timezone.map_or(0, str::len), system_time.as_ref().map_or(0, ReadTime::text_len))?;
+        let _input = session.region.memory().reserve(add(4096, mul(text_bytes, 4)?)?)?;
+        let timezone = timezone.map(str::to_owned);
+        let system_time = system_time.map(ReadTime::into_owned);
+        let metadata = if metadata.is_null() && metadata_length == 0 { None } else {
+            let (value, _decoded) = rtdb_pg_codec::decode_transit_msgpack(bytes(metadata, metadata_length)?, session.region.memory())?.into_parts();
+            Some(rtdb_tx::UserMetadata::new(value, session.region.memory())?)
+        };
+        let session_handle = Arc::clone(&session);
+        session.region.run(move || async move {
+            let mut state = session_handle.state.lock().await;
+            token.run_until_cancelled(async {
+                state.state().revalidate().await?;
+                let effective_timezone = match &timezone {
+                    Some(zone) => rtdb_expr::normalize_timezone(zone)?,
+                    None => state.state().effective_timezone().to_owned(),
+                };
+                let system_time = system_time.map(|time| time.snapshot(&effective_timezone)).transpose()?;
+                state.state_mut().begin_with(TransactionSettings {
+                    access: Some(AccessSettings::ReadWrite(ReadWriteSettings {
+                        system_time: system_time.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
+                        user_metadata: metadata.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
+                        asynchronous: OptionUpdate::Set(asynchronous),
+                    })),
+                    timezone: timezone.map_or(OptionUpdate::Unchanged, |_| OptionUpdate::Set(effective_timezone)),
+                })
+            }).await.ok_or_else(cancelled)?
         })
     }) }
 }
@@ -614,12 +737,97 @@ pub unsafe extern "C" fn rtdb_v1_database_pgwire_port(database: u64, out: *mut i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_database_pgwire_client_host(database: u64, out: *mut u8, capacity: usize, length: *mut usize, error: *mut u64) -> i32 {
     unsafe { call(error, || {
-        let host = handles::database(database)?.0.server.addresses().pgwire
-            .map(|address| if address.ip().is_unspecified() { "localhost".to_owned() } else { address.ip().to_string() })
-            .unwrap_or_default();
-        if host.len() > capacity { return Err(rtdb_types::Anomaly::incorrect("rtdb.ffi/buffer-too-small", "Host buffer is too small")); }
-        if !host.is_empty() { std::ptr::copy_nonoverlapping(host.as_ptr(), out, host.len()); }
-        *output(length)? = host.len();
+        let address = handles::database(database)?.0.server.addresses().pgwire;
+        write_client_host(address, out, capacity, length)
+    }) }
+}
+
+unsafe fn write_client_host(address: Option<std::net::SocketAddr>, out: *mut u8, capacity: usize, length: *mut usize) -> Result<()> {
+    let length = unsafe { output(length)? };
+    let host = address
+        .map(|address| if address.ip().is_unspecified() { "localhost".to_owned() } else { address.ip().to_string() })
+        .unwrap_or_default();
+    if host.len() > capacity { return Err(Anomaly::incorrect("rtdb.ffi/buffer-too-small", "Host buffer is too small")); }
+    if !host.is_empty() {
+        if out.is_null() { return Err(invalid("Host buffer is null")); }
+        unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), out, host.len()) };
+    }
+    *length = host.len();
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_read_only_pgwire_client_host(database: u64, out: *mut u8, capacity: usize, length: *mut usize, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let database = handles::database(database)?;
+        let _admitted = database.0.enter()?;
+        write_client_host(database.0.server.addresses().read_only_pgwire, out, capacity, length)
+    }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_read_only_pgwire_port(database: u64, out: *mut i32, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let database = handles::database(database)?;
+        let _admitted = database.0.enter()?;
+        *output(out)? = database.0.server.addresses().read_only_pgwire.map_or(-1, |address| i32::from(address.port()));
+        Ok(())
+    }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_healthz_port(database: u64, out: *mut i32, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let database = handles::database(database)?;
+        let _admitted = database.0.enter()?;
+        *output(out)? = database.0.server.addresses().health.map_or(-1, |address| i32::from(address.port()));
+        Ok(())
+    }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_catalog_status(database: u64, out: *mut u64, error: *mut u64) -> i32 {
+    use rtdb_format::transit::{TransitValue as T, encode_json};
+
+    unsafe { call(error, || {
+        let out = output(out)?;
+        *out = 0;
+        let database = handles::database(database)?;
+        let _admitted = database.0.enter()?;
+        let memory = database.0.memory();
+        let snapshot = database.0.server.node().catalog().open_database_map();
+        let bound = snapshot.keys().try_fold(4096, |size, name| add(size, add(1024, mul(16, name.len())?)?))?;
+        let reservation = memory.reserve(bound)?;
+        let status = T::Map(snapshot.iter().map(|(name, database)| {
+            let key = database.progress().current().tx_key.map_or(T::Null, |key| {
+                T::Array(vec![T::Integer(key.tx_id.0), T::Integer(key.system_time.0)])
+            });
+            (T::String(name.clone()), T::Array(vec![key]))
+        }).collect());
+        let value = rtdb_tx::RetainedBytes::with_reservation(encode_json(&status)?, reservation)?;
+        *out = handles::insert(Handle::Bytes(Arc::new(handles::NativeBytes { value, memory: Arc::clone(memory) })))?;
+        Ok(())
+    }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_auth_method(
+    database: u64, user: *const u8, user_length: usize, remote: *const u8, remote_length: usize,
+    out: *mut u32, error: *mut u64,
+) -> i32 {
+    use rtdb_auth::Method;
+
+    unsafe { call(error, || {
+        let database = handles::database(database)?;
+        let _admitted = database.0.enter()?;
+        let method = database.0.server.authenticator().method_for(optional_text(user, user_length)?, optional_text(remote, remote_length)?);
+        *output(out)? = match method {
+            None => 0,
+            Some(Method::Trust) => 1,
+            Some(Method::Password) => 2,
+            Some(Method::ClientCredentials) => 3,
+            Some(Method::DeviceAuth) => 4,
+        };
         Ok(())
     }) }
 }
@@ -640,10 +848,26 @@ pub unsafe extern "C" fn rtdb_v1_session_transact(session: u64, operation: u64, 
         let token = handles::cancellation(operation, &session)?;
         let memory = session.region.memory();
         let request = transit::TransactionInput::decode(bytes(request, length)?, memory)?;
-        let value = transit::transaction(&session, &token, request)?;
+        let value = transit::transaction_key(transit::transaction(&session, &token, request)?)?;
         let reservation = memory.reserve(add(mul(value.retained_bytes()?, 32)?, 8192)?)?;
         let value = rtdb_tx::RetainedBytes::with_reservation(transit::encode(&value)?, reservation)?;
         *out = handles::insert(Handle::Bytes(Arc::new(handles::NativeBytes { value, memory: Arc::clone(memory) })))?; Ok(())
+    }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_transact_result(
+    session: u64, operation: u64, request: *const u8, length: usize, out: *mut RtdbCommitResult, error: *mut u64,
+) -> i32 {
+    unsafe { call(error, || {
+        let out = output(out)?;
+        *out = RtdbCommitResult::default();
+        let session = handles::session(session)?;
+        let _admitted = session.region.enter()?;
+        let token = handles::cancellation(operation, &session)?;
+        let request = transit::TransactionInput::decode(bytes(request, length)?, session.region.memory())?;
+        *out = transit::transaction(&session, &token, request)?.into();
+        Ok(())
     }) }
 }
 

@@ -2,7 +2,7 @@ use rtdb_types::StructFields;
 use std::sync::Arc;
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, arrow_relayout_bound, relayout_arrow_column, to_field};
 use rtdb_format::transit::{TransitValue as T, encode_json};
-use rtdb_node::AutonomousTxOptions;
+use rtdb_node::{AutonomousTxOptions, CommitResult};
 use rtdb_tx::{ArrowDocumentWrite, ArrowDocuments, Documents, SqlArguments, TxOp, UserMetadata};
 use rtdb_types::{ListValue, ListView, LogicalType, Result, ScalarType, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
@@ -52,7 +52,7 @@ impl TransactionInput {
     }
 }
 
-pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToken, input: TransactionInput) -> Result<Value> {
+pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToken, input: TransactionInput) -> Result<CommitResult> {
     let memory = session.region.memory();
     let TransactionInput { value, reservation: _reservation } = input;
     let mut request = fields(value)?;
@@ -72,22 +72,32 @@ pub(crate) fn transaction(session: &Arc<SessionHandle>, token: &CancellationToke
         let mut state = session_handle.state.lock().await;
         let options = AutonomousTxOptions { database, default_timezone: timezone, system_time, user_metadata };
         token.run_until_cancelled(async {
-            let mut values = StructFields::new();
             if asynchronous {
-                let submitted = state.state_mut().submit_tx(operations, options).await?;
-                values.insert("tx_id".into(), Value::I64(submitted.tx_id.0));
-                if let Some(receipt) = submitted.placed_receipt { values.insert("await_token".into(), Value::Utf8(receipt)); }
+                state.state_mut().submit_tx(operations, options).await.map(CommitResult::Submitted)
             } else {
-                let result = state.state_mut().execute_tx(operations, options).await?;
-                if let Some(error) = result.error() { return Err(error.clone()); }
-                if !result.committed() { return Err(rtdb_types::Anomaly::fault("xtdb/tx-aborted", "Transaction aborted")); }
-                let key = result.tx_key();
-                values.insert("tx_id".into(), Value::I64(key.tx_id.0));
-                values.insert("system_time".into(), Value::Timestamp { value: key.system_time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+                state.state_mut().execute_tx(operations, options).await.map(CommitResult::Executed)
             }
-            Ok(Value::Struct(values))
         }).await.ok_or_else(crate::cancelled)?
     })
+}
+
+pub(crate) fn transaction_key(result: CommitResult) -> Result<Value> {
+    let mut values = StructFields::new();
+    match result {
+        CommitResult::Submitted(tx) => {
+            values.insert("tx_id".into(), Value::I64(tx.tx_id.0));
+            if let Some(receipt) = tx.placed_receipt { values.insert("await_token".into(), Value::Utf8(receipt)); }
+        }
+        CommitResult::Executed(tx) => {
+            if let Some(error) = tx.error() { return Err(error.clone()); }
+            if !tx.committed() { return Err(rtdb_types::Anomaly::fault("xtdb/tx-aborted", "Transaction aborted")); }
+            let key = tx.tx_key();
+            values.insert("tx_id".into(), Value::I64(key.tx_id.0));
+            values.insert("system_time".into(), Value::Timestamp { value: key.system_time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+        }
+        CommitResult::NoTransaction => return Err(rtdb_types::Anomaly::fault("rtdb.ffi/transaction-result", "Autonomous transaction produced no result")),
+    }
+    Ok(Value::Struct(values))
 }
 /// Deletes and erases are submitted as SQL DML, as the reference Clojure client submits them over ADBC,
 /// so an empty or inverted valid-time range deletes nothing rather than aborting the transaction.

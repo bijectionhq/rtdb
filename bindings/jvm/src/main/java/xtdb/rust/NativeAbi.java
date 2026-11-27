@@ -41,14 +41,18 @@ final class NativeAbi {
         register(library, linker, "operation_new", I64, PTR, PTR);
         register(library, linker, "cancel", I64, PTR);
         register(library, linker, "session_action", I64, I64, I32, PTR);
+        registerOptional(library, linker, "session_commit_result", I64, I64, I32, PTR, PTR);
         register(library, linker, "session_set_catalog", I64, PTR, I64, PTR);
         registerOptional(library, linker, "session_set_application_name", I64, PTR, I64, PTR);
         register(library, linker, "session_transact", I64, I64, PTR, I64, PTR, PTR);
+        registerOptional(library, linker, "session_transact_result", I64, I64, PTR, I64, PTR, PTR);
         registerOptional(library, linker, "session_query_ra", I64, I64, PTR, I64, PTR, I64, PTR, PTR);
         registerOptional(library, linker, "session_query_ra_arrow", I64, I64, PTR, I64, PTR, PTR, PTR, PTR);
         register(library, linker, "session_await_token", I64, PTR, PTR);
         registerOptional(library, linker, "session_set_await_token", I64, I64, PTR, I64, PTR);
         registerOptional(library, linker, "session_set_read_settings", I64, I64, PTR, I64, PTR, I64, PTR, PTR, PTR);
+        registerOptional(library, linker, "session_begin_read_only", I64, I64, PTR, I64, PTR, I64, PTR, PTR, PTR);
+        registerOptional(library, linker, "session_begin_write_only", I64, I64, PTR, I64, PTR, PTR, I64, I32, PTR);
         register(library, linker, "statement_new", I64, PTR, I64, I32, PTR, PTR);
         register(library, linker, "statement_set_sql", I64, PTR, I64, PTR);
         register(library, linker, "statement_prepare", I64, I64, PTR);
@@ -68,7 +72,12 @@ final class NativeAbi {
         register(library, linker, "memory_used", I64, PTR, PTR);
         register(library, linker, "database_pgwire_port", I64, PTR, PTR);
         register(library, linker, "database_pgwire_client_host", I64, PTR, I64, PTR, PTR);
+        registerOptional(library, linker, "database_read_only_pgwire_port", I64, PTR, PTR);
+        registerOptional(library, linker, "database_read_only_pgwire_client_host", I64, PTR, I64, PTR, PTR);
         register(library, linker, "database_flight_sql_port", I64, PTR, PTR);
+        registerOptional(library, linker, "database_healthz_port", I64, PTR, PTR);
+        registerOptional(library, linker, "database_catalog_status", I64, PTR, PTR);
+        registerOptional(library, linker, "database_auth_method", I64, PTR, I64, PTR, I64, PTR, PTR);
         try { if (invoke("abi_version") != 1) throw new IllegalStateException("Unsupported RTDB native ABI version"); }
         catch (AdbcException error) { throw new IllegalStateException(error); }
     }
@@ -118,7 +127,7 @@ final class NativeAbi {
             return copySlice(slice);
         }
     }
-    private NativeException diagnostic(long handle) throws AdbcException {
+    NativeException diagnostic(long handle) throws AdbcException {
         try (Arena arena = Arena.ofConfined()) {
             byte[][] fields = new byte[4][];
             String message = null;
@@ -151,6 +160,10 @@ final class NativeAbi {
     }
     static MemorySegment bytes(Arena arena, byte[] bytes) { return arena.allocateFrom(ValueLayout.JAVA_BYTE, bytes); }
     static MemorySegment text(Arena arena, String text) { return bytes(arena, text.getBytes(StandardCharsets.UTF_8)); }
+    static MemorySegment optionalText(Arena arena, String value) {
+        if (value == null) return MemorySegment.NULL;
+        return value.isEmpty() ? arena.allocate(1).asSlice(0, 0) : text(arena, value);
+    }
     static MemorySegment address(long address) { return MemorySegment.ofAddress(address); }
     static String json(String text) {
         if (text == null) return "null";

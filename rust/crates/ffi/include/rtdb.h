@@ -80,6 +80,24 @@ int32_t rtdb_v1_database_flush_all(RtdbHandle handle, int64_t timeout_nanos, Rtd
  * began. timeout_nanos is a positive overall deadline.
  */
 int32_t rtdb_v1_database_sync_all(RtdbHandle handle, int64_t timeout_nanos, RtdbHandle *error);
+/* Listener ports are -1 when absent. Host calls write UTF-8 without a terminator.
+ * A wildcard address is reported as localhost; absent listeners write length 0.
+ */
+int32_t rtdb_v1_database_pgwire_port(RtdbHandle database, int32_t *out, RtdbHandle *error);
+int32_t rtdb_v1_database_pgwire_client_host(RtdbHandle database, uint8_t *out, size_t capacity, size_t *length, RtdbHandle *error);
+int32_t rtdb_v1_database_read_only_pgwire_port(RtdbHandle database, int32_t *out, RtdbHandle *error);
+int32_t rtdb_v1_database_read_only_pgwire_client_host(RtdbHandle database, uint8_t *out, size_t capacity, size_t *length, RtdbHandle *error);
+int32_t rtdb_v1_database_flight_sql_port(RtdbHandle database, int32_t *out, RtdbHandle *error);
+int32_t rtdb_v1_database_healthz_port(RtdbHandle database, int32_t *out, RtdbHandle *error);
+/* In-process host status. Returns an owned Transit JSON byte handle.
+ * Each open database name maps to its vector of partition keys, where a key is
+ * [tx_id, system_time_micros] or null if that partition has never completed a transaction.
+ */
+int32_t rtdb_v1_database_catalog_status(RtdbHandle database, RtdbHandle *out, RtdbHandle *error);
+/* Null text pointers mean an unknown user or address. Output: 0 no match,
+ * 1 trust, 2 password, 3 client credentials, 4 device authorization.
+ */
+int32_t rtdb_v1_database_auth_method(RtdbHandle database, const uint8_t *user, size_t user_length, const uint8_t *remote, size_t remote_length, uint32_t *out, RtdbHandle *error);
 int32_t rtdb_v1_retain(RtdbHandle handle, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_release(RtdbHandle handle, RtdbHandle *error);
 
@@ -121,6 +139,21 @@ int32_t rtdb_v1_cancel(RtdbHandle operation_or_cursor, RtdbHandle *error);
  */
 int32_t rtdb_v1_session_action(RtdbHandle session, RtdbHandle operation, uint32_t action, RtdbHandle *error);
 
+typedef struct RtdbCommitResult {
+    int64_t tx_id;
+    int64_t system_time_micros;
+    RtdbHandle diagnostic;
+    uint32_t kind;
+    uint32_t reserved;
+} RtdbCommitResult;
+/* Commits an explicit transaction with asynchronous set to 0 or 1.
+ * kind: 0 no write transaction, 1 submitted, 2 committed, 3 aborted.
+ * tx_id is set for kinds 1-3; system_time_micros for kinds 2-3.
+ * An indexed abort is a successful call and may transfer an owned diagnostic handle.
+ * Release any nonzero diagnostic after reading it. Call failures use error as usual.
+ */
+int32_t rtdb_v1_session_commit_result(RtdbHandle session, RtdbHandle operation, uint32_t asynchronous, RtdbCommitResult *out, RtdbHandle *error);
+
 /* A null token clears the await token. Null read options leave their settings unchanged. */
 int32_t rtdb_v1_session_set_await_token(RtdbHandle session, RtdbHandle operation, const uint8_t *token, size_t length, RtdbHandle *error);
 typedef struct RtdbReadTime {
@@ -130,6 +163,10 @@ typedef struct RtdbReadTime {
     uint32_t kind; /* 1: SQL time text, 2: epoch parts, 3: local date, 4: local date-time, 5: zoned date-time */
 } RtdbReadTime;
 int32_t rtdb_v1_session_set_read_settings(RtdbHandle session, RtdbHandle operation, const uint8_t *timezone, size_t timezone_length, const uint8_t *snapshot_token, size_t snapshot_length, const RtdbReadTime *snapshot_time, const RtdbReadTime *clock_time, RtdbHandle *error);
+/* A failed begin preserves the previous transaction state. Null options use the session basis and time zone. */
+int32_t rtdb_v1_session_begin_read_only(RtdbHandle session, RtdbHandle operation, const uint8_t *timezone, size_t timezone_length, const uint8_t *snapshot_token, size_t snapshot_length, const RtdbReadTime *snapshot_time, const RtdbReadTime *clock_time, RtdbHandle *error);
+/* The optional metadata is a borrowed Transit MessagePack map. asynchronous is 0 or 1. */
+int32_t rtdb_v1_session_begin_write_only(RtdbHandle session, RtdbHandle operation, const uint8_t *timezone, size_t timezone_length, const RtdbReadTime *system_time, const uint8_t *metadata, size_t metadata_length, uint32_t asynchronous, RtdbHandle *error);
 
 /* bulk=0: SQL source; bulk=1: CREATE_APPEND table name.
  * A bind replaces existing arguments, preserves ordinal positions and explicit zero-row batches.
@@ -174,6 +211,8 @@ int32_t rtdb_v1_cursor_next_transit(RtdbHandle cursor, RtdbHandle *out, RtdbHand
 int32_t rtdb_v1_cursor_next_row_bytes(RtdbHandle cursor, RtdbSlice *view, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_bytes(RtdbHandle bytes, RtdbSlice *out, RtdbHandle *error);
 int32_t rtdb_v1_session_transact(RtdbHandle session, RtdbHandle operation, const uint8_t *request, size_t length, RtdbHandle *out, RtdbHandle *error);
+/* Takes the same request as session_transact and returns the structured transaction outcome. */
+int32_t rtdb_v1_session_transact_result(RtdbHandle session, RtdbHandle operation, const uint8_t *request, size_t length, RtdbCommitResult *out, RtdbHandle *error);
 /* The plan is an EDN logical relation. Arguments are a Transit MessagePack map of named values. */
 int32_t rtdb_v1_session_query_ra(RtdbHandle session, RtdbHandle operation, const uint8_t *plan, size_t plan_length, const uint8_t *arguments, size_t arguments_length, RtdbHandle *out, RtdbHandle *error);
 /* Takes one Arrow row with unique named fields under the retained bind ownership contract. */

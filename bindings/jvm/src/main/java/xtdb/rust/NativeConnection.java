@@ -1,13 +1,19 @@
 package xtdb.rust;
 
+import clojure.java.api.Clojure;
+import clojure.lang.IFn;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
+import java.time.ZoneId;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -25,6 +31,22 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Calls share the native session's transaction state; serialize ordinary connection use. Cancellation is concurrent. */
 public final class NativeConnection extends NativeResource implements AdbcConnection {
+    public record SubmittedTx(long txId) implements CommitOutcome {}
+    public record ExecutedTx(long txId, Instant systemTime, boolean committed, NativeException error) implements CommitOutcome {}
+    /** A SQL transaction operation. Null arguments mean unbound SQL and an empty batch executes no rows. */
+    public record SqlOperation(String sql, List<? extends List<?>> argumentRows) {
+        public SqlOperation(String sql) { this(sql, null); }
+    }
+    public record TxOptions(ZoneId defaultTimezone, Instant systemTime, Map<?, ?> metadata) {}
+    private sealed interface CommitOutcome permits SubmittedTx, ExecutedTx {}
+
+    private static final MemoryLayout COMMIT_RESULT = MemoryLayout.structLayout(
+        NativeAbi.I64, NativeAbi.I64, NativeAbi.I64, NativeAbi.I32, NativeAbi.I32);
+
+    private static final class TransactionCodec {
+        static final IFn WRITE = (IFn) Clojure.var("clojure.core", "requiring-resolve").invoke(Clojure.read("xtdb.rust/write-request"));
+    }
+
     final BufferAllocator allocator;
     private final Set<Operation> operations = ConcurrentHashMap.newKeySet();
     private String catalog;
@@ -48,6 +70,16 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     }
     @Override public NativeStatement createStatement() throws AdbcException { return createStatement(""); }
     public NativeStatement createStatement(String sql) throws AdbcException { return statement(sql, false); }
+    public NativeStatement prepareStatement(String sql) throws AdbcException {
+        var statement = createStatement(sql);
+        try {
+            statement.prepare();
+            return statement;
+        } catch (AdbcException | RuntimeException | Error failure) {
+            try { statement.close(); } catch (AdbcException close) { failure.addSuppressed(close); }
+            throw failure;
+        }
+    }
     @Override public NativeStatement bulkIngest(String table, BulkIngestMode mode) throws AdbcException {
         if (mode != BulkIngestMode.CREATE_APPEND) throw AdbcException.invalidArgument("Only CREATE_APPEND mode is supported");
         return statement(table, true);
@@ -64,9 +96,56 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     @Override public void commit() throws AdbcException { action(3); }
     @Override public void rollback() throws AdbcException { action(4); }
     public void begin() throws AdbcException { action(2); }
+    /** Opens an explicit read-only transaction at the connection's basis. */
+    public void beginReadOnly() throws AdbcException { beginReadOnly(null, null, null, null); }
+    /** Opens a read-only transaction with optional basis and time-zone overrides. */
+    public void beginReadOnly(ZoneId timezone, String snapshotToken, Instant snapshotTime, Instant clockTime) throws AdbcException {
+        changeReadSettings("session_begin_read_only", timezone == null ? null : timezone.getId(), snapshotToken, snapshotTime, clockTime, false);
+    }
+    /** Opens an explicit write-only transaction with the session time zone and synchronous ADBC commit. */
+    public void beginWriteOnly() throws AdbcException { beginWriteOnly(null, null, false, null); }
+    /** Opens a write-only transaction with optional backfill time, metadata, commit mode, and time zone. */
+    public void beginWriteOnly(Instant systemTime, Map<?, ?> metadata, boolean asynchronous, ZoneId timezone) throws AdbcException {
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var zone = NativeAbi.optionalText(arena, timezone == null ? null : timezone.getId());
+            var metadataBytes = metadata == null ? MemorySegment.NULL : NativeAbi.bytes(arena, (byte[]) TransactionCodec.WRITE.invoke(metadata));
+            abi.call("session_begin_write_only", handle(), operation.id(), zone, zone.byteSize(), readTime(arena, systemTime, false),
+                metadataBytes, metadataBytes.byteSize(), asynchronous ? 1 : 0);
+        }
+    }
     public void commitSync() throws AdbcException { action(5); }
     public void commitAsync() throws AdbcException { action(6); }
+    /** Commits an explicit write transaction and returns its indexed outcome, including an abort. */
+    public ExecutedTx commitSyncResult() throws AdbcException { return (ExecutedTx) commitResult(false); }
+    /** Submits an explicit write transaction and returns its transaction ID. */
+    public SubmittedTx commitAsyncResult() throws AdbcException { return (SubmittedTx) commitResult(true); }
     public void rollbackTx() throws AdbcException { action(7); }
+
+    private CommitOutcome commitResult(boolean asynchronous) throws AdbcException {
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var out = arena.allocate(COMMIT_RESULT);
+            abi.call("session_commit_result", handle(), operation.id(), asynchronous ? 1 : 0, out);
+            return decodeCommitResult(out);
+        }
+    }
+
+    private CommitOutcome decodeCommitResult(MemorySegment result) throws AdbcException {
+        long txId = result.get(NativeAbi.I64, 0);
+        long micros = result.get(NativeAbi.I64, 8);
+        long diagnostic = result.get(NativeAbi.I64, 16);
+        int kind = result.get(NativeAbi.I32, 24);
+        NativeException abort = diagnostic == 0 ? null : abi.diagnostic(diagnostic);
+        return switch (kind) {
+            case 0 -> null;
+            case 1 -> new SubmittedTx(txId);
+            case 2, 3 -> new ExecutedTx(txId, instantFromMicros(micros), kind == 2, abort);
+            default -> throw AdbcException.internal("Unknown native transaction result kind: " + kind);
+        };
+    }
+
+    static Instant instantFromMicros(long micros) {
+        return Instant.ofEpochSecond(Math.floorDiv(micros, 1_000_000L), Math.floorMod(micros, 1_000_000L) * 1_000L);
+    }
     public String getAwaitToken() throws AdbcException {
         long token = abi.handle("session_await_token", handle());
         if (token == 0) return null;
@@ -74,31 +153,36 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     }
     public boolean supportsTypedAwaitToken() { return abi.supports("session_set_await_token"); }
     public boolean supportsTypedReadSettings() { return abi.supports("session_set_read_settings"); }
+    public boolean tryBeginReadOnly(String timezone, String snapshotToken, Object snapshotTime, Object clockTime) throws AdbcException {
+        if (!abi.supports("session_begin_read_only")) return false;
+        changeReadSettings("session_begin_read_only", timezone, snapshotToken, snapshotTime, clockTime, true);
+        return true;
+    }
     public void setAwaitToken(String token) throws AdbcException {
         try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
-            var text = optionalText(arena, token);
+            var text = NativeAbi.optionalText(arena, token);
             abi.call("session_set_await_token", handle(), operation.id(), text, text.byteSize());
         }
     }
     public void setReadSettings(String timezone, String snapshotToken, Object snapshotTime, Object clockTime) throws AdbcException {
+        changeReadSettings("session_set_read_settings", timezone, snapshotToken, snapshotTime, clockTime, true);
+    }
+    private void changeReadSettings(String function, String timezone, String snapshotToken, Object snapshotTime, Object clockTime,
+                                    boolean transitPrecision) throws AdbcException {
         try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
-            var zone = optionalText(arena, timezone);
-            var snapshot = optionalText(arena, snapshotToken);
-            abi.call("session_set_read_settings", handle(), operation.id(), zone, zone.byteSize(), snapshot, snapshot.byteSize(),
-                    readTime(arena, snapshotTime), readTime(arena, clockTime));
+            var zone = NativeAbi.optionalText(arena, timezone);
+            var snapshot = NativeAbi.optionalText(arena, snapshotToken);
+            abi.call(function, handle(), operation.id(), zone, zone.byteSize(), snapshot, snapshot.byteSize(),
+                    readTime(arena, snapshotTime, transitPrecision), readTime(arena, clockTime, transitPrecision));
         }
     }
-    private static MemorySegment optionalText(Arena arena, String value) {
-        if (value == null) return MemorySegment.NULL;
-        return value.isEmpty() ? arena.allocate(1).asSlice(0, 0) : NativeAbi.text(arena, value);
-    }
-    private static MemorySegment readTime(Arena arena, Object value) {
+    private static MemorySegment readTime(Arena arena, Object value, boolean transitPrecision) {
         if (value == null) return MemorySegment.NULL;
         var time = arena.allocate(32, 8);
         if (value instanceof Instant instant) {
             time.set(NativeAbi.I64, 16, instant.getEpochSecond());
-            // Match the microsecond precision of the Transit timestamp object codec.
-            time.set(NativeAbi.I32, 24, instant.getNano() / 1000 * 1000);
+            int nanos = instant.getNano();
+            time.set(NativeAbi.I32, 24, transitPrecision ? nanos / 1000 * 1000 : nanos);
             time.set(NativeAbi.I32, 28, 2);
         } else {
             int kind = switch (value) {
@@ -122,6 +206,40 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
             MemorySegment input = NativeAbi.bytes(arena, request);
             long result = abi.handle("session_transact", handle(), operation.id(), input, input.byteSize());
             try { return abi.copiedBytes(result); } finally { abi.dispose(result, false); }
+        }
+    }
+
+    /** Submits SQL transaction operations to this connection's database without waiting for indexing. */
+    public SubmittedTx submitTx(List<SqlOperation> operations, TxOptions options) throws AdbcException {
+        return (SubmittedTx) transactResult(operations, options, true);
+    }
+
+    /** Executes SQL transaction operations atomically and returns the indexed outcome, including an abort. */
+    public ExecutedTx executeTx(List<SqlOperation> operations, TxOptions options) throws AdbcException {
+        return (ExecutedTx) transactResult(operations, options, false);
+    }
+
+    private CommitOutcome transactResult(List<SqlOperation> operations, TxOptions options, boolean asynchronous) throws AdbcException {
+        var encodedOperations = operations.stream().map(operation -> {
+            var result = new LinkedHashMap<String, Object>();
+            result.put("op", "sql");
+            result.put("sql", operation.sql());
+            if (operation.argumentRows() != null) result.put("arguments", operation.argumentRows());
+            return result;
+        }).toList();
+        var encodedOptions = new LinkedHashMap<String, Object>();
+        if (options != null) {
+            if (options.defaultTimezone() != null) encodedOptions.put("default_timezone", options.defaultTimezone().getId());
+            if (options.systemTime() != null) encodedOptions.put("system_time", options.systemTime());
+            if (options.metadata() != null) encodedOptions.put("metadata", options.metadata());
+        }
+        byte[] request = (byte[]) TransactionCodec.WRITE.invoke(Map.of(
+            "operations", encodedOperations, "options", encodedOptions, "asynchronous", asynchronous));
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var input = NativeAbi.bytes(arena, request);
+            var out = arena.allocate(COMMIT_RESULT);
+            abi.call("session_transact_result", handle(), operation.id(), input, input.byteSize(), out);
+            return decodeCommitResult(out);
         }
     }
     public NativeRows queryLogicalRelation(String plan, byte[] arguments) throws AdbcException {

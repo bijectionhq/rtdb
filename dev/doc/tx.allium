@@ -74,6 +74,8 @@
 -- The embedded Transit batch writer reuses one top-level column selection across rows, emitting each name at its first position with its last column's value and omitting a null winner.
 -- Transit JSON writes escaped text from borrowed Arrow strings, keywords and URIs directly into the result.
 -- Clojure callers can set the connection await token and the read-only transaction settings through typed session calls.
+-- Embedded callers can open a read-only or write-only transaction with typed settings in a single session operation.
+-- The structured embedded outcome carries the submitted position or the indexed transaction key and abort diagnostic.
 -- Embedded ADBC metadata builds its catalog, schema, table, and column arrays with the declared ADBC field order and list validity.
 -- JSON Bind preserves the spelling of numeric tokens through native type inference.
 -- The decoder borrows tokens while visiting nested input.

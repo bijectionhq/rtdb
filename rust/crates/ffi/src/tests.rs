@@ -87,6 +87,53 @@ fn flight_sql_port_reports_the_bound_listener_or_its_absence() {
 }
 
 #[test]
+fn read_only_pgwire_and_healthz_ports_report_the_bound_listeners() {
+    let ports = |native: &Native| {
+        let (mut pgwire, mut healthz, mut error) = (0, 0, 0);
+        ok(unsafe { rtdb_v1_database_read_only_pgwire_port(native.database, &mut pgwire, &mut error) }, error);
+        ok(unsafe { rtdb_v1_database_healthz_port(native.database, &mut healthz, &mut error) }, error);
+        (pgwire, healthz)
+    };
+    assert_eq!(ports(&Native::open()), (-1, -1));
+    let listening = Native::open_yaml(b"server: { port: -1, readOnlyPort: 0, host: 127.0.0.1 }\nflightSql: null\nhealthz: { port: 0 }\n");
+    let (pgwire, healthz) = ports(&listening);
+    assert!(pgwire > 0);
+    assert!(healthz > 0);
+    let (mut host, mut length, mut error) = ([0; 64], 0, 0);
+    ok(unsafe { rtdb_v1_database_read_only_pgwire_client_host(listening.database, host.as_mut_ptr(), host.len(), &mut length, &mut error) }, error);
+    assert_eq!(&host[..length], b"127.0.0.1");
+    ok(unsafe { rtdb_v1_close(listening.database, &mut error) }, error);
+    let status = unsafe { rtdb_v1_database_healthz_port(listening.database, std::ptr::null_mut(), &mut error) };
+    incorrect(status, error, "rtdb.ffi/closed");
+}
+
+#[test]
+fn structured_commit_keeps_the_abort_after_the_session_closes() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let mut error = 0;
+    let mut result = RtdbCommitResult::default();
+    ok(unsafe { rtdb_v1_session_commit_result(native.session, operation, 0, &mut result, &mut error) }, error);
+    assert_eq!(result.kind, 0);
+    assert_eq!(result.diagnostic, 0);
+
+    let null = std::ptr::null();
+    ok(unsafe { rtdb_v1_session_begin_write_only(native.session, operation, null, 0, std::ptr::null(), null, 0, 0, &mut error) }, error);
+    let assertion = native.statement("ASSERT FALSE");
+    let mut affected = 0;
+    ok(unsafe { rtdb_v1_statement_update(assertion, operation, &mut affected, &mut error) }, error);
+    ok(unsafe { rtdb_v1_session_commit_result(native.session, operation, 0, &mut result, &mut error) }, error);
+    assert_eq!(result.kind, 3);
+    assert_ne!(result.diagnostic, 0);
+    ok(unsafe { rtdb_v1_close(native.database, &mut error) }, error);
+
+    let mut code = RtdbSlice { data: std::ptr::null(), length: 0 };
+    ok(unsafe { rtdb_v1_error_field(result.diagnostic, 1, &mut code, &mut error) }, error);
+    assert_eq!(unsafe { std::slice::from_raw_parts(code.data, code.length) }, b"xtdb/assert-failed");
+    ok(unsafe { rtdb_v1_release(result.diagnostic, &mut error) }, error);
+}
+
+#[test]
 fn diagnostic_slices_distinguish_absent_empty_and_present_messages_through_retain() {
     for message in [None, Some(String::new()), Some("échec".into())] {
         let original = handles::diagnostic(Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone()));

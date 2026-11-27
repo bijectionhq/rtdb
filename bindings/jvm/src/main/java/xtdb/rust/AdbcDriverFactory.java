@@ -1,6 +1,5 @@
 package xtdb.rust;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import org.apache.arrow.adbc.core.AdbcDriver;
 import org.apache.arrow.adbc.core.AdbcException;
@@ -16,12 +15,10 @@ public final class AdbcDriverFactory implements org.apache.arrow.adbc.drivermana
             if (options.containsKey("xtdb.config")) throw AdbcException.invalidArgument("JVM Xtdb.Config factories require migration to native YAML");
             String yaml = XTDB_CONFIG_YAML.get(options);
             Path path = XTDB_CONFIG_FILE.get(options);
-            if (yaml == null && path != null) {
-                if (!path.toString().endsWith(".yaml")) throw AdbcException.invalidArgument("Configuration file must end in .yaml");
-                try { yaml = Files.readString(path); } catch (java.io.IOException error) { throw AdbcException.io(error.getMessage()).withCause(error); }
-            }
-            Long limit = NATIVE_MEMORY_BYTES.get(options);
-            return NativeDatabase.open(allocator, yaml == null ? "" : yaml, limit == null ? 512L * 1024 * 1024 : limit);
+            Long configuredLimit = NATIVE_MEMORY_BYTES.get(options);
+            long limit = configuredLimit == null ? 512L * 1024 * 1024 : configuredLimit;
+            if (yaml == null && path != null) return NativeDatabase.openFile(allocator, path, limit);
+            return NativeDatabase.open(allocator, yaml == null ? "" : yaml, limit);
         };
     }
 }

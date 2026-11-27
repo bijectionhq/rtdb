@@ -39,10 +39,22 @@ Ordinary session and statement calls are serialized by the caller, as required b
 `cancel()` is safe from another thread.
 
 `xtdb.rust.AdbcDriverFactory` accepts `xtdb.config-yaml`, `xtdb.config-path` and `xtdb.native-memory-bytes`.
+`NativeDatabase.openFile(allocator, path, nativeMemoryBytes)` opens the same native YAML configuration directly from a `.yaml` file.
+`getServerPort()`, `getServerReadOnlyPort()`, `getFlightSqlPort()` and `getHealthzPort()` report each bound port or `-1` when absent.
+The JDBC connection builder uses the read-write PostgreSQL listener when present and otherwise uses the read-only listener.
+`getDatabaseNames()` and `latestCompletedTxs()` read the native catalog's open databases.
+`latestCompletedTxs()` retains a null entry for each partition that has yet to complete a transaction.
+`authMethodFor(user, remoteAddress)` inspects native authentication rules without opening a connection or authenticating the caller.
 Only `CREATE_APPEND` bulk ingest is supported, matching the pinned embedded API.
 Arrow binds are copied, including duplicate or unnamed parameter columns, so an external source allocator may close immediately after `bind` returns.
 Metadata includes `getInfo`, `getObjects`, `getTableTypes` and `getTableSchema` with the standard ADBC schemas.
 SQL transaction-control statements are rejected; use autocommit, commit and rollback, or the explicit native begin/commit methods.
+`beginReadOnly()` and `beginWriteOnly()` have overloads for a read basis or write settings.
+`commitSyncResult()` returns the indexed key and abort information, and `commitAsyncResult()` returns the submitted transaction ID.
+Both return null when there is no write transaction to submit.
+`executeTx` and `submitTx` on a connection accept a list of `NativeConnection.SqlOperation` records and optional `TxOptions`.
+Use `NativeDatabase.executeTx` or `submitTx` to select a database for those operations.
+For transaction operations expressed as Clojure documents or SQL, use `xtdb.api/execute-tx` and `xtdb.api/submit-tx`.
 
 [source,clojure]
 ----

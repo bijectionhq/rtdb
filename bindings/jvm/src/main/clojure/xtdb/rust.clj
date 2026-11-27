@@ -35,7 +35,7 @@
           Integer (transit/write-handler "i32" long)
           Float (transit/write-handler "f32" double)})))
 
-(defn- write-request ^bytes [value]
+(defn ^:no-doc write-request ^bytes [value]
   (with-open [out (ByteArrayOutputStream.)]
     (transit/write (transit/writer out :msgpack {:handlers request-write-handlers}) value)
     (.toByteArray out)))
@@ -72,19 +72,20 @@
   (let [timezone (some-> default-tz str)]
     (if-not (or (some? timezone) (some? snapshot-token) (some? snapshot-time) (some? current-time))
       (f)
-      (do
-        (.begin connection)
+      (let [typed? (and (or (nil? snapshot-token) (string? snapshot-token))
+                        (native-read-time? snapshot-time) (native-read-time? current-time))
+            begun? (and typed? (.tryBeginReadOnly connection timezone snapshot-token snapshot-time current-time))]
+        (when-not begun? (.begin connection))
         (try
-          (if (and (.supportsTypedReadSettings connection)
-                   (or (nil? snapshot-token) (string? snapshot-token))
-                   (native-read-time? snapshot-time) (native-read-time? current-time))
-            (.setReadSettings connection timezone snapshot-token snapshot-time current-time)
-            (let [settings (filterv (comp some? second)
-                                    [["TIMEZONE" timezone] ["SNAPSHOT_TOKEN" snapshot-token]
-                                     ["SNAPSHOT_TIME" snapshot-time] ["CLOCK_TIME" current-time]])]
-              (execute-set! connection
-                            (str "SET TRANSACTION READ ONLY, " (str/join ", " (map #(str (first %) " = ?") settings)))
-                            (mapv second settings))))
+          (when-not begun?
+            (if (and typed? (.supportsTypedReadSettings connection))
+              (.setReadSettings connection timezone snapshot-token snapshot-time current-time)
+              (let [settings (filterv (comp some? second)
+                                      [["TIMEZONE" timezone] ["SNAPSHOT_TOKEN" snapshot-token]
+                                       ["SNAPSHOT_TIME" snapshot-time] ["CLOCK_TIME" current-time]])]
+                (execute-set! connection
+                              (str "SET TRANSACTION READ ONLY, " (str/join ", " (map #(str (first %) " = ?") settings)))
+                              (mapv second settings)))))
           (f)
           (finally (.rollbackTx connection)))))))
 

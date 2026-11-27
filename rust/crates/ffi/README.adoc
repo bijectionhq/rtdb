@@ -8,6 +8,9 @@ Bulk ingestion applies the same cell admission before constructing logical docum
 It opens the Rust server composition, including configured storage, logs, authentication, source ingestion and listeners.
 For an embedded node without network listeners, set `server: null` and `flightSql: null` in the native YAML configuration.
 `all-backends` enables the native backend features exposed by `rtdb-server`.
+The listener port functions return `-1` for unconfigured read-write PostgreSQL, read-only PostgreSQL, Flight SQL and health endpoints.
+The PostgreSQL client-host functions write the reached address into caller-owned storage and report `localhost` for wildcard bindings.
+`rtdb_v1_database_catalog_status` returns catalog membership and completed keys as an owned Transit JSON byte handle.
 
 `rtdb_v1_database_open` selects the default TimSort object sorter.
 The additive `rtdb_v1_database_open_with_properties` entry accepts a borrowed UTF-8 JSON object of string values, limited to 4096 bytes, under the startup allocation budget.
@@ -98,6 +101,9 @@ Null document fields are omitted and narrow integer/float values retain their Tr
 The legacy C Transit cursor still returns the same owned-byte-handle interface.
 Autonomous transaction requests carry operations, options and the asynchronous flag explicitly.
 Absent SQL arguments and a present empty row batch remain distinct.
+The typed read-only and write-only begin functions use the same transaction state as SQL and ADBC.
+The additive structured commit and autonomous transaction functions distinguish an indexed abort from a failed call.
+Release a returned abort diagnostic as a normal diagnostic handle even after the session closes.
 
 == Source verification
 

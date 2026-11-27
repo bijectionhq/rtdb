@@ -3,7 +3,10 @@ package xtdb.rust;
 import static org.junit.jupiter.api.Assertions.*;
 import clojure.java.api.Clojure;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Map;
@@ -19,17 +22,116 @@ import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import xtdb.api.error.Incorrect;
 
 final class NativeAdbcTest {
     private static final String YAML = "server: null\nflightSql: null\nnodeId: jvm-binding-test\n";
     private static NativeDatabase open(RootAllocator allocator) throws Exception { return NativeDatabase.open(allocator, YAML, 512L * 1024 * 1024); }
 
+    @Test void opensYamlAndConnectsJdbcThroughAReadOnlyListener(@TempDir Path directory) throws Exception {
+        Path yaml = Files.writeString(directory.resolve("node.yaml"), """
+                server: { port: -1, readOnlyPort: 0, host: 127.0.0.1 }
+                flightSql: null
+                healthz: { port: 0 }
+                """);
+        try (var allocator = new RootAllocator(); var database = NativeDatabase.openFile(allocator, yaml, 512L * 1024 * 1024)) {
+            assertSame(allocator, database.getAllocator());
+            assertEquals(-1, database.getServerPort());
+            assertEquals(-1, database.getFlightSqlPort());
+            assertTrue(database.getServerReadOnlyPort() > 0);
+            assertTrue(database.getHealthzPort() > 0);
+            try (var connection = database.getConnection(); var statement = connection.createStatement();
+                 var result = statement.executeQuery("SELECT 42")) {
+                assertTrue(result.next());
+                assertEquals(42, result.getInt(1));
+            }
+        }
+    }
+
     @Test void setsTheEmbeddedApplicationName() throws Exception {
         try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
             assertEquals("XTDB", applicationName(connection));
             connection.setApplicationName("météo's importer");
             assertEquals("météo's importer", applicationName(connection));
+        }
+    }
+
+    @Test void selectsTheConfiguredAuthenticationRuleWithoutAuthenticating() throws Exception {
+        String yaml = YAML + """
+                authn: !UserList
+                  users: {}
+                  rules:
+                    - user: alice
+                      method: PASSWORD
+                    - remoteAddress: 127.0.0.1
+                      method: TRUST
+                """;
+        try (var allocator = new RootAllocator(); var database = NativeDatabase.open(allocator, yaml, 512L * 1024 * 1024)) {
+            assertEquals(NativeDatabase.AuthMethod.PASSWORD, database.authMethodFor("alice", "127.0.0.1"));
+            assertEquals(NativeDatabase.AuthMethod.TRUST, database.authMethodFor(null, "127.0.0.1"));
+            assertNull(database.authMethodFor("unknown", null));
+        }
+    }
+
+    @Test void beginsWithAReadBasisAndLeavesTheSessionUsableAfterARejectedBegin() throws Exception {
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
+            assertThrows(NativeException.class, () -> connection.beginReadOnly(ZoneOffset.UTC, null, Instant.MAX, null));
+            var clock = Instant.parse("2021-04-26T10:00:00.123456Z");
+            connection.beginReadOnly(ZoneOffset.UTC, null, null, clock);
+            assertThrows(NativeException.class, connection::beginWriteOnly);
+            try (var statement = connection.prepareStatement("SELECT CAST(CURRENT_TIMESTAMP AS TEXT)");
+                 var result = statement.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                var time = result.getReader().getVectorSchemaRoot().getVector(0).getObject(0).toString();
+                assertEquals(clock, ZonedDateTime.parse(time).toInstant());
+            }
+            assertNull(connection.commitSyncResult());
+            connection.beginWriteOnly();
+            connection.rollbackTx();
+        }
+    }
+
+    @Test void returnsExplicitAndAutonomousTransactionOutcomesAndCatalogProgress() throws Exception {
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
+            assertTrue(database.getDatabaseNames().contains("xtdb"));
+            assertNull(database.latestCompletedTxs().get("xtdb").getFirst());
+
+            var supplied = Instant.parse("2021-04-26T10:00:00.123456Z");
+            connection.beginWriteOnly(supplied, Map.of("source", "java"), false, ZoneOffset.UTC);
+            try (var insert = connection.createStatement("INSERT INTO docs (_id) VALUES (1)")) {
+                insert.executeUpdate();
+            }
+            var committed = connection.commitSyncResult();
+            assertTrue(committed.committed());
+            assertNull(committed.error());
+            assertEquals(supplied, committed.systemTime());
+
+            var aborted = database.executeTx("xtdb", List.of(
+                new NativeConnection.SqlOperation("INSERT INTO docs (_id) VALUES (?)", List.of(List.of(2L))),
+                new NativeConnection.SqlOperation("ASSERT FALSE")), null);
+            assertFalse(aborted.committed());
+            assertEquals("xtdb/assert-failed", aborted.error().code());
+            assertTrue(aborted.txId() > committed.txId());
+            var latest = database.latestCompletedTxs().get("xtdb").getFirst();
+            assertEquals(aborted.txId(), latest.getTxId());
+            assertEquals(aborted.systemTime(), latest.getSystemTime());
+
+            connection.beginWriteOnly();
+            try (var insert = connection.createStatement("INSERT INTO docs (_id) VALUES (3)")) {
+                insert.executeUpdate();
+            }
+            var submitted = connection.commitAsyncResult();
+            assertTrue(submitted.txId() > aborted.txId());
+            try (var query = connection.createStatement("SELECT _id FROM docs ORDER BY _id");
+                 var result = query.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                var ids = result.getReader().getVectorSchemaRoot().getVector("_id");
+                assertEquals(2, ids.getValueCount());
+                assertEquals(1L, ((Number) ids.getObject(0)).longValue());
+                assertEquals(3L, ((Number) ids.getObject(1)).longValue());
+                assertFalse(result.getReader().loadNextBatch());
+            }
         }
     }
 
