@@ -70,23 +70,12 @@ impl ReceiptLookups {
                 .is_some_and(|coverage| &coverage.table == table)
     }
 
-    pub(super) fn observe(
-        &mut self,
-        table: &TableRef,
-        event: StoredEvent,
-        sha256: [u8; 32],
-        charge: Arc<MemoryReservation>,
-    ) -> Result<()> {
-        let iid = event.iid;
+    pub(super) fn select(&mut self, table: &TableRef, iid: Iid) -> Option<&mut ReceiptLookup> {
         if &self.receipt.table == table && self.receipt.iid == iid {
-            self.receipt.observe(event, sha256, charge)?;
-        } else if let Some(coverage) = &mut self.coverage
-            && &coverage.table == table
-            && coverage.iid == iid
-        {
-            coverage.observe(event, sha256, charge)?;
+            Some(&mut self.receipt)
+        } else {
+            self.coverage.as_mut().filter(|coverage| &coverage.table == table && coverage.iid == iid)
         }
-        Ok(())
     }
 
     pub(super) fn observe_relation(&mut self, relation: &RelationInventory) {
@@ -117,7 +106,7 @@ impl ReceiptLookup {
         }
     }
 
-    fn observe(
+    pub(super) fn observe(
         &mut self,
         event: StoredEvent,
         sha256: [u8; 32],
@@ -218,14 +207,19 @@ mod tests {
         let retained = Value::Binary(vec![8, 9, 10]);
         let receipt = event(&receipt_id, 9, 55, ("native_transaction", retained.clone()));
         let coverage = event(&coverage_id, 4, 28, ("version", Value::U8(2)));
-        read.observe(&coverage_table, coverage, [1; 32], memory.reserve(512)?)?;
-        read.observe(
-            &coverage_table,
-            receipt.clone(),
-            [2; 32],
-            memory.reserve(512)?,
-        )?;
-        read.observe(&receipt_table, receipt, [2; 32], memory.reserve(512)?)?;
+        read.select(&coverage_table, coverage.iid).unwrap()
+            .observe(coverage, [1; 32], memory.reserve(512)?)?;
+        assert!(read.select(&coverage_table, receipt.iid).is_none());
+        let other = event(&EntityId::Integer(7), 8, 44, ("nested", Value::Struct(StructFields::from([
+            ("z".into(), Value::I32(1)),
+            ("missing".into(), Value::Undefined),
+            ("a".into(), Value::Binary(vec![7, 8])),
+        ]))));
+        assert!(read.select(&receipt_table, other.iid).is_none());
+        let retained_digest = other.retained_history_fingerprint()?;
+        assert_eq!(other.history_fingerprint()?, retained_digest);
+        read.select(&receipt_table, receipt.iid).unwrap()
+            .observe(receipt, [2; 32], memory.reserve(512)?)?;
         let readback = read.finish();
         let [receipt] = readback.receipt.events.as_slice() else {
             panic!("expected one retained receipt")

@@ -281,6 +281,7 @@ surface StatelessDatabase {
         -- A Classic migration can import authenticated canonical receipts whose original installed coordinates map to retained native cuts.
         -- The imported canonical receipt keeps its namespace, key, request digest and outcome.
         -- Classic-only receipt controls preserve the original lookup identity through authenticated read-through.
+        -- Classic receipt read-through fingerprints the complete inspected relation and returns the history at the requested physical identity.
         -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
 
     @guarantee FundedDecisionClock

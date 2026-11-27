@@ -425,13 +425,16 @@ async fn inspect_relation(
             relation.unpositioned += header.position.is_none() as u64;
             relation.erasures += (header.op == EventOp::Erase) as u64;
             relation.redacted += (header.op == EventOp::Redacted) as u64;
-            let fingerprint = if projection.is_some() || receipt.is_some() {
+            let outcome = receipt.as_deref_mut().and_then(|lookups| {
+                lookups.select(&relation.table, header.iid)
+            });
+            let fingerprint = if projection.is_some() || outcome.is_some() {
                 let event = batch.read_event(row)?;
                 let fingerprint = event.retained_history_fingerprint()?;
                 if let Some(projection) = projection.as_deref_mut() {
                     projection.observe(&relation.table, event, fingerprint, charge)?;
-                } else if let Some(receipt) = receipt.as_deref_mut() {
-                    receipt.observe(&relation.table, event, fingerprint, charge)?;
+                } else if let Some(outcome) = outcome {
+                    outcome.observe(event, fingerprint, charge)?;
                 }
                 fingerprint
             } else if let Some(fingerprint) = borrowed.history_fingerprint_without_document() {
