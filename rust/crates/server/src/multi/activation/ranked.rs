@@ -437,13 +437,13 @@ mod tests {
     async fn ranked_writer_exports_and_the_broker_reconciles_after_keepers_stop() {
         use std::{collections::BTreeSet, net::Ipv4Addr};
 
-        use bytes::Bytes;
         use rtdb_crypt::FileKms;
-        use rtdb_db::{MultiDatabase, MultiOptions, PortableBackup, Role, WritePipeline};
-        use rtdb_node::{Clock, SystemClock};
-        use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
-        use rtdb_types::{EntityId, MemoryBudget, TableRef, rtdb_v1::MAIN_BRANCH};
+        use rtdb_db::{MultiDatabase, MultiOptions, PortableBackup, Role};
+        use rtdb_node::{Clock, MultiServing, SystemClock};
+        use rtdb_tx::transact::{Cell, Declaration, Op, Outcome, Row, Transact};
+        use rtdb_types::{EntityId, Interval, MemoryBudget, TableRef, rtdb_v1::MAIN_BRANCH};
         use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+        use tokio_util::sync::CancellationToken;
 
         let config = test_provider();
         let directory = tempfile::tempdir().unwrap();
@@ -465,7 +465,7 @@ mod tests {
         let journal = Arc::new(keepers.journal(PRINCIPAL, &placement).unwrap());
         journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
         let node = Ipv4Addr::LOCALHOST.into();
-        let mut database = MultiDatabase::new(MultiOptions {
+        let database = MultiDatabase::new(MultiOptions {
             database: binding.incarnation,
             node,
             lease_micros: 10_000_000,
@@ -476,46 +476,53 @@ mod tests {
             .with_serving_authority(authority.serving_authority("xtdb", binding.incarnation).unwrap())
             .with_ranked_admission(ranked).unwrap();
         database.create().await.unwrap();
-        assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
-        let receipt = database.transact(&Transact {
+        let serving = MultiServing::new(database, MemoryBudget::new(64 << 20));
+        assert!(matches!(serving.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        let write = |key, ops| Transact {
             custody_request_digest: None,
             request_memory: None,
-            key: vec![17; 16],
+            key: vec![key; 16],
             require: vec![],
             window: Default::default(),
             guards: vec![],
             requires: vec![],
             otherwise: vec![],
-            ops: vec![Op::Put {
+            ops,
+        };
+        let table = TableRef::new("public", "docs");
+        let change: Declaration = serde_json::from_value(serde_json::json!({"RankedIndex": {
+            "name": "nearest", "definition": {"columns": ["embedding"], "kind": {"Ivf": {
+                "dimensions": 2, "recall_bits": 0.95_f64.to_bits(),
+            }}},
+        }})).unwrap();
+        let declared = serving.transact_local(write(16, vec![Op::Declare { table: table.clone(), change }]), None)
+            .await.unwrap();
+        assert_eq!(declared.outcome, Outcome::Then);
+        let receipt = serving.transact_local(write(17, vec![Op::Put {
                 branch: MAIN_BRANCH.into(),
-                table: TableRef::new("public", "docs"),
+                table,
                 if_absent: false,
                 rows: vec![Row {
                     id: EntityId::Integer(1),
-                    valid: None,
+                    valid: Some(Interval::ALL.into()),
                     custody_group: None,
                     protected_columns: vec![],
                     custody_payload: None,
-                    cells: rtdb_types::StructFields::from([("value".into(), Cell::Value(rtdb_types::Value::I64(1)))]),
+                    cells: rtdb_types::StructFields::from([("embedding".into(), Cell::Value(rtdb_types::Value::list(vec![
+                        rtdb_types::Value::F32(1.0), rtdb_types::Value::F32(0.0),
+                    ])))]),
                 }],
-            }],
-        }).await.unwrap();
+            }]), None).await.unwrap();
         assert_eq!(receipt.outcome, Outcome::Then);
-        let build = database.ranked_build().unwrap().unwrap();
-        let database = Arc::new(tokio::sync::Mutex::new(database));
-        let pipeline = WritePipeline::start(database.clone());
-        let memory = MemoryBudget::new(32 << 20);
-        pipeline.publish_ranked_catalog(build, vec![1], vec![Bytes::from_static(b"index")], memory.clone()).await.unwrap();
-        let cut = database.lock().await.fresh_index().await.unwrap().head();
-        let publication = database.lock().await.ranked_publication(cut).unwrap();
-        assert_eq!(publication.open(&memory).await.unwrap().files[0].0.as_ref(), b"index");
-        let archive = database.lock().await.portable_backup().await.unwrap();
+        assert!(serving.maintenance_schedule().await.ranked_due.is_some());
+        serving.maintain_ranked_catalog(&CancellationToken::new()).await.unwrap();
+        assert!(serving.maintenance_schedule().await.ranked_due.is_none());
+        let archive = serving.portable_backup().await.unwrap();
         let verified = PortableBackup::verify(&archive.into_bytes(), keys).await.unwrap();
         assert_eq!(verified.source_basis(), receipt.basis);
         assert_eq!(verified.source_receipt(&[17; 16]).await.unwrap().basis, receipt.basis);
-        pipeline.shutdown().await.unwrap();
-        drop(pipeline);
-        drop(database);
+        serving.shutdown_writer().await.unwrap();
+        drop(serving);
         io.close_and_wait().await;
         keepers.shutdown().await.unwrap();
 
