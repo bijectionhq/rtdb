@@ -1145,6 +1145,12 @@ fn emit_result_column<'a>(
     if let Some((array, scratch)) = crate::columnar::float_vector::relayout(column, batch.len, layout, memory)? {
         return Ok((array, scratch, ResultArrayFunding::Copy));
     }
+    // The full writer still determines error order and reports original row positions.
+    if let Column::Selected(selected) = column
+        && let Ok(Some((array, scratch))) = selected.copy_mixed_result(column, logical, layout, memory)
+    {
+        return Ok((array, scratch, ResultArrayFunding::Copy));
+    }
     let (array, scratch) = rtdb_columnar::copy_evaluated_cells(logical, batch.len, memory,
         |row| column.bound(row), |row| column.value(row))?;
     Ok((array, scratch, ResultArrayFunding::Copy))
@@ -1698,6 +1704,64 @@ mod tests {
         assert_eq!(texts.iter().collect::<Vec<_>>(), [Some("second"), None, Some("first"), Some("second")]);
         drop(values);
         assert_eq!(output_memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn result_conformance_copies_only_declined_cells_in_a_mixed_union() -> Result<()> {
+        use crate::columnar::{Column, ColumnBatch, SelectedColumn, relayout_output};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let unsigned = LogicalType::Scalar(ScalarType::U64);
+        let target = text.join(&LogicalType::Scalar(ScalarType::I64));
+        let field = to_field("v", &target)?;
+        let text_values = [Value::Utf8("first".into()), Value::Utf8("last".into())];
+        let column = Column::Selected(SelectedColumn::new(vec![
+            Some((copy_array(&text, &text_values)?, Arc::new(to_field("v", &text)?), Some(text), None)),
+            Some((Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX])), Arc::new(to_field("v", &unsigned)?), Some(unsigned), None)),
+            Some((copy_array(&target, &[Value::I64(12)])?, Arc::new(field.clone()), Some(target.clone()), None)),
+        ], Arc::new(vec![(0, 1), (1, 0), (2, 0), (0, 0)])));
+        assert!(relayout_output(&column, &target, &field, &memory)?.is_none());
+        let Column::Selected(selected) = &column else { unreachable!() };
+        let (array, scratch) = selected.copy_mixed_result(&column, &target, &field, &memory)?.unwrap();
+        assert_eq!(array.data_type(), field.data_type());
+        let read = |row| rtdb_columnar::read_value(&field, array.as_ref(), row);
+        assert_eq!([read(0)?, read(1)?, read(2)?, read(3)?], [text_values[1].clone(), Value::I64(-1), Value::I64(12), text_values[0].clone()]);
+        drop((array, scratch));
+
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: target,
+        }])?;
+        let page = ColumnBatch::settled(vec![column], 4, memory.reserve(0)?)?;
+        let output = column_batch(&schema, &memory, page)?;
+        assert_eq!(output.batch().schema_ref().field(0), &field);
+        drop(output);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_result_reports_the_original_position_of_a_declined_cell() -> Result<()> {
+        use crate::columnar::{Column, ColumnBatch, SelectedColumn};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let unsigned = LogicalType::Scalar(ScalarType::U32);
+        let target = text.join(&LogicalType::Scalar(ScalarType::I64));
+        let column = Column::Selected(SelectedColumn::new(vec![
+            Some((copy_array(&text, &[Value::Utf8("supported".into())])?, Arc::new(to_field("v", &text)?), Some(text), None)),
+            Some((Arc::new(arrow_array::UInt32Array::from(vec![u32::MAX])), Arc::new(to_field("v", &unsigned)?), Some(unsigned), None)),
+        ], Arc::new(vec![(0, 0), (1, 0)])));
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: target.clone(),
+        }])?;
+        let expected = copy_array(&target, &[Value::Utf8("supported".into()), Value::I32(-1)]).unwrap_err();
+        let page = ColumnBatch::settled(vec![column], 2, memory.reserve(0)?)?;
+        assert_eq!(column_batch(&schema, &memory, page).unwrap_err(), expected);
+        assert_eq!(memory.used_bytes(), 0);
         Ok(())
     }
 

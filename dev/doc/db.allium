@@ -2424,9 +2424,11 @@ surface QueryAccess {
         -- Direct outputs from those scans and from prepacked literal pages retain compatible scalar Arrow buffers.
         -- The table block files relation validates its persisted schema types even when the projection omits their rendered forms.
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
-        -- Transaction metadata projection selects compatible receipt or original event payloads by Arrow position and keeps their backing charged while the selection is held.
+        -- Transaction metadata projection preserves receipt precedence and retains Arrow positions from receipt and original event payloads in the same selection.
+        -- Those positions keep their backing charged while the selection is held.
         -- A plain unsigned integer metadata column can share its buffers through a signed Arrow view of the same width and nullability.
-        -- A transaction metadata projection requiring value reads owns its decoded results under a separate charge.
+        -- A compatible row-backed metadata cell is packed under its own charge alongside the retained positions.
+        -- A transaction metadata projection that requires an owned value representation keeps its decoded results charged.
         -- Archive history and owned event projections write resolved transaction bounds, physical timestamps and assertion coordinates into typed Arrow columns.
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- COALESCE over compatible selected or mixed-layout scalar columns retains the first non-null cell by Arrow position and keeps its source charged.
@@ -2668,6 +2670,7 @@ surface QueryAccess {
         -- Cursor output gathers selected floating-point components and compatible interpreted fields into their declared Arrow layouts.
         -- A sparse result selection can compact source rows before aligning their Arrow layouts.
         -- A declared plain scalar result can gather compatible active union cells and nulls from mixed Arrow selections.
+        -- A mixed result can gather compatible cells from their Arrow positions while adapting the other cells to the same declared layout.
         -- Struct and collection output align selected child fields by position and preserve their validity.
         -- Compatible packed component unions retain the numeric tags and stored bits of selected masked children.
         -- A selected vector component must belong to an admitted width in the declared output field.

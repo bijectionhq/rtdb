@@ -3550,6 +3550,63 @@ pub(crate) fn relayout_spatial_probe_output(
 }
 
 impl SelectedColumn {
+    pub(crate) fn copy_mixed_result(&self, column: &Column, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>)
+        -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
+        let base = self.cells.len().checked_mul(192).and_then(|bytes| bytes.checked_add(field.size().checked_mul(8)?))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let mut scratch = memory.reserve(base)?;
+        let mut arrays = Vec::new();
+        let mut inputs = HashMap::new();
+        let mut picks = Vec::with_capacity(self.cells.len());
+        let mut declined = Vec::new();
+        let mut widen = Vec::new();
+        let mut bytes = base;
+        for (row, (source, offset)) in self.cells.iter().enumerate() {
+            let vector = self.sources[source].as_ref();
+            let direct = vector.and_then(|(array, source, logical, _)| {
+                exact_result_cell(rtdb_columnar::ArrowCell { array: array.as_ref(), field: source, row: offset }, logical.as_ref(), target, field, memory)
+            });
+            if let Some(cell) = direct {
+                let source = *inputs.entry(std::ptr::from_ref(cell.array).addr()).or_insert_with(|| {
+                    arrays.push(cell.array);
+                    arrays.len() + 1
+                });
+                let size = rtdb_columnar::estimate_copy_cell_bytes(field, cell.array, cell.row)?;
+                bytes = size.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)?;
+                picks.push((source, cell.row));
+            } else if matches!(target, LogicalType::Union(_)) && vector.is_some_and(|(_, field, logical, _)| {
+                logical.as_ref().is_some_and(|logical| plain_scalar(logical).is_some_and(copyable)
+                    && stable_read_layout(logical, field) && logical.join(target) == *target)
+            }) {
+                picks.push((1, widen.len()));
+                widen.push((source, offset));
+            } else {
+                picks.push((0, declined.len()));
+                declined.push(row);
+            }
+        }
+        if (arrays.is_empty() && widen.is_empty()) || declined.is_empty() { return Ok(None); }
+
+        let widened = if widen.is_empty() { None } else {
+            let selected = Self { sources: Arc::clone(&self.sources), cells: SelectedRows::Picks(Arc::new(widen)) };
+            let Some(output) = selected.relayout(target, field, memory, true)? else { return Ok(None); };
+            Some(output)
+        };
+        let (adapted, _adapted_charge) = rtdb_columnar::copy_evaluated_cells(target, declined.len(), memory,
+            |row| column.bound(declined[row]), |row| column.value(declined[row]))?;
+        let widened_array = widened.as_ref().map_or(adapted.as_ref(), |(array, _)| array.as_ref());
+        for array in std::iter::once(adapted.as_ref()).chain(widened.as_ref().map(|(array, _)| array.as_ref())) {
+            for row in 0..array.len() {
+                let size = rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?;
+                bytes = size.checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(size_error)?;
+            }
+        }
+        let arrays = [adapted.as_ref(), widened_array].into_iter().chain(arrays).collect::<Vec<_>>();
+        Arc::get_mut(&mut scratch).expect("Mixed selection owns its scratch").grow_to(bytes)?;
+        let array = copy_selected_cells(&arrays, &picks)?;
+        Ok(Some((array, scratch)))
+    }
+
     fn relayout_result(&self, target: &LogicalType, field: &ArrowField, memory: &Arc<MemoryBudget>, compact_sources: bool)
         -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
         if let Some(output) = self.relayout(target, field, memory, compact_sources)? {
@@ -3696,6 +3753,26 @@ impl SelectedColumn {
         if !target.nullable() && array.logical_null_count() != 0 { return Ok(None); }
         Ok(Some((array, scratch)))
     }
+}
+
+fn exact_result_cell<'a>(cell: rtdb_columnar::ArrowCell<'a>, logical: Option<&LogicalType>, target: &LogicalType,
+    field: &ArrowField, memory: &Arc<MemoryBudget>) -> Option<rtdb_columnar::ArrowCell<'a>> {
+    let scalar = plain_scalar(target).is_some_and(copyable);
+    let (selected, actual) = if scalar {
+        cell.logical_position(logical).ok()?
+    } else {
+        (cell, logical.cloned().or_else(|| rtdb_columnar::from_field(cell.field).ok())?)
+    };
+    let exact = selected.field.data_type() == field.data_type() && selected.field.metadata() == field.metadata()
+        && selected.array.data_type() == field.data_type() && selected.row < selected.array.len()
+        && actual != LogicalType::Nothing && stable_read_layout(&actual, selected.field)
+        && (actual == *target || actual.clone().maybe() == *target
+            || plain_scalar(&actual).is_some_and(|actual| plain_scalar(target) == Some(actual)));
+    if !exact || (!target.nullable() && selected.array.is_null(selected.row)) {
+        return None;
+    }
+    if !scalar { admit_cell_read(selected.field, selected.array, Some(&actual), selected.row, memory).ok()?; }
+    Some(selected)
 }
 
 pub(crate) fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> bool {
