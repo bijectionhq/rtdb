@@ -119,6 +119,36 @@ fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
     assert_eq!((receipt.basis, receipt.outcome), (basis(4), Outcome::Then));
 }
 
+/// In shared main a classic transaction becomes the branch index head, stamped by XTDB's rule: one tick
+/// past a stalled predecessor, or at a supplied time ahead of the writer's clock. The next store append
+/// follows it one tick later instead of faulting as a clock regression.
+#[test]
+fn a_store_append_follows_a_classic_head_stamped_past_its_clock() {
+    let mut state = TransactState::new(INCARNATION);
+    let write = |n: u8| StoreWrite { key: vec![0, 1, b'p', n], value: Some(vec![n]), key_stamp: None, value_stamp: None };
+    let classic = |state: &mut TransactState, position: u64, time: i64| {
+        let mut index = state.index().clone();
+        index.advance_classic(BranchCut { basis: basis(position), system_time: Timestamp(time) }).unwrap();
+        state.replace_applied_index(index).unwrap();
+    };
+    // A classic transaction that stepped one tick past its predecessor at 100.
+    classic(&mut state, 1, 101);
+    let first = plan(&state, &store_append(1, 0, Vec::new(), vec![write(1)], Window::default()), 2, 100, DEFAULT);
+    let receipt = apply(&mut state, 2, first.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.system_time, receipt.outcome), (basis(2), Timestamp(102), Outcome::Then));
+    // A classic transaction at a supplied time far ahead of the clock, then a write-free append and a commit.
+    classic(&mut state, 3, 5_000);
+    let validated = plan(&state, &store_append(2, 3, vec![KeyRange { start: vec![0, 1, b'p'], end: None }], Vec::new(), Window::default()), 4, 200, DEFAULT);
+    let receipt = apply(&mut state, 4, validated.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.system_time, receipt.outcome), (basis(4), Timestamp(5_001), Outcome::Then));
+    let committed = plan(&state, &store_append(3, 0, Vec::new(), vec![write(3)], Window::default()), 5, 201, DEFAULT);
+    let receipt = apply(&mut state, 5, committed.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.system_time, receipt.outcome), (basis(5), Timestamp(5_002), Outcome::Then));
+    // The window is judged at the smoothed time, as the commit is stamped at it.
+    let closed = Window { not_before: None, before: Some(Timestamp(5_003)) };
+    assert_eq!(refused(&state, &store_append(4, 0, Vec::new(), vec![write(4)], closed), 6, 300), STORE_OUTSIDE_LATE);
+}
+
 /// The SHA-256 of Bijection's `crates/fact_store/src/persistence/judge.rs`.
 /// Bijection's `fact_store` pins the same digest of its own copy
 /// (`persistence::tests::the_store_judge_matches_rtdbs_vendored_copy`), so a
