@@ -511,47 +511,55 @@ The scalar interpreter implements operations and layouts that require cell-wise 
 **What differs.**
 Upstream XTDB runs Clojure zipper rewrites (`logical_plan.clj`, `rewrite.clj`) and formats `EXPLAIN` from those plans.
 RTDB implements its own Rust optimizer (`optimize.rs`, `optimize/decorrelate.rs`), so `EXPLAIN` text and plan structure can differ from XTDB's.
-RTDB ports XTDB's decorrelation rules (rules 1–4, 8, 9, `apply-table-col->unnest`, `select-mark-join->semi-join`, and the push-down rules) with deliberate exceptions:
-- RTDB lifts a correlated selection above an unnest whose list reads no bound parameter (preserving the same rows), which XTDB does not;
-- RTDB does not lift correlated selections from the null-supplying side of an outer join;
-- ungrouped collecting/ordered aggregates under scalar/single/inner/left applies, parameterized percentile fractions, volatile dependent plans, and `PULL`/`PULL_MANY` keep their per-row apply.
+RTDB ports XTDB's decorrelation rules 1–4, 8, and 9, `apply-table-col->unnest`, `select-mark-join->semi-join`, and the pushdown rules.
+RTDB can also lift a correlated selection above an unnest whose list reads no bound parameter when the rewrite preserves reached evaluation.
+For bounded fixed-width literal inputs, RTDB can lift an equality from the null-supplying side of a dependent outer join whose preserved side has one row.
+Bounded literal inputs can also collect `ARRAY_AGG` or `VEC_AGG` once per directly captured signed 64-bit equality key.
+Eligible `PULL` and `PULL_MANY` plans replay completed results within the current outer page for repeated snapshot scan keys or lexical references.
+Other correlated outer-join and collecting shapes, parameterized percentile fractions, and volatile dependent plans retain the per-row path.
 
-For a filtered left lateral `UNNEST` over eligible `VALUES` inputs, RTDB can use a total outer-row predicate to decide whether to expand a captured list of booleans or signed integers.
-A rejected, null, or empty list yields one null-extended row.
-Each element of an accepted list keeps its original ordinality, including a real null element.
-Element-dependent and ordinal-dependent filters keep their per-row `Apply`.
-The same fallback preserves validation and projection errors for scans, raw Arrow pages, and computed outer projections.
+Filtered left lateral `UNNEST` can batch directly captured lists of booleans or signed integers from eligible literal, Arrow, and scan pages.
+Supported total predicates can read captured outer columns, the element, and its original one-based ordinal.
+Each surviving candidate retains its original position, including a surviving null element.
+Each parent with a null list, an empty list, or no surviving candidates yields one null-extended row.
+The batch path validates each reached input page and uses the dependent `Apply` for incompatible layouts, fallible predicates, and fallible bindings.
 
 **Why.**
 The Rust optimizer targets semantic equivalence and safe decorrelation without replicating Clojure's internal zipper AST verbatim.
 
 **What a user sees.**
 Query results match XTDB, while `EXPLAIN` plans and the row order of unordered queries can differ.
-Correlated shapes on the remaining per-row apply list execute once per outer row.
+The per-row fallback opens the dependent plan for each reached outer row.
 
 **Where in the code.**
 - `RC/query/src/optimize.rs`
 - `RC/query/src/optimize/decorrelate.rs`
 - `RC/query/README.adoc`
 
-### 4.4 Plan caching without a global SQL parse or emit cache
+### 4.4 Bounded SQL syntax and plan reuse
 
 **What differs.**
-Upstream XTDB maintains a 4,096-entry SQL parse cache, a 4,096-entry plan cache, per-plan emit caches, and a DML skeleton cache.
-RTDB caches plans per prepared statement (`CachedPlan`, LRU of 4 parameter-type signatures), shares read plans across sessions in `SharedPlans` (128 plans within 1/64 of execution memory, capped at 16 MiB, excluding DML and `EXPLAIN`), and reuses prepared mutations across argument rows in `MutationPlans`.
-Plan reuse checks catalog dependencies and the recorded join estimates.
-Parsing is scoped to statement preparation.
+Upstream XTDB maintains separate 4,096-entry single and multi-statement SQL parse caches, a 4,096-entry plan cache, per-plan emit caches, and a DML skeleton cache.
+Each RTDB node shares up to 128 read plans and up to 128 resolved read syntax entries across its sessions.
+The overall cache limit is 1/64 of execution memory, capped at 16 MiB, and syntax has one eighth of that ceiling.
+Syntax reuse requires eligible complete read SQL with identical source text and retains the original diagnostic coordinates and parameter positions.
+Plan reuse checks planning options, catalog dependencies, and recorded join estimates.
+Prepared queries also retain up to four compiled parameter-type signatures.
+An eligible prepared `INSERT` or `PATCH` can retain one charged static submission plan for matching positional types, target database, submission options, and effective time zone.
+Every submission evaluates its own rows and temporal bounds through the existing materializer.
 
 **Why.**
-Bounded caches charge retained plans to execution memory.
+Bounded caches charge retained syntax and plans to execution memory.
 
 **What a user sees.**
-Repeated preparations can reuse read plans when their dependencies and estimates still agree with the current snapshot.
+Repeated preparations can reuse read syntax and plans while keeping source coordinates and checking the current catalog and join estimates.
+Matching prepared writes reuse planning work and preserve the ordinary submission encoding and retry digest.
 
 **Where in the code.**
 - `RC/node/src/statement.rs`
 - `RC/query/src/shared_plans.rs`
 - `RC/query/src/compiled.rs`
+- `RC/tx/src/submission.rs` (`PreparedDml`)
 - `RC/tx/src/resolver.rs` (`MutationPlans`)
 
 ### 4.5 Scan accelerators: UUID `_id` ranges, IID-ordered `LIMIT`, and top-k sort
@@ -566,7 +574,9 @@ For general sorts with `LIMIT <= 12_800` (`top_k_rows`), RTDB uses an in-memory 
 UUID keys already preserve order in the hash trie's IID space, allowing range scans and ordered limits to skip unrelated trie leaves without an extra index.
 
 **What a user sees.**
-UUID range queries, `ORDER BY _id LIMIT n` over UUID tables, and small top-k queries read fewer pages and run faster than on XTDB, while returning the same rows.
+Eligible UUID range queries can skip leaves outside the range.
+The IID-ordered limit can stop as soon as it produces the requested rows.
+Small top-k sorts retain a bounded set of candidate rows.
 
 **Where in the code.**
 - `RC/query/src/scan.rs` (`id_interval`, `iid_ordered_input`)
@@ -605,7 +615,9 @@ RTDB implements several core engine internals differently from XTDB while preser
   RTDB's trie catalog shares immutable table and block maps across catalog versions.
 - **Scan merge and temporal resolution.** `PartitionScan` runs a heap-based merge across event sources.
   Eligible Classic point scans track the valid-time gap around the point and seek to the next IID once the result is settled.
-  Eligible range predicates run before payload gathering, and historical cuts that require full bounds use the polygon resolver.
+  Eligible total Arrow predicates run after temporal resolution and before payload gathering in ordinary scans and delegated readers.
+  Reached persisted pages still follow the same read and IPC decode path.
+  Historical cuts that require full bounds use the polygon resolver.
 - **Metadata pruning.** Leaf statistics are decoded as the scan visits each leaf.
   Byte equality probes use a validated borrowed view of standard serialized Roaring blooms.
   Other encodings go through the checked bitmap decoder.
