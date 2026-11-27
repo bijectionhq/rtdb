@@ -200,6 +200,11 @@ surface StatelessDatabase {
         -- Read, Watch and Rank return UNAUTHENTICATED on an admitted route when the Store bearer is unknown or expired, so the caller can start a new handshake.
         -- Each store action on a listener with a linked release requires the session established by that agreement.
 
+    @guarantee StoreRangeBatch
+        -- A Store Read and each range batch in Store Rank return one page per requested range at one version of the admitted incarnation.
+        -- An exact request uses its requested version.
+        -- An empty range result carries its page's version.
+
     @guarantee StoreStorageSizes
         -- An installation-wide database read grant admits StorageSizes for the current store incarnation.
         -- StorageSizes returns a complete byte balance for one retained version, grouped by structural key family and opaque tablet.

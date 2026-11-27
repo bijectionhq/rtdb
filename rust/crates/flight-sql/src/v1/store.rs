@@ -93,8 +93,8 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
                 let after = read.after.clone().filter(|after| range.contains(after));
                 StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false }
             });
-            let pages = self.service.read_store_batch(self.driver, &mut reads, at, self.now, self.cancellation).await?;
-            let at = store_read::store::Version(pages.last().map_or(0, |page| page.cut.basis.position()));
+            let (basis, pages) = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation).await?;
+            let at = store_read::store::Version(basis.position());
             let pages = pages.into_iter().map(|page| store_read::source::RangePage {
                 entries: page.entries.into_iter().map(|entry| store_read::store::Entry {
                     key: entry.key,
@@ -140,6 +140,21 @@ fn reads_within(scope: Option<&StoreScope>, ranges: &[KeyRange]) -> Result<(), S
 
 fn incarnation(bytes: &[u8]) -> Result<[u8; 16], Status> {
     bytes.try_into().map_err(|_| error::incorrect("A store incarnation has 16 bytes"))
+}
+
+fn read_batch_basis(at: At, incarnation: [u8; 16], expected_pages: usize, pages: &[StorePage]) -> Result<Basis, Status> {
+    let first = pages.first().filter(|_| pages.len() == expected_pages)
+        .ok_or_else(|| Status::internal("A Store read must return one page per range in a nonempty batch"))?;
+    let basis = first.cut.basis;
+    if pages.iter().any(|page| page.cut.basis.incarnation() != incarnation) {
+        return Err(Status::failed_precondition("The store incarnation changed"));
+    }
+    if matches!(at, At::Exactly(expected) if basis != expected)
+        || pages.iter().any(|page| page.cut.basis != basis)
+    {
+        return Err(Status::internal("A Store read must return every page at the selected version"));
+    }
+    Ok(basis)
 }
 
 impl Service {
@@ -191,21 +206,26 @@ impl Service {
 
     async fn read_store_batch(
         &self, driver: &dyn rtdb_node::serving::ServingDriver,
-        reads: &mut (dyn ExactSizeIterator<Item = StoreRead> + Send), at: At, now: Timestamp,
+        reads: &mut (dyn ExactSizeIterator<Item = StoreRead> + Send), at: At, incarnation: [u8; 16], now: Timestamp,
         cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<StorePage>, Status> {
+    ) -> Result<(Basis, Vec<StorePage>), Status> {
+        let expected_pages = reads.len();
         #[cfg(feature = "multi")]
-        if let Some(follower) = self.follower() {
-            let mut at = at;
-            let mut pages = Vec::with_capacity(reads.len());
+        let pages = if let Some(follower) = self.follower() {
+            let mut page_at = at;
+            let mut pages = Vec::with_capacity(expected_pages);
             for read in reads {
-                let page = follower.reader.read_store(read, at, now, cancellation).await.map_err(error::follower)?;
-                at = At::Exactly(page.cut.basis);
+                let page = follower.reader.read_store(read, page_at, now, cancellation).await.map_err(error::follower)?;
+                page_at = At::Exactly(page.cut.basis);
                 pages.push(page);
             }
-            return Ok(pages);
-        }
-        driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)
+            pages
+        } else {
+            driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?
+        };
+        #[cfg(not(feature = "multi"))]
+        let pages = driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?;
+        Ok((read_batch_basis(at, incarnation, expected_pages, &pages)?, pages))
     }
 
     async fn store_read(&self, call: &Call, request: proto::ReadRequest) -> Result<Vec<u8>, Status> {
@@ -237,8 +257,7 @@ impl Service {
             StoreRead { range, after, limit, projection, filter: filter.clone(), reverse: request.reverse }
         });
         let clock = self.0.node.now();
-        let pages = self.read_store_batch(driver, &mut reads, at, clock, &call.cancellation).await?;
-        let at = pages.last().map_or(0, |page| page.cut.basis.position());
+        let (basis, pages) = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation).await?;
         let pages = pages.into_iter().map(|page| proto::RangePage {
             entries: page.entries.into_iter().map(|entry| proto::Entry {
                 key: entry.key, value: entry.value, written: entry.written.position(),
@@ -248,7 +267,7 @@ impl Service {
         self.check_attachment(call, &database)?;
         Ok(proto::ReadReply {
             incarnation: incarnation.to_vec(),
-            at,
+            at: basis.position(),
             pages,
             clock_micros: Some(clock.0),
         }.encode_to_vec())
@@ -436,6 +455,45 @@ mod rank_tests {
         for pin in store_read::rank::PINS.lines() {
             let (name, version) = pin.split_once('=').expect("a pin is name=version");
             assert!(lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")), "{name} {version} is not locked");
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_batch_tests {
+    use super::*;
+    use rtdb_index::branches::BranchCut;
+    use tonic::Code;
+
+    const INCARNATION: [u8; 16] = [7; 16];
+
+    fn page(basis: Basis) -> StorePage {
+        StorePage { cut: BranchCut { basis, system_time: Timestamp(0) }, entries: Vec::new(), resume: None }
+    }
+
+    #[test]
+    fn empty_range_pages_can_carry_version_zero() {
+        let basis = Basis::new(INCARNATION, 0);
+        let pages = [page(basis), page(basis)];
+        for at in [At::Latest, At::Exactly(basis)] {
+            assert_eq!(read_batch_basis(at, INCARNATION, 2, &pages).unwrap(), basis);
+        }
+    }
+
+    #[test]
+    fn read_batches_refuse_missing_ranges_and_inconsistent_bases() {
+        let basis = Basis::new(INCARNATION, 3);
+        let later = Basis::new(INCARNATION, 4);
+        let foreign = Basis::new([8; 16], 3);
+        for (at, expected_pages, pages, code) in [
+            (At::Latest, 1, vec![], Code::Internal),
+            (At::Latest, 2, vec![page(basis)], Code::Internal),
+            (At::Latest, 1, vec![page(basis), page(basis)], Code::Internal),
+            (At::Latest, 2, vec![page(basis), page(later)], Code::Internal),
+            (At::Exactly(basis), 1, vec![page(later)], Code::Internal),
+            (At::Latest, 2, vec![page(basis), page(foreign)], Code::FailedPrecondition),
+        ] {
+            assert_eq!(read_batch_basis(at, INCARNATION, expected_pages, &pages).unwrap_err().code(), code);
         }
     }
 }
