@@ -15,7 +15,7 @@ pub(crate) mod window;
 use std::{borrow::Borrow, collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, ListArray, MapArray, NullArray, StringArray, StructArray, UnionArray,
     builder::{BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder},
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
@@ -4763,11 +4763,11 @@ mod tests {
         ], Expr::Literal(Value::Null)));
         let double_type = LogicalType::Scalar(ScalarType::F64).maybe();
         for expression in [&doubles, &floored] {
-            assert!(matches!(ProjectionValues::new(expression, &double_type, len), ProjectionValues::F64(_)));
+            assert!(matches!(ProjectionValues::new(expression, &double_type, len, None), ProjectionValues::F64(_)));
         }
         let truth = Expr::Unary { op: UnaryOp::IsTrue, expr: Box::new(case(vec![(0, Expr::Literal(Value::Bool(true)))], Expr::Literal(Value::Null))) };
         let bool_type = LogicalType::Scalar(ScalarType::Bool);
-        assert!(matches!(ProjectionValues::new(&truth, &bool_type, len), ProjectionValues::Bool(_)));
+        assert!(matches!(ProjectionValues::new(&truth, &bool_type, len, None), ProjectionValues::Bool(_)));
         let single_nan = f32::from_bits(0x7fc0_0042);
         let singles = case(vec![
             (0, cast("-0.0", ScalarType::F32)),
@@ -4776,7 +4776,7 @@ mod tests {
         ], Expr::Literal(Value::Null));
         let single_nulls = case(vec![(3, cast("unreached real", ScalarType::F32))], Expr::Literal(Value::Null));
         let single_type = LogicalType::Scalar(ScalarType::F32).maybe();
-        assert!(matches!(ProjectionValues::new(&singles, &single_type, len), ProjectionValues::F32(_)));
+        assert!(matches!(ProjectionValues::new(&singles, &single_type, len, None), ProjectionValues::F32(_)));
         let integers = Expr::Case {
             branches: vec![(
                 Expr::binary(BinaryOp::Eq, selector.clone(), Expr::Literal(Value::I64(0))),
@@ -4864,7 +4864,7 @@ mod tests {
             ], Expr::Literal(Value::Null));
             let ty = LogicalType::Scalar(scalar.clone()).maybe();
             assert!(matches!(
-                ProjectionValues::new(&expression, &ty, len),
+                ProjectionValues::new(&expression, &ty, len, None),
                 ProjectionValues::Bool(_) | ProjectionValues::I8(_) | ProjectionValues::I16(_) | ProjectionValues::I32(_),
             ));
             let nulls = case(vec![(3, cast("unreached cast", scalar))], Expr::Literal(Value::Null));
@@ -4888,7 +4888,7 @@ mod tests {
 
         let mismatched = case(vec![(0, Expr::Literal(Value::Bool(true)))], Expr::Literal(Value::I32(1)));
         assert!(matches!(
-            ProjectionValues::new(&mismatched, &LogicalType::Scalar(ScalarType::Bool), len),
+            ProjectionValues::new(&mismatched, &LogicalType::Scalar(ScalarType::Bool), len, None),
             ProjectionValues::Dynamic(_),
         ));
 
@@ -5014,7 +5014,7 @@ mod tests {
             ],
             otherwise: Box::new(literal("other")),
         };
-        assert!(matches!(ProjectionValues::new(&expression, &expression.data_type(), len), ProjectionValues::Text(_)));
+        assert!(matches!(ProjectionValues::new(&expression, &expression.data_type(), len, None), ProjectionValues::Text(_)));
         let array = Int64Array::from_iter_values((0..len).map(|row| i64::from(row % 2 == 0)));
         let batch = ColumnBatch::settled(vec![arrow(Arc::new(array), ScalarType::I64)], len, memory.reserve(0).unwrap()).unwrap();
         let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
@@ -5037,11 +5037,49 @@ mod tests {
         let page = cursor.next_batch().await.unwrap().unwrap();
         assert!(matches!(&page.columns[0], Column::Arrow { logical: Some(LogicalType::Null), .. }));
         assert!(matches!(
-            ProjectionValues::new(&literal(&"x".repeat(size_of::<Value>())), &LogicalType::Scalar(ScalarType::Utf8), len),
+            ProjectionValues::new(&literal(&"x".repeat(size_of::<Value>())), &LogicalType::Scalar(ScalarType::Utf8), len, None),
             ProjectionValues::Dynamic(_)
         ));
         let mut cursor = record_projection_cursor(batch(), Schema::default(), vec![reached_error], &memory);
         assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+    }
+
+    #[tokio::test]
+    async fn bounded_text_case_writes_reached_arrow_arms_in_row_order() {
+        let memory = MemoryBudget::new(1 << 22);
+        let len = 256;
+        let schema = Schema::new(vec![field(0, ScalarType::I64), field(1, ScalarType::Utf8)]).unwrap();
+        let expression = Expr::SimpleCase {
+            operand: Box::new(schema.fields()[0].expression()),
+            branches: vec![
+                (Expr::Literal(Value::I64(1)), schema.fields()[1].expression()),
+                (Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0))),
+                    Expr::Literal(Value::Utf8("unreached".into()))),
+            ],
+            otherwise: Box::new(Expr::Literal(Value::Utf8("other".into()))),
+        };
+        let selector = Int64Array::from_iter((0..len).map(|row| (row % 3 != 2).then_some(1)));
+        let text = StringArray::from_iter((0..len).map(|row| (row % 3 == 0).then_some("é😀")));
+        let logical = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("c1", &logical).unwrap());
+        let text = SelectedColumn::new(
+            vec![Some((Arc::new(text), field, Some(logical), Some(memory.reserve(0).unwrap())))],
+            Arc::new((0..len).map(|row| (0, row % 3)).collect()),
+        );
+        let batch = ColumnBatch::settled(vec![
+            arrow(Arc::new(selector), ScalarType::I64),
+            Column::Selected(text),
+        ], len, memory.reserve(0).unwrap()).unwrap();
+        assert!(matches!(
+            ProjectionValues::new(&expression, &expression.data_type(), len, Some((&schema, &batch))),
+            ProjectionValues::Text(_)
+        ));
+        let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [Column::Arrow { array, field, .. }] = page.columns.as_slice() else { panic!("Expected an Arrow text column"); };
+        let actual = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(field.is_nullable());
+        assert!(actual.iter().enumerate().all(|(row, value)| value == [Some("é😀"), None, Some("other")][row % 3]));
     }
 
     #[tokio::test]
@@ -5053,7 +5091,7 @@ mod tests {
             args: vec![Expr::Coalesce(vec![Expr::Literal(Value::Null), Expr::Literal(Value::Utf8("é😀".into()))])],
             return_type: LogicalType::Scalar(ScalarType::I32),
         };
-        assert!(matches!(ProjectionValues::new(&length, &length.data_type(), len), ProjectionValues::I32(_)));
+        assert!(matches!(ProjectionValues::new(&length, &length.data_type(), len, None), ProjectionValues::I32(_)));
         let batch = ColumnBatch::settled(vec![], len, memory.reserve(0).unwrap()).unwrap();
         let mut cursor = record_projection_cursor(batch, Schema::default(), vec![length], &memory);
         let page = cursor.next_batch().await.unwrap().unwrap();
@@ -6178,18 +6216,27 @@ impl BatchCursor for BatchExpressions {
             }
             lease.grow_to(retained.checked_add(value_slots).ok_or_else(size_error)?)?;
             let mut values = if primitive_bound <= value_slots {
-                ProjectionValues::new(expression, invocation.data_type(), batch.len)
+                ProjectionValues::new(expression, invocation.data_type(), batch.len, Some((&self.schema, &batch)))
             } else {
                 ProjectionValues::Dynamic(Vec::with_capacity(batch.len))
             };
             for row in 0..batch.len {
                 let input = BatchRow { batch: &batch, row, admit_dates: false };
-                let value = self.execution.evaluate_invocation_row(
-                    &scope, &invocation, rtdb_expr::ExpressionRow::Borrowed(&input),
-                ).await?;
-                // Keep the same per-row admission so a tight budget fails at the same row.
-                lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size_error)?)?;
-                values.push(value)?;
+                let input = rtdb_expr::ExpressionRow::Borrowed(&input);
+                let value = if let ProjectionValues::Text(builder) = &mut values {
+                    self.execution.evaluate_invocation_row_with_text(&scope, &invocation, input, |text| {
+                        let bytes = size_of::<Value>().checked_add(text.len()).ok_or_else(size_error)?;
+                        grow_projection_row(lease, bytes)?;
+                        builder.append_value(text);
+                        Ok(())
+                    }).await?
+                } else {
+                    Some(self.execution.evaluate_invocation_row(&scope, &invocation, input).await?)
+                };
+                if let Some(value) = value {
+                    grow_projection_row(lease, value.retained_bytes()?)?;
+                    values.push(value)?;
+                }
                 scope.reset()?;
             }
             let values = match values.finish()? {
@@ -6310,9 +6357,9 @@ enum ProjectionValues {
 }
 
 impl ProjectionValues {
-    fn new(expression: &Expr, output: &LogicalType, len: usize) -> Self {
+    fn new(expression: &Expr, output: &LogicalType, len: usize, input: Option<(&rtdb_plan::Schema, &ColumnBatch)>) -> Self {
         if plain_scalar(output) == Some(&ScalarType::Utf8)
-            && let Some(width) = literal_text_result_width(expression)
+            && let Some(width) = text_result_width(expression, input)
             && let Some(payload) = len.checked_mul(width).filter(|bytes| *bytes <= i32::MAX as usize)
             && let Some(value_slots) = len.checked_mul(size_of::<Value>())
             && len.checked_add(1).and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
@@ -6381,15 +6428,39 @@ impl ProjectionValues {
     }
 }
 
-fn literal_text_result_width(expression: &Expr) -> Option<usize> {
+fn grow_projection_row(lease: &mut MemoryReservation, bytes: usize) -> Result<()> {
+    lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)
+}
+
+fn text_result_width(expression: &Expr, input: Option<(&rtdb_plan::Schema, &ColumnBatch)>) -> Option<usize> {
     match expression {
         Expr::Literal(Value::Null) => Some(0),
         Expr::Literal(Value::Utf8(text)) => Some(text.len()),
         Expr::Case { branches, otherwise } | Expr::SimpleCase { branches, otherwise, .. } => {
             branches.iter().map(|(_, value)| value).chain([otherwise.as_ref()]).try_fold(0, |width, value| {
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || literal_text_result_width(value))
+                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || text_result_width(value, input))
                     .map(|next| width.max(next))
             })
+        }
+        Expr::Column { id, .. } => {
+            let (schema, batch) = input?;
+            let position = schema.position(*id)?;
+            let width = |array: &dyn Array, field: &ArrowField, logical: Option<&LogicalType>| {
+                if !field.metadata().is_empty() || field.data_type() != array.data_type()
+                    || !logical.is_none_or(|ty| plain_scalar(ty) == Some(&ScalarType::Utf8) && ty.nullable() == field.is_nullable())
+                {
+                    return None;
+                }
+                let array = array.as_any().downcast_ref::<StringArray>()?;
+                Some(array.value_offsets().windows(2).map(|pair| (pair[1] - pair[0]) as usize).max().unwrap_or(0))
+            };
+            match batch.columns.get(position)? {
+                Column::Arrow { array, field, logical } => width(array.as_ref(), field, logical.as_ref()),
+                Column::Selected(selected) => selected.source_layouts().try_fold(0, |max, (array, field, logical)| {
+                    width(array, field, logical).map(|next| max.max(next))
+                }),
+                Column::Values(_) => None,
+            }
         }
         _ => None,
     }

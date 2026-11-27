@@ -177,6 +177,21 @@ impl<'expr> ExpressionInvocation<'expr> {
         Ok(value)
     }
 
+    /// Writes a reached borrowed text result while its input is available, or returns the validated owned result.
+    pub async fn evaluate_projection_row_with_text(
+        &self, row: ExpressionRow<'_>, context: &EvalContext<'_>, write: impl FnOnce(&str) -> Result<()> + Send,
+    ) -> Result<Option<Value>> {
+        if !matches!(self.expression, Expr::Case { .. } | Expr::SimpleCase { .. }) {
+            return self.evaluate_projection_row_async(row, context).await.map(Some);
+        }
+        let mut value = reader::execute_with_text(self.expression, self.schema, row, context, &self.replacements, write).await?;
+        if let Some(value) = &mut value {
+            value.admit_expression_dates()?;
+            self.validate(value)?;
+        }
+        Ok(value)
+    }
+
     /// Offers a reached Arrow list and its backing to a caller that can preserve projection semantics.
     /// A declined list uses the ordinary materialization and validation of that same evaluation.
     pub async fn evaluate_projection_row_with_arrow_list<T>(

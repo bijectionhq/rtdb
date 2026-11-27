@@ -922,6 +922,19 @@ impl Execution {
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
             invocation.evaluate_projection_row_async(row,&context))).await.flatten().ok_or_else(cancelled)?
     }
+    pub(crate) async fn evaluate_invocation_row_with_text(
+        &self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>,
+        row: rtdb_expr::ExpressionRow<'_>, write: impl FnOnce(&str) -> Result<()> + Send,
+    ) -> Result<Option<Value>> {
+        self.context.check_cancelled()?;
+        scope.reserve(4096)?;
+        scope.reserve(self.outer.len.checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(outer_bindings_size)?)?;
+        let outer_rows = self.outer.expression_rows();
+        let inputs = ExpressionInputs { parameters: &self.parameters, outer: &self.outer };
+        let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Lookup(&inputs), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
+        self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
+            invocation.evaluate_projection_row_with_text(row, &context, write))).await.flatten().ok_or_else(cancelled)?
+    }
     async fn evaluate_apply_argument(
         &self, scope: &rtdb_expr::EvaluationScope, invocation: &rtdb_expr::ExpressionInvocation<'_>, row: &OuterInput,
     ) -> Result<OverlayValue> {

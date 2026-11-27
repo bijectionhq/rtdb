@@ -252,8 +252,12 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
 }
 
 fn boxed<'a,T>(future: impl Future<Output=Result<T>> + Send + 'a, frame: &EvaluationFrame<'_>) -> Result<Pending<'a,T>> {
-    frame.context.reserve(std::mem::size_of_val(&future).checked_add(256).ok_or_else(overflow)?)?;
+    reserve_continuation(&future, frame)?;
     Ok(Box::pin(GrowStack(future)))
+}
+
+fn reserve_continuation(future: &impl Future, frame: &EvaluationFrame<'_>) -> Result<()> {
+    frame.context.reserve(std::mem::size_of_val(future).checked_add(256).ok_or_else(overflow)?)
 }
 
 /// Polls its future with stack to spare: each expression level nests one poll inside its parent's.
@@ -335,6 +339,26 @@ async fn execute(expr: &Expr,schema: &Schema,row: ExpressionRow<'_>,context: &Ev
     let frame = EvaluationFrame { schema,row,context,asynchronous,replacements };
     let value = evaluate(expr,&frame)?.await?;
     materialize(value,&frame)?.await
+}
+
+pub(super) async fn execute_with_text(
+    expr: &Expr, schema: &Schema, row: ExpressionRow<'_>, context: &EvalContext<'_>, replacements: &Replacements<'_>,
+    write: impl FnOnce(&str) -> Result<()> + Send,
+) -> Result<Option<Value>> {
+    use computed::Output;
+
+    let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
+    reserve_continuation(&evaluated(expr, &frame), &frame)?;
+    let output = scalar::prepare(expr, &frame)?.await?.demand_output().await?;
+    match output {
+        Output::Text(text, admission) => {
+            admission.reserve(text.len())?;
+            reserve_continuation(&materialized(scalar(Value::Null), &frame), &frame)?;
+            write(text)?;
+            Ok(None)
+        }
+        output => materialize(output.into_value()?, &frame)?.await.map(Some),
+    }
 }
 
 pub(super) async fn execute_with_arrow_list<T>(
@@ -693,7 +717,11 @@ async fn append_list_element<'a>(
 }
 
 fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Value>> {
-    boxed(async move {
+    boxed(materialized(value, frame), frame)
+}
+
+fn materialized<'a>(value: EvalValue<'a>, frame: &'a EvaluationFrame<'a>) -> impl Future<Output = Result<Value>> + Send + 'a {
+    async move {
         match value {
             EvalValue::Scalar(value) => Ok(value),
             EvalValue::Struct(fields) => {
@@ -777,7 +805,7 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                 Ok(if matches!(kind, Kind::Fixed) { Value::FixedSizeList(values) } else { Value::List(values) })
             }
         }
-    },frame)
+    }
 }
 
 fn element_target<'a>(target: Target<'a>) -> Option<Target<'a>> {
@@ -850,7 +878,11 @@ fn cast_value<'a>(value: EvalValue<'a>,target: Target<'a>,frame: &'a EvaluationF
 }
 
 fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
-    boxed(async move {
+    boxed(evaluated(expr, frame), frame)
+}
+
+fn evaluated<'a>(expr: &'a Expr, frame: &'a EvaluationFrame<'a>) -> impl Future<Output = Result<EvalValue<'a>>> + Send + 'a {
+    async move {
         if let Some(cell) = frame.arrow_input(expr) {
             let value = from_arrow(cell, frame.arrow_backing(expr, cell), frame)?;
             return if matches!(expr, Expr::Field { .. }) { box_cell(value) } else { Ok(value) };
@@ -896,7 +928,7 @@ fn evaluate<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Result<Pending
             Expr::Like { .. } => scalar::prepare(expr,frame)?.await?.demand().await,
             _ => Err(Anomaly::fault("rtdb.expr/collection-dispatch","Expression has no collection dispatch")),
         }
-    },frame)
+    }
 }
 
 async fn evaluate_scalar<'a>(expr: &Expr, frame: &'a EvaluationFrame<'a>) -> Result<EvalValue<'a>> {
