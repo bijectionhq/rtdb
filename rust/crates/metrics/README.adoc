@@ -37,6 +37,8 @@ Both usages are measured since the previous sample and normalised over every pro
 `block.upload.timer` runs from the leader's block cut to the durable append of its `BlockUploaded`, as upstream's `BlockCutter` times it.
 `xtdb.gc.tries.delete.timer` times each collected trie's data and metadata deletes, as upstream's `TrieGarbageCollector` does.
 Follower replica records are published per database from its first follower observation under upstream's `FollowerLogProcessor` names: `xtdb.replica.process.timer` (tagged `db` and `msg.type` in `ResolvedTx`, `TriesAdded`, `BlockBoundary`, `BlockUploaded`, `TriesDeleted`), `xtdb.replica.block.buffer.timer` (tagged `db`), and the `xtdb.replica.block.buffered.records` distribution summary (tagged `db`).
+Prometheus uses the reference descriptions for these families and their separate maximum gauges.
+The buffered-records summary also publishes native p50, p95 and p99 samples.
 The node provider adds upstream's `memory-cache.pinnedBytes`, `memory-cache.evictableBytes` (always zero, as upstream's `MemoryCache` registers it) and `memory-cache.freeBytes` over the cache budget, and a per-database `compactor.jobs.available` gauge.
 `query.warning` counts the queries opened from a prepared plan that carries warnings, once per open, as upstream's `xtdb.query` does.
 `memory-cache-misses` counts the reads any buffer pool on the node's cache budget sends to its store, and `record-batch-requests` counts every data-page request (cache hits and misses alike) across those pools.

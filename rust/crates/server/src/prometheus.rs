@@ -32,8 +32,7 @@ pub fn render(metrics: &[CatalogMetric], memory: &Arc<MemoryBudget>) -> Result<B
     })?;
     let mut output = ReservedText::new(bound, memory)?;
     for family in families(metrics) {
-        // Micrometer's help text for a meter without a description is a single space.
-        writeln!(&mut output, "# HELP {}  \n# TYPE {} {}", family.name, family.name, family.kind.as_str()).map_err(|_| overflow())?;
+        writeln!(&mut output, "# HELP {} {}\n# TYPE {} {}", family.name, family.help, family.name, family.kind.as_str()).map_err(|_| overflow())?;
         for (metric, part) in family.members { write_series(&mut output, &family.name, metric, part).map_err(|_| overflow())?; }
     }
     Ok(Bytes::from_owner(output))
@@ -45,7 +44,7 @@ impl Kind { fn as_str(self) -> &'static str { match self { Self::Gauge => "gauge
 /// Micrometer exports a timer or distribution summary's maximum as its own `_max` gauge family.
 #[derive(Clone, Copy)]
 enum Part { Whole, Maximum }
-struct Family<'a> { name: String, kind: Kind, members: Vec<(&'a CatalogMetric, Part)> }
+struct Family<'a> { name: String, kind: Kind, help: &'static str, members: Vec<(&'a CatalogMetric, Part)> }
 
 fn families(metrics: &[CatalogMetric]) -> Vec<Family<'_>> {
     let mut families = Families::default();
@@ -77,9 +76,19 @@ impl<'a> Families<'a> {
             Some(&position) => self.families[position].members.push((metric, part)),
             None => {
                 self.index.insert((name.clone(), kind.as_str()), self.families.len());
-                self.families.push(Family { name, kind, members: vec![(metric, part)] });
+                self.families.push(Family { name, kind, help: metric_help(metric.name()), members: vec![(metric, part)] });
             }
         }
+    }
+}
+
+fn metric_help(name: &str) -> &'static str {
+    match name {
+        "xtdb.replica.process.timer" => "Time spent processing replica log records, by message type",
+        "xtdb.replica.block.buffer.timer" => "Time the follower spends buffering records between BlockBoundary and BlockUploaded",
+        "xtdb.replica.block.buffered.records" => "Number of records buffered while a follower waits for BlockUploaded",
+        // Micrometer uses a single space when a meter has no description.
+        _ => " ",
     }
 }
 

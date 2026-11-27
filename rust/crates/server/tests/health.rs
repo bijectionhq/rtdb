@@ -135,3 +135,23 @@ fn prometheus_families_carry_help_and_type_and_group_their_series() {
     assert_eq!(text.matches("# TYPE ").count(), 4);
     assert_eq!(text.matches("# HELP ").count(), 4);
 }
+
+#[test]
+fn prometheus_describes_follower_metrics_and_their_maxima() {
+    let memory = MemoryBudget::new(1_000_000);
+    let metrics = vec![
+        CatalogMetric::Timer { name: "xtdb.replica.process.timer".into(), tags: BTreeMap::new(), count: 1, total_ns: 1e9, mean_ns: None, max_ns: Some(1_000_000_000), p75_ns: None, p95_ns: None, p99_ns: None, p999_ns: None, percentiles_ns: [1e9; 6] },
+        CatalogMetric::Timer { name: "xtdb.replica.block.buffer.timer".into(), tags: BTreeMap::new(), count: 0, total_ns: 0.0, mean_ns: None, max_ns: None, p75_ns: None, p95_ns: None, p99_ns: None, p999_ns: None, percentiles_ns: [0.0; 6] },
+        CatalogMetric::DistributionSummary { name: "xtdb.replica.block.buffered.records".into(), tags: BTreeMap::new(), unit: None, count: 1, total: 7.0, maximum: 7.0, percentiles: [7.0; 3] },
+    ];
+    let bytes = prometheus::render(&metrics, &memory).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    for (family, help) in [
+        ("xtdb_replica_process_timer_seconds", "Time spent processing replica log records, by message type"),
+        ("xtdb_replica_block_buffer_timer_seconds", "Time the follower spends buffering records between BlockBoundary and BlockUploaded"),
+        ("xtdb_replica_block_buffered_records", "Number of records buffered while a follower waits for BlockUploaded"),
+    ] {
+        assert!(text.contains(&format!("# HELP {family} {help}\n# TYPE {family} summary\n")));
+        assert!(text.contains(&format!("# HELP {family}_max {help}\n# TYPE {family}_max gauge\n")));
+    }
+}
