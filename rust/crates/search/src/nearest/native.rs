@@ -1,18 +1,19 @@
 use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
 
-use rtdb_columnar::{ArrowCell, EntityIdRef};
+use arrow_schema::DataType;
+use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget};
 use rtdb_index::branches::RankedIndexDeclaration;
 use rtdb_plan::{Binder, Catalog, Expr, QualifiedTable, Relation, Scan, Schema, TemporalFilter};
 use rtdb_query::{CandidateIids, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, FloatComponent, Interval, LogicalType, Result,
+    Anomaly, AnomalyCategory, EntityId, FloatComponent, Interval, LogicalType, NumericCell, Result,
     ScalarType, TableRef, TemporalBounds, TimeUnit, Timestamp, Value,
 };
 use rtdb_vector::{Cut, Partition, Round, Shortlist, UnitProbe, VectorDefinition};
 
 use super::{
     HeldVectorOverlay, MAX_NEAREST_FILTERS, NearestQuery, NearestWindow, identity_charge,
-    not_a_vector,
+    not_a_vector, run_vector_span,
 };
 
 pub struct NativeNearest<'a> {
@@ -214,7 +215,7 @@ impl NativeNearest<'_> {
                     array: batch.column(1).as_ref(),
                     row,
                 };
-                if let Some(distance) = score_f32(context, cell, query)? {
+                if let Some(distance) = score_f32(&context.memory, cell, query)? {
                     window.admit(0, id, distance)?;
                 }
             }
@@ -224,7 +225,7 @@ impl NativeNearest<'_> {
 }
 
 fn score_f32(
-    context: &QueryContext,
+    memory: &Arc<MemoryBudget>,
     cell: ArrowCell<'_>,
     query: &NearestQuery,
 ) -> Result<Option<f64>> {
@@ -243,13 +244,45 @@ fn score_f32(
         return score(values, range);
     }
     let bytes = rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?;
-    let _cell = context.memory.reserve(bytes.saturating_mul(2))?;
+    let _cell = memory.reserve(bytes.saturating_mul(2))?;
+    if let Some((DataType::Float32, span)) = run_vector_span(cell) {
+        return query.distance(span.iter().map(|value| match value {
+            NumericCell::F32(value) => f64::from(value),
+            _ => f64::NAN,
+        })).map_err(Anomaly::from);
+    }
     let value = rtdb_columnar::read_execution_value(cell.field, cell.array, cell.row)?;
     let (Value::List(values) | Value::FixedSizeList(values)) = &value else {
         return Err(not_a_vector());
     };
     let values = values.view();
     score(values, 0..values.len())
+}
+
+#[test]
+fn native_nearest_scores_run_encoded_f32_and_preserves_admission_and_component_errors() {
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, Int16Array, RunArray, types::Int16Type};
+    use arrow_schema::Field;
+
+    let values = RunArray::<Int16Type>::try_new(
+        &Int16Array::from(vec![1, 2, 3, 4, 5, 6]),
+        &Float32Array::from(vec![Some(3.0), Some(0.0), None, Some(1.0), Some(f32::NAN), Some(1.0)]),
+    ).unwrap();
+    let array = FixedSizeListArray::new(
+        Arc::new(Field::new("item", values.data_type().clone(), true)), 2, Arc::new(values), None,
+    );
+    let field = Field::new("vector", array.data_type().clone(), false);
+    let cell = ArrowCell { field: &field, array: &array, row: 0 };
+    let query = NearestQuery::new(vec![1.0, 0.0], Vec::new(), 1).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    assert_eq!(score_f32(&memory, cell, &query).unwrap(), Some(0.0));
+    let error = Anomaly::from(super::InvalidComponents);
+    assert_eq!(score_f32(&memory, ArrowCell { row: 1, ..cell }, &query).unwrap_err(), error);
+    assert_eq!(score_f32(&memory, ArrowCell { row: 2, ..cell }, &query).unwrap_err(), error);
+    let decode = rtdb_columnar::estimate_read_value_bytes(&field, &array, 0).unwrap().saturating_mul(2);
+    assert_eq!(score_f32(&MemoryBudget::new(decode), cell, &query).unwrap(), Some(0.0));
+    assert_eq!(score_f32(&MemoryBudget::new(decode - 1), cell, &query).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 fn finish(context: &Arc<QueryContext>, window: NearestWindow) -> Result<QueryCursor> {

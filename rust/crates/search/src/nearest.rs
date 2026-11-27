@@ -523,6 +523,20 @@ fn packed_vector_element(field: &Field) -> bool {
     }
 }
 
+fn run_vector_span(cell: ArrowCell<'_>) -> Option<(&DataType, NumericSpan<'_>)> {
+    let list = plain_vector_list(cell)?;
+    rtdb_columnar::from_field(cell.field).ok()?;
+    let (element, _, _) = list.sequence_range()?;
+    let DataType::RunEndEncoded(_, child) = element.data_type() else { return None; };
+    let ty = child.data_type();
+    if !element.metadata().is_empty() || !child.metadata().is_empty()
+        || !matches!(ty, DataType::Float32 | DataType::Float64 | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64)
+    {
+        return None;
+    }
+    Some((ty, list.numeric_list_span()?))
+}
+
 fn read_vector<'a>(cell: ArrowCell<'a>, query: &NearestQuery, fallback_memory: Option<&Arc<MemoryBudget>>)
     -> Result<Option<VectorCell<'a>>>
 {
@@ -560,6 +574,10 @@ fn read_vector<'a>(cell: ArrowCell<'a>, query: &NearestQuery, fallback_memory: O
         let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
         memory.reserve(bytes.saturating_mul(2))
     }).transpose()?;
+    if let Some((_, span)) = run_vector_span(cell) {
+        if span.iter().any(|value| matches!(value, NumericCell::Null)) { return Err(not_a_vector()); }
+        return Ok(Some(VectorCell::Numeric(span)));
+    }
     let value = rtdb_columnar::read_value(field, array, row)?;
     let list = match &value {
         Value::Null | Value::Undefined => return Ok(None),
@@ -821,6 +839,34 @@ mod tests {
         let cell = ArrowCell { field: &field, array: &array, row: 0 };
         assert!(cell.numeric_list_span().is_some());
         assert_eq!(read_vector(cell, &query(Vec::new(), 1), None).err(), Some(not_a_vector()));
+    }
+
+    #[test]
+    fn nearest_borrows_run_encoded_components_with_the_scalar_error_order() {
+        use arrow_array::{Int16Array, RunArray, types::Int16Type};
+
+        let values = RunArray::<Int16Type>::try_new(
+            &Int16Array::from(vec![2, 4, 5, 6, 7, 9, 10]),
+            &Float32Array::from(vec![Some(7.0), Some(-0.3), Some(0.125), Some(f32::NAN), None, Some(1.0), Some(f32::INFINITY)]),
+        ).unwrap();
+        let array = ListArray::new(
+            Arc::new(Field::new("item", values.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 2, 5, 7, 10].into()), Arc::new(values), None,
+        ).slice(1, 3);
+        let field = Field::new("vector", array.data_type().clone(), false);
+        let query = NearestQuery::new(vec![0.25, -0.5, 0.125], Vec::new(), 1).unwrap();
+        for row in 0..array.len() {
+            let cell = ArrowCell { field: &field, array: &array, row };
+            let Value::List(decoded) = rtdb_columnar::read_value(&field, &array, row).unwrap() else { panic!("Expected a list"); };
+            let expected = score_decoded_list(&decoded, &query);
+            let actual = read_vector(cell, &query, None).map(|vector| {
+                let vector = vector.unwrap();
+                assert!(matches!(vector, VectorCell::Numeric(_)));
+                vector.distance(&query)
+            });
+            let comparable = |result: Result<Distance>| result.map(|score| score.map(|score| score.map(f64::to_bits)).map_err(Anomaly::from));
+            assert_eq!(comparable(actual), comparable(expected));
+        }
     }
 
     #[test]

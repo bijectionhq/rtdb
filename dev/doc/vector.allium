@@ -43,6 +43,8 @@ entity ProbePlan {
 -- COSINE_DISTANCE_F32 evaluates equal-dimension float32 vectors in component order with binary64 products and sums.
 -- A zero vector has no distance, and a zero probe is invalid.
 -- A bounded exact Query can select the effective filtered corpus before ranking, including replacements and tombstones staged by the caller.
+-- Exact nearest scoring reads admitted run-end encoded signed integer and floating-point children in component order under the original cell admission.
+-- A null child in those exact reads raises the same cell error regardless of the vector's dimension or finiteness.
 -- Its total counts non-null distances before the requested window, and ties use the complete typed entity sort key.
 -- Serving lookup validates the catalog rows and retains the selected definition under its own admission.
 -- The artefact builder retains admitted definition metadata while enumerating jobs or building a generation.
@@ -107,6 +109,7 @@ entity ProbePlan {
 -- The reader requires complete persisted inventory and a covered temporal point.
 -- Each round resolves the candidate IIDs at that cut, masks stored rows by complete typed identity, and filters the surviving rows and staged replacements before applying k.
 -- The final order uses cosine distance on the original float32 components and the complete typed identity.
+-- Native verification can read run-end encoded float32 children under the original cell admission, with the same component error for null and non-finite values.
 -- A replacement with absent or zero-norm embedding still masks its stored row.
 -- The reply counts scored candidates and reports approximation when the settled shortlist leaves candidates unconsidered.
 -- An unavailable generation proof or exhausted budget refuses ranked IVF execution.
