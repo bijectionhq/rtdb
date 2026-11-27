@@ -89,6 +89,15 @@ resource "aws_vpc_security_group_ingress_rule" "original_private_replay_approval
   to_port                      = 2049
 }
 
+resource "aws_vpc_security_group_ingress_rule" "consensus_journal" {
+  count                        = local.consensus_journal == null ? 0 : 1
+  security_group_id            = local.consensus_journal.mount_target_security_group_id
+  referenced_security_group_id = aws_security_group.node.id
+  ip_protocol                  = "tcp"
+  from_port                    = 2049
+  to_port                      = 2049
+}
+
 resource "aws_vpc_security_group_egress_rule" "node" {
   security_group_id = aws_security_group.node.id
   ip_protocol       = "tcp"

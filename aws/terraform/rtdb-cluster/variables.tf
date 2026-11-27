@@ -213,9 +213,32 @@ variable "kafka_topic" {
 }
 
 variable "journal_url" {
-  description = "Multi-mode journal URL from the Logkeeper cluster's journal_url output."
+  description = "Multi-mode journal URL: a `logkeeper+tls://` URL from the Logkeeper cluster's journal_url output, or `logkeeper-consensus:///run/rtdb/journal/<file>` with `consensus_journal`. Omit it with `consensus_journal` to use its file."
   type        = string
   default     = null
+}
+
+variable "consensus_journal" {
+  description = "Optional Multi-only read-only EFS projection holding the Logkeeper consensus keeper JournalConfig JSON, mounted at /run/rtdb/journal."
+  type = object({
+    file_system_arn                = string
+    access_point_arn               = string
+    mount_target_security_group_id = string
+    file                           = optional(string, "journal.json")
+  })
+  default = null
+
+  validation {
+    condition = var.consensus_journal == null || try(
+      can(regex("^arn:[a-z0-9-]+:elasticfilesystem:[a-z0-9-]+:[0-9]{12}:file-system/fs-[0-9a-f]+$", var.consensus_journal.file_system_arn)) &&
+      can(regex("^arn:[a-z0-9-]+:elasticfilesystem:[a-z0-9-]+:[0-9]{12}:access-point/fsap-[0-9a-f]+$", var.consensus_journal.access_point_arn)) &&
+      slice(split(":", var.consensus_journal.file_system_arn), 0, 5) == slice(split(":", var.consensus_journal.access_point_arn), 0, 5) &&
+      can(regex("^sg-([a-f0-9]{8}|[a-f0-9]{17})$", var.consensus_journal.mount_target_security_group_id)) &&
+      can(regex("^[A-Za-z0-9._-]+\\.json$", var.consensus_journal.file)),
+      false
+    )
+    error_message = "The consensus journal needs a private EFS file system, a dedicated access point, its mount target security group and a plain JSON file name."
+  }
 }
 
 variable "journal_credentials" {

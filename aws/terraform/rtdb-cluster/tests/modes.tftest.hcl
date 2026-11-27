@@ -156,3 +156,115 @@ run "default_rejects_classic_candidate_ingress" {
   }
   expect_failures = [aws_ecs_task_definition.node]
 }
+
+run "multi_mounts_the_consensus_keeper_journal_file" {
+  command = plan
+  variables {
+    mode = "multi"
+    journal_credentials = {
+      "0" = {
+        ca_certificate = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:ca-Abcdef"
+        certificate    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:crt-Abcdef"
+        private_key    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:key-Abcdef"
+      }
+    }
+    journal_client_security_group_id = "sg-22222222"
+    consensus_journal = {
+      file_system_arn                = "arn:aws:elasticfilesystem:eu-north-1:123456789012:file-system/fs-0123456789abcdef0"
+      access_point_arn               = "arn:aws:elasticfilesystem:eu-north-1:123456789012:access-point/fsap-0123456789abcdef0"
+      mount_target_security_group_id = "sg-44444444"
+    }
+  }
+  assert {
+    condition = (
+      local.environment.RTDB_JOURNAL_URL == "logkeeper-consensus:///run/rtdb/journal/journal.json" &&
+      local.secrets.RTDB_JOURNAL_0_CERTIFICATE == var.journal_credentials["0"].certificate &&
+      contains(jsondecode(aws_ecs_task_definition.node.container_definitions)[0].mountPoints, {
+        sourceVolume = "consensus-journal", containerPath = "/run/rtdb/journal", readOnly = true
+      }) &&
+      aws_vpc_security_group_ingress_rule.consensus_journal[0].security_group_id == "sg-44444444" &&
+      aws_vpc_security_group_ingress_rule.consensus_journal[0].from_port == 2049 &&
+      length(aws_iam_role_policy.consensus_journal) == 1
+    )
+    error_message = "The consensus keeper JournalConfig must be mounted read-only and named by the journal URL."
+  }
+}
+
+run "multi_accepts_a_matching_consensus_journal_url" {
+  command = plan
+  variables {
+    mode        = "multi"
+    journal_url = "logkeeper-consensus:///run/rtdb/journal/keepers.json"
+    journal_credentials = {
+      "0" = {
+        ca_certificate = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:ca-Abcdef"
+        certificate    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:crt-Abcdef"
+        private_key    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:key-Abcdef"
+      }
+    }
+    journal_client_security_group_id = "sg-22222222"
+    consensus_journal = {
+      file_system_arn                = "arn:aws:elasticfilesystem:eu-north-1:123456789012:file-system/fs-0123456789abcdef0"
+      access_point_arn               = "arn:aws:elasticfilesystem:eu-north-1:123456789012:access-point/fsap-0123456789abcdef0"
+      mount_target_security_group_id = "sg-44444444"
+      file                           = "keepers.json"
+    }
+  }
+  assert {
+    condition     = local.environment.RTDB_JOURNAL_URL == var.journal_url
+    error_message = "A consensus URL naming the mounted file must pass unchanged."
+  }
+}
+
+run "multi_rejects_a_consensus_url_without_its_mounted_file" {
+  command = plan
+  variables {
+    mode        = "multi"
+    journal_url = "logkeeper-consensus:///run/rtdb/journal/journal.json"
+    journal_credentials = {
+      "0" = {
+        ca_certificate = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:ca-Abcdef"
+        certificate    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:crt-Abcdef"
+        private_key    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:key-Abcdef"
+      }
+    }
+    journal_client_security_group_id = "sg-22222222"
+  }
+  expect_failures = [aws_ecs_task_definition.node]
+}
+
+run "multi_rejects_a_consensus_url_outside_the_mount" {
+  command = plan
+  variables {
+    mode        = "multi"
+    journal_url = "logkeeper-consensus:///etc/journal.json"
+    journal_credentials = {
+      "0" = {
+        ca_certificate = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:ca-Abcdef"
+        certificate    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:crt-Abcdef"
+        private_key    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:key-Abcdef"
+      }
+    }
+    journal_client_security_group_id = "sg-22222222"
+    consensus_journal = {
+      file_system_arn                = "arn:aws:elasticfilesystem:eu-north-1:123456789012:file-system/fs-0123456789abcdef0"
+      access_point_arn               = "arn:aws:elasticfilesystem:eu-north-1:123456789012:access-point/fsap-0123456789abcdef0"
+      mount_target_security_group_id = "sg-44444444"
+    }
+  }
+  expect_failures = [aws_ecs_task_definition.node]
+}
+
+run "default_rejects_a_consensus_journal" {
+  command = plan
+  variables {
+    kafka_bootstrap = "kafka.internal:9092"
+    kafka_topic     = "rtdb"
+    consensus_journal = {
+      file_system_arn                = "arn:aws:elasticfilesystem:eu-north-1:123456789012:file-system/fs-0123456789abcdef0"
+      access_point_arn               = "arn:aws:elasticfilesystem:eu-north-1:123456789012:access-point/fsap-0123456789abcdef0"
+      mount_target_security_group_id = "sg-44444444"
+    }
+  }
+  expect_failures = [aws_ecs_task_definition.node]
+}

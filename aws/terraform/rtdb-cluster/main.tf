@@ -12,6 +12,10 @@ locals {
   native_dependent_directory = "/run/rtdb/native-dependent-custody"
   replay_approvals           = local.multi ? var.original_private_replay_approvals : null
   replay_approvals_directory = "/run/rtdb/original-private-replay"
+  consensus_journal          = local.multi ? var.consensus_journal : null
+  consensus_directory        = "/run/rtdb/journal"
+  consensus_journal_url      = local.consensus_journal == null ? null : "logkeeper-consensus://${local.consensus_directory}/${local.consensus_journal.file}"
+  journal_url                = local.consensus_journal == null ? var.journal_url : local.consensus_journal_url
   peer_discovery_host        = "node.${aws_service_discovery_private_dns_namespace.cluster.name}"
   node_ports = concat(
     [{ containerPort = local.flight_port, protocol = "tcp" }],
@@ -44,7 +48,7 @@ locals {
     RTDB_KMS_KEY            = var.kms_key
     RTDB_MEMORY_LIMIT_BYTES = "3221225472"
     }, local.multi ? {
-    RTDB_JOURNAL_URL   = var.journal_url
+    RTDB_JOURNAL_URL   = local.journal_url
     RTDB_JOURNAL_SLOTS = tostring(var.node_count)
     RTDB_KEY_DIRECTORY = "/var/lib/rtdb/keys"
     RTDB_DATABASES     = jsonencode(var.databases == null ? { xtdb = uuidv5("dns", "${var.name}.${var.bucket}.rtdb") } : var.databases)
@@ -134,6 +138,20 @@ resource "aws_ecs_task_definition" "node" {
     }
   }
   dynamic "volume" {
+    for_each = local.consensus_journal == null ? [] : [local.consensus_journal]
+    content {
+      name = "consensus-journal"
+      efs_volume_configuration {
+        file_system_id     = split("/", volume.value.file_system_arn)[1]
+        transit_encryption = "ENABLED"
+        authorization_config {
+          access_point_id = split("/", volume.value.access_point_arn)[1]
+          iam             = "ENABLED"
+        }
+      }
+    }
+  }
+  dynamic "volume" {
     for_each = local.replay_approvals == null ? [] : [local.replay_approvals]
     content {
       name = "original-private-replay"
@@ -159,6 +177,7 @@ resource "aws_ecs_task_definition" "node" {
       local.multi ? [{ sourceVolume = "keys", containerPath = "/var/lib/rtdb/keys", readOnly = false }] : [],
       local.native_dependent_custody == null ? [] : [{ sourceVolume = "native-dependent-custody", containerPath = local.native_dependent_directory, readOnly = true }],
       local.replay_approvals == null ? [] : [{ sourceVolume = "original-private-replay", containerPath = local.replay_approvals_directory, readOnly = true }],
+      local.consensus_journal == null ? [] : [{ sourceVolume = "consensus-journal", containerPath = local.consensus_directory, readOnly = true }],
     )
     stopTimeout     = 90
     portMappings    = local.node_ports
@@ -172,7 +191,10 @@ resource "aws_ecs_task_definition" "node" {
   lifecycle {
     precondition {
       condition = local.multi ? (
-        try(startswith(var.journal_url, "logkeeper+tls://"), false) && try(toset(keys(var.journal_credentials)) == toset([for slot in range(var.node_count) : tostring(slot)]), false) &&
+        (
+          local.consensus_journal == null ? try(startswith(var.journal_url, "logkeeper+tls://"), false) :
+          var.journal_url == null || var.journal_url == local.consensus_journal_url
+        ) && try(toset(keys(var.journal_credentials)) == toset([for slot in range(var.node_count) : tostring(slot)]), false) &&
         try(length(distinct([for config in values(var.journal_credentials) : config.certificate])) == var.node_count, false) &&
         var.node_count <= 8 && var.journal_client_security_group_id != null &&
         var.kafka_bootstrap == null && var.kafka_topic == null
@@ -180,7 +202,18 @@ resource "aws_ecs_task_definition" "node" {
         try(length(trimspace(var.kafka_bootstrap)) > 0, false) && try(length(trimspace(var.kafka_topic)) > 0, false) &&
         var.journal_url == null && var.journal_credentials == null && var.journal_client_security_group_id == null && var.databases == null
       )
-      error_message = "Default mode requires Kafka bootstrap and topic. Multi mode requires a Logkeeper TLS URL, one distinct journal credential per slot, at most eight nodes and a journal client security group."
+      error_message = "Default mode requires Kafka bootstrap and topic. Multi mode requires a Logkeeper TLS URL or a consensus journal file, one distinct journal credential per slot, at most eight nodes and a journal client security group."
+    }
+    precondition {
+      condition     = local.multi || var.consensus_journal == null
+      error_message = "A consensus journal requires Multi mode."
+    }
+    precondition {
+      condition = local.consensus_journal == null || try(
+        local.consensus_journal.access_point_arn != try(local.native_dependent_custody.access_point_arn, "") &&
+        local.consensus_journal.access_point_arn != try(local.replay_approvals.access_point_arn, ""), false
+      )
+      error_message = "The consensus journal needs its own EFS access point."
     }
     precondition {
       condition     = local.multi || var.multi_configuration_secret == null
@@ -253,6 +286,8 @@ resource "aws_ecs_service" "node" {
     aws_iam_role_policy.native_dependent_custody,
     aws_vpc_security_group_ingress_rule.original_private_replay_approvals,
     aws_iam_role_policy.original_private_replay_approvals,
+    aws_vpc_security_group_ingress_rule.consensus_journal,
+    aws_iam_role_policy.consensus_journal,
     aws_vpc_security_group_egress_rule.node,
     aws_iam_role_policy.objects,
     aws_iam_role_policy.secrets,

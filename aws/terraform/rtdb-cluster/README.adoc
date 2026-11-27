@@ -56,6 +56,18 @@ Configure the authentication provider that verifies the deployment administrator
 Use `deploymentCreatePrincipals` for identities that need only `CreateDeployment`, such as an assigned cell provisioning new databases.
 The ECS execution role receives read access to the selected secret and needs access to its encryption key.
 
+=== Consensus keeper journal
+
+To journal through Logkeeper's consensus keepers instead of the stream keeper, set `consensus_journal` and leave `journal_url` unset.
+The object supplies the commissioned encrypted EFS `file_system_arn`, a dedicated `access_point_arn`, the `mount_target_security_group_id` and an optional `file`, `journal.json` by default.
+Write the keepers' client `JournalConfig` JSON to that file under the access point's root, readable by UID and GID 20000.
+It lists the keepers, the catalog keeper and the placement domains, as in the Logkeeper deployment guide.
+ECS mounts the access point read-only at `/run/rtdb/journal`, and the module sets `RTDB_JOURNAL_URL` to `logkeeper-consensus:///run/rtdb/journal/<file>`.
+An explicit `journal_url` must name that same file.
+The module allows NFS from the node security group to the mount targets and grants the node role TLS-only `ClientMount` at that access point.
+Each node rereads the file every few seconds, so placement changes such as draining or retiring a keeper reach running nodes without a restart.
+The per-slot `journal_credentials` and `journal_client_security_group_id` work as for the stream keeper; admit the client group on the keepers' application port.
+
 === Private Classic recovery relay
 
 Set `classic_candidate_ingress` for a Multi deployment that is receiving a Classic history through its enrolled Original recovery service.
