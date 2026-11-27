@@ -223,51 +223,6 @@ pub fn read_tstzrange(text: &str) -> Result<Option<(i64, i64)>> {
 }
 
 
-fn read_json_legacy(text: &str) -> Result<Value> {
-    use serde_json::value::RawValue;
-    let text = text.trim();
-    Ok(match text.as_bytes().first() {
-        Some(b'n') if text == "null" => Value::Null,
-        Some(b't') if text == "true" => Value::Bool(true),
-        Some(b'f') if text == "false" => Value::Bool(false),
-        Some(b'"') => Value::Utf8(serde_json::from_str(text).map_err(invalid)?),
-        Some(b'[') => {
-            let values: Vec<&RawValue> = serde_json::from_str(text).map_err(invalid)?;
-            if let Some(list) = json_float_list(&values)? { Value::List(list) }
-            else { Value::list(values.into_iter().map(|value| read_json_legacy(value.get())).collect::<Result<_>>()?) }
-        },
-        Some(b'{') => {
-            let mut fields: BTreeMap<String, &RawValue> = serde_json::from_str(text).map_err(invalid)?;
-            let kind = fields.get("@type").and_then(|kind| serde_json::from_str::<String>(kind.get()).ok());
-            if let Some(kind) = kind {
-                let value = fields.remove("@value").ok_or_else(|| invalid("JSON-LD value requires @value"))?;
-                json_tag(&kind, value.get(), || read_json_legacy(value.get()))?
-            } else { Value::Struct(fields.into_iter().map(|(key, value)| Ok((key, read_json_legacy(value.get())?))).collect::<Result<_>>()?) }
-        }
-        _ => {
-            let _: &RawValue = serde_json::from_str(text).map_err(invalid)?;
-            json_number(text)?
-        }
-    })
-}
-fn json_float_list(values: &[&serde_json::value::RawValue]) -> Result<Option<rtdb_types::ListValue>> {
-    let is_float = |text: &str| {
-        matches!(text.as_bytes().first(), Some(b'-' | b'0'..=b'9'))
-            && (text.contains(['.', 'e', 'E']) || text.trim_start_matches('-').len() > 64)
-    };
-    if !values.iter().all(|value| value.get() == "null" || is_float(value.get()))
-        || !values.iter().any(|value| value.get() != "null")
-    {
-        return Ok(None);
-    }
-    let mut builder = arrow_array::builder::Float64Builder::with_capacity(values.len());
-    for value in values {
-        let text = value.get();
-        builder.append_option((text != "null").then(|| float(text)).transpose()?);
-    }
-    Ok(Some(rtdb_types::ListValue::from_f64(builder.finish())))
-}
-
 fn json_tag(kind: &str, raw: &str, read_set: impl FnOnce() -> Result<Value>) -> Result<Value> {
     let string = || serde_json::from_str::<String>(raw).map_err(invalid);
     Ok(match kind {

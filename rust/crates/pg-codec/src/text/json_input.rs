@@ -5,7 +5,7 @@ use rtdb_types::{ListValue, Result, Value};
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::value::RawValue;
 
-use super::{float, invalid, json_number, json_tag, read_json_legacy};
+use super::{float, invalid, json_number, json_tag};
 
 pub(super) fn read_json(text: &str) -> Result<Value> {
     let text = text.trim();
@@ -14,14 +14,11 @@ pub(super) fn read_json(text: &str) -> Result<Value> {
         offset: Cell::new(0),
     };
     let mut deserializer = serde_json::Deserializer::from_str(text);
-    match input.read(&mut deserializer).and_then(|node| {
-        deserializer.end()?;
-        Ok(node)
-    }) {
-        Ok(node) => node.into_value(),
-        // The raw decoder retains its syntax diagnostics and admits deeper nesting than serde's visitors.
-        Err(_) => read_json_legacy(text),
-    }
+    // Depth is bounded by the caller's input and stack; do not reject valid nested documents at serde's 128-level default.
+    deserializer.disable_recursion_limit();
+    let node = input.read(&mut deserializer).map_err(invalid)?;
+    deserializer.end().map_err(invalid)?;
+    node.into_value()
 }
 
 struct Input<'a> {
@@ -152,9 +149,7 @@ impl Node<'_> {
             Kind::Object(entries) => {
                 let mut fields = BTreeMap::new();
                 for (key, value) in entries {
-                    let Ok(key) = serde_json::from_str::<String>(key) else {
-                        return read_json_legacy(self.raw);
-                    };
+                    let key = serde_json::from_str::<String>(key).map_err(invalid)?;
                     fields.insert(key, value);
                 }
                 let kind = fields
@@ -199,29 +194,93 @@ fn float_list(values: &[Node<'_>]) -> Result<Option<ListValue>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, Input, Kind, Value, read_json, read_json_legacy};
+    use super::{BTreeMap, Cell, Input, Kind, Value, read_json};
 
     #[test]
-    fn json_input_matches_legacy_names_tags_numbers_and_error_order() {
-        for input in [
+    fn json_input_preserves_names_tags_numbers_and_error_order() {
+        let Value::Struct(top) = read_json(
             r#"{"b":[1.0,-0,-0.0,1e999,18446744073709551616,1234567890123456789012345678901234567890],"a":{"@type":"xt:double","@value":-0}}"#,
+        )
+        .unwrap() else {
+            panic!("expected struct");
+        };
+        let Value::F64(number) = top["a"] else { panic!() };
+        assert_eq!(number.to_bits(), (-0.0f64).to_bits());
+
+        let Value::Struct(inner) = read_json(
             r#"{"inner":[{"ke\"y":true,"x\\":null,"\u00e9":{"$serde_json::private::Number":12}}]}"#,
-            r#"{"z":{"@type":"xt:missing"},"z":{"@type":"xt:long","@value":"20"},"@type":false}"#,
-            r#"{"@type":"xt:set","@value":[1,1,null,null,{"z":true,"a":false}]}"#,
-            r#"{"@type":"xt:long","@value":"20","ignored":{"@type":"xt:missing"}}"#,
-            r#"{"@type":"xt:error","@value":{"xtdb.error/message":"no","xtdb.error/data":{"xtdb.error/code":"demo/fault","number":7,"nested":{"z":0,"a":1}}}}"#,
-            r#"{"z":{"@type":"xt:long"},"a":{"@type":"xt:missing","@value":12}}"#,
-            r#"[{"@type":"xt:missing","@value":12}, ["\ud800"]]"#,
-            r#"{"@type":"xt:long","@value":7,"ignored":{"\ud800":0}}"#,
-            r#"{"@type":"xt:timestamp","@value":[2]}"#,
-            r#"{"z":{"@type":"xt:missing","@value":12},"a":[1,]}"#,
-        ] {
-            assert_eq!(read_json(input), read_json_legacy(input), "{input}");
-        }
-        let Value::F64(number) = read_json(r#"{"@type":"xt:double","@value":-0}"#).unwrap() else {
+        )
+        .unwrap() else {
             panic!()
         };
-        assert_eq!(number.to_bits(), (-0.0f64).to_bits());
+        assert!(inner.contains_key("inner"));
+
+        // Duplicate keys keep the last value; @type=false is not a JSON-LD tag.
+        let Value::Struct(dups) = read_json(
+            r#"{"z":{"@type":"xt:missing"},"z":{"@type":"xt:long","@value":"20"},"@type":false}"#,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(dups["z"], Value::I64(20));
+        assert_eq!(dups["@type"], Value::Bool(false));
+
+        // JSON-LD set deduplicates values, and tagged values ignore sibling fields.
+        let Value::Set(items) = read_json(
+            r#"{"@type":"xt:set","@value":[1,1,null,null,{"z":true,"a":false}]}"#,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            read_json(r#"{"@type":"xt:long","@value":"20","ignored":{"@type":"xt:missing"}}"#).unwrap(),
+            Value::I64(20)
+        );
+        assert_eq!(
+            read_json(r#"{"@type":"xt:long","@value":7,"ignored":{"\ud800":0}}"#).unwrap(),
+            Value::I64(7)
+        );
+
+        let Value::Transit(_) = read_json(
+            r#"{"@type":"xt:error","@value":{"xtdb.error/message":"no","xtdb.error/data":{"xtdb.error/code":"demo/fault","number":7,"nested":{"z":0,"a":1}}}}"#,
+        )
+        .unwrap() else {
+            panic!()
+        };
+
+        // Keys convert in sorted order so "a"'s unsupported tag fails before "z"'s missing @value.
+        assert_eq!(
+            read_json(r#"{"z":{"@type":"xt:long"},"a":{"@type":"xt:missing","@value":12}}"#)
+                .unwrap_err()
+                .code,
+            "xtdb.postgres/unsupported-json-ld-value"
+        );
+        // Array elements convert in order, before later invalid string escapes.
+        assert_eq!(
+            read_json(r#"[{"@type":"xt:missing","@value":12}, ["\ud800"]]"#)
+                .unwrap_err()
+                .code,
+            "xtdb.postgres/unsupported-json-ld-value"
+        );
+        // Syntax errors fail before semantic tag conversion, and invalid object keys fail cleanly.
+        assert_eq!(
+            read_json(r#"{"z":{"@type":"xt:missing","@value":12},"a":[1,]}"#)
+                .unwrap_err()
+                .code,
+            "xtdb.postgres/invalid-column-value"
+        );
+        assert_eq!(
+            read_json(r#"{"@type":"xt:timestamp","@value":[2]}"#)
+                .unwrap_err()
+                .code,
+            "xtdb.postgres/invalid-column-value"
+        );
+        assert_eq!(
+            read_json(r#"{"\ud800":0}"#).unwrap_err().code,
+            "xtdb.postgres/invalid-column-value"
+        );
+        let _ = BTreeMap::<String, Value>::new();
     }
 
     #[test]
@@ -254,7 +313,11 @@ mod tests {
     fn json_input_keeps_deep_documents_and_packed_float_bits() {
         let depth = 150;
         let deep = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
-        assert_eq!(read_json(&deep), read_json_legacy(&deep));
+        let mut expected = Value::Null;
+        for _ in 0..depth {
+            expected = Value::list(vec![expected]);
+        }
+        assert_eq!(read_json(&deep).unwrap(), expected);
         for oid in [114, 3802] {
             let value = super::super::read_text(oid, "[-0.0,null,1e-300,1e999]").unwrap();
             let Some(rtdb_types::ListView::F64(array)) = value.list_view() else {
