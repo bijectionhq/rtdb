@@ -23,6 +23,7 @@
 -- Recovery accepts the rewrite only when the authenticated checkpoint contains that same receipt installation.
 -- An authenticated inventory binds prior checkpoint and replay objects to the exact replacement.
 -- A Local retirement installs the erasure floor, refusing prior catalogs, and waits for the original deadline; no reader hold delays it.
+-- Default erasure keeps the prior generation readable for the configured `garbage_lifetime`, and at least the sealed plaintext delivery window when sealed.
 -- Object retirement follows settlement of both ordered log prefixes.
 -- Recovery resumes object retirement from the same inventory and cursor after an interruption.
 -- Generation retirement requires durable closure of earlier views, plaintext caches and exports at the original deadline.

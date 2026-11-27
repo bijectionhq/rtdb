@@ -190,6 +190,8 @@ value EntityDirectory {
     erase_frontier_digest: Bytes
     allocation: Bytes
     writer_fence: Integer
+    -- Set only on a retired root: the system time of the transaction that replaced it.
+    superseded_at: Instant?
 }
 
 entity TrieCatalog {
@@ -205,7 +207,8 @@ entity TrieCatalog {
     -- Ordered abandonment retires an unadopted allocation and its receipt survives checkpoint recovery.
     -- Each table has at most one active entity directory.
     -- An entity-directory record is anchored to the L0 block the receipt covers.
-    -- Installing the receipt makes it active and retains the former root for collection.
+    -- Installing the receipt makes it active and retains the former root with its supersession time for collection on the garbage-as-of horizon.
+    -- Retired term directories are recorded in the table block with their supersession time and released on the same horizon.
     -- Primary relocation preserves the table's entity directory and event origins.
     --
     -- addTries(tries, as_of): register new tries, transitioning superseded inputs to garbage.

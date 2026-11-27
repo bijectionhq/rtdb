@@ -4,8 +4,8 @@
 -- Merges small tries into larger ones for better query performance.
 -- The consumer of this work is the scan operator.
 -- It reads the trie catalog to understand which files it has to read for a given query.
--- On a residence with coordinated retirement, a compaction job admits its live inputs under the catalog floor before opening them.
--- The hold follows admitted provider requests through cancellation.
+-- A compaction job reads its captured catalog without registering with collection.
+-- Where a hosted journal grants per-read custody, the job admits its captured catalog through that custody before opening its inputs, and that custody follows admitted provider requests through cancellation.
 -- Native compaction reserves the temporary buffers for each authenticated input range or for a whole-object input before downloading it.
 -- Native compaction charges each input pair's admitted lengths against the job's cumulative temporary input allowance before reading it.
 -- An input object already on the node's disk is read in place and charges nothing against that allowance.
@@ -17,7 +17,7 @@
 -- Small uncompressed primary files without dictionaries can supply Arrow buffers directly from reserved object bytes.
 -- Retained primary bytes share a separate per-job ceiling of 1 MiB or one eighth of the memory budget, whichever is smaller.
 -- The object reservation follows the last Arrow buffer that uses the file, and merged output pages own their copied cells.
--- If input preparation or merge runs out of memory after retaining either kind of input, compaction retries once with file-backed data and metadata readers under the same catalog hold.
+-- If input preparation or merge runs out of memory after retaining either kind of input, compaction retries once with file-backed data and metadata readers under the same captured view.
 --
 -- This assumes understanding of the "Building a Bitemporal Index" trilogy:
 -- https://xtdb.com/blog/building-a-bitemp-index-1-taxonomy

@@ -294,7 +294,7 @@ rule RetireSearchFiles {
     -- The lane looks at every table when it starts, at a table whenever its definitions in force change, and again at a table whose last look, or one of whose jobs, failed; it looks only while no job of its own is running.
     -- GC collects an artefact under a retired trie or under a group with no remaining members.
     -- A format 15 file and every superseded singleton stay available to pinned readers.
-    -- Sealed level-0 search files retire once their trie is obsolete in the checkpoint and all reader holds have expired.
+    -- Sealed level-0 search files retire once their trie is garbage, no checkpoint needs it, and it was superseded at or before the garbage-as-of horizon.
     -- A format 16 run retires on ordered replacement or when its definition leaves force.
     -- Collection orders abandonment of a completed upload once the source cut is installed and the staging owner has drained.
     -- An ordered upload receipt for a rejected replacement is itself eligible for retirement.

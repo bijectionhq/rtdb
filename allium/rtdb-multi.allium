@@ -104,10 +104,9 @@
 -- - LINEAGE -- a root deployment and every fork descended from it within one organisation.
 --   Objects are shared within a lineage and never across one.
 
--- A catalog reader has one durable hold in its serving storage region.
--- Each admission sees the residence's catalog floor in the version that orders the new hold.
--- A batch admits readers with different cuts only if each cut satisfies that floor.
--- A release after an uncertain admission fences the older directory version.
+-- Catalog readers register nothing in the directory.
+-- Superseded files remain readable for the garbage-collection window, and an installed retirement advances the serving residence's retirement floor without waiting for reader claims.
+-- Legacy reader claims in a deployment record are ignored and leave with their storage region.
 
 ------------------------------------------------------------
 -- External Entities
@@ -458,8 +457,7 @@ contract Directory {
         -- Both layouts carry the same deployment state and use the item's version for CAS.
         -- A catalog admission floor persists in both layouts, scoped to its residence, storage root, object namespace and replica journal.
         -- The current serving writer advances the floor from a durable installed trie-removal receipt.
-        -- The same versioned update coordinates floor advancement and reader admission.
-        -- An older or untracked held catalog blocks advancement, and a new reader at an older or untracked cut is refused once the floor exists.
+        -- Readers register no holds and never block floor advancement; only a closed residence or superseded writer refuses an advance, and legacy reader claims left in the record are ignored.
         -- Enable packed writes after all readers can decode them.
 
     @invariant PlacementWorkScalesWithHoldings
@@ -543,7 +541,8 @@ contract LogService {
         -- An installed journal route owns its session authority independently of the cell directory.
 
     @invariant InstalledReplicaPromotionFollowsEmptyRead
-        -- After an empty replica read, a following worker with leadership enabled, a recognized replica prefix and a positive current-grant check can promote.
+        -- After an empty replica read, a following worker with leadership enabled, a complete applied and recognized replica prefix through the received position, and a positive current-grant check can promote.
+        -- An unrecognized replica record withholds promotion and installed-prefix publication.
         -- The worker opens the successor of the highest term it has read at sequence zero.
         -- A newly delivered record below the highest observed term is fenced at admission.
 
@@ -776,7 +775,7 @@ contract LogService {
         -- Equivalent submissions retain one candidate, and the candidate survives a worker restart.
         -- The queue retains each candidate independently of checkpoint selection and conveys no permission to remove its object.
         -- Physical removal requires an exact withdrawal decision ordered against reference admission.
-        -- Every selectable checkpoint and pending preparation, every retained typed replay suffix, every live journal hold, and every live RTDB reader lease protect their dependencies from withdrawal.
+        -- Every selectable checkpoint and pending preparation, every retained typed replay suffix, and every live journal hold protect their dependencies from withdrawal.
         -- Installed S3 reads of reclaimable serving objects register before testing the physical admission fence and retain their registrations through conclusive provider completion.
         -- The withdrawal owner closes the object's physical admission before observing an empty provider census.
         -- Ambiguous provider completion retains the read's registration.
@@ -3329,6 +3328,7 @@ rule BeginDeletion {
 rule ClaimStoreRoot {
     -- Local nodes can prepare a durable locked witness before admitting a storage region.
     -- Each local region consumes its witness once and keeps the lock until its operations have drained.
+    -- The region removes its witness file only once its directory release settles; a refused or cancelled release drops the lock and leaves the witness for reconciliation.
     when: DeploymentStoreOpened(record, storage_prefix, writer_epoch)
 
     requires: record.lifecycle in {live, quarantined}
