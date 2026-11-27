@@ -1661,50 +1661,57 @@ pub async fn read_owned_fixed_range_rule(
 pub async fn read_owned_change_entry(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, revision: i64,
 ) -> Result<OwnedChangeEntry> {
+    try_read_owned_change_entry(context, owner, relation, revision).await?
+        .ok_or_else(rtdb_types::change_feed_uncovered)
+}
+
+pub async fn try_read_owned_change_entry(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, revision: i64,
+) -> Result<Option<OwnedChangeEntry>> {
     read_owned_journal_cell(context, owner, relation, revision, "entry").await
 }
 
 pub async fn read_owned_fixed_range_changes(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, revision: i64,
 ) -> Result<OwnedChangeEntry> {
-    read_owned_journal_cell(context, owner, relation, revision, "fixed_assertion_keys").await
+    read_owned_journal_cell(context, owner, relation, revision, "fixed_assertion_keys").await?
+        .ok_or_else(rtdb_types::change_feed_uncovered)
 }
 
 async fn read_owned_journal_cell(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, revision: i64, cell: &str,
-) -> Result<OwnedChangeEntry> {
-    use rtdb_types::change_feed_uncovered;
-
+) -> Result<Option<OwnedChangeEntry>> {
     let id = EntityId::Integer(revision);
     let memory = Arc::clone(&context.memory);
     let journal = relation.change_journal(owner)?;
     let Some(mut cursor) = open_owned_table_point(context, journal, id.iid(), Some(&id), None, Some(&[cell, "through_events", rtdb_types::OWNED_EVENT_POSITION_COLUMN]), false).await? else {
-        return Err(change_feed_uncovered());
+        return Ok(None);
     };
     let mut entry = None;
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         for row in 0..batch.num_rows() {
-            if entry.is_some() { return Err(change_feed_uncovered()); }
+            if entry.is_some() { return Ok(None); }
             let system_time = owned_row_revision(batch, row, &id, &memory)?;
             let position = owned_row_event_position(batch, row)?;
-            let (frontier_column, frontier_field) = batch.schema_ref().column_with_name("through_events")
-                .ok_or_else(change_feed_uncovered)?;
+            let Some((frontier_column, frontier_field)) = batch.schema_ref().column_with_name("through_events") else {
+                return Ok(None);
+            };
             let Value::I64(through) = rtdb_columnar::read_value(frontier_field, batch.column(frontier_column).as_ref(), row)?
-                else { return Err(change_feed_uncovered()); };
-            if through < 0 { return Err(change_feed_uncovered()); }
-            let (index, field) = batch.schema_ref().column_with_name(cell).ok_or_else(change_feed_uncovered)?;
+                else { return Ok(None); };
+            if through < 0 { return Ok(None); }
+            let Some((index, field)) = batch.schema_ref().column_with_name(cell) else { return Ok(None); };
             let values = batch.column(index).as_ref();
             let size = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
-            let retained = memory.reserve(size.checked_mul(2).and_then(|bytes| bytes.checked_add(4096))
-                .ok_or_else(change_feed_uncovered)?)?;
+            let Some(bytes) = size.checked_mul(2).and_then(|bytes| bytes.checked_add(4096)) else { return Ok(None); };
+            let retained = memory.reserve(bytes)?;
             entry = Some(OwnedChangeEntry {
                 publication: TransactionKey { tx_id: position.transaction, system_time },
                 through_events: through, value: rtdb_columnar::read_value(field, values, row)?, retained,
             });
         }
     }
-    entry.ok_or_else(change_feed_uncovered)
+    Ok(entry)
 }
 
 #[cfg(test)]
