@@ -11,6 +11,7 @@ syntax = "proto3";
 //   rtdb.store.v1.Read   ReadRequest   -> ReadReply
 //   rtdb.store.v1.Append AppendRequest -> AppendReply
 //   rtdb.store.v1.Watch  WatchRequest  -> WatchReply
+//   rtdb.store.v1.Rank   RankRequest   -> RankReply
 //
 // A version is a commit position within one store incarnation. A restore or a
 // reset starts a new incarnation; a request naming another incarnation fails
@@ -209,4 +210,25 @@ message WatchReply {
   optional uint64 touched = 2;
   // Every version through this one was inspected.
   uint64 through = 3;
+}
+
+// A ranked read run next to the data (`rtdb.store.v1.Rank`): text BM25,
+// exact cosine, spatial predicates and nearest, as Bijection's vendored
+// `store_read::rank` (vendor/bijection). `program` is that crate's own
+// encoding of the request: its frames (label-partition key prefixes,
+// versions and cuts, never labels), the query and the RANK_DIGEST it
+// expects. The store runs the program over its ordered entries and adds no
+// semantics; a program for other ranking code fails with
+// `rtdb.store/rank-version`, and a sealed partition with
+// `rtdb.store/rank-sealed`.
+message RankRequest {
+  bytes incarnation = 1;
+  bytes program = 2;
+}
+
+message RankReply {
+  bytes incarnation = 1;
+  // `store_read::rank::RankReply`: the window (or a split read's part) and
+  // the ranges each partition consulted.
+  bytes reply = 2;
 }

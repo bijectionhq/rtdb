@@ -1,0 +1,11 @@
+{
+  "source": "https://github.com/bijectionhq/bijection",
+  "branch": "store-cut-rank",
+  "commit": "0136d81308e47696b54afe6e038886a3c41a533d",
+  "crates": [
+    "crates/store_read",
+    "crates/kernel_text",
+    "crates/geometry"
+  ],
+  "rank_digest": "852c5735181081692b43fae86f311f6dc517108cff87d7864ed8643e1736b1d5"
+}

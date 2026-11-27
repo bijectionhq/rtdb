@@ -1,0 +1,24 @@
+[package]
+name = "bijection-store-read"
+version = "0.1.0"
+edition = "2024"
+license-file = "../LICENSE.md"
+publish = false
+build = "build.rs"
+
+# Bijection's crates/store_read, verbatim (src/, build.rs, pins.txt). Never
+# edit it here: see ../VENDOR.json and ../README.md.
+[lib]
+name = "store_read"
+doctest = false
+
+[dependencies]
+anyhow = "1"
+geometry = { package = "bijection-rank-geometry", path = "../geometry" }
+kernel_text = { package = "bijection-kernel-text", path = "../kernel_text" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[build-dependencies]
+sha2 = "0.10"

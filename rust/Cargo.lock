@@ -1242,6 +1242,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bijection-kernel-text"
+version = "0.1.0"
+dependencies = [
+ "rust-stemmers",
+ "unicode-normalization",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "bijection-rank-geometry"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "num-rational",
+ "num-traits",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bijection-store-derive"
 version = "0.1.0"
 
@@ -1254,6 +1274,18 @@ name = "bijection-store-judge"
 version = "0.1.0"
 dependencies = [
  "bijection-store-read-order",
+]
+
+[[package]]
+name = "bijection-store-read"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bijection-kernel-text",
+ "bijection-rank-geometry",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5067,6 +5099,7 @@ dependencies = [
 name = "rtdb-flight-sql"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
@@ -5077,6 +5110,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "bijection-store-read",
  "bytes",
  "chrono",
  "futures",
@@ -7415,9 +7449,9 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "unicode-normalization"
-version = "0.1.24"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5033c97c4262335cded6d6fc3e5c18ab755e1a3dc96376350f3d8e9f009ad956"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
 dependencies = [
  "tinyvec",
 ]
@@ -7430,9 +7464,9 @@ checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "unicode-segmentation"
-version = "1.13.3"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
 name = "unicode-width"

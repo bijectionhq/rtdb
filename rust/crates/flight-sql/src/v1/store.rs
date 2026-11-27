@@ -1,6 +1,6 @@
-//! `rtdb.store.v1`: versioned ordered bytes with read, conditional append and watch.
+//! `rtdb.store.v1`: versioned ordered bytes with read, conditional append, watch and rank.
 //!
-//! The three actions carry no caller semantics. A read returns ordered entries
+//! The actions carry no caller semantics. A read returns ordered entries
 //! at one version, ascending or descending by key; an append commits its writes
 //! only when no write committed after `since` intersects its read ranges and
 //! the writer's clock at the ordering point lies in its window, and the
@@ -11,10 +11,16 @@
 //!
 //! A store grant's caller (a placement fence or a provisioning grant,
 //! `rtdb_auth::StoreScope`) is confined to its scope: every read range,
-//! append guard and watch range lies inside one read prefix, every written
-//! key and bounded counter under one write prefix, and its appends carry no
+//! append guard, watch range and ranked scan lies inside one read prefix,
+//! every written key and bounded counter under one write prefix, and its appends carry no
 //! derives, whose keys the scope cannot bound. Anything else refuses with
 //! `rtdb.store/outside-grant` before it is read or ordered.
+//!
+//! `Rank` runs Bijection's vendored `store_read::rank` (vendor/bijection)
+//! over the same ordered entries: the ranking is Bijection's code, the store
+//! only reads ranges at versions for it. A program for other ranking code is
+//! refused; the server refuses to start with a vendored copy whose compiled
+//! digest differs from the recorded one.
 
 use std::time::Duration;
 
@@ -38,7 +44,68 @@ use crate::{rtdb::store::v1 as proto, service::{Call, Service}};
 pub(crate) const READ: &str = "rtdb.store.v1.Read";
 pub(crate) const APPEND: &str = "rtdb.store.v1.Append";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
-pub(crate) const ACTIONS: [&str; 3] = [READ, APPEND, WATCH];
+pub(crate) const RANK: &str = "rtdb.store.v1.Rank";
+pub(crate) const ACTIONS: [&str; 4] = [READ, APPEND, WATCH, RANK];
+
+/// The `RANK_DIGEST` recorded with the vendored copy (vendor/bijection).
+const VENDORED_RANK_DIGEST: &str = include_str!("../../../../vendor/bijection/RANK_DIGEST");
+
+/// Refuse to serve with a vendored ranking crate whose compiled digest is not
+/// the one recorded from Bijection: a local edit of the copy, or a copy and
+/// record out of step.
+pub(crate) fn check_rank_digest() -> rtdb_types::Result<()> {
+    if store_read::rank::RANK_DIGEST != VENDORED_RANK_DIGEST.trim() {
+        return Err(rtdb_types::Anomaly::unsupported(
+            "rtdb.store/rank-version",
+            "The vendored Bijection ranking code does not match its recorded RANK_DIGEST",
+        ));
+    }
+    Ok(())
+}
+
+/// The store's ordered entries as the ranges `store_read` reads: each read
+/// takes one cut, selected by its first range, as `Read` does.
+struct StoreRanges<'a> {
+    driver: &'a dyn rtdb_node::serving::ServingDriver,
+    scope: Option<&'a StoreScope>,
+    incarnation: [u8; 16],
+    now: rtdb_types::Timestamp,
+    cancellation: &'a tokio_util::sync::CancellationToken,
+}
+
+impl store_read::source::RangeSource for StoreRanges<'_> {
+    fn read(&self, read: store_read::source::RangeRead) -> impl std::future::Future<Output = anyhow::Result<store_read::source::RangePages>> + Send {
+        async move {
+            let mut at = read.at.map_or(At::Latest, |at| At::Exactly(Basis::new(self.incarnation, at.0)));
+            let limit = read.limit.clamp(1, MAX_PAGE_ENTRIES);
+            let read_ranges: Vec<_> = read.ranges.into_iter()
+                .map(|range| KeyRange { start: range.start, end: range.end })
+                .collect();
+            for range in &read_ranges {
+                range.check().map_err(error::anomaly)?;
+            }
+            reads_within(self.scope, &read_ranges)?;
+            let mut pages = Vec::with_capacity(read_ranges.len());
+            let mut read_at = None;
+            for range in read_ranges {
+                let after = read.after.clone().filter(|after| range.contains(after));
+                let request = StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false };
+                let page = self.driver.read_store(request, at, self.now, self.cancellation).await.map_err(error::anomaly)?;
+                at = At::Exactly(page.cut.basis);
+                read_at = Some(page.cut.basis.position());
+                pages.push(store_read::source::RangePage {
+                    entries: page.entries.into_iter().map(|entry| store_read::store::Entry {
+                        key: entry.key,
+                        value: entry.value,
+                        written: store_read::store::Version(entry.written.position()),
+                    }).collect(),
+                    resume: page.resume,
+                });
+            }
+            Ok(store_read::source::RangePages { at: store_read::store::Version(read_at.unwrap_or_default()), pages })
+        }
+    }
+}
 
 fn decode<M: Message + Default>(bytes: Bytes) -> Result<M, Status> {
     M::decode(bytes).map_err(|_| error::incorrect("Invalid protobuf request"))
@@ -80,6 +147,7 @@ impl Service {
             READ => self.store_read(call, decode(body)?).await,
             APPEND => self.store_append(call, decode(body)?).await,
             WATCH => self.store_watch(call, decode(body)?).await,
+            RANK => self.store_rank(call, decode(body)?).await,
             _ => Err(error::unsupported("rtdb.store.v1")),
         }
     }
@@ -294,5 +362,45 @@ impl Service {
             touched,
             through: after.position(),
         }.encode_to_vec())
+    }
+
+    async fn store_rank(&self, call: &Call, request: proto::RankRequest) -> Result<Vec<u8>, Status> {
+        if request.incarnation.is_empty() {
+            return Err(error::incorrect("A ranked read states its incarnation"));
+        }
+        let program = store_read::rank::RankRequest::decode(&request.program).map_err(|refused| error::incorrect(&refused.to_string()))?;
+        let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
+        let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
+        let source = StoreRanges { driver, scope, incarnation, now: self.0.node.now(), cancellation: &call.cancellation };
+        let reply = store_read::rank::rank(&source, program).await.map_err(|refused| {
+            let refused = match refused.downcast::<Status>() {
+                Ok(status) => return status,
+                Err(refused) => refused,
+            };
+            let message = refused.to_string();
+            if message.starts_with("rtdb.store/rank-version") {
+                Status::failed_precondition(message)
+            } else {
+                error::incorrect(&message)
+            }
+        })?;
+        self.check_attachment(call, &database)?;
+        let reply = reply.encode().map_err(|failed| Status::internal(failed.to_string()))?;
+        Ok(proto::RankReply { incarnation: incarnation.to_vec(), reply }.encode_to_vec())
+    }
+}
+
+#[cfg(test)]
+mod rank_tests {
+    /// The vendored ranking code is the copy recorded from Bijection, and
+    /// its pins are the versions this workspace locks.
+    #[test]
+    fn the_vendored_ranking_code_is_bijections_recorded_copy() {
+        super::check_rank_digest().expect("vendor/bijection/RANK_DIGEST is the compiled digest");
+        let lock = include_str!("../../../../Cargo.lock");
+        for pin in store_read::rank::PINS.lines() {
+            let (name, version) = pin.split_once('=').expect("a pin is name=version");
+            assert!(lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")), "{name} {version} is not locked");
+        }
     }
 }

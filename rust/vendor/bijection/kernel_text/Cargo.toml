@@ -1,0 +1,17 @@
+[package]
+name = "bijection-kernel-text"
+version = "0.1.0"
+edition = "2024"
+license-file = "../LICENSE.md"
+publish = false
+
+# Bijection's crates/kernel_text, verbatim src/. Its pins are Bijection's
+# and part of RANK_DIGEST (../store_read/pins.txt).
+[lib]
+name = "kernel_text"
+doctest = false
+
+[dependencies]
+rust-stemmers = "=1.2.0"
+unicode-normalization = { version = "=0.1.26", default-features = false }
+unicode-segmentation = "=1.12.0"

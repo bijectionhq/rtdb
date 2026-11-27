@@ -13,7 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// Bumped whenever any analyzer's tokenisation changes, the pinned segmentation, normalization and stemming tables included,
 /// so that search files built by an earlier analyzer are never read by a later one.
-pub const ANALYZER_VERSION: i32 = 3;
+pub const ANALYZER_VERSION: i32 = 4;
 
 /// The maximum UTF-8 byte length of one token for this analyzer version.
 pub const MAX_TOKEN_BYTES: usize = 65_530;

@@ -95,3 +95,8 @@ UTF16 captures retain all code-unit intervals, while borrowed UTF8 capture APIs 
 `matches_utf16` starts once at zero and requires the final Java `LastNode` to consume the complete input.
 An early endpoint can backtrack through source alternatives, and inner lookaround and atomic accepts retain their source behavior.
 `tests/java_utf16.rs` contains unexecuted regression source for explicit selection, option resets, surrogate intervals, empty matches and execution limits.
+
+== Unicode normalization tables follow Bijection's ranking pins
+
+`unicode-normalization` moves from `=0.1.24` to `=0.1.26`: one lockfile holds one semver-compatible version, and the vendored Bijection ranking crates (`vendor/bijection`) pin `=0.1.26` as part of their `RANK_DIGEST`.
+Normalization-sensitive matching follows the 0.1.26 tables.
