@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use super::*;
 
 #[cfg(feature = "backup-object-holds")]
+mod hosted_export;
+#[cfg(feature = "backup-object-holds")]
 mod held_objects;
 #[cfg(feature = "backup-object-holds")]
 mod staged;
@@ -16,6 +18,8 @@ pub const MULTI_BACKUP_HELP: &str = "\
 Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
                                  [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
+       rtdb multi-backup export-hosted --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
+                    --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
        rtdb multi-backup stage --archive FILE --source-key-vault DIR --operation-id UUID
                     --expected-incarnation UUID --expected-revision REVISION
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
@@ -28,6 +32,7 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
        rtdb multi-backup release-object-holds --readback FILE --installation-proof FILE --authority-socket PATH
                     --bucket BUCKET [--region REGION] [--s3-endpoint URL]
 Export and restore operate on stopped, local RTDB Multi development data.
+Export-hosted reads one commissioned immutable source and its original S3 allocation.
 Stage installs a pending activation's backup in S3 and holds its destination key.
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
@@ -60,6 +65,8 @@ pub struct MultiBackupOptions(BackupCommand);
 enum BackupCommand {
     Local(LocalBackupOptions),
     #[cfg(feature = "backup-object-holds")]
+    HostedExport(hosted_export::Export),
+    #[cfg(feature = "backup-object-holds")]
     Stage(staged::Stage),
     #[cfg(feature = "backup-object-holds")]
     VerifyObjects(held_objects::Verifier),
@@ -84,10 +91,11 @@ impl MultiBackupOptions {
                 return Err(arguments_error());
             }
         }
-        if matches!(operation.as_str(), "stage" | "verify-object-holds" | "attest" | "release-object-holds") {
+        if matches!(operation.as_str(), "export-hosted" | "stage" | "verify-object-holds" | "attest" | "release-object-holds") {
             if immutable_streams { return Err(arguments_error()); }
             #[cfg(feature = "backup-object-holds")]
             return Ok(Self(match operation.as_str() {
+                "export-hosted" => BackupCommand::HostedExport(hosted_export::Export::parse(fields)?),
                 "stage" => BackupCommand::Stage(staged::Stage::parse(fields)?),
                 "verify-object-holds" => BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?),
                 #[cfg(unix)]
@@ -142,6 +150,8 @@ impl MultiBackupOptions {
     pub async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
         match self.0 {
             BackupCommand::Local(options) => options.run(apple_sync).await,
+            #[cfg(feature = "backup-object-holds")]
+            BackupCommand::HostedExport(export) => export.run(apple_sync).await,
             #[cfg(feature = "backup-object-holds")]
             BackupCommand::Stage(stage) => stage.run().await,
             #[cfg(feature = "backup-object-holds")]
@@ -324,11 +334,15 @@ impl LocalBackupOptions {
     }
 
     fn publish(&self, backup: PortableBackup, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
-        let bytes = backup.into_bytes();
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        publish_archive(&self.archive, &bytes, apple_sync)?;
-        Ok(json!({ "manifest_sha256": digest_hex(&digest) }))
+        export_archive(&self.archive, backup, apple_sync)
     }
+}
+
+fn export_archive(path: &Path, backup: PortableBackup, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
+    let bytes = backup.into_bytes();
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    publish_archive(path, &bytes, apple_sync)?;
+    Ok(json!({ "manifest_sha256": digest_hex(&digest) }))
 }
 
 fn read_marker<const N: usize>(file: &mut File) -> Result<[u8; N]> {

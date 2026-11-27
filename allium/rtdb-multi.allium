@@ -1176,6 +1176,10 @@ contract EpochScopedStorage {
 }
 
 contract PortableApplicationBackup {
+    @invariant HostedSourceExport
+        -- A hosted export opens the commissioned source by its exact incarnation and reads its original journal, object allocation and generation keys.
+        -- It records the observed cut in the encrypted archive without acquiring a source writer session.
+
     @invariant AuthenticatedCut
         -- The writer captures one settled applied cut and binds its source incarnation, basis, system time and journal position to the encrypted checkpoint.
         -- An immutable stream can capture its settled application state at a quorum-confirmed head with read authority and without provisioning any source streams.

@@ -445,6 +445,18 @@ Exercise derivative staging and funded dispatch across that same handoff only af
 
 ## Portable application backups
 
+For a commissioned hosted source, use `multi-backup export-hosted` with the original journal's reader credential, S3 allocation, and generation key vault.
+The command checks the immutable source's commissioning identity and creates an encrypted archive without advancing the source journal.
+For lossless recovery, export after `seal-source` so the archive covers the final source LSN required by the activation broker.
+
+```sh
+rtdb multi-backup export-hosted --archive "$ARCHIVE" --incarnation "$PREDECESSOR" \
+  --authority-id "$AUTHORITY" --journal-url "$SOURCE_JOURNAL" --tls-dir "$SOURCE_READER_TLS" \
+  --key-vault "$SOURCE_KEY_VAULT" --bucket "$SOURCE_BUCKET" --region "$SOURCE_REGION"
+```
+
+For a source commissioned in a cell, also pass its original `--cell-id`.
+
 `rtdb multi-backup export` captures a settled cut from a stopped, initialized development deployment, using its journal and object store to verify the current checkpoint dependencies.
 An immutable export takes the existing local journal lock and replays a quorum-confirmed head directly from the application stream using reader credentials.
 Legacy exports and destination installation acquire the writer lease.
