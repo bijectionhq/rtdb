@@ -1646,6 +1646,8 @@ async fn block_tables_test_block_files_with_params_and_table_block_tries() {
 
 #[tokio::test]
 async fn shared_show_controls_pin_snapshot_reads_and_keep_generic_show_unresolved() {
+    use rtdb_types::{LogicalType, ScalarType};
+
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let token = session.state().cancellation().child_token();
