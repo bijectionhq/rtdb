@@ -3,7 +3,10 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use journal_contract::{CheckpointInstallation, Epoch, JournalError, Lsn, WriterSessionId};
+use journal_contract::{
+    CheckpointAnchor, CheckpointHold, CheckpointInstallation, Epoch, JournalError, Lsn,
+    WriterSessionId,
+};
 use rtdb_db::{TimedOriginal, WritePipeline};
 use rtdb_node::DecisionClock;
 use rtdb_stream_journal::{KeeperId, TimedOriginalVerifier};
@@ -252,18 +255,48 @@ async fn funded_acceptance_proof_survives_replacement_and_expiry_until_checkpoin
         .seal_session(stream, Epoch(0), WriterSessionId(1))
         .await
         .unwrap();
+    let preceding_record = bytes::Bytes::from_static(b"checkpoint preceding funded stage");
+    let preceding = journal
+        .install_checkpoint(
+            writer.fence,
+            CheckpointInstallation {
+                operation_id: 1,
+                checkpoint_lsn: Lsn(1),
+                covered_through_lsn: Lsn(0),
+                record: preceding_record.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let hold = CheckpointHold {
+        operation_id: 2,
+        installation_sha256: [7; 32],
+        anchor: CheckpointAnchor {
+            announced_at: preceding.checkpoint_lsn,
+            covered_through: preceding.covered_through_lsn,
+            record_sha256: Sha256::digest(&preceding_record).into(),
+        },
+    };
+    assert!(
+        !journal
+            .retain_checkpoint(stream, hold)
+            .await
+            .unwrap()
+            .released
+    );
     let batch = ConsensusJournalBatch(journal.clone());
     let payload = bytes::Bytes::from_static(b"exact funded stage");
     let original = TimedOriginal {
         stream,
         epoch: writer.fence.writer_epoch,
-        at: Lsn(1),
+        at: Lsn(2),
         payload_sha256: Sha256::digest(&payload).into(),
-        cutoff: TimedJournalCutoff::new(Timestamp(SystemClock.now().0 + 60_000_000), [9; 32]).unwrap(),
+        cutoff: TimedJournalCutoff::new(Timestamp(SystemClock.now().0 + 60_000_000), [9; 32])
+            .unwrap(),
     };
     assert!(matches!(
         batch.prove_timed_original(original).await,
-        Err(JournalError::Conflict { head: Lsn(0) })
+        Err(JournalError::Conflict { head: Lsn(1) })
     ));
     let accepted = batch
         .append_session_timed_original(writer.fence, original, payload)
@@ -278,24 +311,52 @@ async fn funded_acceptance_proof_survives_replacement_and_expiry_until_checkpoin
         .await
         .unwrap();
     assert_eq!(replacement.sealed_head_lsn, original.at);
-    assert_eq!(batch.prove_timed_original(original).await.unwrap(), accepted);
+    let covering = CheckpointInstallation {
+        operation_id: 3,
+        checkpoint_lsn: Lsn(3),
+        covered_through_lsn: original.at,
+        record: bytes::Bytes::from_static(b"checkpoint covering funded stage"),
+    };
+    assert!(matches!(
+        journal
+            .install_checkpoint(replacement.fence, covering.clone())
+            .await,
+        Err(JournalError::Conflict { head: Lsn(2) })
+    ));
+    assert_eq!(
+        batch.prove_timed_original(original).await.unwrap(),
+        accepted
+    );
 
+    assert!(
+        journal
+            .release_checkpoint(stream, hold)
+            .await
+            .unwrap()
+            .released
+    );
+    let covering_digest = Sha256::digest(&covering.record).into();
     let checkpoint = journal
-        .install_checkpoint(
-            replacement.fence,
-            CheckpointInstallation {
-                operation_id: 1,
-                checkpoint_lsn: Lsn(2),
-                covered_through_lsn: original.at,
-                record: bytes::Bytes::from_static(b"checkpoint covering funded stage"),
-            },
-        )
+        .install_checkpoint(replacement.fence, covering)
         .await
         .unwrap();
-    assert_eq!(checkpoint.logical_floor_lsn, Lsn(2));
+    assert_eq!(checkpoint.logical_floor_lsn, Lsn(3));
     assert!(matches!(
         batch.prove_timed_original(original).await,
-        Err(JournalError::Trimmed { floor: Lsn(2) })
+        Err(JournalError::Trimmed { floor: Lsn(3) })
+    ));
+    let next_hold = CheckpointHold {
+        operation_id: 4,
+        installation_sha256: [8; 32],
+        anchor: CheckpointAnchor {
+            announced_at: checkpoint.checkpoint_lsn,
+            covered_through: checkpoint.covered_through_lsn,
+            record_sha256: covering_digest,
+        },
+    };
+    assert!(matches!(
+        journal.retain_checkpoint(stream, next_hold).await,
+        Err(JournalError::Conflict { head: Lsn(3) })
     ));
     keepers.shutdown().await.unwrap();
 }
