@@ -6,18 +6,71 @@ use rtdb_plan::{Relation, RelationNode, SpanContext, TraceSpan, TraceValue, Trac
 use rtdb_types::Result;
 use crate::{QueryContext, pages::{BoxPageCursor, OwnedPage, PageCursor}};
 
-pub(crate) struct QueryTrace { span: Box<dyn TraceSpan>, memory: Arc<rtdb_columnar::MemoryBudget> }
+#[allow(dead_code, reason = "Operator producer changes land independently of the trace contract")]
+pub(crate) enum OperatorCounter {
+    PeakMemoryBytes,
+    InnerExecutions,
+    PredicateScalarFallbacks,
+    ProjectionScalarFallbacks,
+    ScanDecodedBytes,
+    ScanGatheredBytes,
+    ScanSelectedRows,
+    JoinFilterBuildDistinctKeys,
+    JoinFilterBuildDistinctKeysComplete,
+    JoinFilterAdmittedIids,
+    JoinFilterCheckedHeaders,
+    JoinFilterRejectedHeaders,
+    SpillBytesWritten,
+    WindowInputOrderReused,
+}
+
+impl OperatorCounter {
+    pub(crate) fn record(self, span: &mut dyn TraceSpan, value: u64) {
+        let name = match self {
+            Self::PeakMemoryBytes => "cursor.peak_memory_bytes",
+            Self::InnerExecutions => "cursor.apply.inner_executions",
+            Self::PredicateScalarFallbacks => "cursor.predicate.scalar_fallbacks",
+            Self::ProjectionScalarFallbacks => "cursor.projection.scalar_fallbacks",
+            Self::ScanDecodedBytes => "cursor.scan.decoded_bytes",
+            Self::ScanGatheredBytes => "cursor.scan.gathered_bytes",
+            Self::ScanSelectedRows => "cursor.scan.selected_rows",
+            Self::JoinFilterBuildDistinctKeys => "cursor.join_filter.build_distinct_keys",
+            Self::JoinFilterBuildDistinctKeysComplete => "cursor.join_filter.build_distinct_keys_complete",
+            Self::JoinFilterAdmittedIids => "cursor.join_filter.admitted_iids",
+            Self::JoinFilterCheckedHeaders => "cursor.join_filter.checked_headers",
+            Self::JoinFilterRejectedHeaders => "cursor.join_filter.rejected_headers",
+            Self::SpillBytesWritten => "cursor.spill.bytes_written",
+            Self::WindowInputOrderReused => "cursor.window.input_order_reused",
+        };
+        span.attribute(name, TraceValue::Unsigned(value));
+    }
+}
+
+pub(crate) fn operator_evidence_enabled(context: &QueryContext) -> bool {
+    context.trace_parent.is_some() && context.tracer.as_ref().is_some_and(|tracer| tracer.query_enabled())
+}
+
+pub(crate) struct QueryTrace {
+    span: Box<dyn TraceSpan>,
+    memory: Arc<rtdb_columnar::MemoryBudget>,
+    spill: Arc<crate::spill::SpillRegion>,
+}
 impl QueryTrace {
     pub fn start(context: &Arc<QueryContext>, text: Option<&str>) -> Option<Self> {
         let tracer = context.tracer.as_ref().filter(|tracer| tracer.query_enabled())?;
         let mut span = tracer.start(context.trace_parent, "xtdb.query", &[])?;
         if let Some(text) = text { span.attribute("query.text", TraceValue::Text(text)); }
         if let Some((name, _)) = &context.application_name { span.attribute("application.name", TraceValue::Text(name)); }
-        Some(Self { span, memory: Arc::clone(&context.memory) })
+        Some(Self { span, memory: Arc::clone(&context.memory), spill: Arc::clone(&context.spill) })
     }
     pub fn context(&self) -> SpanContext { self.span.context() }
 }
-impl Drop for QueryTrace { fn drop(&mut self) { self.span.attribute("query.peak_memory_bytes", TraceValue::Unsigned(self.memory.peak_bytes() as u64)); } }
+impl Drop for QueryTrace {
+    fn drop(&mut self) {
+        self.span.attribute("query.peak_memory_bytes", TraceValue::Unsigned(self.memory.peak_bytes() as u64));
+        self.span.attribute("query.spill_region_peak_bytes", TraceValue::Unsigned(self.spill.peak_bytes()));
+    }
+}
 
 pub(crate) struct CursorTrace {
     tracer: Arc<dyn Tracer>, parent: SpanContext, name: String, kind: &'static str,
@@ -53,14 +106,14 @@ impl Drop for CursorTrace {
             span.attribute(if self.pages { "cursor.page_count" } else { "cursor.pull_count" }, TraceValue::Unsigned(self.pulls));
             span.attribute("cursor.row_count", TraceValue::Unsigned(self.rows));
             if let Some(memory) = &self.operator_memory {
-                span.attribute("cursor.peak_memory_bytes", TraceValue::Unsigned(memory.peak_bytes() as u64));
+                OperatorCounter::PeakMemoryBytes.record(span.as_mut(), memory.peak_bytes() as u64);
             }
             span.end_at(self.end);
         }
     }
 }
 pub(crate) fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -> Option<CursorTrace> {
-    context.trace_parent?;
+    if !operator_evidence_enabled(context) { return None; }
     let kind = crate::analysis::operator(relation);
     let extra = match relation.node() { RelationNode::Scan(scan) => scan.table.name.table.schema.len().saturating_add(scan.table.name.table.table.len()), _ => 0 };
     let _name = context.memory.reserve(extra.saturating_add(1024)).ok()?;
@@ -85,8 +138,8 @@ impl crate::columnar::BatchCursor for TracedBatches {
         if let Ok(batch) = &result { self.trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.len)); }
         result
     }
+    fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> { self.input.skip_complete_pages(rows) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
-    fn trace_attributes(&self, span: &mut dyn TraceSpan) { self.input.trace_attributes(span); }
 }
 impl Drop for TracedBatches {
     fn drop(&mut self) {
@@ -103,7 +156,6 @@ impl PageCursor for TracedCursor {
         result
     }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.as_ref().and_then(|input| input.scan_counts()) }
-    fn trace_attributes(&self, span: &mut dyn TraceSpan) { if let Some(input) = &self.input { input.trace_attributes(span); } }
 }
 impl Drop for TracedCursor {
     fn drop(&mut self) {
@@ -114,21 +166,45 @@ impl Drop for TracedCursor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
     use rtdb_columnar::MemoryBudget;
-    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
+    use rtdb_plan::{ColumnId, Expr, Field, Relation, RelationNode, Schema, SpanContext, Tracer};
     use rtdb_storage::{MemoryStore, cache::BufferPool};
-    use rtdb_types::Timestamp;
+    use rtdb_types::{LogicalType, ScalarType, Timestamp, Value};
     use tokio_util::sync::CancellationToken;
+    use crate::{BoundParameters, CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
+    use crate::columnar::BoxBatchCursor;
+    use crate::context::{Execution, OuterRows};
+    use crate::operators::build_column_pages;
+    use crate::runtime_schema::EmittedRelation;
+    use super::{CursorTrace, QueryTrace, operator_evidence_enabled, operator_trace};
+
+    fn query_context() -> Arc<QueryContext> {
+        let memory = MemoryBudget::new(1 << 24);
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) })]), false).unwrap();
+        QueryContext::new(catalog, memory, Timestamp(0), "UTC", QueryOptions { list_batch_rows: 3, ..Default::default() }, &CancellationToken::new()).unwrap()
+    }
+
+    async fn open(relation: Arc<Relation>, context: Arc<QueryContext>) -> BoxBatchCursor {
+        let memory = &context.memory;
+        let parameters = Arc::new(BoundParameters::infer(vec![], memory).unwrap());
+        let runtime = EmittedRelation::derive(relation, &context.catalog, parameters.types(), memory).unwrap();
+        let execution = Execution { parameters, outer: OuterRows::empty(memory).unwrap(), context, bindings: None, analysis: None };
+        build_column_pages(runtime, execution).await.unwrap().unwrap()
+    }
+
+    fn field(id: u32, name: &str, scalar: ScalarType) -> Field {
+        Field { id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(scalar) }
+    }
 
     #[tokio::test]
     async fn tracing_cursor_test_accumulates_only_supplied_pull_durations() {
-        let memory = MemoryBudget::new(1 << 24);
-        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) })]), false).unwrap();
-        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&memory), 4, true, true).unwrap();
+        let context = query_context();
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 4, true, true).unwrap();
         let parent = tracer.start(None, "xtdb.query", &[]).unwrap();
-        let context = QueryContext::new(catalog, memory, Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap().with_tracer(Some(tracer.clone()), Some(parent.context()));
+        let context = context.with_tracer(Some(tracer.clone()), Some(parent.context()));
         let mut trace = CursorTrace::new(&context, "output", "query.cursor.output", true).unwrap();
         trace.start(); trace.completed(Duration::from_millis(7), Some(3)); trace.completed(Duration::from_millis(5), None); drop(trace); drop(parent); tracer.close();
         let span = receiver.next().await.unwrap();
@@ -136,5 +212,64 @@ mod tests {
         assert_eq!(attributes["cursor.total_time_ms"], "12");
         assert_eq!(attributes["cursor.time_to_first_page_ms"], "7");
         assert_eq!(attributes["cursor.page_count"], "1"); assert_eq!(attributes["cursor.row_count"], "3");
+    }
+
+    #[test]
+    fn query_tracing_disabled_with_a_parent_leaves_reservation_peak_at_zero() {
+        let parent = SpanContext { trace_id: [1; 16], span_id: [1; 8] };
+        let (tracer, _receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 4, false, true).unwrap();
+        let context = query_context().with_tracer(Some(tracer), Some(parent));
+
+        assert!(!operator_evidence_enabled(&context));
+        assert!(operator_trace(&Relation::unit(), &context).is_none());
+        assert_eq!(context.memory.peak_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn trace_preserves_skipping_whole_series_pages() {
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 8, true, false).unwrap();
+        let context = query_context().with_tracer(Some(tracer.clone()), None);
+        let query = QueryTrace::start(&context, None).unwrap();
+        let context = context.with_tracer(Some(tracer.clone()), Some(query.context()));
+        let int = |value| Expr::Literal(Value::I64(value));
+        let args = vec![int(1), int(10), int(1), Expr::Literal(Value::Bool(false))];
+        let expr = Expr::Call { name: "generate_series".into(), return_type: rtdb_plan::function_type_with_args("generate_series", &args).unwrap(), args };
+        let element = field(0, "n", ScalarType::I64);
+        let list = Arc::new(Relation::new(Schema::new(vec![element.clone()]).unwrap(), RelationNode::List { expr, element, page_rows: None }).unwrap());
+        let limit = Arc::new(list.limit(Some(int(4)), Some(int(1))).unwrap());
+        let mut cursor = open(limit, context).await;
+
+        let batch = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(batch.len, 1);
+        assert_eq!(batch.columns[0].value(0).unwrap(), Value::I64(5));
+        drop((cursor, query));
+        tracer.close();
+
+        let mut pulled_pages = None;
+        while let Some(span) = receiver.next().await {
+            if span.name == "query.cursor.list" {
+                pulled_pages = span.attributes().find(|(name, _)| *name == "cursor.page_count").map(|(_, value)| value.parse::<u64>().unwrap());
+            }
+        }
+        assert_eq!(pulled_pages, Some(1));
+    }
+
+    #[tokio::test]
+    async fn query_trace_reports_spill_region_peak_after_files_close() {
+        let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(1 << 20), 4, true, false).unwrap();
+        let context = query_context().with_tracer(Some(tracer.clone()), None);
+        let query = QueryTrace::start(&context, None).unwrap();
+        let mut writer = context.spill.create().unwrap();
+        writer.write_frame(b"spill").unwrap();
+        let bytes = writer.position().unwrap();
+        drop(writer.finish().unwrap());
+        assert_eq!(context.spill_bytes(), 0);
+        drop(query);
+        tracer.close();
+
+        let span = receiver.next().await.unwrap();
+        let attributes: BTreeMap<_, _> = span.attributes().collect();
+        assert!(bytes > 0);
+        assert_eq!(attributes["query.spill_region_peak_bytes"].parse::<u64>().unwrap(), bytes);
     }
 }
