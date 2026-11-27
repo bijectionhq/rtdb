@@ -111,3 +111,24 @@ async fn information_schema_columns_are_numbered_temporal_first_then_by_name() {
     let expected = ["_id", "_system_from", "_system_to", "_valid_from", "_valid_to", "alpha", "zeta"].map(|name| Value::Utf8(name.into()));
     assert_eq!(names, expected);
 }
+
+#[tokio::test]
+async fn information_schema_select_star_projects_columns_in_alphabetical_order() {
+    let context = context(false, None);
+    let projected = |sql| {
+        PreparedSql::prepare(sql, &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap()
+            .prepared_schema().unwrap().fields().iter().map(|field| field.name.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        projected("SELECT * FROM information_schema.key_column_usage LIMIT 5"),
+        ["column_name", "constraint_catalog", "constraint_name", "constraint_schema", "ordinal_position", "position_in_unique_constraint", "table_catalog", "table_name", "table_schema"],
+    );
+    assert_eq!(
+        projected("SELECT * FROM information_schema.table_constraints LIMIT 5"),
+        ["constraint_catalog", "constraint_name", "constraint_schema", "constraint_type", "initially_deferred", "is_deferrable", "table_catalog", "table_name", "table_schema"],
+    );
+    assert_eq!(
+        projected("SELECT * FROM information_schema.tables LIMIT 0"),
+        ["table_catalog", "table_name", "table_schema", "table_type"],
+    );
+}

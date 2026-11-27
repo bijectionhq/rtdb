@@ -68,7 +68,8 @@ impl Definition {
             .and_then(|n| n.checked_add(4096)).ok_or_else(system_schema_size)
     }
     pub fn columns(&self) -> StructFields<L> {
-        self.fields.split_ascii_whitespace().map(|field| {
+        // Upstream `xtdb.sql/xform-table-info` orders every catalog table's columns alphabetically for `SELECT *`.
+        let mut fields: Vec<(String, L)> = self.fields.split_ascii_whitespace().map(|field| {
             let (name, ty) = field.split_once(':').expect("catalog field delimiter");
             let base = ty.strip_suffix('?').unwrap_or(ty);
             let value = match base {
@@ -82,7 +83,9 @@ impl Definition {
                 _ => unreachable!("catalog field type"),
             };
             (name.to_owned(), if ty.ends_with('?') { value.maybe() } else { value })
-        }).collect()
+        }).collect();
+        fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+        fields.into_iter().collect()
     }
     pub fn binding(&self, database: &str) -> TableBinding {
         let table = TableRef::new(self.schema, self.name);
@@ -90,3 +93,26 @@ impl Definition {
     }
 }
 pub(crate) fn instant() -> L { L::Scalar(S::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_table_columns_are_ordered_alphabetically_like_upstream() {
+        for entry in DEFINITIONS {
+            let names: Vec<_> = entry.columns().keys().cloned().collect();
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(names, sorted, "{}.{} columns must be sorted alphabetically", entry.schema, entry.name);
+        }
+        assert_eq!(
+            definition(&TableRef::new("information_schema", "key_column_usage")).unwrap().columns().keys().map(String::as_str).collect::<Vec<_>>(),
+            ["column_name", "constraint_catalog", "constraint_name", "constraint_schema", "ordinal_position", "position_in_unique_constraint", "table_catalog", "table_name", "table_schema"],
+        );
+        assert_eq!(
+            definition(&TableRef::new("information_schema", "table_constraints")).unwrap().columns().keys().map(String::as_str).collect::<Vec<_>>(),
+            ["constraint_catalog", "constraint_name", "constraint_schema", "constraint_type", "initially_deferred", "is_deferrable", "table_catalog", "table_name", "table_schema"],
+        );
+    }
+}
