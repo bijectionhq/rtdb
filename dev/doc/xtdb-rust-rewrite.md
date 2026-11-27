@@ -144,6 +144,8 @@ Document which side owns each buffer and which operation releases it. [Pgwire](.
 
 Ship the server binary, container image and configuration migrator together.
 The migrator should resolve a deployment's backend, auth settings, module registrations, storage roots, and log identities and list unsupported options before cutover.
+For Classic S3, the offline configuration report can compare a captured inventory of exact keys and provider version IDs with the literal JVM and legacy RTDB spellings for recorded logical paths.
+The [Classic S3 preflight procedure](../../rust/crates/config/README.adoc#classic-s3-key-preflight) covers capture, key-layout eligibility and the upgrade decisions that follow it.
 Export per-partition durable position, term, replication lag, live bytes, compaction backlog, object reads, cache behavior, rejected waits and query cancellations.
 Validate clean shutdown, slow object storage, exhausted disk cache, credential rotation and restore from real backend snapshots in integration tests.
 

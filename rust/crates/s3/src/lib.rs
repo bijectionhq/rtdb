@@ -1,5 +1,7 @@
 mod credential;
+mod classic_keys;
 mod scoped;
+pub use classic_keys::classic_key_aliases;
 pub use scoped::{SCOPED_S3_CLOCK_ALLOWANCE, SCOPED_S3_WRITE_TTL, ScopedS3Writes, WriteAuthorization};
 #[cfg(feature = "versioning")]
 mod versions;
@@ -319,12 +321,7 @@ impl S3Config {
     fn configured_endpoint(&self) -> Result<Option<url::Url>> {
         let environment = AmazonS3Builder::from_env();
         let endpoint = self.endpoint.clone().or_else(|| environment.get_config_value(&AmazonS3ConfigKey::S3Endpoint)).or_else(|| environment.get_config_value(&AmazonS3ConfigKey::Endpoint));
-        let endpoint = endpoint.as_ref().map(|endpoint| url::Url::parse(endpoint)
-            .map_err(|_| Anomaly::incorrect("xtdb.aws/invalid-config", "Invalid S3 endpoint"))).transpose()?;
-        if endpoint.as_ref().is_some_and(|endpoint| !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() || !endpoint.username().is_empty() || endpoint.password().is_some() || endpoint.query().is_some() || endpoint.fragment().is_some()) {
-            return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 endpoint must be an HTTP URL without embedded credentials, query, or fragment"));
-        }
-        Ok(endpoint)
+        endpoint.as_deref().map(parse_endpoint).transpose()
     }
 
     fn virtual_hosted(&self, endpoint: Option<&url::Url>) -> bool {
@@ -337,7 +334,10 @@ impl S3Config {
     }
 
     fn endpoint_addressing(&self) -> Result<(Option<url::Url>, bool)> {
-        let endpoint = self.configured_endpoint()?;
+        self.address_endpoint(self.configured_endpoint()?)
+    }
+
+    fn address_endpoint(&self, endpoint: Option<url::Url>) -> Result<(Option<url::Url>, bool)> {
         let virtual_hosted = self.virtual_hosted(endpoint.as_ref());
         let endpoint = endpoint.map(|mut endpoint| {
             if virtual_hosted {
@@ -365,6 +365,16 @@ impl S3Config {
             credentials: config.credentials.as_ref().map(|credentials| S3Credentials { access_key: credentials.access_key.clone().unwrap_or_default(), secret_key: credentials.secret_key.clone().unwrap_or_default() }),
             endpoint: nonempty(&config.endpoint), path_style_access_enabled: config.path_style_access_enabled.unwrap_or_default(), remote: nonempty(&config.remote), terminal_scope: None }
     }
+}
+
+fn parse_endpoint(raw: &str) -> Result<url::Url> {
+    let endpoint = url::Url::parse(raw).map_err(|_| Anomaly::incorrect("xtdb.aws/invalid-config", "Invalid S3 endpoint"))?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() || !endpoint.username().is_empty()
+        || endpoint.password().is_some() || endpoint.query().is_some() || endpoint.fragment().is_some()
+    {
+        return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 endpoint must be an HTTP URL without embedded credentials, query, or fragment"));
+    }
+    Ok(endpoint)
 }
 
 fn is_terminal_root(path: &str) -> bool {

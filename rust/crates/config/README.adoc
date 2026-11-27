@@ -8,7 +8,8 @@ This source has not been compiled or executed during Phase 1.
 `rtdb-config --build-info` prints the compiled version, full revision and selected time-zone version/SHA-256 without configuration inputs.
 Runtime `XTDB_VERSION` and `GIT_SHA` overrides do not alter this artifact identity.
 
-The qualification command reads exactly three explicitly supplied files and writes JSON to standard output.
+The qualification command reads three explicitly supplied files and writes JSON to standard output.
+Classic S3 key preflight takes one additional explicit inventory file.
 It opens no node, log, object store, credential provider, TLS keystore, Kafka properties file, registry, subprocess or network connection.
 It creates no configuration or storage files and changes no deployment state.
 The supplied environment JSON is the entire environment used by the production decoder; the tool does not inherit deployment credentials or options from its own process environment.
@@ -83,6 +84,88 @@ Include the exact token endpoint, including any query string.
 The report records the variable's name and omits its value and the broker and converter option values.
 Custom OAuth hooks, file token retrieval, and client assertions require a native adapter.
 Broker authentication, token issuance and refresh, TLS material, and librdkafka client construction require deployment-time verification.
+
+[[classic-s3-key-preflight]]
+== Classic S3 key preflight
+
+Use the `rtdb-config` binary packaged with S3 support to check one configured Classic database per invocation.
+Select `xtdb` for ordinary node YAML or the recorded database name in the fixed `ingest-yaml` configuration.
+
+[source,shell]
+----
+rtdb-config ingest-yaml databases.yaml environment.json provenance.json \
+  --classic-s3-key-inventory s3-keys.json
+----
+
+The JVM S3 adapter sends literal rooted paths to the SDK.
+Legacy RTDB encodes the object path first, which changes the key stored by S3 independently of HTTP escaping.
+For example, the JVM's `tables/public$t%3F/data/l00-rc-b00.arrow` and RTDB's encoding of `tables/public$t?/data/l00-rc-b00.arrow` both end up at the same key under a shared root.
+RTDB encodes the percent sign in the already literal `public$t%3F` as `public$t%253F`.
+The preflight reads explicit logical names and provider keys so it can detect this collision without guessing from a percent sequence.
+
+=== Capture and inspect
+
+. Record the selected database's exact configuration, including the S3 region, endpoint when custom, prefix, and storage epoch.
+  The namespace uses the effective endpoint URI, including the bucket host prefix for virtual-hosted custom endpoints, or `null` for standard AWS addressing.
+  Declare addressing in YAML and remove deployment endpoint environment overrides before taking the capture.
+. Fence publishers and quiesce compaction, GC, multipart activity and lifecycle deletion for the capture.
+  Resolve or account for unfinished uploads before declaring the capture complete.
+  Record the retained catalog and log basis, then enumerate its recorded logical object paths relative to the storage root.
+  Use recorded slugs and locators, including retained historical references, and account for every listed key independently of its provider spelling.
+  Mark keys needed by a current read with `requires_current_version: true`.
+. From a read-only provider capture at the same cut, supply all pages of data versions and delete markers for both exact storage directory prefixes, including empty listings.
+  The roots include the configured prefix and the storage version and epoch, with a trailing slash.
+  Supply one prefix if both spellings agree.
+  Preserve the raw stored key and opaque version ID as returned by the provider, after removing any listing response encoding.
+  Keep `%` sequences in stored keys and version IDs verbatim.
+  Set `complete: true` only after confirming the capture's scope, ownership, completeness and stable cut.
+. Run the preflight on the files and retain the report alongside the capture and provenance.
+  The command reads the supplied files locally, with no S3 connection or deployment mutation.
+  Store the output as deployment metadata because it contains exact paths and version IDs.
+
+[source,json]
+----
+{
+  "schema_version": 1,
+  "database": "inventory",
+  "namespace": {"bucket": "fixture-bucket", "endpoint": null, "region": "us-east-1"},
+  "complete": true,
+  "listed_prefixes": ["snapshots/v06_e02/"],
+  "logical_objects": [
+    {"key": "tables/public$t?/data/l00-rc-b00.arrow", "requires_current_version": true}
+  ],
+  "versions": [
+    {
+      "key": "snapshots/v06_e02/tables/public$t%3F/data/l00-rc-b00.arrow",
+      "version_id": "current+/=",
+      "kind": "object",
+      "is_latest": true
+    }
+  ]
+}
+----
+
+The sample is eligible for `legacy_rtdb` spelling at the captured cut.
+`shared` means all recorded paths resolve to the same exact keys in both layouts.
+`jvm_literal` and `legacy_rtdb` identify the sole layout covering the capture when at least one recorded spelling differs.
+`refused` carries findings for incomplete or mismatched scope, collisions between logical paths, both aliases in use, mixed layouts, missing or unexplained keys, unversioned or inconsistent histories, and missing current objects.
+A delete marker still occupies its exact key for collision detection.
+The report includes the raw input digest and, for matched scope, each logical path with both candidates and the in-scope version identities.
+`eligible` applies to key spelling at the supplied cut only.
+The report's separate `cutover_eligible` remains false and a completed report still exits with status 2.
+See the link:tests/fixtures/classic-s3-alias-collision.json[collision fixture] for a capture that the preflight refuses.
+
+=== Upgrade and rollback
+
+. Keep serving with the current layout while resolving refusals and qualifying a protected shadow restore at the same catalog and log basis.
+  Use the report to establish the exact provider identities, and qualify object bytes, storage formats and version-scoped access independently.
+. Before any cross-layout upgrade, choose and approve an offline migration or a storage profile with a stable namespace rule.
+  An apply plan must reconcile the recorded locators, each `(bucket, endpoint, region, key, version ID)` used by existing grants, and the disk-cache namespace together.
+  A copied object has its own destination version identity.
+  Keep the original keys, versions, exact grants, catalog and log basis protected through rollback.
+. Rehearse restart, historical reads and return to the original protected basis before transferring publisher ownership.
+  Rerun the preflight against a fresh final capture if the storage or catalog has moved since qualification.
+  Apply, runtime activation and any future default change require separate approval.
 
 == Cutover inventory
 

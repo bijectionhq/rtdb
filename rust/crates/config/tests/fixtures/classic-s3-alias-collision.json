@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "database": "inventory",
+  "namespace": {"bucket": "fixture-bucket", "endpoint": null, "region": "us-east-1"},
+  "complete": true,
+  "listed_prefixes": ["snapshots/v06_e02/"],
+  "logical_objects": [
+    {"key": "tables/public$t?/data/l00-rc-b00.arrow", "requires_current_version": true},
+    {"key": "tables/public$t%3F/data/l00-rc-b00.arrow", "requires_current_version": true}
+  ],
+  "versions": [
+    {
+      "key": "snapshots/v06_e02/tables/public$t%3F/data/l00-rc-b00.arrow",
+      "version_id": "current+/=",
+      "kind": "object",
+      "is_latest": true
+    },
+    {
+      "key": "snapshots/v06_e02/tables/public$t%3F/data/l00-rc-b00.arrow",
+      "version_id": "older%2F",
+      "kind": "object",
+      "is_latest": false
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+mod classic_s3_keys;
 mod inventory;
 mod resolved;
 
@@ -59,6 +60,8 @@ pub struct QualificationReport {
     pub runtime: Option<Value>,
     pub environment_lookups: BTreeSet<String>,
     pub configuration_gaps: Vec<Finding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classic_s3_key_preflight: Option<classic_s3_keys::Preflight>,
     pub cutover_requirements: Vec<&'static str>,
     pub assumptions: Vec<&'static str>,
     pub unsupported_jvm_extensions: Vec<&'static str>,
@@ -80,10 +83,26 @@ impl QualificationReport {
 /// The returned report owns its allocation reservation; caller-owned input buffers remain the caller's responsibility.
 /// Invalid configuration produces a redacted, ineligible report; size/budget exhaustion returns an error.
 pub fn qualify(configuration: &str, format: InputFormat, environment_json: &[u8], provenance_json: &[u8], memory: &Arc<MemoryBudget>) -> Result<QualificationReport> {
-    for length in [configuration.len(), environment_json.len(), provenance_json.len()] {
+    qualify_inputs(configuration, format, environment_json, provenance_json, None, memory)
+}
+
+/// Adds a read-only Classic S3 key preflight against an explicitly captured version inventory.
+pub fn qualify_with_classic_s3_inventory(
+    configuration: &str, format: InputFormat, environment_json: &[u8], provenance_json: &[u8],
+    s3_inventory_json: &[u8], memory: &Arc<MemoryBudget>,
+) -> Result<QualificationReport> {
+    qualify_inputs(configuration, format, environment_json, provenance_json, Some(s3_inventory_json), memory)
+}
+
+fn qualify_inputs(
+    configuration: &str, format: InputFormat, environment_json: &[u8], provenance_json: &[u8],
+    s3_inventory_json: Option<&[u8]>, memory: &Arc<MemoryBudget>,
+) -> Result<QualificationReport> {
+    let lengths = [configuration.len(), environment_json.len(), provenance_json.len(), s3_inventory_json.map_or(0, <[u8]>::len)];
+    for length in lengths {
         if length > MAX_INPUT_BYTES { return Err(invalid("A qualification input exceeds the one MiB limit")); }
     }
-    let total = configuration.len().checked_add(environment_json.len()).and_then(|value| value.checked_add(provenance_json.len())).ok_or_else(|| invalid("Qualification size overflow"))?;
+    let total: usize = lengths.into_iter().sum();
     let bytes = total.checked_mul(256).and_then(|value| value.checked_add(1024 * 1024)).ok_or_else(|| invalid("Qualification size overflow"))?;
     let reservation = memory.reserve(bytes)?;
     let mut report = QualificationReport {
@@ -91,6 +110,9 @@ pub fn qualify(configuration: &str, format: InputFormat, environment_json: &[u8]
         configuration_sha256: digest(configuration.as_bytes()), environment_input_sha256: digest(environment_json), provenance_input_sha256: digest(provenance_json),
         provenance: None, compiled_features: compiled_features(), databases: Vec::new(), authentication: None, remotes: BTreeMap::new(), modules: Vec::new(), runtime: None,
         environment_lookups: BTreeSet::new(), configuration_gaps: Vec::new(),
+        classic_s3_key_preflight: s3_inventory_json.map(|input| classic_s3_keys::Preflight::refused(
+            input, "unresolved-configuration", "configuration", "The Classic S3 key inventory requires a decoded YAML configuration.",
+        )),
         cutover_requirements: vec![
             "Inventory attached databases, partitions, every writer, CDC source, compactor, GC worker, client version and restore procedure.",
             "Approve a write-pause budget, recovery-time target, retained log range and protected object versions.",
@@ -143,6 +165,15 @@ pub fn qualify(configuration: &str, format: InputFormat, environment_json: &[u8]
             report.reservations.push(memory.reserve(parsed.allocation_bound().checked_mul(2).ok_or_else(|| invalid("Qualification size overflow"))?)?);
             if !parsed.warnings().is_empty() { report.gap("ignored-edn-options", "configuration", "The production decoder reported ignored configuration keys; none are accepted for cutover."); }
             resolved::describe(parsed.configuration(), &environment, &mut report);
+            if let Some(input) = s3_inventory_json.filter(|_| !matches!(format, InputFormat::Edn)) {
+                #[cfg(feature = "s3")]
+                let preflight = classic_s3_keys::inspect(input, parsed.configuration(), &environment);
+                #[cfg(not(feature = "s3"))]
+                let preflight = classic_s3_keys::Preflight::refused(
+                    input, "s3-backend-not-compiled", "configuration", "Use the rtdb-config binary packaged with S3 support.",
+                );
+                report.classic_s3_key_preflight = Some(preflight);
+            }
         }
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Err(error),
         Err(_) => report.gap("production-decoder-rejected", "configuration", "The bounded production decoder rejected the configuration or its environment; diagnostic values are withheld to protect secrets."),
