@@ -1,3 +1,4 @@
+use std::num::NonZeroI64;
 use rtdb_types::StructFields;
 use crate::{EvalContext, cast, numeric::{division_by_zero, inapplicable, integer}, temporal::{IntervalParts, timestamp_units}};
 use rtdb_plan::{BinaryOp, TemporalField as F};
@@ -256,24 +257,35 @@ fn age(end: &Value,start: &Value,timezone: &str) -> Result<Value> {
 }
 
 #[derive(Clone,Copy)]
-pub(crate) struct RangeBins { stride: i64, from: i64, to: i64, base: i64, size: i64 }
+pub struct RangeBins { stride: i64, from: i64, to: i64, base: i64, size: i64 }
 impl RangeBins {
     pub(crate) fn prepare(args: &[Value],context: &EvalContext<'_>) -> Result<Option<Self>> {
         context.reserve(args.iter().try_fold(4096usize,|bytes,value|bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
         rtdb_plan::function_type("range_bins",&args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
         if args.iter().any(crate::compare::nullish) { return Ok(None); }
-        let Value::Duration { value: stride,.. } = cast(&args[0],&L::Scalar(S::Duration(U::Microsecond)),context.timezone)? else { return Err(inapplicable("range_bins",&[])); };
-        if stride == 0 { return Err(division_by_zero()); }
+        let stride = Self::stride_micros(&args[0], context.timezone)?;
         let convert = |value: &Value| -> Result<i64> { let Value::Timestamp { value,.. } = cast(value,&instant_type(),context.timezone)? else { return Err(inapplicable("range_bins",&[])); };Ok(value) };
         let from = convert(&args[1])?;let to = convert(&args[2])?;let origin = args.get(3).map(convert).transpose()?.unwrap_or(0);
+        Ok(Some(Self::from_micros(stride, from, to, origin)))
+    }
+
+    pub fn stride_micros(value: &Value, timezone: &str) -> Result<NonZeroI64> {
+        let Value::Duration { value, .. } = cast(value, &L::Scalar(S::Duration(U::Microsecond)), timezone)? else {
+            return Err(inapplicable("range_bins", &[]));
+        };
+        NonZeroI64::new(value).ok_or_else(division_by_zero)
+    }
+
+    pub fn from_micros(stride: NonZeroI64, from: i64, to: i64, origin: i64) -> Self {
+        let stride = stride.get();
         let base = from.wrapping_sub(origin).wrapping_div(stride).wrapping_mul(stride).wrapping_add(origin);
         let top = to.wrapping_sub(origin).wrapping_sub(1).wrapping_div(stride).wrapping_add(1).wrapping_mul(stride).wrapping_add(origin);
         let size = top.wrapping_sub(base).wrapping_div(stride);
-        Ok(Some(Self { stride,from,to,base,size }))
+        Self { stride, from, to, base, size }
     }
     pub(crate) fn size(self) -> Result<i32> { i32::try_from(self.size).map_err(|_|overflow()) }
-    pub(crate) fn len(self) -> Result<usize> { Ok(self.size()?.max(0) as usize) }
-    fn cell(self, index: usize) -> (i64, i64, f64) {
+    pub fn len(self) -> Result<usize> { Ok(self.size()?.max(0) as usize) }
+    pub fn cell(self, index: usize) -> (i64, i64, f64) {
         let from = self.base.wrapping_add((index as i64).wrapping_mul(self.stride));
         let to = self.base.wrapping_add((index as i64).wrapping_add(1).wrapping_mul(self.stride));
         let weight = (to.min(self.to).wrapping_sub(from.max(self.from))) as f64 / self.to.wrapping_sub(self.from) as f64;

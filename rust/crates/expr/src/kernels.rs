@@ -30,6 +30,7 @@ pub fn extract_timestamps(field: &str, values: &TimestampMicrosecondArray, timez
 }
 
 pub use crate::functions::FloatMath;
+pub use crate::temporal_functions::RangeBins;
 
 /// A scalar function with a column-at-a-time form, resolved once from its call's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

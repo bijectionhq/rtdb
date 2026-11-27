@@ -20,7 +20,7 @@ use rtdb_types::{IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value}
 
 use crate::columnar::{
     BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_column_rows_iter,
-    gather_join_probe, gather_nullable_column, poll_nested_batch,
+    gather_join_probe, gather_nullable_column, periods, poll_nested_batch,
 };
 use crate::context::Execution;
 use crate::invalid;
@@ -361,6 +361,7 @@ pub(crate) struct Residual {
 struct PreparedResidual<'a> {
     comparisons: Vec<rtdb_expr::ExpressionInvocation<'a>>,
     sides: &'a [(bool, usize)],
+    period_point: Option<(usize, usize)>,
     _metadata: rtdb_expr::EvaluationScope,
 }
 
@@ -384,6 +385,20 @@ impl JoinRow<'_> {
         let &(on_build, column) = self.sides.get(index)?;
         if on_build { Some((self.build.columns.get(column)?, self.build_row, self.admit_dates[0])) }
         else { Some((self.probe.columns.get(column)?, self.probe_row, self.admit_dates[1])) }
+    }
+
+    fn period_contains_point(&self, period: usize, point: usize) -> Option<bool> {
+        let (ranges, range_row, _) = self.column(period)?;
+        let (points, point_row, _) = self.column(point)?;
+        let bounds = periods::bounds(ranges, range_row)?;
+        let point = ThetaKind::Timestamp(TimeUnit::Microsecond, true).arrow(points, point_row)?;
+        match (bounds, point) {
+            (Some((lower, upper)), Some(ThetaValue::Number(ThetaNumber::Integer(point)))) => {
+                Some((i128::from(lower)..i128::from(upper)).contains(&point))
+            }
+            (None, _) | (_, None) => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -426,7 +441,17 @@ impl Residual {
         let metadata = execution.scope()?;
         metadata.reserve(self.expressions.len().checked_mul(std::mem::size_of::<rtdb_expr::ExpressionInvocation<'_>>()).ok_or_else(size_error)?)?;
         let comparisons = self.expressions.iter().map(|expr| execution.prepare_expression(expr, &self.schema, &metadata)).collect::<Result<_>>()?;
-        Ok(PreparedResidual { comparisons, sides: &self.sides, _metadata: metadata })
+        Ok(PreparedResidual { comparisons, sides: &self.sides, period_point: self.period_point(), _metadata: metadata })
+    }
+
+    fn period_point(&self) -> Option<(usize, usize)> {
+        let [Expr::Call { name, args, .. }] = self.expressions.as_slice() else { return None; };
+        if name != "contains?" { return None; }
+        let [Expr::Column { id: period, .. }, Expr::Column { id: point, .. }] = args.as_slice() else { return None; };
+        let period = self.schema.position(*period)?;
+        let point = self.schema.position(*point)?;
+        (periods::is_period(&self.schema.fields()[period].data_type)
+            && periods::is_zoned_micros(&self.schema.fields()[point].data_type)).then_some((period, point))
     }
 }
 
@@ -1047,6 +1072,11 @@ impl Spec {
         let Some(keys) = self.residual_keys(build, build_row, probe, probe_row, equality)? else { return Ok(false); };
         let mut unknown = !keys;
         let input = JoinRow { build, build_row, probe, probe_row, sides: residual.sides, admit_dates: self.projected };
+        if let Some((period, point)) = residual.period_point
+            && let Some(matched) = input.period_contains_point(period, point)
+        {
+            return Ok(keys && matched);
+        }
         for comparison in &residual.comparisons {
             let scope = self.execution.scope()?;
             let value = self.execution.evaluate_invocation_row(&scope, comparison, rtdb_expr::ExpressionRow::Borrowed(&input)).await?;

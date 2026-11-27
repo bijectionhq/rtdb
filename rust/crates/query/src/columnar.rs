@@ -6,6 +6,7 @@ pub(crate) mod float_vector;
 mod float_vectors;
 pub(crate) mod functions;
 mod patch;
+pub(crate) mod periods;
 pub(crate) mod search;
 pub(crate) mod window;
 
@@ -5337,6 +5338,11 @@ impl BatchCursor for BatchExpressions {
                 continue;
             }
             if let Some((column, owner)) = concat::utf8_column(kernel, &self.schema, &batch, &self.execution.context)? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
+            if let Some((column, owner)) = periods::range_bins(kernel, &self.schema, &batch, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
                 continue;

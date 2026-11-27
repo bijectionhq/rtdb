@@ -50,6 +50,54 @@ fn timestamp(value: i64) -> V { V::Timestamp { value, unit: TimeUnit::Microsecon
 fn period(lower: i64, upper: i64) -> V { V::TimestampTzRange { lower, upper } }
 
 #[tokio::test]
+async fn tsbs_period_bins_preserve_typed_bounds_weights_and_open_end() {
+    let sql = "WITH readings AS (
+                 SELECT _valid_time AS p FROM foo FOR ALL VALID_TIME
+                 UNION ALL SELECT _valid_time FROM bar FOR ALL VALID_TIME
+               )
+               SELECT (bin)._from AS lo, (bin)._to AS hi, (bin)._weight AS weight
+               FROM readings, UNNEST(RANGE_BINS(INTERVAL 'PT0.000020S', p)) AS bins(bin)
+               ORDER BY lo";
+    let (_, rows) = query(sql).await.unwrap();
+    assert_eq!(rows, [vec![timestamp(0), timestamp(20), V::F64(0.5)],
+                      vec![timestamp(20), timestamp(40), V::F64(0.5)]]);
+
+    let sql = "SELECT RANGE_BINS(INTERVAL 'PT0.000020S', p) AS bins FROM (
+                 SELECT PERIOD(TIMESTAMP '1969-12-31T23:59:59.999970Z',
+                               TIMESTAMP '1969-12-31T23:59:59.999990Z') AS p
+               ) bounds";
+    let explicit_origin = sql.replace(", p)", ", p, TIMESTAMP '1970-01-01T00:00:00Z')");
+    assert_eq!(query(sql).await.unwrap().1, query(&explicit_origin).await.unwrap().1);
+
+    let sql = "SELECT RANGE_BINS(INTERVAL 'PT0.000020S', b._valid_time) AS bins
+               FROM (VALUES (TRUE), (FALSE)) matches(keep)
+               LEFT JOIN bar FOR ALL VALID_TIME AS b ON matches.keep";
+    assert_eq!(query(sql).await.unwrap().1, [vec![V::Null], vec![V::Null]]);
+}
+
+#[tokio::test]
+async fn tsbs_period_point_left_join_preserves_boundaries_duplicates_and_null_extension() {
+    let sql = "WITH hours AS (
+                 SELECT h::timestamptz AS hour FROM generate_series(
+                   TIMESTAMP '1970-01-01T00:00:00Z', TIMESTAMP '1970-01-01T00:00:00.000040Z',
+                   INTERVAL 'PT0.000010S') AS x(h)
+                 UNION ALL SELECT TIMESTAMP '1970-01-01T00:00:00.000010Z'
+                 UNION ALL SELECT NULL::timestamptz
+               )
+               SELECT hour, COUNT(d._id) AS n FROM hours
+               LEFT JOIN foo FOR ALL VALID_TIME AS d ON d._valid_time CONTAINS hours.hour
+               GROUP BY hour ORDER BY hour NULLS LAST";
+    let (_, rows) = query(sql).await.unwrap();
+    assert_eq!(rows, [vec![timestamp(0), V::I64(0)], vec![timestamp(10), V::I64(2)],
+                      vec![timestamp(20), V::I64(1)], vec![timestamp(30), V::I64(0)],
+                      vec![timestamp(40), V::I64(0)], vec![V::Null, V::I64(0)]]);
+    let (_, rows) = query(&sql.replace("JOIN foo", "JOIN bar")).await.unwrap();
+    assert_eq!(rows, [vec![timestamp(0), V::I64(0)], vec![timestamp(10), V::I64(0)],
+                      vec![timestamp(20), V::I64(1)], vec![timestamp(30), V::I64(1)],
+                      vec![timestamp(40), V::I64(1)], vec![V::Null, V::I64(0)]]);
+}
+
+#[tokio::test]
 async fn temporal_test_period_projections_and_upper_infinity() {
     let (schema, rows) = query("SELECT _valid_time,_system_time FROM foo").await.unwrap();
     assert_eq!(schema.fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["_valid_time", "_system_time"]);
