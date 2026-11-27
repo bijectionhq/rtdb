@@ -1,6 +1,6 @@
 use super::activation::{ActivationAuthority, VerifiedSuccessor};
 use journal_contract::Journal;
-use rtdb_crypt::LocalKms;
+use rtdb_crypt::FileKms;
 use rtdb_db::{MultiDatabase, MultiOptions, PortableBackup, Role};
 use rtdb_node::{Clock, MultiServing, SystemClock, serving::ServingDriver};
 use rtdb_storage::MemoryStore;
@@ -39,7 +39,7 @@ fn database(
     incarnation: Uuid,
     journal: Arc<dyn Journal>,
     store: Arc<MemoryStore>,
-    keys: Arc<LocalKms>,
+    keys: Arc<FileKms>,
 ) -> MultiDatabase {
     MultiDatabase::new(
         MultiOptions {
@@ -56,6 +56,12 @@ fn database(
     .unwrap()
     .with_immutable_journal()
     .with_binary_checkpoints(true)
+}
+
+fn vault(directory: &tempfile::TempDir, name: &str) -> Arc<FileKms> {
+    let path = directory.path().join(name);
+    FileKms::create_directory(&path).unwrap();
+    Arc::new(FileKms::open(&path, || SystemClock.now().0).unwrap())
 }
 
 fn transaction(key: u8) -> Transact {
@@ -94,10 +100,11 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
     let predecessor_id = Uuid::new_v4();
     let successor_id = Uuid::new_v4();
     let predecessor_binding = authority.bootstrap(NAME, predecessor_id).await.unwrap();
+    let vaults = tempfile::tempdir().unwrap();
     let (mut source_keepers, source_journal) = journal().await;
     let source_keeper_ids = source_keepers.keepers().keys().copied().collect::<Vec<_>>();
     let source_store = Arc::new(MemoryStore::default());
-    let source_keys = Arc::new(LocalKms::new(|| SystemClock.now().0));
+    let source_keys = vault(&vaults, "source");
     let source = database(
         predecessor_id,
         source_journal.clone(),
@@ -122,7 +129,7 @@ async fn portable_cut_replaces_a_lost_cell_and_fences_its_return() {
 
     let (mut destination_keepers, destination_journal) = journal().await;
     let destination_store = Arc::new(MemoryStore::default());
-    let destination_keys = Arc::new(LocalKms::new(|| SystemClock.now().0));
+    let destination_keys = vault(&vaults, "destination");
     let mut staging = database(
         successor_id,
         destination_journal.clone(),
