@@ -1,0 +1,44 @@
+use rtdb_index::branches::store::KeyRange;
+use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::Basis};
+
+use super::{MultiDatabase, next, no_writer};
+
+impl MultiDatabase {
+    /// Advisory preflight at the settled Multi writer prefix. Durable
+    /// publication must repeat admission under its fenced append authority.
+    pub async fn check_store_purge_floor(&mut self, since: Basis, keep_from: u64, reads: &[KeyRange]) -> Result<()> {
+        self.stream.require_serving().await?;
+        self.refresh().await?;
+        let lease = self.authority()?;
+        self.require_armed_rotation()?;
+        let state = self.state();
+        let head = state.head;
+        let journal_floor = state.floor;
+        let writer = self.writer.as_ref().ok_or_else(no_writer)?;
+        if writer.acknowledged != head || writer.pipeline.next_position() != state.coordinates.position(next(head)?)? {
+            return Err(prefix_unsettled());
+        }
+
+        let index = state.transactions.index();
+        index.check_store_purge_guards(since, keep_from, reads)?;
+        if keep_from <= index.oldest_retained_cut().basis.position() {
+            return self.require_authority(lease);
+        }
+        index.check_store_purge_branch_retention(keep_from)?;
+        self.require_destroyed_generation()?;
+        if self.reachability(lease).await?.pins().next().is_some() {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/purge-pin",
+                "An ordered checkpoint pin still retains history"));
+        }
+        self.refresh().await?;
+        if self.authority()?.epoch != lease.epoch || self.state().head != head || self.state().floor != journal_floor {
+            return Err(prefix_unsettled());
+        }
+        Ok(())
+    }
+}
+
+fn prefix_unsettled() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Busy, "rtdb.store/purge-prefix-unsettled",
+        "The writer must check the purge floor against a settled journal prefix")
+}

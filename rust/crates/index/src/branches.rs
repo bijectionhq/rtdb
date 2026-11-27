@@ -19,6 +19,7 @@ mod custody_transfer;
 mod schema;
 mod scoped_hold;
 pub mod store;
+mod store_floor;
 mod visibility;
 pub use schema::{DeclaredSchema, TEMPORAL_COLUMNS, TableSchema};
 pub use scoped_hold::{ScopedHold, ScopedHoldCommand};

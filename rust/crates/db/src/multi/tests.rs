@@ -335,6 +335,89 @@ fn put(key: u8, id: i64, text: &str) -> Transact {
     )
 }
 
+fn store_write(request_key: u8, key: &[u8], value: Option<&[u8]>) -> Transact {
+    use rtdb_tx::transact::{StoreAppend, StoreWrite};
+
+    request(request_key, Op::Store(StoreAppend {
+        writes: vec![StoreWrite { key: key.to_vec(), value: value.map(<[u8]>::to_vec), key_stamp: None, value_stamp: None }],
+        bounds: Vec::new(),
+        derives: Vec::new(),
+        window: Window::default(),
+    }))
+}
+
+#[tokio::test]
+async fn store_purge_preflight_checks_exact_absence_guards_after_checkpoint_trim() {
+    use rtdb_index::branches::store::KeyRange;
+
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let basis = writer.transact(&store_write(1, b"a", Some(b"live"))).await.unwrap().basis;
+    let reads = [
+        KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) },
+        KeyRange { start: b"h".to_vec(), end: Some(b"i".to_vec()) },
+    ];
+    writer.transact(&store_write(2, b"i", Some(b"outside"))).await.unwrap();
+    writer.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap();
+    writer.transact(&store_write(3, b"held", Some(b"hold"))).await.unwrap();
+    writer.transact(&store_write(4, b"held", None)).await.unwrap();
+    writer.checkpoint(Vec::new()).await.unwrap();
+
+    let error = writer.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.store/purge-guard");
+    assert_eq!(error.context.get("read").and_then(|read| read.as_u64()), Some(1));
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert_eq!(follower.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code, "rtdb/no-writer");
+    cluster.at(200);
+    assert_eq!(writer.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code, "rtdb/no-writer");
+    assert!(matches!(follower.tick(&live(2)).await.unwrap(), Role::Writer(_)));
+    assert_eq!(follower.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code, "rtdb.store/purge-guard");
+}
+
+#[tokio::test]
+async fn store_purge_preflight_checks_committed_bases_and_preserves_native_retention() {
+    use rtdb_index::branches::store::KeyRange;
+
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let old = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap().basis;
+    let current = writer.transact(&store_write(2, b"a", Some(b"new"))).await.unwrap().basis;
+    let floor = current.position();
+    let reads = [KeyRange { start: b"a".to_vec(), end: None }];
+    let foreign = Basis::new([0; 16], floor);
+    assert_eq!(writer.check_store_purge_floor(foreign, floor, &reads).await.unwrap_err().code, "rtdb/foreign-basis");
+    assert_eq!(writer.check_store_purge_floor(current, floor + 1, &reads).await.unwrap_err().code, "rtdb.store/purge-floor-ahead");
+    let empty = KeyRange { start: b"a".to_vec(), end: Some(b"a".to_vec()) };
+    assert_eq!(writer.check_store_purge_floor(current, floor, &[empty]).await.unwrap_err().code, "rtdb.store/empty-range");
+
+    let id = Uuid::from_u128(9);
+    writer.pin_checkpoint_at(id, old, None).await.unwrap();
+    let control = writer.state().coordinates.position(writer.state().head).unwrap();
+    let control = Basis::new(current.incarnation(), control);
+    assert_eq!(writer.check_store_purge_floor(control, floor, &reads).await.unwrap_err().code, "rtdb/unknown-basis");
+    assert_eq!(writer.check_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-pin");
+    writer.release_pin(id).await.unwrap();
+
+    writer.transact(&request(3, Op::Fork {
+        child: "held".into(), from: (MAIN_BRANCH.into(), old), writable: false, expires_at: None,
+    })).await.unwrap();
+    assert_eq!(writer.check_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-retention");
+    let dropped = writer.transact(&request(4, Op::DropBranch { branch: "held".into() })).await.unwrap().basis;
+    let head = writer.stream.head().await.unwrap();
+    writer.check_store_purge_floor(dropped, dropped.position(), &reads).await.unwrap();
+    assert_eq!(writer.stream.head().await.unwrap(), head);
+    assert_eq!(writer.fresh_index().await.unwrap().exact(old).unwrap().basis, old);
+    let replay = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap();
+    assert_eq!(replay.basis, old);
+    assert!(replay.replayed);
+}
+
 async fn text_at(node: &mut MultiDatabase, branch: &str, id: i64) -> Option<Value> {
     let time = (node.clock)();
     let index = node.fresh_index().await.unwrap();

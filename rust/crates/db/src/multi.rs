@@ -37,6 +37,7 @@ mod pipeline;
 mod ranked;
 mod rotation;
 mod retirement;
+mod store_floor;
 mod timing;
 pub use backup::{BackupFileRelocation, InstalledBackup, PortableBackup, VerifiedBackup};
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
