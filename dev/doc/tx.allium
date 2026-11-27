@@ -213,6 +213,7 @@
 -- Hash joins hash admitted scalar key columns over each page and use the same row hash for other layouts.
 -- Its Bloom and bounded entity ID filters use those same build-side vectors.
 -- Join Bloom preparation reads the children of compatible scalar lists from their Arrow positions.
+-- Descriptive list and child field metadata leaves the key's hash and equality unchanged.
 -- A query-generated join Bloom covers both persisted floating zero encodings for a numeric zero build key.
 -- An equijoin can partition and replay its consumed input as Arrow record batches and Arrow selections.
 -- Supported computed join keys retain the payload positions through match selection.

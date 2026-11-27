@@ -12,7 +12,7 @@ use crate::{
     invalid,
     join_storage::combine_cell_hash,
     operators::{combine_equality_hash, equality_cell_hash, has_uri, local_micros_equality_hash},
-    scalar_key::{ScalarColumn, ScalarKey},
+    scalar_key::{ScalarColumn, ScalarKey, plain_key_metadata},
 };
 
 #[derive(Clone, Copy)]
@@ -202,7 +202,7 @@ struct PlainListKey<'a> {
 impl<'a> PlainListKey<'a> {
     fn arrow(cell: ArrowCell<'a>, logical: &LogicalType) -> Option<Self> {
         let ArrowCell { array, field, row } = cell;
-        if row >= array.len() || field.data_type() != array.data_type() || !field.metadata().is_empty() || array.is_null(row) {
+        if row >= array.len() || field.data_type() != array.data_type() || !plain_key_metadata(field) || array.is_null(row) {
             return None;
         }
         let LogicalType::List { kind, element } = nonnull(logical) else { return None; };
@@ -210,13 +210,13 @@ impl<'a> PlainListKey<'a> {
             (ListKind::List, DataType::List(child)) => {
                 let list = array.as_any().downcast_ref::<ListArray>()?;
                 let offsets = list.value_offsets();
-                let children = ScalarColumn::bind(list.values().as_ref(), child, Some(element))?;
+                let children = ScalarColumn::bind_plain(list.values().as_ref(), child, element)?;
                 (children, offsets[row] as usize..offsets[row + 1] as usize)
             }
             (ListKind::FixedSizeList(width), DataType::FixedSizeList(child, physical)) if width == physical => {
                 let list = array.as_any().downcast_ref::<FixedSizeListArray>()?;
                 let start = list.value_offset(row) as usize;
-                let children = ScalarColumn::bind(list.values().as_ref(), child, Some(element))?;
+                let children = ScalarColumn::bind_plain(list.values().as_ref(), child, element)?;
                 (children, start..start + *physical as usize)
             }
             _ => return None,
@@ -1555,6 +1555,63 @@ mod tests {
                 assert_eq!(cell as u32, crate::operators::equality_cell_hash(&value, &context.timezone), "direct and set cell hash of {value:?}");
                 assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).map(|key| key.hashes.0), Some(cell), "Bloom hash of {value:?}");
             }
+        }
+    }
+
+    #[test]
+    fn decorated_scalar_lists_borrow_children_for_hashes_and_three_valued_equality() {
+        use std::collections::HashMap;
+        use arrow_buffer::OffsetBuffer;
+
+        let context = context();
+        let batch = |kind, decorated| {
+            let metadata = || if decorated { HashMap::from([("origin".into(), "test".into())]) } else { HashMap::new() };
+            let child = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(metadata()));
+            let values = Arc::new(Int64Array::from(vec![Some(4), Some(7), None, Some(7), Some(4), Some(8)]));
+            let array: arrow_array::ArrayRef = match kind {
+                ListKind::List => Arc::new(ListArray::new(child, OffsetBuffer::new(vec![0, 2, 4, 6].into()), values, None)),
+                ListKind::FixedSizeList(2) => Arc::new(FixedSizeListArray::new(child, 2, values, None)),
+                _ => unreachable!(),
+            };
+            let field = Arc::new(Field::new("key", array.data_type().clone(), false).with_metadata(metadata()));
+            let logical = rtdb_columnar::from_field(&field).unwrap();
+            ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(logical) }],
+                3, context.memory.reserve(4096).unwrap()).unwrap()
+        };
+
+        for kind in [ListKind::List, ListKind::FixedSizeList(2)] {
+            let plain = batch(kind.clone(), false);
+            let decorated = batch(kind, true);
+            for row in 0..decorated.len {
+                let value = decorated.columns[0].value(row).unwrap();
+                let (hash, key) = Key::bind(&decorated, row, true, &context, KeyHash::Set, true).unwrap();
+                assert!(key.cached(0).is_none());
+                assert_eq!(hash, crate::operators::equality_hash(std::slice::from_ref(&value), &context.timezone));
+                assert_eq!(key.vector_hash().unwrap(), crate::join_storage::hash_values([&value]).unwrap());
+                let bloom = direct_bloom_hashes(&decorated.columns[0], row).unwrap();
+                assert_eq!(bloom.hashes, (rtdb_columnar::hash_value(&value, 0).unwrap(), rtdb_columnar::hash_value_murmur3(&value, 0).unwrap()));
+            }
+            for (left, right, expected) in [(0, 0, Some(true)), (0, 1, None), (2, 1, Some(false))] {
+                assert_eq!(direct_key_equal(&plain.columns[0], left, &decorated.columns[0], right, false), Some(expected));
+            }
+        }
+
+        let plain = batch(ListKind::List, true);
+        let Column::Arrow { array, field, logical } = &plain.columns[0] else { unreachable!() };
+        for (annotation, value) in [
+            (rtdb_columnar::EXTENSION_NAME_KEY, "unknown"),
+            (rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY, "1000"),
+        ] {
+            let metadata = HashMap::from([(annotation.into(), value.into())]);
+            let invalid = (**field).clone().with_metadata(metadata.clone());
+            let cell = ArrowCell { array: array.as_ref(), field: &invalid, row: 0 };
+            assert!(PlainListKey::arrow(cell, logical.as_ref().unwrap()).is_none());
+
+            let child = Arc::new(Field::new("item", DataType::Int64, true).with_metadata(metadata));
+            let array = ListArray::new(child, OffsetBuffer::new(vec![0, 1].into()), Arc::new(Int64Array::from(vec![1])), None);
+            let field = Field::new("key", array.data_type().clone(), false);
+            let cell = ArrowCell { array: &array, field: &field, row: 0 };
+            assert!(PlainListKey::arrow(cell, logical.as_ref().unwrap()).is_none());
         }
     }
 

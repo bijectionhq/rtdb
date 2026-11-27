@@ -2474,6 +2474,7 @@ surface QueryAccess {
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- DISTINCT holds its seen keys in memory and fails when the memory budget cannot hold them.
         -- Their key index retains Arrow batches and hashes and compares compatible scalar and list cells at their indexed positions.
+        -- A compatible scalar list can use its child positions when its parent and child fields carry descriptive metadata.
         -- Two plain list keys of the same shape are equal when every child compares true, and a child comparison that is unknown leaves the list equality unknown unless another child compares false.
         -- Each hash bucket stores the position of its collision chain's tail.
         -- Probes visit retained candidates in insertion order.

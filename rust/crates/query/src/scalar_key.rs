@@ -41,10 +41,15 @@ pub(crate) enum ScalarColumn<'a> {
 
 impl<'a> ScalarColumn<'a> {
     pub fn bind(array: &'a dyn Array, field: &Field, logical: Option<&LogicalType>) -> Option<Self> {
-        if !field.metadata().is_empty() || array.data_type() != field.data_type() {
+        if !field.metadata().is_empty() { return None; }
+        Self::bind_plain(array, field, logical?)
+    }
+
+    pub(crate) fn bind_plain(array: &'a dyn Array, field: &Field, logical: &LogicalType) -> Option<Self> {
+        if array.data_type() != field.data_type() || !plain_key_metadata(field) {
             return None;
         }
-        let logical = crate::columnar::float_vector::nonnull(logical?);
+        let logical = crate::columnar::float_vector::nonnull(logical);
         let array_type = array.as_any();
         Some(match (array.data_type(), logical) {
             (DataType::Null, LogicalType::Null) if field.is_nullable() => Self::Null,
@@ -104,6 +109,11 @@ impl<'a> ScalarColumn<'a> {
             Self::Bytes(array) => read_rows(array, rows, |row| ScalarKey::Bytes(array.value(row)), visit),
         }
     }
+}
+
+pub(crate) fn plain_key_metadata(field: &Field) -> bool {
+    field.metadata().is_empty() || (!field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)
+        && rtdb_columnar::decimal_field_parameters(field).is_ok())
 }
 
 impl<'a> ScalarKey<'a> {
