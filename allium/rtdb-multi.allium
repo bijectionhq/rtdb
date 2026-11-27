@@ -3672,7 +3672,9 @@ rule ScheduleCheckpointCaptureRevocation {
 rule CommitCheckpointCaptureRevocation {
     -- A brokered handle invokes the original authority every time it opens or seals protected bytes.
     -- Revocation serializes with broker operations and fences later calls through already issued handles.
-    -- The directory can publish the observation after the authority durably closes the key.
+    -- The original archive vault binds the capture ID and exact request digest before closing its operation key.
+    -- The vault retains its observation only after the operation key and its enrolled unit scope are withdrawn.
+    -- An exact retry reads back the same provider observation after either process restarts.
     when: AuthenticatedCaptureRevocationContinued(operator, authority, capture)
 
     requires: CaptureAdmissionFenced(capture)
@@ -3681,7 +3683,8 @@ rule CommitCheckpointCaptureRevocation {
 
     ensures:
         IrrevocablyCloseCaptureKey(capture)
-        ObserveCaptureOperationRevocation(capture)
+        RetainOriginalVaultRevocation(capture)
+        PublishOriginalVaultObservation(capture)
 }
 
 rule SettleCheckpointCaptureDiscard {

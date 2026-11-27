@@ -105,6 +105,8 @@ pub(crate) use writable_world::{WorldFact, WorldPoint, matches_retention};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use read_world::reopen_checkpoint_world_archive;
 pub(crate) use retirement::{capture_retirement_receipt, commit_capture_revocation, prepare_capture_retirement, finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, schedule_capture_revocation, retire_world_suffix};
+#[cfg(test)]
+pub(crate) use retirement::capture_revocation_order;
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, StageSelector, inspect_staged_owned_relations, stream_staged_owned_event_files, tunnel_staged_checkpoint};
 pub(crate) use reader::{ApplicationEvidence, ApplicationLayout, ApplicationReadback, ClassicMigrationInventory, ClassicProjection, ClassicRead, PointHistory, PointHistoryRead, PointSelector, ReceiptHistory, ReceiptLookup, ReceiptLookups, ReceiptPolicyReadback, ReceiptPolicySelection, inspect_classic_migration_inventory, read_classic_migration};

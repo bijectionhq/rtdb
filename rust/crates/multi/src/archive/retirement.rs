@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::{CapturePoint, archive_binding, archive_key_id, archive_witness, capture_point, inconsistent, key, read, require_archive_key_authority, unavailable};
 use crate::{
-    admin::update_installation, deployment::CellStorage, keys::{ArchiveKeyWithdrawal, KeyService},
+    admin::update_installation, deployment::CellStorage, keys::{ArchiveRevocation, KeyService},
     store::reconcile_storage_regions,
 };
 
@@ -395,23 +395,22 @@ async fn withdraw_capture_key(
         return Ok(accepted);
     }
     let registered = record.checkpoint_captures.get(&capture).filter(|value| value.media_bound).cloned();
-    let key = if let Some(registration) = &registered {
+    let point = if let Some(registration) = &registered {
         require_archive_key_authority(keys, registration).await?;
         let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
-        Some(archive_key_id(&capture_point(&record, deployment, capture, &accepted.archive)?))
+        Some(capture_point(&record, deployment, capture, &accepted.archive)?)
     } else {
         None
     };
+    let key = point.as_ref().map(archive_key_id);
     let enrolled = registered.as_ref().is_some_and(|value| value.key_namespace.is_some())
         && matches!(serde_json::from_str::<CellStorage>(&accepted.archive), Ok(CellStorage::Local { .. }));
-    if require_operation_authority {
-        let Some(key) = &key else {
-            return Err(inconsistent("The capture has no enrolled archive key"));
-        };
-        if !enrolled || !keys.archive_key_is_operation_only(key).await?
-        {
-            return Err(inconsistent("The capture has no enrolled operation-only key authority"));
-        }
+    let operation_authority = match key.as_deref() {
+        Some(key) if enrolled && accepted.manifest_sha256.is_some() => keys.archive_key_is_operation_only(key).await?,
+        _ => false,
+    };
+    if require_operation_authority && !operation_authority {
+        return Err(inconsistent("The capture has no enrolled operation-only key authority"));
     }
     if let Some(due_at_ms) = accepted.scheduled_revocation_at_ms {
         let key = key.as_deref().filter(|_| enrolled)
@@ -431,15 +430,22 @@ async fn withdraw_capture_key(
             return Err(inconsistent("The closed capture changed while draining its archive I/O"));
         }
     }
-    let operation_only = match key {
-        Some(key) => keys.withdraw_archive_key(&key).await? == ArchiveKeyWithdrawal::OperationAuthority,
-        None => false,
+    let not_before_ms = accepted.authorized_at_ms.max(accepted.scheduled_revocation_at_ms.unwrap_or(i64::MIN));
+    let withdrawal_observed_at = match (key, point) {
+        (Some(key), Some(point)) if operation_authority => {
+            let request = capture_revocation_order(keys, &point, &accepted)?;
+            let observed_at_ms = keys.reconcile_archive_revocation(&key, request).await?;
+            if observed_at_ms < request.not_before_ms {
+                return Err(unavailable("The archive provider returned an invalid revocation observation time"));
+            }
+            observed_at_ms
+        }
+        (Some(key), _) => {
+            keys.withdraw_archive_key(&key).await?;
+            now_ms().max(not_before_ms)
+        }
+        (None, _) => now_ms().max(not_before_ms),
     };
-    if require_operation_authority && !operation_only {
-        return Err(inconsistent("The authority returned an exporting-vault withdrawal"));
-    }
-    let withdrawal_observed_at = now_ms().max(accepted.authorized_at_ms)
-        .max(accepted.scheduled_revocation_at_ms.unwrap_or(i64::MIN));
     let current = update_installation(directory, id, |current| {
         if has_capture_region(current, capture)
             || current.checkpoint_captures.get(&capture).filter(|value| value.media_bound) != registered.as_ref()
@@ -448,7 +454,7 @@ async fn withdraw_capture_key(
         }
         let retirement = checked_retirement(current, capture, &accepted)?;
         let withdrawn_at = *retirement.key_withdrawn_at_ms.get_or_insert(withdrawal_observed_at);
-        if operation_only && enrolled {
+        if operation_authority {
             retirement.operation_revoked_at_ms.get_or_insert(withdrawn_at);
         }
         Ok(())
@@ -458,6 +464,21 @@ async fn withdraw_capture_key(
         observe_scheduled_custody("key-revoked", &current, capture, &receipt, due_at_ms);
     }
     Ok(receipt)
+}
+
+pub(crate) fn capture_revocation_order(
+    keys: &dyn KeyService, point: &CapturePoint, accepted: &CheckpointCaptureRetirement,
+) -> Result<ArchiveRevocation> {
+    let request = serde_json::to_vec(&(
+        "rtdb.multi/archive-revocation/v1", keys.custody_namespace()?, point,
+        &accepted.archive, &accepted.manifest_sha256, accepted.authorized_at_ms, accepted.scheduled_revocation_at_ms,
+    )).map_err(|_| inconsistent("Cannot encode the exact capture revocation order"))?;
+    Ok(ArchiveRevocation {
+        operation_id: point.operation,
+        request_sha256: ring::digest::digest(&ring::digest::SHA256, &request)
+            .as_ref().try_into().expect("SHA-256 width"),
+        not_before_ms: accepted.authorized_at_ms.max(accepted.scheduled_revocation_at_ms.unwrap_or(i64::MIN)),
+    })
 }
 
 fn observe_scheduled_custody(event: &'static str, record: &DeploymentRecord, capture: Uuid,

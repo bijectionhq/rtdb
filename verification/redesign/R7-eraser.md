@@ -100,6 +100,8 @@ The directory publishes the revocation observation after that closure has comple
 A previously issued handle cannot decrypt another object after the observation, including ciphertext already retained by the handle's owner.
 The source capture and its copies are distinct custody domains only after a completed independent re-encryption.
 The authenticated preparation first closes new archive admissions, and the revocation commit waits for outstanding regions and provider operations.
+The original operation vault persists the exact capture and request digest before withdrawal and retains the provider observation after closing the capture and unit authority.
+An interrupted publication can read back that observation by retrying the same capture request and publish it after the original serving process is gone.
 Preparation can take an unbounded time.
 The contract excludes plaintext already returned and depends on keeping vault material outside recoverable backups and older material-exporting binaries.
 Serving history and existing exported keys still require a separately qualified deadline authority.

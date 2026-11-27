@@ -75,6 +75,14 @@ pub enum ArchiveKeyWithdrawal {
     OperationAuthority,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRevocation {
+    pub operation_id: uuid::Uuid,
+    pub request_sha256: [u8; 32],
+    pub not_before_ms: i64,
+}
+
 #[async_trait::async_trait]
 pub trait KeyService: Send + Sync {
     async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.key(NAMESPACE_KEY_ID).await }
@@ -168,6 +176,10 @@ pub trait KeyService: Send + Sync {
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         self.destroy(id).await?;
         Ok(ArchiveKeyWithdrawal::Vault)
+    }
+
+    async fn reconcile_archive_revocation(&self, _id: &str, _request: ArchiveRevocation) -> Result<i64> {
+        Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault cannot settle an exact revocation"))
     }
 
     /// The standalone key authority can witness the lifetime of a local I/O
@@ -551,6 +563,10 @@ impl KeyService for LocalKeyService {
         }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))??;
         self.withdraw_local_scope(scope, &IoRegion::new()).await?;
         Ok(withdrawal)
+    }
+
+    async fn reconcile_archive_revocation(&self, id: &str, request: ArchiveRevocation) -> Result<i64> {
+        self.revoke_archive(id, request).await
     }
 
     fn hold_local_storage_region(&self, region: uuid::Uuid) -> Result<Option<File>> {

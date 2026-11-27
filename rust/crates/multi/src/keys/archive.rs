@@ -13,8 +13,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use crate::cipher::Cipher;
 
 use super::{
-    DESTROYED, FramedObject, KEY_BYTES, LocalKeyService, UnitOperation, UnitOutput, UnitScope, io,
-    is_destroyed, malformed, read_key,
+    ArchiveRevocation, DESTROYED, FramedObject, KEY_BYTES, LocalKeyService, UnitOperation, UnitOutput,
+    UnitScope, io, is_destroyed, malformed, read_key, require_general_key_namespace,
     unit::{self, OPERATION_LIMIT},
 };
 
@@ -234,6 +234,88 @@ pub(super) fn expire_locked(vault: &LocalKeyService, path: &Path) -> Result<Opti
     }
     vault.publish(path, DESTROYED)?;
     Ok(Some(due_at_ms))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevocationRecord {
+    request: ArchiveRevocation,
+    revoked_at_ms: Option<i64>,
+}
+
+impl LocalKeyService {
+    pub(super) async fn revoke_archive(&self, id: &str, request: ArchiveRevocation) -> Result<i64> {
+        if request.operation_id.is_nil() || request.request_sha256 == [0; 32] || request.not_before_ms <= 0 {
+            return Err(Anomaly::incorrect("rtdb.multi/archive-vault", "Invalid archive revocation order"));
+        }
+        if let Some(revoked_at) = self.update_archive_revocation(id, request, false).await? {
+            return Ok(revoked_at);
+        }
+        self.withdraw_local_scope(UnitScope::archive(id), &IoRegion::new()).await?;
+        self.update_archive_revocation(id, request, true).await?.ok_or_else(malformed)
+    }
+
+    async fn update_archive_revocation(
+        &self, id: &str, request: ArchiveRevocation, drained: bool,
+    ) -> Result<Option<i64>> {
+        require_general_key_namespace(id)?;
+        let service = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            service.require_service_root()?;
+            let raw_path = service.path(&id)?;
+            let _raw_lock = service.lock_key(&raw_path)?;
+            if !service.is_brokered(&id)? {
+                return Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The capture has no operation-only key authority"));
+            }
+            let vault = service.archive_vault()?;
+            let path = vault.path(&id)?;
+            let _lock = vault.lock_key(&path)?;
+            let record_path = path.with_extension("revocation");
+            let now_ms = rtdb_directory::now_ms();
+            let material = zeroize::Zeroizing::new(fs::read(&path).map_err(io)?);
+            let withdrawn = is_destroyed(&material);
+            if !withdrawn && material.len() != KEY_BYTES { return Err(malformed()); }
+            let retained = match fs::read(&record_path) {
+                Ok(bytes) => {
+                    let record: RevocationRecord = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
+                    if record.request != request {
+                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/archive-vault", "The capture has another exact revocation order"));
+                    }
+                    if let Some(revoked_at_ms) = record.revoked_at_ms {
+                        if !withdrawn || revoked_at_ms < request.not_before_ms {
+                            return Err(malformed());
+                        }
+                        vault.sync_directory()?;
+                        return Ok(Some(revoked_at_ms));
+                    }
+                    true
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => return Err(io(error)),
+            };
+            if now_ms < request.not_before_ms {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/archive-vault", "The archive authority is waiting for revocation"));
+            }
+            let publish = |revoked_at_ms| {
+                let bytes = serde_json::to_vec(&RevocationRecord { request, revoked_at_ms }).map_err(|_| malformed())?;
+                vault.publish(&record_path, &bytes)
+            };
+            if drained {
+                if !retained || !withdrawn { return Err(malformed()); }
+                publish(Some(now_ms))?;
+                Ok(Some(now_ms))
+            } else {
+                if !retained { publish(None)?; }
+                if withdrawn {
+                    vault.sync_directory()?;
+                } else {
+                    withdraw_locked(&vault, &path)?;
+                }
+                Ok(None)
+            }
+        }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
+    }
 }
 
 fn archive_io(error: Anomaly) -> Error {
@@ -521,6 +603,37 @@ mod tests {
     use crate::keys::KeyService;
     use rtdb_storage::ReadReservation;
     use rtdb_types::MemoryBudget;
+
+    #[tokio::test]
+    async fn capture_revocation_retries_the_same_order_after_partial_withdrawal() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = LocalKeyService::with_archive_broker(directory.path())?;
+        let key = vault.archive_key("capture", true, IoRegion::new()).await?;
+        let body = key.seal("member", Bytes::from_static(b"checkpoint")).await?;
+        let request = ArchiveRevocation {
+            operation_id: uuid::Uuid::new_v4(),
+            request_sha256: [1; 32],
+            not_before_ms: rtdb_directory::now_ms(),
+        };
+        assert_eq!(vault.update_archive_revocation("capture", request, false).await?, None);
+        assert!(key.open("member", body).await.is_err());
+        drop(vault);
+
+        let reopened = LocalKeyService::new(directory.path())?;
+        assert!(reopened.reconcile_archive_revocation("capture", ArchiveRevocation {
+            request_sha256: [2; 32], ..request
+        }).await.is_err());
+        let (first, retry) = tokio::join!(
+            reopened.reconcile_archive_revocation("capture", request),
+            reopened.reconcile_archive_revocation("capture", request),
+        );
+        let terminal = first?;
+        assert_eq!(retry?, terminal);
+        drop(reopened);
+        assert_eq!(LocalKeyService::new(directory.path())?
+            .reconcile_archive_revocation("capture", request).await?, terminal);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn archive_delivery_owns_the_capture_and_refuses_expired_plaintext() -> Result<()> {

@@ -1824,8 +1824,19 @@ mod tests {
         assert!(matches!(service.handle(directory.clone(), commit()).await, Reply::Deferred));
 
         drop(witness);
+        let original = directory.deployment(&authority.to_string()).await?.unwrap();
+        let (point, _) = archive::capture_receipt(&original, &service.archive, authority, capture)?.unwrap();
+        let order = archive::capture_revocation_order(reopened.as_ref(), &point, &original.checkpoint_capture_retirements[&capture])?;
+        let observed = reopened.reconcile_archive_revocation(&key_id, order).await?;
+        assert!(observed >= due_at_ms);
+        assert!(directory.deployment(&authority.to_string()).await?.unwrap()
+            .checkpoint_capture_retirements[&capture].operation_revoked_at_ms.is_none());
+        drop(reopened);
+        service.keys = Arc::new(crate::keys::LocalKeyService::new(&key_root)?);
         assert!(matches!(service.handle(directory.clone(), commit()).await,
-            Reply::CaptureRevocationCommitted { operation_revoked_at_ms, .. } if operation_revoked_at_ms >= due_at_ms));
+            Reply::CaptureRevocationCommitted { operation_revoked_at_ms, .. } if operation_revoked_at_ms == observed));
+        assert!(matches!(service.handle(directory.clone(), commit()).await,
+            Reply::CaptureRevocationCommitted { operation_revoked_at_ms, .. } if operation_revoked_at_ms == observed));
         let settle = request(serde_json::json!({
             "operation": "settle_checkpoint_capture_discard", "manifest_sha256": manifest,
         }));
