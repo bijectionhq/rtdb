@@ -515,6 +515,11 @@ RTDB ports XTDB's decorrelation rules (rules 1–4, 8, 9, `apply-table-col->unne
 - RTDB lifts a correlated selection above an unnest whose list reads no bound parameter (preserving the same rows), which XTDB does not;
 - RTDB does not lift correlated selections from the null-supplying side of an outer join;
 - ungrouped collecting/ordered aggregates under scalar/single/inner/left applies, parameterized percentile fractions, volatile dependent plans, and `PULL`/`PULL_MANY` keep their per-row apply.
+For a filtered left lateral `UNNEST` over eligible `VALUES` inputs, RTDB can use a total outer-row predicate to decide whether to expand a captured list of booleans or signed integers.
+A rejected, null, or empty list yields one null-extended row.
+Each element of an accepted list keeps its original ordinality, including a real null element.
+Element-dependent and ordinal-dependent filters keep their per-row `Apply`.
+The same fallback preserves validation and projection errors for scans, raw Arrow pages, and computed outer projections.
 
 **Why.**
 The Rust optimizer targets semantic equivalence and safe decorrelation without replicating Clojure's internal zipper AST verbatim.
