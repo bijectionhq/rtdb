@@ -1,9 +1,9 @@
 use std::{mem::size_of, sync::Arc};
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, TimeUnit as ArrowTimeUnit};
 use rtdb_columnar::{EXTENSION_NAME_KEY, MemoryBudget, MemoryReservation};
 use rtdb_plan::{ColumnId, Expr, NamedExpr, RelationNode, SortExpr};
-use rtdb_types::{LogicalType, ScalarType, Value};
+use rtdb_types::{LogicalType, ScalarType, TimeUnit, Value};
 
 use crate::{
     columnar::{Column, ColumnBatch},
@@ -142,6 +142,7 @@ enum PhysicalKey {
     F64,
     Bool,
     Utf8,
+    Timestamp(TimeUnit, bool),
 }
 
 impl PhysicalKey {
@@ -157,6 +158,7 @@ impl PhysicalKey {
             LogicalType::Scalar(ScalarType::F64) => Self::F64,
             LogicalType::Scalar(ScalarType::Bool) => Self::Bool,
             LogicalType::Scalar(ScalarType::Utf8) => Self::Utf8,
+            LogicalType::Scalar(ScalarType::Timestamp { unit, timezone }) => Self::Timestamp(*unit, timezone.is_some()),
             _ => return None,
         })
     }
@@ -170,6 +172,15 @@ impl PhysicalKey {
         }
         if logical.is_some_and(|logical| Self::bind(logical) != Some(self)) {
             return false;
+        }
+        if let (Self::Timestamp(unit, zoned), DataType::Timestamp(physical, timezone)) = (self, field.data_type()) {
+            let physical = match physical {
+                ArrowTimeUnit::Second => TimeUnit::Second,
+                ArrowTimeUnit::Millisecond => TimeUnit::Millisecond,
+                ArrowTimeUnit::Microsecond => TimeUnit::Microsecond,
+                ArrowTimeUnit::Nanosecond => TimeUnit::Nanosecond,
+            };
+            return unit == physical && zoned == timezone.is_some();
         }
         matches!(
             (self, field.data_type()),
@@ -185,6 +196,9 @@ impl PhysicalKey {
     }
 
     fn admits_value(self, value: &Value) -> bool {
+        if let (Self::Timestamp(unit, zoned), Value::Timestamp { unit: actual, timezone, .. }) = (self, value) {
+            return unit == *actual && zoned == timezone.is_some();
+        }
         matches!(
             (self, value),
             (_, Value::Null)

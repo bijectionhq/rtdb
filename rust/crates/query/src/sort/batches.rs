@@ -544,7 +544,7 @@ impl Block {
                 if let Some(keys) = &mut keys {
                     return keys.compare(left_index, right_index, plan, &|index| {
                         let (batch, row) = row_at(index);
-                        scalar_key(batch, row, plan, key_columns, projected, KeyRead::Comparison)
+                        comparison_key(batch, row, plan, key_columns, projected)
                     });
                 }
                 native.expect("only an admitted sort can borrow its keys")
@@ -610,20 +610,41 @@ fn observe_scalar_keys(
     }
     for row in 0..batch.len {
         context.check_cancelled_at(row)?;
-        let key = scalar_key(batch, row, plan, columns, projected, KeyRead::Observation)?;
-        types.observe(&key.values, plan)?;
+        let _scratch = plan.execution.context.memory.reserve(key_bound(batch, columns, row, size_of::<Value>())?)?;
+        let values = columns.iter().map(|&column| batch.columns[column].expression_value(row, projected, None))
+            .collect::<Result<Vec<_>>>()?;
+        types.observe(&values, plan)?;
     }
     Ok(())
 }
 
 fn covered_arrow_key(column: &Column, rows: usize, known: &LogicalType, memory: &Arc<MemoryBudget>) -> bool {
-    let Column::Arrow { array, field, logical } = column else { return false };
-    if array.len() != rows || array.data_type() != field.data_type() || field.data_type().is_nested() {
+    let covered = |array: &dyn arrow_array::Array, field: &arrow_schema::Field, logical: Option<&LogicalType>| {
+        covered_arrow_layout(array, field, logical, known, memory)
+    };
+    match column {
+        Column::Arrow { array, field, logical } =>
+            array.len() == rows && covered(array.as_ref(), field, logical.as_ref()),
+        Column::Selected(selected) => {
+            if !selected.source_layouts().all(|(array, field, logical)| covered(array, field, logical)) {
+                return false;
+            }
+            let mut cells = selected.arrow_cells();
+            (0..rows).all(|_| cells.next().is_some_and(|cell| cell.is_none_or(|(array, _, _, row)| row < array.len())))
+                && cells.next().is_none()
+        }
+        Column::Values(_) => false,
+    }
+}
+
+fn covered_arrow_layout(array: &dyn arrow_array::Array, field: &arrow_schema::Field, logical: Option<&LogicalType>,
+    known: &LogicalType, memory: &Arc<MemoryBudget>) -> bool {
+    if array.data_type() != field.data_type() || field.data_type().is_nested() {
         return false;
     }
     let Ok(_metadata) = memory.reserve(field.size().saturating_mul(4)) else { return false };
     let Ok(physical) = rtdb_columnar::from_field(field) else { return false };
-    if logical.as_ref().is_some_and(|logical| *logical != physical) {
+    if logical.is_some_and(|logical| *logical != physical) {
         return false;
     }
     let execution = rtdb_columnar::execution_type(&physical);
@@ -709,10 +730,11 @@ fn gather<'a>(
     ColumnBatch::take_rows(&sources, &rows, columns, memory)
 }
 
-fn key_bound(batch: &ColumnBatch, columns: &[usize], row: usize) -> Result<usize> {
+fn key_bound(batch: &ColumnBatch, columns: &[usize], row: usize, slot: usize) -> Result<usize> {
     let base = columns
         .len()
-        .checked_mul(size_of::<Value>())
+        .checked_mul(slot)
+        .and_then(|bytes| bytes.checked_add(256))
         .ok_or_else(size_error)?;
     columns.iter().try_fold(base, |bytes, &column| {
         bytes
@@ -754,19 +776,45 @@ impl Runs {
     }
 }
 
+enum ComparisonCell {
+    Decimal(f64),
+    Scalar(Value),
+}
+
+impl ComparisonCell {
+    fn number(&self) -> Option<native_keys::Key<'_>> {
+        match self {
+            Self::Decimal(value) => Some(native_keys::Key::Float(*value)),
+            Self::Scalar(value) => native_keys::Kind::Number.value(value),
+        }
+    }
+
+    fn as_value(&self) -> std::borrow::Cow<'_, Value> {
+        match self {
+            Self::Decimal(value) => std::borrow::Cow::Owned(Value::F64(*value)),
+            Self::Scalar(value) => std::borrow::Cow::Borrowed(value),
+        }
+    }
+}
+
 struct Key {
-    values: Vec<Value>,
+    cells: Vec<ComparisonCell>,
     _reservation: Arc<MemoryReservation>,
 }
+
 impl Key {
-    fn for_comparison(mut self) -> Self {
-        // ORDER BY compares decimals as doubles, including against integral keys.
-        for value in &mut self.values {
-            if let Value::Decimal(decimal) = value {
-                *value = Value::F64(rtdb_expr::decimal_to_f64(decimal));
-            }
+    fn compare(&self, other: &Self, plan: &SortPlan) -> Result<std::cmp::Ordering> {
+        for (index, order) in plan.order.iter().enumerate() {
+            let left = &self.cells[index];
+            let right = &other.cells[index];
+            let comparison = if let (Some(left), Some(right)) = (left.number(), right.number()) {
+                left.compare(right, order.descending, order.nulls_first)?
+            } else {
+                plan.compare_cell(&left.as_value(), &right.as_value(), order)?
+            };
+            if !comparison.is_eq() { return Ok(comparison); }
         }
-        self
+        Ok(std::cmp::Ordering::Equal)
     }
 }
 
@@ -796,10 +844,8 @@ impl BlockKeys {
     ) -> Result<std::cmp::Ordering> {
         self.load(left, read)?;
         self.load(right, read)?;
-        plan.compare(
-            &self.keys[left].as_ref().expect("loaded sort key").values,
-            &self.keys[right].as_ref().expect("loaded sort key").values,
-        )
+        self.keys[left].as_ref().expect("loaded sort key")
+            .compare(self.keys[right].as_ref().expect("loaded sort key"), plan)
     }
 }
 
@@ -853,7 +899,7 @@ impl Run {
         if self.native {
             self.key = None;
         } else if let Some(batch) = &self.batch {
-            self.key = Some(scalar_key(batch, self.row, plan, columns, false, KeyRead::Comparison)?);
+            self.key = Some(comparison_key(batch, self.row, plan, columns, false)?);
         }
         Ok(())
     }
@@ -872,55 +918,48 @@ impl Run {
                 .compare(left, self.row, right, other.row, &plan.order);
         }
         if self.key.is_none() {
-            self.key = Some(scalar_key(left, self.row, plan, columns, false, KeyRead::Comparison)?);
+            self.key = Some(comparison_key(left, self.row, plan, columns, false)?);
         }
         if other.key.is_none() {
-            other.key = Some(scalar_key(right, other.row, plan, columns, false, KeyRead::Comparison)?);
+            other.key = Some(comparison_key(right, other.row, plan, columns, false)?);
         }
-        plan.compare(
-            &self.key.as_ref().expect("loaded run key").values,
-            &other.key.as_ref().expect("loaded run key").values,
-        )
+        self.key.as_ref().expect("loaded run key")
+            .compare(other.key.as_ref().expect("loaded run key"), plan)
     }
 }
 
-enum KeyRead {
-    Observation,
-    Comparison,
-}
-
-fn scalar_key(
-    batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize], projected: bool, read: KeyRead,
-) -> Result<Key> {
-    let comparison = matches!(read, KeyRead::Comparison);
-    let reservation = plan
-        .execution
-        .context
-        .memory
-        .reserve(256 + key_bound(batch, columns, row)?)?;
-    let values = columns
-        .iter()
-        .map(|&column| {
-            let column = &batch.columns[column];
-            if comparison && let Some(value) = decimal_comparison_key(column, row) {
-                return Ok(value);
-            }
-            column.expression_value(row, projected, None)
+fn comparison_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize], projected: bool) -> Result<Key> {
+    let reservation = plan.execution.context.memory.reserve(key_bound(batch, columns, row, size_of::<ComparisonCell>())?)?;
+    let cells = columns.iter().map(|&column| {
+        let column = &batch.columns[column];
+        if let Some(key) = decimal_comparison_key(column, row) {
+            return Ok(ComparisonCell::Decimal(key));
+        }
+        Ok(match column.expression_value(row, projected, None)? {
+            Value::Decimal(decimal) => ComparisonCell::Decimal(rtdb_expr::decimal_to_f64(&decimal)),
+            value => ComparisonCell::Scalar(value),
         })
-        .collect::<Result<Vec<_>>>()?;
-    let key = Key {
-        values,
-        _reservation: reservation,
-    };
-    Ok(if comparison { key.for_comparison() } else { key })
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(Key { cells, _reservation: reservation })
 }
 
-fn decimal_comparison_key(column: &Column, row: usize) -> Option<Value> {
+fn decimal_comparison_key(column: &Column, row: usize) -> Option<f64> {
     let (array, field, logical, row) = column.arrow_cell(row)??;
-    if !field.data_type().is_decimal() || field.extension_type_name().is_some() {
+    let cell = ArrowCell { field, array, row };
+    if field.extension_type_name().is_some() { return None; }
+    if field.data_type().is_decimal() {
+        return decimal_at(cell, logical);
+    }
+    if !matches!(field.data_type(), arrow_schema::DataType::RunEndEncoded(..) | arrow_schema::DataType::Union(..)) {
         return None;
     }
-    let (parameters, bytes) = (ArrowCell { field, array, row }).decimal_coefficient().ok()??;
+    let (cell, logical) = cell.logical_position(logical).ok()?;
+    decimal_at(cell, Some(&logical))
+}
+
+fn decimal_at(cell: ArrowCell<'_>, logical: Option<&LogicalType>) -> Option<f64> {
+    if !cell.field.data_type().is_decimal() || cell.field.extension_type_name().is_some() { return None; }
+    let (parameters, bytes) = cell.decimal_coefficient().ok()??;
     let scale = match logical {
         None => parameters.scale,
         Some(logical) => {
@@ -931,7 +970,7 @@ fn decimal_comparison_key(column: &Column, row: usize) -> Option<Value> {
         }
     };
     let width = usize::from(parameters.bit_width / 8);
-    Some(Value::F64(rtdb_types::jvm_number::decimal_bytes_to_f64(&bytes[bytes.len() - width..], scale)))
+    Some(rtdb_types::jvm_number::decimal_bytes_to_f64(&bytes[bytes.len() - width..], scale))
 }
 
 fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) -> Result<()> {
@@ -1076,7 +1115,7 @@ fn arrow_wave4_sort_reads_each_cached_key_once() {
     let reads = Cell::new(0);
     let read = |index| {
         reads.set(reads.get() + 1);
-        Ok(Key { values: vec![Value::I64(index as i64)], _reservation: memory.reserve(64)? })
+        Ok(Key { cells: vec![ComparisonCell::Scalar(Value::I64(index as i64))], _reservation: memory.reserve(64)? })
     };
     for index in [1, 0, 0, 1, 0] {
         keys.load(index, &read).unwrap();
@@ -1103,6 +1142,16 @@ fn declared_arrow_sort_key_types_cover_only_infallible_scalar_reads() {
     assert!(covered_arrow_key(&column, 2, &mixed, &memory));
     assert!(!covered_arrow_key(&column, 2, &decimal, &memory));
     assert!(!covered_arrow_key(&column, 3, &mixed, &memory));
+
+    let Column::Arrow { array, field, logical } = column else { unreachable!() };
+    let source = (array, field, logical, None);
+    for (offset, covered) in [(0, true), (2, false)] {
+        let selected = Column::Selected(crate::columnar::SelectedColumn::new(
+            vec![Some(source.clone()), None], Arc::new(vec![(0, offset), (1, 0)]),
+        ));
+        assert_eq!(covered_arrow_key(&selected, 2, &mixed, &memory), covered);
+        assert!(!covered_arrow_key(&selected, 2, &decimal, &memory));
+    }
 
     let bottom = Column::Arrow {
         array: Arc::new(NullArray::new(1)),
@@ -1137,9 +1186,31 @@ fn decimal_arrow_sort_keys_use_the_reached_logical_scale_and_signed_zero() {
         let column = Column::Arrow { array: array.clone(), field: field.clone(), logical };
         for row in 0..2 {
             let Value::Decimal(scalar) = column.value(row).unwrap() else { panic!("expected decimal input") };
-            let Some(Value::F64(key)) = decimal_comparison_key(&column, row) else { panic!("expected Arrow comparison key") };
+            let Some(key) = decimal_comparison_key(&column, row) else { panic!("expected Arrow comparison key") };
             assert_eq!(key.to_bits(), rtdb_expr::decimal_to_f64(&scalar).to_bits());
         }
         assert!(decimal_comparison_key(&column, 2).is_none());
+    }
+}
+
+#[test]
+fn encoded_decimal_sort_keys_use_the_active_scalar_without_decoding_it() {
+    use rtdb_types::{DecimalValue, RunEndWidth};
+
+    let decimal = |coefficient: i128| Value::Decimal(DecimalValue {
+        unscaled: coefficient.to_be_bytes().into(), precision: 38, scale: 400, bit_width: 128,
+    });
+    let values = [decimal(-1), decimal(-1), Value::F64(0.0), decimal(1), Value::Null];
+    let scalar = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
+    let run = LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(scalar.clone()) };
+    for logical in [scalar, run] {
+        let array = rtdb_columnar::copy_array(&logical, &values).unwrap();
+        let field = Arc::new(rtdb_columnar::to_field("key", &logical).unwrap());
+        let column = Column::Arrow { array, field, logical: Some(logical) };
+        assert_eq!(decimal_comparison_key(&column, 0).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert_eq!(decimal_comparison_key(&column, 1).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert!(decimal_comparison_key(&column, 2).is_none());
+        assert_eq!(decimal_comparison_key(&column, 3).unwrap().to_bits(), 0.0f64.to_bits());
+        assert!(decimal_comparison_key(&column, 4).is_none());
     }
 }

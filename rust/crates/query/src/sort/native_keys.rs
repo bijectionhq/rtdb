@@ -174,7 +174,7 @@ impl Kind {
         }
     }
 
-    fn value<'a>(self, value: &'a Value) -> Option<Key<'a>> {
+    pub(super) fn value<'a>(self, value: &'a Value) -> Option<Key<'a>> {
         Some(match (self, value) {
             (_, Value::Null | Value::Undefined) => Key::Null,
             (Self::Number, Value::I8(value)) => Key::Integer(i64::from(*value)),
@@ -364,7 +364,7 @@ impl Key<'_> {
         }
     }
 
-    fn compare(self, right: Self, descending: bool, nulls_first: bool) -> rtdb_types::Result<Ordering> {
+    pub(super) fn compare(self, right: Self, descending: bool, nulls_first: bool) -> rtdb_types::Result<Ordering> {
         let comparison = match (self, right) {
             (Self::Null, Self::Null) => return Ok(Ordering::Equal),
             (Self::Null, _) => {

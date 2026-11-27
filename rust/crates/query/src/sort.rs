@@ -17,15 +17,24 @@ const MERGE_FAN_IN: usize = 4;
 
 struct SortPlan { schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution }
 impl SortPlan {
+    #[cfg(test)]
     fn compare(&self, left: &[Value], right: &[Value]) -> Result<Ordering> {
         for (index, order) in self.order.iter().enumerate() {
             let left = left.get(index).ok_or_else(|| invalid("invalid-spill", "Sort key is absent"))?;
             let right = right.get(index).ok_or_else(|| invalid("invalid-spill", "Sort key is absent"))?;
-            let mut comparison = ordered_compare_in_timezone(left, right, order.nulls_first, &self.execution.context.timezone)?;
-            if order.descending && !matches!(left, Value::Null | Value::Undefined) && !matches!(right, Value::Null | Value::Undefined) { comparison = comparison.reverse(); }
+            let comparison = self.compare_cell(left, right, order)?;
             if comparison != Ordering::Equal { return Ok(comparison); }
         }
         Ok(Ordering::Equal)
+    }
+
+    fn compare_cell(&self, left: &Value, right: &Value, order: &SortExpr) -> Result<Ordering> {
+        let comparison = ordered_compare_in_timezone(left, right, order.nulls_first, &self.execution.context.timezone)?;
+        if order.descending && !matches!(left, Value::Null | Value::Undefined) && !matches!(right, Value::Null | Value::Undefined) {
+            Ok(comparison.reverse())
+        } else {
+            Ok(comparison)
+        }
     }
 }
 

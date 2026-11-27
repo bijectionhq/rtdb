@@ -2630,8 +2630,10 @@ surface QueryAccess {
         -- A computed decimal result whose coefficient exceeds the signed width of its selected field fails when materialized.
         -- Run-end encoding of list values groups adjacent equal representations and preserves raw floating-point bits.
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
-        -- A page whose sort keys have flat vectors with known, infallible read types can use their metadata for type observation.
+        -- Sort type observation can use field metadata for flat keys with known, infallible read types.
+        -- A selected page can use the same metadata when its source layouts and reached positions cover every key.
         -- Compatible Arrow decimal cells supply the same binary64 comparison keys as decoded decimals and retain their original decimal payloads.
+        -- A decimal at an active union leg or run end uses its reached logical scale.
         -- A sort can retain comparison keys within its memory grant and reuse them across comparisons in the same block or at the head of a spill run.
         -- Heap selection for a total order reads its native leading key once per candidate in each selection pass.
         -- Heap selection for a total order can retain fixed-size prefixes and borrow the remaining bytes of leading byte keys from the input pages.
@@ -2694,7 +2696,8 @@ surface QueryAccess {
         -- A partitioned window emits the partitions in first-seen order and retains input order among peers within a partition.
         -- It can reuse the order of a stable input sort when the bound partition keys form the leading columns and the following columns match the window keys, directions, and null placement.
         -- An unpartitioned window can reuse a stable input sort with a matching prefix of window keys, directions, and null placement.
-        -- Reuse admits partition key layouts whose comparison and partition equality agree, and can also admit matching floating-point layouts for window ordering keys.
+        -- Reuse admits partition key layouts whose comparison and partition equality agree, including timestamps with one unit and zone presence.
+        -- Matching floating-point layouts can also supply window ordering keys.
         -- An inclusive or exclusive literal upper bound on a single ROW_NUMBER over replayable input can keep a small positive prefix per partition for one or two supported numeric ordering keys.
         -- The bounded window emits the same partition prefixes as the complete sort, with the same null placement, stable peers and row numbers.
         -- The ordinary window sort handles other inputs and can restart a bounded window before publication when the reached layout or memory grant cannot support selection.

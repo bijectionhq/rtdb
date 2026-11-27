@@ -346,3 +346,44 @@ async fn incompatible_physical_window_order_key_replays_the_prefix_and_tail() {
     drop((cursor, runtime));
     assert_eq!(execution.context.memory.used_bytes(), baseline);
 }
+
+#[tokio::test]
+async fn timestamp_partition_order_reuses_stable_peers_across_pages() {
+    use crate::runtime_schema::EmittedRelation;
+    use rtdb_plan::{Expr, Relation, RelationNode};
+    use rtdb_types::TimeUnit;
+
+    let execution = execution(2);
+    let baseline = execution.context.memory.used_bytes();
+    let time = |value| Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    let mut fields = schema().fields().to_vec();
+    fields[0].data_type = time(0).logical_type();
+    let schema = Schema::new(fields).unwrap();
+    let partition = &schema.fields()[0];
+    let partition_by = [partition.id];
+    let pages = vec![
+        vec![vec![time(-1), Value::I64(12)], vec![time(-1), Value::I64(11)]],
+        vec![vec![time(-1), Value::I64(10)], vec![time(0), Value::I64(9)]],
+    ];
+    let source = Arc::new(Relation::new(schema.clone(), RelationNode::Values {
+        rows: pages.iter().flatten().map(|row| row.iter().cloned().map(Expr::Literal).collect()).collect(),
+    }).unwrap());
+    let sorted = Arc::new(Relation::new(schema.clone(), RelationNode::Sort {
+        input: source, order_by: vec![SortExpr { expr: partition.expression(), descending: false, nulls_first: false }],
+    }).unwrap());
+    let runtime = EmittedRelation::derive(sorted, &execution.context.catalog, execution.parameters.types(), &execution.context.memory).unwrap();
+    let proof = InputOrder::bind(&runtime, &partition_by, &[], &execution.context.memory).unwrap();
+    let mut cursor = BatchWindow::with_input_order(
+        input(pages, &execution), schema, &partition_by, vec![], &expressions(&[WindowFunction::RowNumber]),
+        false, execution.clone(), Some(proof),
+    ).unwrap();
+    cursor.reused_input_order = Some(false);
+    let mut rows = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.unwrap() {
+        rows.extend((0..batch.len).map(|row| (batch.columns[1].value(row).unwrap(), batch.columns[2].value(row).unwrap())));
+    }
+    assert_eq!(cursor.reused_input_order, Some(true));
+    assert_eq!(rows, [(Value::I64(12), Value::I64(1)), (Value::I64(11), Value::I64(2)), (Value::I64(10), Value::I64(3)), (Value::I64(9), Value::I64(1))]);
+    drop((cursor, runtime));
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}

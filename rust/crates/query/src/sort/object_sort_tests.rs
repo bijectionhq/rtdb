@@ -81,7 +81,9 @@ async fn arrow_wave4_sort_matches_scalar_keys_for_decimals_in_memory_and_spill()
             outer: OuterRows::empty(&context.memory).unwrap(),
             context, bindings: None, analysis: None,
         };
-        Arc::get_mut(&mut execution.context).unwrap().options.sort_memory_bytes = sort_memory_bytes;
+        let options = &mut Arc::get_mut(&mut execution.context).unwrap().options;
+        options.sort_memory_bytes = sort_memory_bytes;
+        options.batch_rows = 3;
         let context = &execution.context;
         let baseline = context.memory.used_bytes();
         let decimal = |unscaled: i128| Value::Decimal(rtdb_types::DecimalValue {
@@ -96,42 +98,46 @@ async fn arrow_wave4_sort_matches_scalar_keys_for_decimals_in_memory_and_spill()
         let input = [
             decimal(90_071_992_547_409_920), Value::Null, decimal(-1),
             decimal(90_071_992_547_409_921), decimal(5), decimal(5),
+            decimal(5), decimal(7), Value::Null, decimal(5),
         ];
-        for descending in [false, true] {
-            for nulls_first in [false, true] {
-                let order = vec![SortExpr { expr: key.expression(), descending, nulls_first }];
-                let plan = SortPlan { schema: schema.clone(), order: order.clone(), limit: u64::MAX, execution: execution.clone() };
-                let mut expected = (0..input.len()).collect::<Vec<_>>();
-                expected.sort_by(|&a, &b| plan.compare(&input[a..=a], &input[b..=b]).unwrap());
-                let mut batches = VecDeque::new();
-                for (chunk, values) in input.chunks(3).enumerate() {
-                    let value_array = rtdb_columnar::copy_array(&ty, values).unwrap();
-                    let ord_ty = &ordinal.data_type;
-                    let ids = (chunk * 3..chunk * 3 + values.len()).map(|id| Value::I64(id as i64)).collect::<Vec<_>>();
-                    let columns = [
-                        (&key, value_array),
-                        (&ordinal, rtdb_columnar::copy_array(ord_ty, &ids).unwrap()),
-                    ].into_iter().map(|(field, array)| Column::Arrow {
-                        field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
-                        array, logical: Some(field.data_type.clone()),
-                    }).collect();
-                    batches.push_back(ColumnBatch::settled(columns, values.len(), context.memory.reserve(4096).unwrap()).unwrap());
-                }
-                let mut sort = batches::BatchSort::new(Box::new(Batches(batches)), schema.clone(), order, execution.clone(), false, 0, u64::MAX).unwrap();
-                let mut actual = Vec::new();
-                while let Some(batch) = sort.next_batch().await.unwrap() {
-                    for row in 0..batch.len {
-                        let Value::I64(id) = batch.columns[1].value(row).unwrap() else { panic!("expected an ordinal") };
-                        let id = id as usize;
-                        assert_eq!(batch.columns[0].value(row).unwrap(), input[id]);
-                        actual.push(id);
-                    }
-                }
-                assert_eq!(actual, expected);
-                drop(sort);
-                assert_eq!(context.memory.used_bytes(), baseline);
-                assert_eq!(context.spill_bytes(), 0);
+        for (descending, nulls_first, limit) in [false, true].into_iter().flat_map(|descending| {
+            [false, true].into_iter().flat_map(move |nulls_first| {
+                [4, u64::MAX].into_iter().map(move |limit| (descending, nulls_first, limit))
+            })
+        }) {
+            let order = vec![SortExpr { expr: key.expression(), descending, nulls_first }];
+            let plan = SortPlan { schema: schema.clone(), order: order.clone(), limit, execution: execution.clone() };
+            let mut expected = (0..input.len()).collect::<Vec<_>>();
+            expected.sort_by(|&a, &b| plan.compare(&input[a..=a], &input[b..=b]).unwrap());
+            expected.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            let mut batches = VecDeque::new();
+            for (chunk, values) in input.chunks(3).enumerate() {
+                let value_array = rtdb_columnar::copy_array(&ty, values).unwrap();
+                let ord_ty = &ordinal.data_type;
+                let ids = (chunk * 3..chunk * 3 + values.len()).map(|id| Value::I64(id as i64)).collect::<Vec<_>>();
+                let columns = [
+                    (&key, value_array),
+                    (&ordinal, rtdb_columnar::copy_array(ord_ty, &ids).unwrap()),
+                ].into_iter().map(|(field, array)| Column::Arrow {
+                    field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                    array, logical: Some(field.data_type.clone()),
+                }).collect();
+                batches.push_back(ColumnBatch::settled(columns, values.len(), context.memory.reserve(4096).unwrap()).unwrap());
             }
+            let mut sort = batches::BatchSort::new(Box::new(Batches(batches)), schema.clone(), order, execution.clone(), false, 0, limit).unwrap();
+            let mut actual = Vec::new();
+            while let Some(batch) = sort.next_batch().await.unwrap() {
+                for row in 0..batch.len {
+                    let Value::I64(id) = batch.columns[1].value(row).unwrap() else { panic!("expected an ordinal") };
+                    let id = id as usize;
+                    assert_eq!(batch.columns[0].value(row).unwrap(), input[id]);
+                    actual.push(id);
+                }
+            }
+            assert_eq!(actual, expected);
+            drop(sort);
+            assert_eq!(context.memory.used_bytes(), baseline);
+            assert_eq!(context.spill_bytes(), 0);
         }
     }
 }
