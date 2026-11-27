@@ -8,7 +8,7 @@ use rtdb_expr::kernels::{RangeBins, validate_period_bounds};
 use rtdb_plan::{Expr, Schema};
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, TimeUnit, Value};
 
-use super::{Column, ColumnBatch, calendar::{BinStride, CalendarCell, CalendarInput, CalendarOperand, CalendarType}, float_vector::nonnull, owned_projection_bytes, size_error};
+use super::{Column, ColumnBatch, calendar::{BinStride, CalendarCell, CalendarOperand, CalendarType}, float_vector::nonnull, owned_projection_bytes, size_error};
 use crate::{QueryContext, parameters::BoundParameters};
 
 pub(crate) fn is_zoned_micros(ty: &LogicalType) -> bool {
@@ -177,10 +177,11 @@ fn bounds_arrow(array: &dyn Array, field: &ArrowField, logical: Option<&LogicalT
 enum PeriodInput<'a> {
     Column(&'a Column),
     Constant(Option<(i64, i64)>),
+    Constructed(PeriodBounds<'a>),
 }
 
 impl<'a> PeriodInput<'a> {
-    fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters) -> Option<Self> {
+    fn bind(expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters, timezone: &'a str) -> Option<Self> {
         match expr {
             Expr::Column { id, .. } => {
                 let position = schema.position(*id)?;
@@ -195,14 +196,15 @@ impl<'a> PeriodInput<'a> {
                 Some(Self::Constant(period))
             }
             Expr::Literal(value @ Value::TimestampTzRange { .. }) => Some(Self::Constant(period_value(value)?)),
-            _ => None,
+            _ => PeriodBounds::bind(expr, schema, batch, params, timezone).map(Self::Constructed),
         }
     }
 
-    fn bounds(&self, row: usize) -> Option<Option<(i64, i64)>> {
+    fn bounds(&self, row: usize, timezone: &str) -> Result<Option<Option<(i64, i64)>>> {
         match self {
-            Self::Column(column) => bounds(column, row),
-            Self::Constant(bounds) => Some(*bounds),
+            Self::Column(column) => Ok(bounds(column, row)),
+            Self::Constant(bounds) => Ok(Some(*bounds)),
+            Self::Constructed(period) => Ok(period.read(row, timezone)?.map(Some)),
         }
     }
 }
@@ -215,23 +217,30 @@ fn lowered_period<'a>(from: &'a Expr, to: &Expr) -> Option<&'a Expr> {
 
 enum BinEndpoints<'a> {
     Period(PeriodInput<'a>),
-    Direct(CalendarInput<'a>, CalendarInput<'a>),
+    Direct(CalendarOperand<'a>, CalendarOperand<'a>),
 }
 
 impl<'a> BinEndpoints<'a> {
-    fn bind(from: &'a Expr, to: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters) -> Option<Self> {
+    fn bind(from: &'a Expr, to: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, params: &'a BoundParameters, timezone: &'a str) -> Option<Self> {
         if let Some(period) = lowered_period(from, to) {
-            return PeriodInput::bind(period, schema, batch, params).map(Self::Period);
+            return PeriodInput::bind(period, schema, batch, params, timezone).map(Self::Period);
         }
-        Some(Self::Direct(CalendarInput::bind(from, schema, batch, params)?, CalendarInput::bind(to, schema, batch, params)?))
+        Some(Self::Direct(CalendarOperand::bind(from, schema, batch, params, timezone)?,
+            CalendarOperand::bind(to, schema, batch, params, timezone)?))
     }
 
-    fn ticks(&self, row: usize) -> Option<Option<(i64, i64)>> {
+    fn prepare(&self, row: usize, timezone: &str) -> Result<Option<Option<(CalendarCell<'a>, CalendarCell<'a>)>>> {
         match self {
-            Self::Period(period) => period.bounds(row).map(|bounds| bounds.filter(|(_, upper)| *upper != i64::MAX)),
+            Self::Period(period) => {
+                // The nullable UPPER call forces the shared period before the origin is prepared.
+                Ok(period.bounds(row, timezone)?.map(|bounds| bounds.and_then(|(from, to)| {
+                    (to != i64::MAX).then_some((CalendarCell::Ticks(from), CalendarCell::Ticks(to)))
+                })))
+            }
             Self::Direct(from, to) => {
-                let Some(from) = from.ticks(row)? else { return Some(None); };
-                Some(to.ticks(row)?.map(|to| (from, to)))
+                let Some(from) = from.prepare(row, timezone)? else { return Ok(None); };
+                let Some(from) = from else { return Ok(Some(None)); };
+                Ok(to.prepare(row, timezone)?.map(|to| to.map(|to| (from, to))))
             }
         }
     }
@@ -251,11 +260,13 @@ pub(super) fn range_bins(expr: &Expr, schema: &Schema, batch: &ColumnBatch, para
     let ([stride, from, to] | [stride, from, to, _]) = args.as_slice() else { return Ok(None); };
     let logical = LogicalType::list(rtdb_plan::range_bin_element_type());
     if !matches!(name.as_str(), "range_bins" | "range-bins") || nonnull(return_type) != &logical { return Ok(None); }
-    let (Some(stride), Some(bounds)) = (BinStride::bind(stride, schema, batch, params), BinEndpoints::bind(from, to, schema, batch, params))
+    let timezone = &context.timezone;
+    let (Some(stride), Some(bounds)) = (BinStride::bind(stride, schema, batch, params),
+        BinEndpoints::bind(from, to, schema, batch, params, timezone))
         else { return Ok(None); };
     let origin = match args.get(3) {
         Some(origin) => {
-            let Some(origin) = CalendarInput::bind(origin, schema, batch, params) else { return Ok(None); };
+            let Some(origin) = CalendarOperand::bind(origin, schema, batch, params, timezone) else { return Ok(None); };
             Some(origin)
         }
         None => None,
@@ -280,15 +291,18 @@ pub(super) fn range_bins(expr: &Expr, schema: &Schema, batch: &ColumnBatch, para
     let read = |row| -> Result<Option<Option<RangeBins>>> {
         let Some(stride) = stride.parts(row) else { return Ok(None); };
         let Some(stride) = stride else { return Ok(Some(None)); };
-        let Some(ticks) = bounds.ticks(row) else { return Ok(None); };
-        let Some((from_ticks, to_ticks)) = ticks else { return Ok(Some(None)); };
+        let Some(bounds) = bounds.prepare(row, timezone)? else { return Ok(None); };
+        let Some((from_cell, to_cell)) = bounds else { return Ok(Some(None)); };
         let origin = if let Some(origin) = &origin {
-            let Some(ticks) = origin.ticks(row) else { return Ok(None); };
-            let Some(ticks) = ticks else { return Ok(Some(None)); };
-            Some((origin.ty, ticks))
+            let Some(cell) = origin.prepare(row, timezone)? else { return Ok(None); };
+            let Some(cell) = cell else { return Ok(Some(None)); };
+            Some((origin.ty, cell))
         } else { None };
+        let from_ticks = from_cell.demand(timezone)?;
+        let to_ticks = to_cell.demand(timezone)?;
+        let origin = origin.map(|(ty, cell)| cell.demand(timezone).map(|ticks| (ty, ticks))).transpose()?;
         let stride = RangeBins::stride_parts_micros(stride.months, stride.days, stride.nanoseconds)?;
-        let micros = |ty: CalendarType<'_>, ticks| ty.cast_timestamp(ticks, TimeUnit::Microsecond, true, &context.timezone);
+        let micros = |ty: CalendarType<'_>, ticks| ty.cast_timestamp(ticks, TimeUnit::Microsecond, true, timezone);
         let from = micros(from, from_ticks)?;
         let to = micros(to, to_ticks)?;
         let origin = origin.map(|(ty, ticks)| micros(ty, ticks)).transpose()?.unwrap_or(0);
@@ -569,6 +583,97 @@ mod tests {
         let page = batch(&schema, &input, &ctx);
         let (output, _) = range_bins(&expr, &schema, &page, &params, &ctx).unwrap().unwrap();
         assert_eq!(output.value(0).unwrap(), scalar(&expr, &schema, &input, 0, &params, &ctx).unwrap());
+    }
+
+    #[test]
+    fn range_bins_reads_a_constructed_period_and_typed_origin() {
+        let ctx = context("America/New_York");
+        let micros = TimeUnit::Microsecond;
+        let local = |ticks| timestamp(ticks, micros, None);
+        let stride = field(0, interval(0, 0, 0).logical_type().maybe());
+        let from = field(1, local(0).logical_type());
+        let to = field(2, local(0).logical_type().maybe());
+        let origin = field(3, timestamp(0, TimeUnit::Second, None).logical_type().maybe());
+        let schema = Schema::new(vec![stride.clone(), from.clone(), to.clone(), origin.clone()]).unwrap();
+        let period = call("period", vec![zoned_cast(from.expression(), micros, "Europe/Paris"),
+            zoned_cast(to.expression(), micros, "Asia/Tokyo")]);
+        let expr = call("range_bins", vec![stride.expression(), call("lower", vec![period.clone()]),
+            call("upper", vec![period]), zoned_cast(origin.expression(), micros, "UTC")]);
+        let params = BoundParameters::infer(vec![], &ctx.memory).unwrap();
+        let input = [
+            vec![interval(0, 0, 2_000_000), interval(1, 0, 2_000_000), Value::Null],
+            vec![local(1), local(1), local(5_001)],
+            vec![local(5_001), Value::Null, local(1)],
+            vec![timestamp(0, TimeUnit::Second, None), timestamp(i64::MAX, TimeUnit::Second, None),
+                timestamp(i64::MAX, TimeUnit::Second, None)],
+        ];
+        let page = batch(&schema, &input, &ctx);
+        let baseline = ctx.memory.used_bytes();
+        let (output, owner) = range_bins(&expr, &schema, &page, &params, &ctx).unwrap().unwrap();
+        let Column::Arrow { field, logical: Some(logical), .. } = &output else { panic!("Expected an Arrow list"); };
+        assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", logical).unwrap());
+        for row in 0..3 {
+            assert_eq!(output.value(row).unwrap(), scalar(&expr, &schema, &input, row, &params, &ctx).unwrap());
+        }
+        assert_eq!(output.value(1).unwrap(), Value::Null);
+        assert_eq!(output.value(2).unwrap(), Value::Null);
+        assert!(owner.bytes() >= owned_projection_bytes(&output).unwrap());
+        drop(output);
+        drop(owner);
+        assert_eq!(ctx.memory.used_bytes(), baseline);
+    }
+
+    #[test]
+    fn range_bins_prepares_a_nullable_origin_before_demanding_a_deferred_bound() {
+        let ctx = context("America/New_York");
+        let local = |ticks| timestamp(ticks, TimeUnit::Second, None);
+        let from = field(0, local(0).logical_type());
+        let origin = field(1, local(0).logical_type().maybe());
+        let schema = Schema::new(vec![from.clone(), origin.clone()]).unwrap();
+        let from_cast = Expr::Cast { expr: Box::new(from.expression()), target: CastTarget::Temporal(TemporalCast {
+            kind: TemporalKind::TimestampLocal, unit: TimeUnit::Nanosecond, precision: None,
+        }) };
+        let expr = call("range_bins", vec![Expr::Literal(interval(0, 0, 2_000_000)), from_cast,
+            Expr::Literal(timestamp(18_000_005_000, TimeUnit::Microsecond, Some("UTC"))),
+            zoned_cast(origin.expression(), TimeUnit::Second, "UTC")]);
+        let params = BoundParameters::infer(vec![], &ctx.memory).unwrap();
+        let input = [vec![local(0)], vec![local(0)]];
+        let page = batch(&schema, &input, &ctx);
+        let (output, _owner) = range_bins(&expr, &schema, &page, &params, &ctx).unwrap().unwrap();
+        assert_eq!(output.value(0).unwrap(), scalar(&expr, &schema, &input, 0, &params, &ctx).unwrap());
+
+        let input = [vec![local(i64::MAX)], vec![Value::Null]];
+        let page = batch(&schema, &input, &ctx);
+        let (output, _owner) = range_bins(&expr, &schema, &page, &params, &ctx).unwrap().unwrap();
+        assert_eq!(output.value(0).unwrap(), Value::Null);
+        assert_eq!(output.value(0).unwrap(), scalar(&expr, &schema, &input, 0, &params, &ctx).unwrap());
+
+        let input = [vec![local(i64::MAX)], vec![local(i64::MAX)]];
+        let page = batch(&schema, &input, &ctx);
+        let error = range_bins(&expr, &schema, &page, &params, &ctx).err().unwrap();
+        let oracle = scalar(&expr, &schema, &input, 0, &params, &ctx).unwrap_err();
+        assert_eq!(error.code, "xtdb/time-overflow");
+        assert_eq!((error.code, error.message, error.context), (oracle.code, oracle.message, oracle.context));
+    }
+
+    #[test]
+    fn range_bins_validates_a_reached_period_before_preparing_the_origin() {
+        let ctx = context("America/New_York");
+        let instant = |ticks| timestamp(ticks, TimeUnit::Microsecond, Some("UTC"));
+        let local = timestamp(i64::MAX, TimeUnit::Second, None);
+        let from = field(0, instant(0).logical_type());
+        let origin = field(1, local.logical_type().maybe());
+        let schema = Schema::new(vec![from.clone(), origin.clone()]).unwrap();
+        let period = call("period", vec![from.expression(), Expr::Literal(instant(0))]);
+        let expr = call("range_bins", vec![Expr::Literal(interval(1, 0, 0)), call("lower", vec![period.clone()]),
+            call("upper", vec![period]), zoned_cast(origin.expression(), TimeUnit::Microsecond, "UTC")]);
+        let params = BoundParameters::infer(vec![], &ctx.memory).unwrap();
+        let input = [vec![instant(1)], vec![local]];
+        let page = batch(&schema, &input, &ctx);
+        let error = range_bins(&expr, &schema, &page, &params, &ctx).err().unwrap();
+        let oracle = scalar(&expr, &schema, &input, 0, &params, &ctx).unwrap_err();
+        assert_eq!(error.code, "xtdb/invalid-period");
+        assert_eq!((error.code, error.message, error.context), (oracle.code, oracle.message, oracle.context));
     }
 
     #[test]

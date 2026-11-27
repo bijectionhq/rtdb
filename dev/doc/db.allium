@@ -2627,8 +2627,10 @@ surface QueryAccess {
         -- UNNEST of that constructor uses its shared child array and preserves element nulls, active numeric types, and per-list ordinality.
         -- UNNEST can interleave compatible direct scalar column items and can borrow a compatible child span from the list selected by a computed expression.
         -- A RANGE_BINS projection over compatible period, date or timestamp bounds can write one Arrow list column of bin endpoints and weights per input page, with stride and origin read from admitted columns or bindings.
-        -- A null period or a period with an unbounded upper endpoint produces a null list.
-        -- Range binning validates the stride and casts the bounds and origin in scalar order for each reached non-null set of arguments.
+        -- Compatible timestamp casts can supply the direct bounds or origin of RANGE_BINS.
+        -- A reached period constructor can supply both bounds to RANGE_BINS from its validated endpoint pair.
+        -- A null period or a period with an unbounded upper endpoint produces a null list and skips the origin.
+        -- Range binning prepares and demands operands in scalar order, then validates the stride and converts the bounds and origin for a non-null set of arguments.
         -- A period projection can read compatible date and timestamp endpoints and timestamp casts and write their zoned microseconds directly to Arrow.
         -- The period projection evaluates explicit endpoint expressions in scalar order before converting their results to the period's endpoint unit.
         -- A null endpoint denotes the corresponding infinity in that projection.
