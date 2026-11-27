@@ -48,7 +48,7 @@ pub fn sync_file(file: &File) -> std::io::Result<()> {
             let error = std::io::Error::last_os_error();
             if !matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL | libc::ENOTTY)) { return Err(error); }
             static REPORTED: std::sync::Once = std::sync::Once::new();
-            REPORTED.call_once(|| eprintln!("RTDB durable writes fall back from F_FULLFSYNC to fsync where it is unsupported: {error}"));
+            REPORTED.call_once(|| tracing::warn!("RTDB durable writes fall back from F_FULLFSYNC to fsync where it is unsupported: {error}"));
         }
         if unsafe { libc::fsync(file.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
