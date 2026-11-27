@@ -162,7 +162,6 @@ impl Dialect for SqlDialect {
     }
 
     generic_flags!(
-        supports_unicode_string_literal,
         supports_partition_by_after_order_by,
         supports_array_join_syntax,
         supports_group_by_expr,

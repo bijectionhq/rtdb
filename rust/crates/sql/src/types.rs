@@ -117,9 +117,12 @@ pub(crate) fn literal(value: &ast::Value) -> Result<Value> {
     Ok(match value {
         ast::Value::Null => Value::Null,
         ast::Value::Boolean(value) => Value::Bool(*value),
-        ast::Value::Number(value, _) if value.contains(['.', 'e', 'E']) => Value::F64(value.parse().map_err(error)?),
-        ast::Value::Number(value, _) => Value::I64(value.parse().map_err(|_| error(format!("Cannot parse integer: {value}")))?),
-        ast::Value::SingleQuotedString(value) | ast::Value::EscapedStringLiteral(value) | ast::Value::UnicodeStringLiteral(value) | ast::Value::NationalStringLiteral(value) => Value::Utf8(value.clone()),
+        ast::Value::Number(value, true) => return Err(grammar_rejected(format!("Numeric literal {value}L"))),
+        ast::Value::Number(value, false) if value.starts_with('.') || value.ends_with('.') || value.contains(".e") || value.contains(".E") =>
+            return Err(grammar_rejected(format!("Numeric literal {value}"))),
+        ast::Value::Number(value, false) if value.contains(['.', 'e', 'E']) => Value::F64(value.parse().map_err(error)?),
+        ast::Value::Number(value, false) => Value::I64(value.parse().map_err(|_| error(format!("Cannot parse integer: {value}")))?),
+        ast::Value::SingleQuotedString(value) | ast::Value::EscapedStringLiteral(value) => Value::Utf8(value.clone()),
         ast::Value::DollarQuotedString(value) => Value::Utf8(value.value.clone()),
         _ => return Err(grammar_rejected(format!("Literal {value}"))),
     })

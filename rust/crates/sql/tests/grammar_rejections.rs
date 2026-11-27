@@ -236,3 +236,34 @@ fn setting_before_explain_and_setting_from_without_to_are_rejected() {
     }
     prepare("EXPLAIN SETTING DEFAULT VALID_TIME ALL SELECT * FROM docs", &Fixture, &PrepareOptions::default()).unwrap();
 }
+
+#[test]
+fn non_grammar_string_numeric_and_typed_literals_are_rejected() {
+    for sql in [
+        "SELECT N'hello'",
+        "SELECT U&'\\0041'",
+        "SELECT .5",
+        "SELECT 1.",
+        "SELECT 1L + 2",
+        "SELECT INT '1'",
+        "SELECT BOOL 'true'",
+        "SELECT VARCHAR 'a'",
+        "SELECT TIMESTAMP(3) '2020-01-01T00:00:00'",
+        "SELECT TIME(3) '12:00:00'",
+        "SELECT TIME WITH TIME ZONE '12:00:00Z'",
+    ] {
+        let error = rejection(sql);
+        assert_eq!((error.category, error.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"), "{sql}");
+    }
+    for sql in [
+        "SELECT DATE '2020-01-01'",
+        "SELECT TIME '12:00:00'",
+        "SELECT TIMESTAMP WITH TIME ZONE '2020-01-01T00:00:00Z'",
+        "SELECT UUID '00000000-0000-0000-0000-000000000000'",
+        "SELECT DURATION 'PT1S'",
+        "SELECT KEYWORD 'foo'",
+        "SELECT URI 'https://example.com'",
+    ] {
+        prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+}

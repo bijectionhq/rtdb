@@ -87,16 +87,19 @@ impl Context<'_> {
             ast::Expr::TypedString(value) => {
                 use crate::dialect::CustomStringLiteral;
                 use crate::literal_admission::TemporalLiteralKind as Temporal;
+                if value.uses_odbc_syntax { return Err(grammar_rejected(format!("Typed string literal {value}"))); }
                 let literal = crate::types::literal(&value.value.value)?;
                 match (&value.data_type, &literal) {
                     (ast::DataType::Date, Value::Utf8(text)) =>
                         Expr::Literal(self.literals.temporal(value.value.span, Temporal::Date, text)),
-                    (ast::DataType::Timestamp(..), Value::Utf8(text)) =>
+                    (ast::DataType::Timestamp(None, ast::TimezoneInfo::None | ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::WithoutTimeZone), Value::Utf8(text)) =>
                         Expr::Literal(self.literals.temporal(value.value.span, Temporal::Timestamp, text)),
-                    (ast::DataType::Time(..), Value::Utf8(text)) => {
+                    (ast::DataType::Time(None, ast::TimezoneInfo::None), Value::Utf8(text)) => {
                         let admitted = self.literals.temporal(value.value.span, Temporal::Time, text);
                         Expr::Cast { expr: Box::new(Expr::Literal(admitted)), target: self.cast_target(&value.data_type)? }
                     }
+                    (ast::DataType::Uuid, Value::Utf8(_)) =>
+                        Expr::Cast { expr: Box::new(Expr::Literal(literal)), target: self.cast_target(&value.data_type)? },
                     (_, Value::Utf8(text)) if CustomStringLiteral::from_type(&value.data_type).is_some() => {
                         match CustomStringLiteral::from_type(&value.data_type).expect("guarded custom literal type") {
                             CustomStringLiteral::Uri => {
@@ -108,7 +111,7 @@ impl Context<'_> {
                                 .map_err(|message| error(format!("Cannot parse duration: {text} - failed with message {message}")))?),
                         }
                     }
-                    _ => Expr::Cast { expr: Box::new(Expr::Literal(literal)), target: self.cast_target(&value.data_type)? },
+                    _ => return Err(grammar_rejected(format!("Typed string literal {value}"))),
                 }
             },
             ast::Expr::Interval(interval) => self.interval_literal(interval)?,

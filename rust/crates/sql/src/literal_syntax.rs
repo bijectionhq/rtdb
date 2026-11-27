@@ -148,11 +148,13 @@ impl Context<'_> {
             ast::Expr::Interval(interval) => { self.interval_literal(interval)?; }
             ast::Expr::TypedString(value) => {
                 use crate::literal_admission::TemporalLiteralKind as Temporal;
-                let kind = match &value.data_type {
-                    ast::DataType::Date => Some(Temporal::Date),
-                    ast::DataType::Time(..) => Some(Temporal::Time),
-                    ast::DataType::Timestamp(..) => Some(Temporal::Timestamp),
-                    _ => None,
+                let kind = if value.uses_odbc_syntax { None } else {
+                    match &value.data_type {
+                        ast::DataType::Date => Some(Temporal::Date),
+                        ast::DataType::Time(None, ast::TimezoneInfo::None) => Some(Temporal::Time),
+                        ast::DataType::Timestamp(None, ast::TimezoneInfo::None | ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::WithoutTimeZone) => Some(Temporal::Timestamp),
+                        _ => None,
+                    }
                 };
                 if let Some(kind) = kind
                     && let rtdb_types::Value::Utf8(text) = crate::types::literal(&value.value.value)?
