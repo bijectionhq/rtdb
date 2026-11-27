@@ -185,6 +185,8 @@ pub trait ObjectStore: Send + Sync {
         self.local_maintenance_store().map_or(AppleSync::Full, LocalStore::apple_sync)
     }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
+    /// Exposes checkpoint staging when writes can use the local store's own admission.
+    fn checkpoint_publication_store(&self) -> Option<&LocalStore> { None }
     fn local_erasure_custody(&self) -> Option<&Arc<crate::sealing::LocalErasureCustody>> { None }
     fn local_classic_key_slots(&self) -> Option<&dyn crate::sealing::ObjectCipher> { None }
     async fn require_erasure_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<()> { Ok(()) }
@@ -695,6 +697,12 @@ impl LocalStore {
 
     pub(crate) fn io_region(&self) -> &Arc<IoRegion> { &self.io }
 
+    /// Admits scratch writes for a local checkpoint until the batch finishes or is dropped.
+    /// Returns no batch when the platform or descriptor limit precludes staging.
+    pub async fn begin_checkpoint_publication(&self) -> Result<Option<crate::LocalPublicationBatch<'_>>> {
+        crate::LocalPublicationBatch::open(self).await
+    }
+
     /// Settles the prefixes selected by the verified offline repair anchor.
     pub async fn retire_classic_log_prefixes(&self, anchor: crate::LocalRepairAnchor,
         replica: &Path, maximum: usize, vault: Option<&crate::sealing::ClassicKeyVault>,
@@ -822,13 +830,7 @@ impl LocalStore {
                 Some(catalog) => catalog.publication_gate(&key)?,
                 None => None,
             };
-            match upload.persist_noclobber(&path) {
-                Ok(_) => (),
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !equal_local_files(&path, error.file.path())? { return Err(Error::ConflictingObject(key.to_string())); }
-                }
-                Err(error) => return Err(Error::io(&path, error.error)),
-            }
+            install_local_file(upload, &path, &key)?;
             sync_publication_parents(&path, &root, apple_sync)
         }).await
     }
@@ -879,6 +881,16 @@ fn try_sync_publication_volume(path: &Path, root: &Path) -> Result<bool> {
     Ok(crate::durability::unsupported_full_sync(&root_directory).map_err(|error| Error::io(root, error))?.is_none())
 }
 
+pub(crate) fn install_local_file(upload: tempfile::NamedTempFile, path: &Path, key: &ObjectKey) -> Result<()> {
+    match upload.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if equal_local_files(path, error.file.path())? { Ok(()) } else { Err(Error::ConflictingObject(key.to_string())) }
+        }
+        Err(error) => Err(Error::io(path, error.error)),
+    }
+}
+
 fn equal_local_files(left: &Path, right: &Path) -> Result<bool> {
     let mut left_file = File::open(left).map_err(|error| Error::io(left, error))?;
     let mut right_file = File::open(right).map_err(|error| Error::io(right, error))?;
@@ -912,6 +924,7 @@ impl ObjectStore for LocalStore {
     fn permits_shared_read_cache(&self) -> bool { true }
     fn apple_sync(&self) -> AppleSync { self.apple_sync }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { Some(self) }
+    fn checkpoint_publication_store(&self) -> Option<&LocalStore> { Some(self) }
     fn syncs_checkpoints(&self) -> bool { true }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }

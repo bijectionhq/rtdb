@@ -19,6 +19,7 @@ mod remote_version_step;
 pub use local_catalog::LocalRepairAnchor;
 pub use local_erasure::LocalErasureRecovery;
 mod durability;
+mod publication_batch;
 pub use durability::{AppleSync, sync_directory, sync_file};
 #[cfg(feature = "remote")]
 pub mod remote;
@@ -27,4 +28,5 @@ pub use error::{Error, LeaseCutoff, Result};
 pub use remote_version_step::valid_object_version;
 pub use io_region::{HeldView, IoRegion};
 pub use read_lease::ReadLease;
+pub use publication_batch::{LocalPublicationBatch, PreparedLocalObject};
 pub use object_store::{LocalFile, LocalStore, MemoryStore, ObjectKey, ObjectObservation, ObjectStore, ObjectVersionHold, ReadReservation, RetainedBytes, StoredObject, ObjectReadAllocation};

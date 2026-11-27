@@ -706,6 +706,10 @@ impl BlockStore {
             return Ok(ProducedBlock { catalog, tries: l0_tries(index, &tables)? });
         }
         let table_catalog = prepared.table_catalog()?;
+        let mut publication = match self.store.checkpoint_publication_store().filter(|_| search.is_none()) {
+            Some(local) => local.begin_checkpoint_publication().await?,
+            None => None,
+        };
         let mut tries = BTreeMap::new();
         for (table, live) in prepared.value().live().tables() {
             check_cancelled(cancellation)?;
@@ -716,26 +720,39 @@ impl BlockStore {
             let mut reservations = Vec::new();
             let private = self.store.local_erasure_custody().is_some();
             if private && search.is_some() { return Err(crate::default_erasure::unsupported()); }
-            let named = if private { None } else { Some(tempfile::NamedTempFile::new().map_err(io_error)?) };
-            let temporary = match &named {
-                Some(file) => file.reopen(),
-                None => tempfile::tempfile(),
+            let data_key = ObjectKey::new(entry.slug.data_key(&trie))?;
+            let release_receipt_l0 = self.store.releases_receipt_l0() && table.stores_expiring_transaction_metadata()
+                && rtdb_format::keys::is_receipt_l0_file(data_key.as_str());
+            let mut batch = publication.as_mut().filter(|_| !release_receipt_l0);
+            let named = if private || batch.is_some() { None } else { Some(tempfile::NamedTempFile::new().map_err(io_error)?) };
+            let staged = match batch.as_deref_mut() {
+                Some(batch) => Some(batch.prepare_file(data_key.clone()).await?),
+                None => None,
+            };
+            let temporary = match (&staged, &named) {
+                (Some(staged), _) => staged.file().try_clone(),
+                (None, Some(file)) => file.reopen(),
+                (None, None) => tempfile::tempfile(),
             }.map_err(io_error)?;
             let mut writer = None;
             let pages = live.block_pages(&self.memory)?;
             write_node(live.trie().root(), &pages, &self.memory, &temporary, &mut writer, &mut metadata, &mut reservations, cancellation).await?;
             let file = writer.ok_or_else(|| invalid("Nonempty live table produced no pages"))?.finish()?;
-            rtdb_storage::sync_file(&file, self.store.apple_sync()).map_err(io_error)?;
             let size = i64::try_from(file.metadata().map_err(io_error)?.len()).map_err(io_error)?;
-            let data_key = ObjectKey::new(entry.slug.data_key(&trie))?;
-            let release_receipt_l0 = self.store.releases_receipt_l0() && table.stores_expiring_transaction_metadata()
-                && rtdb_format::keys::is_receipt_l0_file(data_key.as_str());
-            let data = match &named {
-                None => self.store.put_private_file(&data_key, file, release_receipt_l0).await?,
-                Some(temporary) if release_receipt_l0 => self.store.put_file_with_publication(&data_key, temporary.path()).await?,
-                Some(temporary) => {
-                    self.store.put_file(&data_key, temporary.path()).await?;
-                    None
+            let data = if let Some(staged) = staged {
+                drop(file);
+                drop(temporary);
+                staged.stage();
+                None
+            } else {
+                rtdb_storage::sync_file(&file, self.store.apple_sync()).map_err(io_error)?;
+                match &named {
+                    None => self.store.put_private_file(&data_key, file, release_receipt_l0).await?,
+                    Some(temporary) if release_receipt_l0 => self.store.put_file_with_publication(&data_key, temporary.path()).await?,
+                    Some(temporary) => {
+                        self.store.put_file(&data_key, temporary.path()).await?;
+                        None
+                    }
                 }
             };
             check_cancelled(cancellation)?;
@@ -743,7 +760,10 @@ impl BlockStore {
             let (metadata_file, summary) = metadata.finish()?;
             let bytes = metadata_file.write()?;
             let metadata_key = ObjectKey::new(entry.slug.metadata_key(&trie))?;
-            let metadata = if release_receipt_l0 {
+            let metadata = if let Some(batch) = batch {
+                batch.stage_bytes(metadata_key.clone(), Bytes::from(bytes)).await?;
+                None
+            } else if release_receipt_l0 {
                 self.store.put_with_publication(&metadata_key, Bytes::from(bytes)).await?
             } else {
                 self.store.put(&metadata_key, Bytes::from(bytes)).await?;
@@ -774,6 +794,10 @@ impl BlockStore {
             tries.insert(table.clone(), vec![notification]);
             tokio::task::yield_now().await;
         }
+        if let Some(batch) = publication.as_mut() {
+            check_cancelled(cancellation)?;
+            batch.flush().await?;
+        }
         let table_blocks = prepared.table_blocks(&tries, boundary.metadata.timestamp)?;
         let mut sha256_by_oid = BTreeMap::new();
         for entry in table_catalog.entries() {
@@ -781,7 +805,15 @@ impl BlockStore {
             let block = table_blocks.get(&entry.table).ok_or_else(|| invalid("Recorded table has no block metadata"))?;
             let bytes = Bytes::from(block.encode());
             sha256_by_oid.insert(entry.oid, Sha256::digest(&bytes).to_vec());
-            self.store.put(&ObjectKey::new(entry.slug.block_key(index)?)?, bytes).await?;
+            let key = ObjectKey::new(entry.slug.block_key(index)?)?;
+            match publication.as_mut() {
+                Some(batch) => batch.stage_bytes(key, bytes).await?,
+                None => self.store.put(&key, bytes).await?,
+            }
+        }
+        if let Some(batch) = publication {
+            check_cancelled(cancellation)?;
+            batch.finish().await?;
         }
         let tx_key = prepared.value().live().latest_completed_tx();
         check_cancelled(cancellation)?;

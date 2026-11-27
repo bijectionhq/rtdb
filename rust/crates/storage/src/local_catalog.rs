@@ -21,7 +21,7 @@ impl LocalRepairAnchor {
     fn well_formed(self) -> bool { repair_anchor_decision::valid_anchor(self.block.0, self.boundary.0) }
 }
 
-fn terminal_name(key: &str) -> bool {
+pub(crate) fn terminal_name(key: &str) -> bool {
     is_compacted_primary_file(key) || is_ranged_run(key)
 }
 

@@ -1129,6 +1129,10 @@ config {
 --   5. Append the upload to the replica log and await it.
 --      This is the message the whole cluster closes the block on, this node included.
 --      It is appended in its turn behind whatever the term has already queued, through the one ordered path every record the term writes takes, and a term ending while it is queued fails the wait.
+--   Native local storage makes each dependency's contents durable before installing its immutable name.
+--   It makes the L0 pairs durable before installing the per-table block names.
+--   It makes every per-table block durable before installing the root name.
+--   A retry accepts an existing dependency only when its contents match.
 --   The block, its L0 tries and its boundary are held from here until the adopt.
 --   What is NOT installed here is the table catalog's metadata fold and the trie catalog's state, and the live index is not rolled — so a term dying between the two operations leaves the block RE-PRODUCIBLE, a second attempt at an index the catalog already holds being refused.
 --   Table entries the produce DOES allocate, minting one for a table new in this block: the per-table file paths of step 3 and the block file of step 4 both record them, so they cannot wait for the adopt.

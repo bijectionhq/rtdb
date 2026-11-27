@@ -394,3 +394,59 @@ async fn local_scan_reads_follow_removed_and_republished_objects() {
     assert_eq!(pool.get_scan_range(&key, 32..37).await.unwrap().as_slice(), b"first");
     assert_eq!(pool.scan_length(&key).await.unwrap(), 37);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_checkpoint_publication_batch_keeps_staged_names_private_and_retries() {
+    use std::io::Write;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = LocalStore::open(root.path()).unwrap();
+    let first = ObjectKey::new("tables/public$test/data/l00-rc-b00.arrow").unwrap();
+    let second = ObjectKey::new("tables/public$test/meta/l00-rc-b00.arrow").unwrap();
+    let mut abandoned = store.begin_checkpoint_publication().await.unwrap().unwrap();
+    let staged = abandoned.prepare_file(first.clone()).await.unwrap();
+    staged.file().try_clone().unwrap().write_all(b"arrow data").unwrap();
+    staged.stage();
+    abandoned.stage_bytes(second.clone(), Bytes::from_static(b"arrow metadata")).await.unwrap();
+    assert!(matches!(store.head(&first).await, Err(Error::MissingObject(_))));
+    assert!(matches!(store.head(&second).await, Err(Error::MissingObject(_))));
+    drop(abandoned);
+
+    for _ in 0..2 {
+        let mut batch = store.begin_checkpoint_publication().await.unwrap().unwrap();
+        let staged = batch.prepare_file(first.clone()).await.unwrap();
+        staged.file().try_clone().unwrap().write_all(b"arrow data").unwrap();
+        staged.stage();
+        batch.stage_bytes(second.clone(), Bytes::from_static(b"arrow metadata")).await.unwrap();
+        batch.finish().await.unwrap();
+    }
+    store.close_and_wait().await;
+    let reopened = LocalStore::open(root.path()).unwrap();
+    assert_eq!(reopened.get(&first).await.unwrap().as_ref(), b"arrow data");
+    assert_eq!(reopened.get(&second).await.unwrap().as_ref(), b"arrow metadata");
+
+    let mut wrong = reopened.begin_checkpoint_publication().await.unwrap().unwrap();
+    wrong.stage_bytes(first.clone(), Bytes::from_static(b"new contents")).await.unwrap();
+    assert!(matches!(wrong.flush().await, Err(Error::ConflictingObject(_))));
+    assert!(matches!(wrong.finish().await, Err(Error::Task(_))));
+    assert_eq!(reopened.get(&first).await.unwrap().as_ref(), b"arrow data");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_checkpoint_publication_batch_close_drains_the_staging_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let store = LocalStore::open(root.path()).unwrap();
+    let mut batch = store.begin_checkpoint_publication().await.unwrap().unwrap();
+    batch.stage_bytes(ObjectKey::new("tables/test/catalog").unwrap(), Bytes::from_static(b"payload")).await.unwrap();
+    let close = store.close_and_wait();
+    tokio::pin!(close);
+    tokio::select! {
+        biased;
+        _ = &mut close => panic!("close completed with a live staging owner"),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(matches!(batch.finish().await, Err(Error::Closed(_))));
+    close.await;
+}
