@@ -4,12 +4,10 @@ use rtdb_types::Result;
 use super::{empty, invalid};
 
 /// How Multi writers checkpoint their journals, from `multiCheckpoints`.
-/// Both modes write checkpoints that only this release's replay installs, so
-/// a deployment enables them once every node runs it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MultiCheckpointSettings {
     /// `deferred`: builds journal-bound checkpoints off the commit path.
-    pub deferred: bool,
+    pub deferred: Option<bool>,
     /// `binary`: writes a checkpoint's transaction state in CBOR.
     pub binary: bool,
 }
@@ -20,6 +18,11 @@ const DEFERRED_SETTING: &str = "RTDB_MULTI_DEFERRED_CHECKPOINTS";
 const BINARY_SETTING: &str = "RTDB_MULTI_BINARY_CHECKPOINTS";
 
 impl MultiCheckpointSettings {
+    pub(crate) fn with_deferred_default(mut self, local_journal: bool) -> Self {
+        self.deferred.get_or_insert(local_journal);
+        self
+    }
+
     /// - Errors: an unknown key, a non-boolean value, or a deprecated variable
     ///   that is not `1`, `true`, `0`, `false` or empty.
     pub(crate) fn decode(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -> Result<Self> {
@@ -28,17 +31,24 @@ impl MultiCheckpointSettings {
         let binary = fields.boolean("binary")?;
         fields.finish()?;
         Ok(Self {
-            deferred: deferred.map_or_else(|| deprecated_flag(DEFERRED_SETTING, environment), Ok)?,
-            binary: binary.map_or_else(|| deprecated_flag(BINARY_SETTING, environment), Ok)?,
+            deferred: match deferred {
+                Some(deferred) => Some(deferred),
+                None => deprecated_flag(DEFERRED_SETTING, environment)?,
+            },
+            binary: match binary {
+                Some(binary) => binary,
+                None => deprecated_flag(BINARY_SETTING, environment)?.unwrap_or_default(),
+            },
         })
     }
 }
 
-fn deprecated_flag(name: &str, environment: &impl Fn(&str) -> Option<String>) -> Result<bool> {
+fn deprecated_flag(name: &str, environment: &impl Fn(&str) -> Option<String>) -> Result<Option<bool>> {
     let value = environment(name);
     let enabled = match value.as_deref() {
-        None | Some("" | "0" | "false") => false,
-        Some("1" | "true") => true,
+        None => None,
+        Some("" | "0" | "false") => Some(false),
+        Some("1" | "true") => Some(true),
         Some(_) => return Err(invalid(format!("{name} must be 1, true, 0 or false"))),
     };
     if value.is_some() {
@@ -61,9 +71,21 @@ mod tests {
     #[test]
     fn the_configuration_key_sets_the_modes_and_wins_over_the_environment() {
         assert_eq!(decode("{}", &[]).unwrap(), MultiCheckpointSettings::default());
-        assert_eq!(decode("{deferred: true, binary: true}", &[]).unwrap(), MultiCheckpointSettings { deferred: true, binary: true });
+        assert_eq!(decode("{deferred: true, binary: true}", &[]).unwrap(), MultiCheckpointSettings { deferred: Some(true), binary: true });
         let settings = decode("{deferred: false}", &[(DEFERRED_SETTING, "1"), (BINARY_SETTING, "true")]).unwrap();
-        assert_eq!(settings, MultiCheckpointSettings { deferred: false, binary: true });
+        assert_eq!(settings, MultiCheckpointSettings { deferred: Some(false), binary: true });
+    }
+
+    #[test]
+    fn only_local_journals_default_to_deferred_checkpointing() {
+        let unspecified = decode("{}", &[]).unwrap();
+        assert_eq!(unspecified.with_deferred_default(true).deferred, Some(true));
+        assert_eq!(unspecified.with_deferred_default(false).deferred, Some(false));
+
+        let disabled = decode("{}", &[(DEFERRED_SETTING, "0")]).unwrap();
+        assert_eq!(disabled.with_deferred_default(true).deferred, Some(false));
+        let enabled = decode("{deferred: true}", &[]).unwrap();
+        assert_eq!(enabled.with_deferred_default(false).deferred, Some(true));
     }
 
     #[test]

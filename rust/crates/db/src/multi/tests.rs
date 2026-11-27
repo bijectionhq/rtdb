@@ -3761,32 +3761,112 @@ async fn an_announced_deferred_checkpoint_replays_from_the_old_floor_until_the_n
 }
 
 #[tokio::test]
-async fn the_pipeline_commits_while_a_deferred_checkpoint_builds() {
-    let journal = journals().await;
+async fn the_pipeline_commits_while_a_deferred_checkpoint_uploads_and_replays_the_suffix() {
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("journal");
+    let journal = FileJournal::open(&path, Limits::default()).unwrap();
     let cluster = Cluster::new();
-    let writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
-    let writes = Arc::new(WritePipeline::start(Arc::new(Mutex::new(writer))));
+    let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    let upload = Arc::new(PausedCheckpointUpload::new(Arc::clone(&cluster.store)));
+    writer.store = upload.clone();
+    let database = Arc::new(Mutex::new(writer));
+    let writes = Arc::new(WritePipeline::start(Arc::clone(&database)));
     for id in 1..=4 {
         writes.transact(put(id as u8, id, "before")).await.unwrap();
     }
-    let commits = {
+    let cut = database.lock().await.state().head;
+    let checkpoint = {
         let writes = Arc::clone(&writes);
-        tokio::spawn(async move {
-            for id in 5..=16 {
-                writes.transact(put(id as u8, id, "concurrent")).await.unwrap();
-            }
-        })
+        tokio::spawn(async move { writes.bound_journal(1).await })
     };
-    let manifest = writes.bound_journal(1).await.unwrap();
-    commits.await.unwrap();
-    assert!(manifest.is_some());
-    assert!(writes.bound_journal(1_000).await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(5), upload.started.notified()).await.unwrap();
+    let during = put(5, 5, "during upload");
+    let receipt = tokio::time::timeout(Duration::from_secs(5), writes.transact(during.clone()))
+        .await.expect("commits can finish while checkpoint upload is paused").unwrap();
+    assert!(!checkpoint.is_finished());
+    assert!(writes.bound_journal(1).await.unwrap().is_none());
+    upload.resume.notify_one();
+    assert!(checkpoint.await.unwrap().unwrap().is_some());
+    assert_eq!(database.lock().await.retained_floor(), Some(Lsn(cut.0 + 1)));
+    writes.shutdown().await.unwrap();
+    drop(writes);
+    drop(database);
+    drop(journal);
+
+    let journal = FileJournal::open(path, Limits::default()).unwrap();
     cluster.at(50);
     let mut fresh = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
     assert_eq!(fresh.tick(&live(1)).await.unwrap(), Role::Follower);
-    assert!(fresh.retained_floor().unwrap() > Lsn(1));
-    for id in 1..=16 {
-        assert!(text_at(&mut fresh, MAIN_BRANCH, id).await.is_some(), "row {id}");
+    assert_eq!(fresh.retained_floor(), Some(Lsn(cut.0 + 1)));
+    assert_texts(&mut fresh, &[(1, "before"), (4, "before"), (5, "during upload")]).await;
+    assert_eq!(fresh.tx_status(&during.key).await.unwrap().basis, receipt.basis);
+}
+
+#[tokio::test]
+async fn stopping_the_pipeline_cancels_a_deferred_checkpoint_upload() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = writer_with_deferred_checkpoints(&cluster, Arc::new(journal.handle(NODE_1_IDENTITY))).await;
+    writer.transact(&put(1, 1, "before")).await.unwrap();
+    let upload = Arc::new(PausedCheckpointUpload::new(Arc::clone(&cluster.store)));
+    writer.store = upload.clone();
+    let writes = Arc::new(WritePipeline::start(Arc::new(Mutex::new(writer))));
+    let checkpoint = {
+        let writes = Arc::clone(&writes);
+        tokio::spawn(async move { writes.bound_journal(1).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), upload.started.notified()).await.unwrap();
+    writes.shutdown().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(5), checkpoint).await.unwrap().unwrap().is_err());
+    assert!(cluster.store.list(None).await.unwrap().iter().all(|object| {
+        !object.key.to_string().parse::<ObjectId>().is_ok_and(|id| id.kind == ObjectKind::Manifest)
+    }));
+}
+
+struct PausedCheckpointUpload {
+    store: Arc<MemoryStore>,
+    started: Notify,
+    resume: Notify,
+}
+
+impl PausedCheckpointUpload {
+    fn new(store: Arc<MemoryStore>) -> Self {
+        Self { store, started: Notify::new(), resume: Notify::new() }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for PausedCheckpointUpload {
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+        if key.to_string().parse::<ObjectId>().is_ok_and(|id| id.kind == ObjectKind::Manifest) {
+            self.started.notify_one();
+            self.resume.notified().await;
+        }
+        self.store.put(key, bytes).await
+    }
+
+    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_store::StoredObject> {
+        self.store.head(key).await
+    }
+
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+        self.store.get(key).await
+    }
+
+    async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> {
+        self.store.get_range(key, range).await
+    }
+
+    async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> rtdb_storage::Result<()> {
+        self.store.put_file(key, source).await
+    }
+
+    async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_store::StoredObject>> {
+        self.store.list(directory).await
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        self.store.delete(key).await
     }
 }
 

@@ -17,7 +17,7 @@ use rtdb_index::branches::{BranchCut, store::KeyRange};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryReservation, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
 use tokio::{
     sync::{Mutex, OnceCell, mpsc, oneshot},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 
 use crate::replay::JournalCoordinates;
@@ -382,7 +382,7 @@ async fn run(
     announcements: mpsc::WeakSender<Command>,
 ) {
     let mut barrier = None;
-    let mut building = false;
+    let mut build = JoinSet::new();
     loop {
         let command = match barrier.take() {
             Some(command) => command,
@@ -424,6 +424,7 @@ async fn run(
             }
             Command::Shutdown(reply) => {
                 input.close();
+                build.shutdown().await;
                 let result = Box::pin(async { database.lock().await.shutdown_writer().await }).await;
                 let _ = reply.send(result);
                 return;
@@ -451,20 +452,20 @@ async fn run(
                         Err(error) => Err(error),
                     };
                     answer_checkpoint(reply, result);
-                } else if building {
+                } else if !build.is_empty() {
                     answer_checkpoint(reply, Ok(None));
                 } else {
                     match Box::pin(guard.capture_checkpoint(limit)).await {
                         Ok(Some(capture)) => {
                             let builder = guard.checkpoint_builder();
                             drop(guard);
-                            building = true;
                             let announcements = announcements.clone();
-                            tokio::spawn(async move {
+                            build.spawn(async move {
                                 // A failed build still reaches the pipeline, which then
                                 // accepts the next capture.
-                                let prepared = tokio::spawn(async move { builder.build(capture).await })
-                                    .await
+                                let mut task = JoinSet::new();
+                                task.spawn(async move { builder.build(capture).await });
+                                let prepared = task.join_next().await.expect("one checkpoint build")
                                     .unwrap_or_else(|error| Err(Anomaly::fault("rtdb/checkpoint-build", error.to_string())));
                                 let stopped = match announcements.upgrade() {
                                     Some(input) => input.send(Command::AnnounceCheckpoint { prepared, reply }).await.is_err(),
@@ -481,7 +482,7 @@ async fn run(
                 }
             }
             Command::AnnounceCheckpoint { prepared, reply } => {
-                building = false;
+                build.join_next().await.expect("a build posted its announcement").expect("checkpoint supervisor completed");
                 let result = match prepared {
                     Ok(prepared) => Box::pin(async {
                         let mut database = database.lock().await;

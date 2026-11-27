@@ -98,7 +98,10 @@ A `TZ` the JVM does not know gives the host's current `GMT±hh:mm` offset rather
 `defaultLocalErasure` and `defaultKafkaErasure` enroll fresh Default primaries for physical erasure; both default to `false`.
 Without the YAML key, each reads `RTDB_DEFAULT_LOCAL_ERASURE` or `RTDB_DEFAULT_KAFKA_ERASURE`, where exactly `1` enables it, `0` or empty disables it, and any other value is a configuration error.
 `defaultLocalErasure` applies only with `defaultV1Serving`; `defaultKafkaErasure` fails startup without native Kafka, `defaultV1Serving` and both original key vaults.
-`multiCheckpoints` (`deferred`, `binary`, both defaulting to `false`) configures Multi journal checkpoint modes in the validated YAML, taking precedence over the deprecated `RTDB_MULTI_DEFERRED_CHECKPOINTS` and `RTDB_MULTI_BINARY_CHECKPOINTS` environment variables (which warn through `tracing` when read).
+`multiCheckpoints` configures Multi journal checkpoint modes in the validated YAML, taking precedence over the deprecated `RTDB_MULTI_DEFERRED_CHECKPOINTS` and `RTDB_MULTI_BINARY_CHECKPOINTS` environment variables (which warn through `tracing` when read).
+`deferred` defaults to `true` for the standalone FileJournal and to `false` for a remote stream.
+Enable `deferred` on a remote stream once every writer and follower can replay deferred checkpoint records.
+`binary` defaults to `false`.
 `RTDB_CLASSIC_KEY_VAULT`, `RTDB_V1_TOKEN_KEY_VAULT` and `RTDB_V1_CHECKPOINT_KEY_VAULT` are read with the rest of the startup environment into the node configuration's `key_vaults`, and `retain-repair-base` reads `RTDB_CLASSIC_KEY_VAULT` from its command's environment; backend construction and repair perform no lookup of their own.
 `RTDB_APPLE_SYNC` selects the durable-write policy on Apple platforms for every `rtdb` and `rtdb-multi` command: absent, empty or `full` keeps `F_FULLFSYNC`, `fsync` selects plain `fsync`, and any other value fails startup.
 `RTDB_TZDB_FILE` names an OpenJDK `tzdb.dat` that replaces the bundled time-zone rules without a rebuild, as replacing a JDK's `lib/tzdb.dat` does for XTDB; the server installs it at startup and it is loaded on the first region-zone lookup, and a file that cannot be read or decoded fails every region-zone lookup (see link:../types/data/tzdb/README.adoc[timezone data]).

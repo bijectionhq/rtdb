@@ -214,6 +214,7 @@ impl MultiRuntime {
             return Err(invalid("Multi development data belongs to another incarnation"));
         }
         let journal_path = path.join("journal");
+        let local_journal = stream_journal.is_none();
         let (journal, batch, writer_lock, placement): (Arc<dyn Journal>, Option<Arc<dyn JournalBatchAppender>>, _, _) =
             match stream_journal {
                 Some(stream) => {
@@ -250,7 +251,7 @@ impl MultiRuntime {
             vault,
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
-            checkpoints: config.multi_checkpoints,
+            checkpoints: config.multi_checkpoints.with_deferred_default(local_journal),
             journal_settings: config.multi_journal,
             activation,
             offline_scope,
@@ -1560,7 +1561,7 @@ async fn open_database_for_name(
         database = database.with_batch_appender(Arc::clone(batch));
     }
     database = database
-        .with_deferred_checkpoints(backends.checkpoints.deferred)
+        .with_deferred_checkpoints(backends.checkpoints.deferred.unwrap_or_default())
         .with_binary_checkpoints(backends.checkpoints.binary)
         .with_hold_writes_after_recovery(backends.journal_settings.hold_writes_after_recovery);
     if backends.journal_settings.immutable_streams {

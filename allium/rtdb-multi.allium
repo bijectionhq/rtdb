@@ -36,6 +36,8 @@
 -- With installed keeper trust they prove timed originals from signed syncs on two voters, so funded appends work on them.
 -- The Multi writer checkpoints and trims before its retained journal suffix reaches the consensus stream's record bound.
 -- With deferred checkpoints the writer captures that checkpoint under its database lock, builds and uploads it without the lock, and announces it later, so commits continue while it builds.
+-- The standalone FileJournal enables deferred checkpoints by default.
+-- The writer pipeline owns the build and cancels its upload future when the pipeline stops.
 -- The stream driver submits contiguous append groups in LSN order and acknowledges the group after every record in it commits.
 -- An unavailable append can leave a committed prefix, which the driver recovers from the journal before resuming writes.
 -- After an operator recovery cuts a legacy consensus stream back to its survivor's head, the next writer acknowledges the recovery, records it in the journal before any transaction, and resumes, unless its node is configured to hold writes until someone else acknowledges it.
