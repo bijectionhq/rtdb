@@ -293,6 +293,24 @@ fn update_subqueries_preserve_target_fields_without_persisting_apply_helpers() {
 }
 
 #[test]
+fn update_evaluates_each_set_expression_once_per_row() {
+    fn count_calls(relation: &Relation, target: &str) -> usize {
+        let mut count = 0;
+        for expr in relation.expressions() {
+            expr.visit(&mut |expr| {
+                if matches!(expr, Expr::Call { name, .. } if name == target) {
+                    count += 1;
+                }
+            });
+        }
+        count + relation.children().into_iter().map(|child| count_calls(child, target)).sum::<usize>()
+    }
+    let mutation = rtdb_sql::prepare_tx("UPDATE foo SET price = RANDOM() WHERE _id = 1", &Fixture, &PrepareOptions::default()).unwrap();
+    let rtdb_sql::Mutation::Put { input, .. } = mutation else { panic!("expected put mutation") };
+    assert_eq!(count_calls(&input, "random"), 1, "SET RHS must be evaluated once before change detection and projection");
+}
+
+#[test]
 fn database_oid_and_quoted_identifier_are_bound_from_catalog() {
     let relation = query("SELECT \"ExactName\" FROM archive.public.docs");
     assert_eq!(find_scan(&relation).table.name.database, "archive");

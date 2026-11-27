@@ -112,17 +112,21 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
             for field in input.schema().fields().iter().filter(|field| target_columns.contains(&field.id)) {
                 if !assignments.iter().any(|(name, _)| name == &field.name) { expressions.push(NamedExpr { field: field.clone(), expr: field.expression() }); }
             }
-            let mut differences = Vec::new();
+            let mut evaluated = Vec::with_capacity(assignments.len());
+            let mut differences = Vec::with_capacity(assignments.len());
             for (name, expression) in assignments {
+                let field = allocator.field(name.clone(), None, expression.data_type())?;
                 differences.push(Expr::unary(UnaryOp::Not, Expr::Call {
                     name: "===".into(),
-                    args: vec![expression.clone(), old.get(&name).cloned().unwrap_or(Expr::Literal(Value::Null))],
+                    args: vec![field.expression(), old.get(&name).cloned().unwrap_or(Expr::Literal(Value::Null))],
                     return_type: LogicalType::Scalar(ScalarType::Bool),
                 }));
-                expressions.push(NamedExpr { field: allocator.field(name, None, expression.data_type())?, expr: expression });
+                evaluated.push(NamedExpr { field: field.clone(), expr: expression });
+                expressions.push(NamedExpr { field: field.clone(), expr: field.expression() });
             }
+            let evaluated = if evaluated.is_empty() { input } else { Arc::new(input.extend(evaluated)?) };
             let differs = differences.into_iter().reduce(|left, right| Expr::binary(BinaryOp::Or, left, right)).unwrap_or(Expr::Literal(Value::Bool(false)));
-            let changed = Arc::new(input.filter(differs)?);
+            let changed = Arc::new(evaluated.filter(differs)?);
             let updated = Arc::new(changed.project(expressions)?);
             Mutation::Put { table, input: canonical_put(updated, Some("_iid"))? }
         }
