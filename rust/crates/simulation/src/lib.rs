@@ -51,6 +51,8 @@ pub struct Summary {
     /// Writers that recovered and opened; every one after the first is a failover or a reactivation.
     pub opened: usize,
     pub faults: usize,
+    /// Append requests decided after their original connection or process was gone.
+    pub stale_appends: usize,
 }
 
 /// A safety property failed: the seed replays it, and the trace shows the steps leading up to it.

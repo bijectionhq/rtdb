@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive a native processor trial from one closed C84 refused-claim capture."""
+"""Drive a native processor trial from one closed upstream refused-claim capture."""
 
 import argparse
 import json
@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile
 
 import run_log_processor_sim as reference
-from run_controls import REFERENCE, REPOSITORY, digest, run_process, validate_native_revision, write_json
+from run_controls import REPOSITORY, digest, run_process, validate_native_revision, write_json
 from source_gate import require_phase_two
 
 
@@ -193,14 +193,15 @@ def verify_runtime(root, original, selection, tape, runtime, captured_requests):
 def read_capture(root):
     capture_file = reference.RecordedFile.read(owned_file(root, "reference-capture.json"))
     capture = json.loads(capture_file.data)
+    reference_revision = capture["reference_revision"]
     require(capture["schema_version"] == 1 and capture["scope"] == "jvm-log-processor-refused-claim-pilot"
-            and capture["source"] == reference.FIXTURE and capture["reference_revision"] == REFERENCE
+            and capture["source"] == reference.FIXTURE and reference_revision in reference.SUPPORTED_REFERENCES
             and capture["qualified_name"] == f"{reference.TEST_CLASS}/{reference.METHOD}"
             and capture["task"] == reference.TASK and capture["selected_iterations"] == 1
             and capture["original_assertion_status"] == "SUCCESSFUL", "archive is not a complete original refused-claim capture")
     inputs_file = reference.RecordedFile.read(root / "inputs.json")
     inputs = json.loads(inputs_file.data)
-    require(inputs["reference_revision"] == REFERENCE and inputs["upstream_sources"] == reference.OVERLAY_HASHES
+    require(inputs["reference_revision"] == reference_revision and inputs["upstream_sources"] == reference.OVERLAY_HASHES
             and set(inputs["adapter"]) == ADAPTER_FILES
             and set(inputs["derived_sources"]) == set(reference.OVERLAY_HASHES) | {reference.HELPER},
             "archive has different source inputs")
@@ -251,7 +252,8 @@ def read_capture(root):
     return tape, tape_file, capture_file
 
 
-def project(tape, tape_sha, capture_sha):
+def project(tape, tape_sha, capture_sha, reference_revision):
+    require(reference_revision in reference.SUPPORTED_REFERENCES, "unsupported upstream simulation reference")
     schema = tape["schema_version"]
     require(type(schema) is int and schema in (1, reference.LIVE_INDEX_TAPE_SCHEMA), "unknown simulation tape version")
     rows_per_block, _, _, documents = tape["events"][1]["fields"]
@@ -321,7 +323,7 @@ def project(tape, tape_sha, capture_sha):
     require(assignments == [[None, 0]] and opened == {0, 1, 2} and refused == {1, 2} and delivered == opened
             and len(boot) == 11 and len(starts) == len(writers) == len(documents),
             "capture lacks the boot and single-assignment stimulus required by this trial")
-    return {"schema_version": schema, "reference_revision": REFERENCE, "unique_id": tape["unique_id"],
+    return {"schema_version": schema, "reference_revision": reference_revision, "unique_id": tape["unique_id"],
             "seed": tape["seed"], "reference_capture_sha256": capture_sha, "tape_sha256": tape_sha,
             "rows_per_block": rows_per_block, "boot": boot, "inputs": inputs}
 
@@ -392,7 +394,8 @@ def replay(args):
     tape_sha = tape_file.sha256
     capture_sha = capture_file.sha256
     projected_path = run / "projected.json"
-    projected = project(tape, tape_sha, capture_sha)
+    reference_revision = json.loads(capture_file.data)["reference_revision"]
+    projected = project(tape, tape_sha, capture_sha, reference_revision)
     write_json(projected_path, projected)
     projected_file = reference.RecordedFile.read(projected_path)
     require(json.loads(projected_file.data) == projected, "recorded projection differs from the authored replay inputs")
@@ -415,6 +418,7 @@ def replay(args):
             and execution["execution_complete"] is True and execution["binary_sha256"] == digest(native) == binary_sha
             and execution["input_sha256"] == projected_file.sha256
             and execution["reference_capture_sha256"] == capture_sha and execution["tape_sha256"] == tape_sha
+            and execution["reference_revision"] == reference_revision
             and execution["unique_id"] == tape["unique_id"] and execution["seed"] == tape["seed"],
             "native replay receipt differs from its observed inputs")
     assertions = match_live_index_assertion(tape, execution)
@@ -427,7 +431,8 @@ def replay(args):
             and all(digest(reference.regular(file.path)) == file.sha256 for file in retained),
             "validated simulation evidence changed before publication")
     terminal = run / "result.json"
-    result = {"schema_version": 1, "scope": SCOPE, "reference_capture_sha256": capture_sha, "artifacts": artifacts}
+    result = {"schema_version": 1, "scope": SCOPE, "reference_revision": reference_revision,
+              "reference_capture_sha256": capture_sha, "artifacts": artifacts}
     if assertions:
         result["matched_assertions"] = assertions
     write_json(terminal, result)

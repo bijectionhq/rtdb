@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
-pub(super) const REFERENCE: &str = "c84f9334eb060ceb92d28ecdd4a06e6b625932fd";
+pub(super) const C84_REFERENCE: &str = "c84f9334eb060ceb92d28ecdd4a06e6b625932fd";
+pub(super) const UPSTREAM_COMMIT: &str = include_str!("../../../../conformance/upstream-commit.txt");
 const MAX_EVENTS: usize = 65_536;
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +59,7 @@ impl Tape {
     pub fn observes_live_indexes(&self) -> bool { self.schema_version == 2 }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(self.schema_version, 1 | 2) || self.reference_revision != REFERENCE || self.unique_id.is_empty()
+        if !matches!(self.schema_version, 1 | 2) || ![C84_REFERENCE, UPSTREAM_COMMIT.trim()].contains(&self.reference_revision.as_str()) || self.unique_id.is_empty()
             || self.unique_id.len() > 4096 || !hash(&self.reference_capture_sha256) || !hash(&self.tape_sha256)
             || !(15..=24).contains(&self.rows_per_block) || self.boot.len() != 11 || self.inputs.len() > 157
         {

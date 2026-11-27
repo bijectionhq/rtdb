@@ -156,9 +156,12 @@ The recorder uses the https://docs.junit.org/current/api/org.junit.platform.laun
 Run that command from the pinned reference checkout after Phase 2 begins, following `xtdb-testing` and delegating the resulting log for review.
 Use separate, newly created evidence directories for additional cloud, Docker, and tagged lanes.
 
-The reference processor pilot runs the original C84 refused-claim method in `:xtdb-core:property-test` with one template invocation.
-After Phase 2 begins, run `python3 rust/conformance/run_log_processor_sim.py --phase-two --reference C84_CHECKOUT --output RUN_DIR` with clean implementation and C84 checkouts and a new output directory outside both checkouts.
+The reference processor pilot runs the original refused-claim method in `:xtdb-core:property-test` with one template invocation.
+After Phase 2 begins, run `python3 rust/conformance/run_log_processor_sim.py --phase-two --reference REFERENCE_CHECKOUT --output RUN_DIR` with clean implementation and reference checkouts and a new output directory outside both checkouts.
+The pilot accepts the upstream SHA in `upstream-commit.txt` and the historical C84 reference.
+Both revisions have identical source for the four overlaid test files.
 The runner creates a detached reference tree in the output directory and verifies the original and derived test sources.
+The native projection and replay receipt retain the SHA the capture actually used.
 Gradle loads the inventory adapter from the retained copy inside that directory.
 It records the seed, authored actions and role samples, dispatcher choices, actual claim refusals, ordered log enqueue and durability, tail delivery, external apply acknowledgements and the original assertions' completion.
 The version 2 tape records both original operands of `assertLiveIndexesCaughtUp` for all three nodes after the original simulation scope joins.

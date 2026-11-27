@@ -112,7 +112,7 @@ class LogProcessorReferenceTest(unittest.TestCase):
         for source in ("absent", "anchor twice anchor"):
             with self.subTest(source=source), self.assertRaisesRegex(ValueError, "anchor is missing or repeated"):
                 sim.replace_once(source, "anchor", "observer")
-        with self.assertRaisesRegex(ValueError, "differs from C84"):
+        with self.assertRaisesRegex(ValueError, "differs from the pinned overlay input"):
             sim.derived_source(sim.FIXTURE, b"modified", None)
 
     def test_original_phase_order_checks_durable_source_and_applied_links(self):

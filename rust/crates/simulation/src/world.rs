@@ -421,6 +421,9 @@ impl World {
         if ready.is_empty() { return Ok(()); }
         let stale = self.stale.remove(ready[self.rng.index(ready.len())]);
         self.summary.faults += 1;
+        if matches!(&stale.body, Body::Append { .. }) {
+            self.summary.stale_appends += 1;
+        }
         self.decide(stale.server, Return { process: stale.process, session: 0, id: 0 }, stale.body, true)
     }
 

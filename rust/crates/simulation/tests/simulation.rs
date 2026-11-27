@@ -19,6 +19,7 @@ fn sweep(seeds: std::ops::Range<u64>, steps: usize, configure: impl Fn(&mut Conf
         total.claims += summary.claims;
         total.opened += summary.opened;
         total.faults += summary.faults;
+        total.stale_appends += summary.stale_appends;
     }
     total
 }
@@ -44,7 +45,8 @@ fn two_thousand_seeds_of_two_thousand_steps_keep_the_single_writer_safe() {
 
 #[test]
 fn requests_a_server_decides_after_newer_ones_cannot_undo_a_commit() {
-    sweep(10_000..11_000, 2_000, |config| config.stale_redelivery = true);
+    let total = sweep(10_000..11_000, 2_000, |config| config.stale_redelivery = true);
+    assert!(total.stale_appends > 0 && total.acknowledged > 0, "the sweep must exercise stale writes and commit data: {total:?}");
 }
 
 #[test]

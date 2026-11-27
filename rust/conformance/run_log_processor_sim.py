@@ -13,11 +13,13 @@ from pathlib import Path
 from uuid import UUID
 from zipfile import BadZipFile, ZipFile
 
-from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, run_process, write_json
+from run_controls import HERE, REFERENCE as C84_REFERENCE, REPOSITORY, digest, git, run_process, write_json
 from runtime_inventory import inspect_plan
 from source_gate import require_phase_two
 
 
+UPSTREAM_COMMIT = (HERE / "upstream-commit.txt").read_text(encoding="ascii").strip()
+SUPPORTED_REFERENCES = (UPSTREAM_COMMIT, C84_REFERENCE)
 PROJECT = ":xtdb-core"
 TASK = PROJECT + ":property-test"
 LANE = TASK.replace(":", "_")
@@ -320,7 +322,7 @@ def replace_once(source, before, after):
 def derived_source(path, raw, seed, tape_schema=LIVE_INDEX_TAPE_SCHEMA):
     require(type(tape_schema) is int and tape_schema in (1, LIVE_INDEX_TAPE_SCHEMA), "unknown simulation tape version")
     if hashlib.sha256(raw).hexdigest() != OVERLAY_HASHES[path]:
-        raise ValueError(f"reference test source differs from C84: {path}")
+        raise ValueError(f"reference test source differs from the pinned overlay input: {path}")
     source = raw.decode("utf-8")
     for before, after in OVERLAYS[path]:
         source = replace_once(source, before, after)
@@ -345,8 +347,8 @@ def require(condition, failure):
         raise ValueError(failure)
 
 
-def verify_overlay(tree, expected):
-    require(git(tree, "rev-parse", "HEAD") == REFERENCE, "derived reference revision changed")
+def verify_overlay(tree, expected, reference_revision):
+    require(git(tree, "rev-parse", "HEAD") == reference_revision, "derived reference revision changed")
     dirty = set(git(tree, "diff", "--name-only", "HEAD").splitlines())
     dirty.update(git(tree, "ls-files", "--others", "--exclude-standard").splitlines())
     require(dirty == set(expected), "derived reference changed outside its declared test overlay")
@@ -355,13 +357,13 @@ def verify_overlay(tree, expected):
         require(not path.is_symlink() and digest(path) == sha256, f"derived reference file changed: {name}")
 
 
-def owned_overlay(reference, run, seed):
+def owned_overlay(reference, run, seed, reference_revision):
     tree = run / "reference"
     subprocess.run(["git", "init", "--quiet", "--template=", str(tree)], check=True)
     subprocess.run(["git", "-C", str(tree), "fetch", "--quiet", "--depth=1", "--no-tags", "--",
-                    str(reference), REFERENCE], check=True)
-    subprocess.run(["git", "-C", str(tree), "checkout", "--quiet", "--detach", REFERENCE], check=True)
-    require(git(tree, "rev-parse", "HEAD") == REFERENCE, "local fetch did not produce C84")
+                    str(reference), reference_revision], check=True)
+    subprocess.run(["git", "-C", str(tree), "checkout", "--quiet", "--detach", reference_revision], check=True)
+    require(git(tree, "rev-parse", "HEAD") == reference_revision, "local fetch did not produce the selected upstream revision")
     require(not git(tree, "status", "--porcelain", "--untracked-files=all"), "derived checkout is dirty")
     require(not (tree / ".git/objects/info/alternates").exists(), "derived checkout borrows Git objects")
     expected = {}
@@ -380,7 +382,7 @@ def owned_overlay(reference, run, seed):
     with helper.open("xb") as target:
         target.write(recorder.read_bytes())
     expected[HELPER] = digest(recorder)
-    verify_overlay(tree, expected)
+    verify_overlay(tree, expected, reference_revision)
     return tree, expected
 
 
@@ -921,7 +923,8 @@ def capture(args):
     revision = clean_checkout(REPOSITORY)
     require_phase_two(REPOSITORY, args.phase_two)
     reference = args.reference.resolve(strict=True)
-    require(clean_checkout(reference) == REFERENCE, "expected the original C84 reference checkout")
+    reference_revision = clean_checkout(reference)
+    require(reference_revision in SUPPORTED_REFERENCES, "expected a pinned upstream reference checkout")
     out = args.output.absolute()
     run = out.parent.resolve(strict=True) / out.name
     require(not any(run.is_relative_to(path) for path in (REPOSITORY, reference)), "run directory must be outside both checkouts")
@@ -938,16 +941,16 @@ def capture(args):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(HERE / name, target)
         require(digest(target) == sha256, f"adapter input changed during capture: {name}")
-    tree, overlay = owned_overlay(reference, run, args.seed)
-    write_json(run / "inputs.json", {"reference_revision": REFERENCE, "implementation_revision": revision,
+    tree, overlay = owned_overlay(reference, run, args.seed, reference_revision)
+    write_json(run / "inputs.json", {"reference_revision": reference_revision, "implementation_revision": revision,
                                     "upstream_sources": OVERLAY_HASHES, "derived_sources": overlay, "adapter": inputs,
                                     "requested_seed": args.seed})
     logs = tree / "build"
     logs.mkdir()
     process = run_process(gradle_command(tree, run), tree, logs / "test-run.log", run / "gradle.stderr.log", args.timeout)
     write_json(run / "process.json", process)
-    verify_overlay(tree, overlay)
-    require(clean_checkout(reference) == REFERENCE and clean_checkout(REPOSITORY) == revision,
+    verify_overlay(tree, overlay, reference_revision)
+    require(clean_checkout(reference) == reference_revision and clean_checkout(REPOSITORY) == revision,
             "input checkout changed during reference recording")
     require(all(digest(HERE / name) == digest(regular(run / "adapter" / name)) == sha256
                 for name, sha256 in inputs.items()), "adapter source changed during recording")
@@ -967,7 +970,7 @@ def capture(args):
     closure.extend(run / "adapter" / name for name in inputs)
     write_json(run / "reference-capture.json", {
         "schema_version": 1, "scope": "jvm-log-processor-refused-claim-pilot",
-        "reference_revision": REFERENCE, "source": FIXTURE, "qualified_name": f"{TEST_CLASS}/{METHOD}",
+        "reference_revision": reference_revision, "source": FIXTURE, "qualified_name": f"{TEST_CLASS}/{METHOD}",
         "task": TASK, "unique_id": unique, "selected_iterations": 1, "original_assertion_status": "SUCCESSFUL",
         "observation": observed,
         "artifacts": [{"path": path.relative_to(run).as_posix(), "sha256": digest(path), "bytes": path.stat().st_size}

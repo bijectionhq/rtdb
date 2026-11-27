@@ -23,15 +23,23 @@ def joined_execution():
 class ProjectedSimulationTest(unittest.TestCase):
     def test_legacy_capture_keeps_its_original_replay_scope(self):
         original = tape()
-        projected = replay.project(original, "a" * 64, "b" * 64)
+        projected = replay.project(original, "a" * 64, "b" * 64, replay.reference.C84_REFERENCE)
         self.assertEqual(projected["schema_version"], 1)
         self.assertEqual(replay.match_live_index_assertion(original, {}), [])
+
+    def test_projection_retains_the_reference_and_rejects_other_commits(self):
+        original = tape(schema_version=replay.reference.LIVE_INDEX_TAPE_SCHEMA)
+        revision = replay.reference.UPSTREAM_COMMIT
+        projected = replay.project(original, "a" * 64, "b" * 64, revision)
+        self.assertEqual(projected["reference_revision"], revision)
+        with self.assertRaisesRegex(ValueError, "unsupported upstream simulation reference"):
+            replay.project(original, "a" * 64, "b" * 64, "f" * 40)
 
     def test_matches_original_live_index_operands_to_the_joined_native_replica(self):
         original = tape(schema_version=replay.reference.LIVE_INDEX_TAPE_SCHEMA)
         replay.reference.check_tape(original, original["unique_id"], -123)
-        projected = replay.project(original, "a" * 64, "b" * 64)
-        legacy = replay.project(tape(), "a" * 64, "b" * 64)
+        projected = replay.project(original, "a" * 64, "b" * 64, replay.reference.C84_REFERENCE)
+        legacy = replay.project(tape(), "a" * 64, "b" * 64, replay.reference.C84_REFERENCE)
         self.assertEqual(projected["schema_version"], 2)
         self.assertEqual(projected["boot"], legacy["boot"])
         self.assertEqual(projected["inputs"], legacy["inputs"])
@@ -80,6 +88,7 @@ class ProjectedSimulationTest(unittest.TestCase):
             ("bool as int", "execution receipt bytes differ from stdout"),
             ("int as float", "execution receipt bytes differ from stdout"),
             ("legacy receipt", "receipt differs from its observed inputs"),
+            ("wrong reference", "receipt differs from its observed inputs"),
         ):
             with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
@@ -90,7 +99,8 @@ class ProjectedSimulationTest(unittest.TestCase):
                 tape_path = capture / "tape.json"
                 marker_path = capture / "marker.json"
                 replay.write_json(tape_path, original)
-                replay.write_json(marker_path, {"original": original["unique_id"]})
+                revision = replay.reference.UPSTREAM_COMMIT
+                replay.write_json(marker_path, {"original": original["unique_id"], "reference_revision": revision})
                 tape_file = replay.reference.RecordedFile.read(tape_path)
                 marker_file = replay.reference.RecordedFile.read(marker_path)
                 binary = root / "binary"
@@ -106,6 +116,7 @@ class ProjectedSimulationTest(unittest.TestCase):
                     execution = joined_execution()
                     execution.update({"schema_version": 1 if defect == "legacy receipt" else 2,
                         "scope": replay.SCOPE, "execution_complete": True,
+                        "reference_revision": replay.reference.C84_REFERENCE if defect == "wrong reference" else revision,
                         "binary_sha256": replay.digest(binary), "input_sha256": replay.digest(command[2]),
                         "reference_capture_sha256": marker_file.sha256, "tape_sha256": tape_file.sha256,
                         "unique_id": original["unique_id"], "seed": original["seed"],
@@ -144,6 +155,7 @@ class ProjectedSimulationTest(unittest.TestCase):
                         self.assertFalse((output / "result.json").exists())
                     else:
                         result = json.loads(replay.replay(args).read_bytes())
+                        self.assertEqual(result["reference_revision"], revision)
                         self.assertEqual(result["matched_assertions"][0]["line"], 461)
                         record = next(item for item in result["artifacts"] if item["path"] == "native/execution.json")
                         self.assertEqual(record["sha256"], replay.digest(execution_path))
@@ -151,7 +163,7 @@ class ProjectedSimulationTest(unittest.TestCase):
     def test_projects_exact_boot_and_authored_edge_sequences(self):
         original = tape()
         replay.reference.check_tape(original, original["unique_id"], -123)
-        projected = replay.project(original, "a" * 64, "b" * 64)
+        projected = replay.project(original, "a" * 64, "b" * 64, replay.reference.C84_REFERENCE)
         self.assertEqual(len(projected["boot"]), 11)
         self.assertEqual(projected["seed"], -123)
         self.assertEqual(projected["rows_per_block"], 16)
@@ -177,7 +189,7 @@ class ProjectedSimulationTest(unittest.TestCase):
         for index, frame in enumerate(frames):
             frame["sequence"] = index
         replay.reference.check_tape(original, original["unique_id"], -123)
-        result = replay.project(original, "a" * 64, "b" * 64)
+        result = replay.project(original, "a" * 64, "b" * 64, replay.reference.C84_REFERENCE)
         self.assertLess(result["inputs"][0]["sequence"], result["boot"][0]["sequence"])
 
     def test_unrecorded_assigned_key_fails_projection(self):
@@ -185,7 +197,7 @@ class ProjectedSimulationTest(unittest.TestCase):
         observer = next(frame for frame in original["events"] if frame["kind"] == "external_writer")
         original["events"].remove(observer)
         with self.assertRaisesRegex(ValueError, "external receipt differs from writer"):
-            replay.project(original, "a" * 64, "b" * 64)
+            replay.project(original, "a" * 64, "b" * 64, replay.reference.C84_REFERENCE)
 
     def test_archived_members_cannot_escape_or_misstate_retained_bytes(self):
         with tempfile.TemporaryDirectory() as directory:

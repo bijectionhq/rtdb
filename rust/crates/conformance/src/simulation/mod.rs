@@ -486,7 +486,7 @@ mod tests {
                 tx_id: i64::from(action), time, documents: committed.then(|| vec![uuid::Uuid::from_u128(u128::from(action))]) } });
             inputs.push(Event { sequence: sequence + 1, event: Input::ExternalApplied { action, tx_id: i64::from(action), time, committed } });
         }
-        Tape { schema_version: 1, reference_revision: tape::REFERENCE.into(), unique_id: "synthetic-native-transport".into(),
+        Tape { schema_version: 1, reference_revision: tape::C84_REFERENCE.into(), unique_id: "synthetic-native-transport".into(),
             seed: 7, reference_capture_sha256: "a".repeat(64), tape_sha256: "b".repeat(64), rows_per_block: 18, boot, inputs }
     }
 
@@ -541,6 +541,15 @@ mod tests {
             tape.schema_version = schema_version;
             assert!(tape.validate().is_err());
         }
+    }
+
+    #[test]
+    fn refused_claim_projection_requires_a_pinned_reference() {
+        let mut tape = fixture();
+        tape.reference_revision = tape::UPSTREAM_COMMIT.trim().into();
+        tape.validate().unwrap();
+        tape.reference_revision = "f".repeat(40);
+        assert!(tape.validate().is_err());
     }
 
     #[tokio::test]
