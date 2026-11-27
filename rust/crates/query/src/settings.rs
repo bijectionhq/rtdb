@@ -49,6 +49,7 @@ pub(crate) struct ReadBasis {
     snapshot_time: Option<Timestamp>,
     clock_fallback: rtdb_types::Instant,
     pub token: Option<String>,
+    admitted_token: Option<String>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -78,7 +79,7 @@ impl QueryContext {
         let times = times.clone();
         let token = None;
         let mut context = self.execution_child_with_memory(Arc::clone(&self.memory));
-        Arc::get_mut(&mut context).ok_or_else(|| invalid("settings-owner", "New context is unexpectedly shared"))?.read_basis = Some(Arc::new(ReadBasis { times: Some(times), snapshot_time, clock_fallback: clock_fallback.into(), token, _reservation: charge }));
+        Arc::get_mut(&mut context).ok_or_else(|| invalid("settings-owner", "New context is unexpectedly shared"))?.read_basis = Some(Arc::new(ReadBasis { times: Some(times), snapshot_time, clock_fallback: clock_fallback.into(), token, admitted_token: None, _reservation: charge }));
         Ok(context)
     }
 
@@ -92,24 +93,48 @@ impl QueryContext {
         self
     }
 
+    fn admitted_snapshot_token(&self) -> Option<&str> {
+        self.read_basis.as_ref().and_then(|basis| basis.admitted_token.as_deref().or(basis.token.as_deref()))
+    }
+
     pub fn with_snapshot_view(mut self: Arc<Self>, mut view: SqlSnapshotView, token: String) -> Result<Arc<Self>> {
+        let option_cap = self.read_basis.as_ref().and_then(|basis| basis.snapshot_time);
+        let clock_fallback = self.read_basis.as_ref().map_or(view.current_time, |basis| basis.clock_fallback);
         view.catalog.runtime = self.catalog.runtime.clone();
+        let mut recapped = false;
+        if let Some(cap) = option_cap {
+            for database in view.catalog.databases_mut().values_mut() {
+                for partition in &mut database.partitions {
+                    let next = partition.system_time_cap()
+                        .or(partition.tx_basis().map(|head| head.system_time))
+                        .map(|time| time.min(cap));
+                    if next != partition.system_time_cap() {
+                        *partition = partition.clone().with_system_time_cap(next)?;
+                        recapped = true;
+                    }
+                }
+            }
+        }
         let context = Arc::make_mut(&mut self);
         context.catalog = view.catalog;
         context.current_time = view.current_time;
         context.timezone = view.timezone;
-        self.with_exact_snapshot_token(token)
+        let charge = context.memory.reserve(token.len().checked_mul(2).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?)?;
+        let caps = captured_caps(&context.catalog);
+        let effective = (!recapped).then(|| token.clone());
+        context.read_basis = Some(Arc::new(ReadBasis {
+            times: caps, snapshot_time: option_cap, clock_fallback,
+            token: effective, admitted_token: Some(token), _reservation: charge,
+        }));
+        Ok(self)
     }
 
     pub async fn reopen_sql_snapshot(self: Arc<Self>, settings: &QuerySettings, parameters: rtdb_expr::Parameters<'_>) -> Result<Arc<Self>> {
         let Some(setting) = &settings.snapshot_token else { return Ok(self); };
         match setting_value(setting, parameters)? {
             Value::Null | Value::Undefined => Ok(self),
-            Value::Utf8(token) if self.snapshot_token() == Some(token) => Ok(self),
+            Value::Utf8(token) if self.admitted_snapshot_token() == Some(token) => Ok(self),
             Value::Utf8(token) => {
-                if self.snapshot_token().is_some() || settings.clock_time.is_some() || settings.snapshot_time.is_some() {
-                    return Err(invalid("snapshot-scope", "An exact snapshot fixes its catalog, clock and system ceiling"));
-                }
                 let admission = self.snapshot_admission.as_ref().ok_or_else(|| invalid("snapshot-unretained", "No SQL snapshot owner is installed"))?;
                 let view = admission.reopen(token, &self).await?;
                 self.with_snapshot_view(view, token.to_owned())
@@ -131,11 +156,13 @@ impl QueryContext {
 
     pub fn with_exact_snapshot_token(mut self: Arc<Self>, token: String) -> Result<Arc<Self>> {
         let charge = self.memory.reserve(token.len().checked_add(256).ok_or_else(size_error)?)?;
-        let current_time = self.current_time;
+        let snapshot_time = self.read_basis.as_ref().and_then(|basis| basis.snapshot_time);
+        let clock_fallback = self.read_basis.as_ref().map_or(self.current_time, |basis| basis.clock_fallback);
+        let admitted_token = self.read_basis.as_ref().and_then(|basis| basis.admitted_token.clone());
         let caps = captured_caps(&self.catalog);
         Arc::make_mut(&mut self).read_basis = Some(Arc::new(ReadBasis {
-            times: caps, snapshot_time: None, clock_fallback: current_time,
-            token: Some(token), _reservation: charge,
+            times: caps, snapshot_time, clock_fallback,
+            token: Some(token), admitted_token, _reservation: charge,
         }));
         Ok(self)
     }
@@ -213,6 +240,7 @@ impl QueryContext {
         context.cancellation = cancellation.child_token();
         context.read_basis = Some(Arc::new(ReadBasis {
             token: None,
+            admitted_token: None,
             times: Some(times), snapshot_time: Some(system_time), clock_fallback: system_time.into(),
             _reservation: charge,
         }));
@@ -275,7 +303,7 @@ impl QueryContext {
         let mut times = if let Some(expression) = &settings.snapshot_token {
             match setting_value(expression, parameters)? {
                 Value::Null | Value::Undefined => captured_caps(&self.catalog),
-                Value::Utf8(token) if self.snapshot_token() == Some(token) => captured_caps(&self.catalog),
+                Value::Utf8(token) if self.admitted_snapshot_token() == Some(token) => captured_caps(&self.catalog),
                 Value::Utf8(_) => return Err(invalid("snapshot-unretained", "SNAPSHOT_TOKEN must be readmitted before binding")),
                 _ => return Err(invalid("invalid-snapshot-token", "SNAPSHOT_TOKEN requires a string or null")),
             }
@@ -291,19 +319,12 @@ impl QueryContext {
             },
             None => None,
         };
-        if self.snapshot_token().is_some() && requested_cap.is_some() {
-            return Err(invalid("snapshot-scope", "An exact snapshot fixes its system ceiling"));
-        }
         let option_cap = self.read_basis.as_ref().and_then(|basis| basis.snapshot_time);
         let snapshot_time = match (option_cap, requested_cap) {
             (Some(option), Some(requested)) => Some(option.min(requested)),
             (option, requested) => option.or(requested),
         };
         if let Some(cap) = snapshot_time { times = times.map(|times| times.capped_at(cap.into())); }
-        if self.snapshot_token().is_some() && current_time != self.current_time {
-            return Err(invalid("snapshot-scope", "A readmitted snapshot fixes its original query clock"));
-        }
-        let token = self.snapshot_token().map(str::to_owned);
         let visible = |name: &String, index: usize, partition: &rtdb_index::Snapshot| -> Result<Option<Timestamp>> {
             let cap = times.as_ref().and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten().map(|time| time.as_micros()).transpose()?;
             Ok(cap.or(snapshot_time).zip(partition.tx_basis()).map(|(cap, head)| cap.min(head.system_time)))
@@ -314,6 +335,8 @@ impl QueryContext {
                 if visible(name, index, partition)? != partition.system_time_cap() { recapped = true; break 'databases; }
             }
         }
+        let token = if recapped { None } else { self.snapshot_token().map(str::to_owned) };
+        let admitted_token = self.read_basis.as_ref().and_then(|basis| basis.admitted_token.clone());
         let catalog = if recapped {
             let mut catalog = self.catalog.clone();
             for (name, database) in catalog.databases_mut() {
@@ -328,7 +351,7 @@ impl QueryContext {
         let mutable = Arc::get_mut(&mut context).ok_or_else(|| invalid("settings-owner", "New context is unexpectedly shared"))?;
         if let Some(catalog) = catalog { mutable.catalog = catalog; }
         mutable.current_time = current_time;
-        mutable.read_basis = Some(Arc::new(ReadBasis { times, snapshot_time, clock_fallback: fallback, token, _reservation: charge }));
+        mutable.read_basis = Some(Arc::new(ReadBasis { times, snapshot_time, clock_fallback: fallback, token, admitted_token, _reservation: charge }));
         Ok(context)
     }
 }
@@ -443,5 +466,68 @@ mod tests {
         assert_eq!(view.catalog.relation_name(after, &scope).unwrap().as_deref(), Some("after"));
         assert_eq!(context.catalog.relation_oid(Some("public"), "before", &scope).unwrap(), before);
         assert_eq!(context.catalog.relation_oid(Some("public"), "after", &scope).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_token_combines_with_clock_time_and_snapshot_time() {
+        struct StaticAdmission(BTreeMap<String, rtdb_index::Snapshot>);
+        #[async_trait::async_trait]
+        impl SnapshotAdmission for StaticAdmission {
+            async fn reopen(&self, token: &str, current: &QueryContext) -> Result<SqlSnapshotView> {
+                let snapshot = self.0.get(token).cloned().ok_or_else(|| invalid("snapshot-unretained", "unknown token"))?;
+                SqlSnapshotView::from_partitions(current, BTreeMap::from([("xtdb".into(), vec![snapshot])]))
+            }
+        }
+
+        let memory = MemoryBudget::new(1 << 26);
+        let state = PartitionState::empty(Default::default()).unwrap();
+        for tx in [1, 2] {
+            let mut buffer = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) }, Arc::clone(&memory)).unwrap();
+            buffer.put(TableRef::new("public", "docs"), StructFields::from([("_id".into(), Value::I64(tx))]), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+            state.apply(&buffer.stage().unwrap()).unwrap();
+        }
+        let head = state.value().snapshot();
+        let cap1 = head.clone().with_system_time_cap(Some(Timestamp(1))).unwrap();
+        let cap2 = head.clone().with_system_time_cap(Some(Timestamp(2))).unwrap();
+        let admission = Arc::new(StaticAdmission(BTreeMap::from([("tok1".into(), cap1), ("tok2".into(), cap2)])));
+        let database = crate::DatabaseSnapshot { partitions: vec![head], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let base = QueryContext::new(catalog, memory, Timestamp(100), "UTC", crate::QueryOptions::default(), &tokio_util::sync::CancellationToken::new())
+            .unwrap()
+            .with_snapshot_admission(admission);
+
+        // SETTING SNAPSHOT_TOKEN + CLOCK_TIME keeps the token and updates the query clock.
+        let settings = QuerySettings {
+            snapshot_token: Some(SettingValue::Literal(Value::Utf8("tok2".into()))),
+            clock_time: Some(SettingValue::TimestampLiteral("2025-01-01T00:00:00Z".into())),
+            snapshot_time: None,
+        };
+        let reopened = Arc::clone(&base).reopen_sql_snapshot(&settings, rtdb_expr::Parameters::Values(&[])).await.unwrap();
+        let applied = reopened.apply_settings(&settings, rtdb_expr::Parameters::Values(&[])).unwrap();
+        assert_eq!(applied.snapshot_token(), Some("tok2"));
+        assert_eq!(applied.current_time, rtdb_types::parse_sql_timestamp_instant("2025-01-01T00:00:00Z", "UTC").unwrap());
+        assert_eq!(applied.catalog.database_snapshots()["xtdb"].partitions[0].system_time_cap(), Some(Timestamp(2)));
+
+        // SETTING SNAPSHOT_TOKEN + SNAPSHOT_TIME lowers the cap and clears the cached token so it re-encodes.
+        let capped_settings = QuerySettings {
+            snapshot_token: Some(SettingValue::Literal(Value::Utf8("tok2".into()))),
+            clock_time: Some(SettingValue::TimestampLiteral("2025-01-01T00:00:00Z".into())),
+            snapshot_time: Some(SettingValue::Literal(Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) })),
+        };
+        let reopened = Arc::clone(&base).reopen_sql_snapshot(&capped_settings, rtdb_expr::Parameters::Values(&[])).await.unwrap();
+        let applied = reopened.apply_settings(&capped_settings, rtdb_expr::Parameters::Values(&[])).unwrap();
+        assert_eq!(applied.snapshot_token(), None);
+        assert_eq!(applied.catalog.database_snapshots()["xtdb"].partitions[0].system_time_cap(), Some(Timestamp(1)));
+        assert_eq!(applied.current_time, rtdb_types::parse_sql_timestamp_instant("2025-01-01T00:00:00Z", "UTC").unwrap());
+
+        // Read-option SNAPSHOT_TIME applied alongside a reopened token lowers the cap on admission and stays idempotent on reopen.
+        let with_cap = Arc::clone(&base).with_read_options(&TimeBasis::default(), Some(Timestamp(1)), Timestamp(100)).unwrap();
+        let reopened = with_cap.reopen_sql_snapshot(&settings, rtdb_expr::Parameters::Values(&[])).await.unwrap();
+        assert_eq!(reopened.snapshot_token(), None);
+        assert_eq!(reopened.catalog.database_snapshots()["xtdb"].partitions[0].system_time_cap(), Some(Timestamp(1)));
+        let reopened_again = reopened.reopen_sql_snapshot(&settings, rtdb_expr::Parameters::Values(&[])).await.unwrap();
+        let applied = reopened_again.apply_settings(&settings, rtdb_expr::Parameters::Values(&[])).unwrap();
+        assert_eq!(applied.snapshot_token(), None);
+        assert_eq!(applied.catalog.database_snapshots()["xtdb"].partitions[0].system_time_cap(), Some(Timestamp(1)));
     }
 }

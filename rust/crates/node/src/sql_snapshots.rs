@@ -73,11 +73,12 @@ fn decode(token: &str, owner: Option<&str>, codec: Option<&dyn crate::placed_rec
 fn read_at(times: Option<&Vec<Option<Instant>>>, current: &[rtdb_index::Snapshot]) -> Result<Vec<rtdb_index::Snapshot>> {
     current.iter().enumerate().map(|(index, snapshot)| {
         if snapshot.has_overlays() { return Err(overlaid()); }
-        let Some(time) = times.and_then(|times| times.get(index)).copied().flatten() else { return Ok(snapshot.clone()); };
+        let Some(time) = times.and_then(|times| times.get(index)).copied().flatten() else {
+            return snapshot.clone().with_system_time_cap(snapshot.tx_basis().map(|head| head.system_time));
+        };
         let system_time = time.as_micros()?;
         if snapshot.tx_basis().is_none_or(|head| head.system_time < system_time) {
-            return Err(Anomaly::incorrect("xtdb/unindexed-tx", format!("system-time ({}) is after the latest completed tx ({:?})",
-                system_time.0, snapshot.tx_basis())));
+            return Err(rtdb_query::unindexed_tx(time, snapshot.tx_basis()));
         }
         snapshot.clone().with_system_time_cap(Some(system_time))
     }).collect()
@@ -102,7 +103,7 @@ fn overlaid() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unsupported, "rtdb/snapshot-token-overlay", "A SQL snapshot token cannot name a read with world overlays")
 }
 
-/// The token cannot be read on this node: another storage generation, or options it cannot be combined with.
+/// The token cannot be read on this node: another storage generation, or a fixed world clock (`bijection.at`).
 pub(crate) fn unretained() -> Anomaly {
     Anomaly::incorrect("rtdb/snapshot-unretained", "The SQL snapshot token cannot be redeemed here")
 }
@@ -198,5 +199,7 @@ mod tests {
         assert_eq!(uncapped.system_time_cap(), Some(Timestamp(30)), "a database the token leaves out reads through its head, as in XTDB");
         let absent = read_at(Some(&vec![None]), &[partition.snapshot()]).unwrap().pop().unwrap();
         assert_eq!(absent.system_time_cap(), Some(Timestamp(30)), "a partition the token gives no time reads through its head");
+        let recapped_to_head = read_at(None, &[redeemed]).unwrap().pop().unwrap();
+        assert_eq!(recapped_to_head.system_time_cap(), Some(Timestamp(30)), "overriding a capped snapshot with a token omitting the database restores reading through its head");
     }
 }

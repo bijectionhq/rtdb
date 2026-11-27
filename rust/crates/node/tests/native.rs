@@ -1712,6 +1712,100 @@ async fn transactions_in_one_microsecond_get_distinct_system_times_that_tokens_n
     ).await.unwrap()).await;
     assert_eq!(reopened, [vec![Value::I64(10)]], "the first transaction's token never reads its successor");
     assert_eq!(rows(reader.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(20)]]);
+async fn sql_snapshot_tokens_combine_with_snapshot_time_await_token_and_clock_time() {
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_log_clock({
+            let clock = Arc::new(AtomicI64::new(1_000_000));
+            Arc::new(move || Ok(Timestamp(clock.fetch_add(1_000_000, Ordering::Relaxed))))
+        })),
+        ..services()
+    };
+    let (node, driver) = running(options(), services).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let tx1 = session.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap().unwrap().tx_key();
+    let tx2 = session.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap().unwrap().tx_key();
+    let tx3 = session.state_mut().execute_operation(put(&node, 1, 30)).await.unwrap().unwrap().tx_key();
+    let tok1 = rtdb_format::basis::encode_time_basis(&rtdb_types::TimeBasis {
+        databases: BTreeMap::from([("xtdb".to_owned(), vec![Some(tx1.system_time.into())])]),
+    });
+    let tok2 = rtdb_format::basis::encode_time_basis(&rtdb_types::TimeBasis {
+        databases: BTreeMap::from([("xtdb".to_owned(), vec![Some(tx2.system_time.into())])]),
+    });
+    let await_token = session.state().effective_await_token().expect("prior writes set an await token").to_owned();
+    assert!(tx1.system_time < tx2.system_time && tx2.system_time < tx3.system_time);
+
+    // SETTING SNAPSHOT_TOKEN combined with CLOCK_TIME on a session that already carries an await token.
+    let combined_clock = rows(session.query_sql(
+        "SETTING SNAPSHOT_TOKEN=?, CLOCK_TIME=TIMESTAMP '2025-01-02T03:04:05Z' SELECT value, CURRENT_TIMESTAMP, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME",
+        vec![Value::Utf8(tok1.clone())],
+    ).await.unwrap()).await;
+    assert_eq!(combined_clock.len(), 1);
+    assert_eq!(combined_clock[0][0], Value::I64(10));
+    assert_eq!(combined_clock[0][1], Value::Timestamp {
+        value: rtdb_types::parse_sql_timestamp_instant("2025-01-02T03:04:05Z", "UTC").unwrap().as_micros().unwrap().0,
+        unit: rtdb_types::TimeUnit::Microsecond,
+        timezone: Some("UTC".into()),
+    });
+    assert_eq!(combined_clock[0][2], Value::Utf8(tok1.clone()));
+
+    // SETTING SNAPSHOT_TOKEN combined with SNAPSHOT_TIME lowers the effective snapshot and re-encodes the token.
+    let capped_setting = rows(session.query_sql(
+        "SETTING SNAPSHOT_TOKEN=?, SNAPSHOT_TIME=? SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME",
+        vec![
+            Value::Utf8(tok2.clone()),
+            Value::Timestamp { value: tx1.system_time.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) },
+        ],
+    ).await.unwrap()).await;
+    assert_eq!(capped_setting, vec![vec![Value::I64(10), Value::Utf8(tok1.clone())]]);
+
+    // BEGIN READ ONLY combining SNAPSHOT_TOKEN, AWAIT_TOKEN, and SNAPSHOT_TIME.
+    session.state_mut().begin_with(TransactionSettings {
+        access: Some(AccessSettings::ReadOnly(ReadOnlySettings {
+            snapshot_token: OptionUpdate::Set(tok2.clone()),
+            snapshot_time: OptionUpdate::Set(tx1.system_time),
+            await_token: OptionUpdate::Set(await_token),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }).unwrap();
+    let cancel = session.state().cancellation().child_token();
+    let show_stmt = rtdb_sql::parse_control("SHOW snapshot_token", &Default::default()).unwrap().unwrap();
+    let ControlResult::Rows(show) = session.execute_control(&show_stmt, &[], &cancel).await.unwrap() else { panic!() };
+    assert_eq!(rows(show).await, vec![vec![Value::Utf8(tok1.clone())]]);
+    let tx_rows = rows(session.query_sql("SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    assert_eq!(tx_rows, vec![vec![Value::I64(10), Value::Utf8(tok1.clone())]]);
+    // SETTING CLOCK_TIME inside a SNAPSHOT_TOKEN transaction also overrides the query clock.
+    let overridden_clock = rows(session.query_sql(
+        "SETTING CLOCK_TIME=TIMESTAMP '2026-06-07T08:09:10Z' SELECT value, CURRENT_TIMESTAMP FROM docs FOR ALL VALID_TIME",
+        vec![],
+    ).await.unwrap()).await;
+    assert_eq!(overridden_clock, vec![vec![
+        Value::I64(10),
+        Value::Timestamp {
+            value: rtdb_types::parse_sql_timestamp_instant("2026-06-07T08:09:10Z", "UTC").unwrap().as_micros().unwrap().0,
+            unit: rtdb_types::TimeUnit::Microsecond,
+            timezone: Some("UTC".into()),
+        },
+    ]]);
+    session.state_mut().rollback_tx().unwrap();
+
+    // BEGIN READ ONLY with SNAPSHOT_TOKEN + AWAIT_TOKEN without SNAPSHOT_TIME sees tok2's data.
+    session.state_mut().begin_with(TransactionSettings {
+        access: Some(AccessSettings::ReadOnly(ReadOnlySettings {
+            snapshot_token: OptionUpdate::Set(tok2.clone()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }).unwrap();
+    let tx2_rows = rows(session.query_sql("SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await;
+    assert_eq!(tx2_rows, vec![vec![Value::I64(20), Value::Utf8(tok2)]]);
+    // Query-level SETTING SNAPSHOT_TOKEN overrides transaction-level SNAPSHOT_TOKEN.
+    let overridden_tok = rows(session.query_sql(
+        "SETTING SNAPSHOT_TOKEN=? SELECT value, SNAPSHOT_TOKEN FROM docs FOR ALL VALID_TIME",
+        vec![Value::Utf8(tok1.clone())],
+    ).await.unwrap()).await;
+    assert_eq!(overridden_tok, vec![vec![Value::I64(10), Value::Utf8(tok1)]]);
+    session.state_mut().rollback_tx().unwrap();
     stop(&node, driver).await;
 }
 

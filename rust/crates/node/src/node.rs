@@ -4562,7 +4562,7 @@ impl NativeSessionService {
             context
         };
         let context = crate::sql_snapshots::with_issuer(context, self.user(), self.placement.clone());
-        Ok(if basis.has_await_floor { context } else { context.with_snapshot_admission(admission) })
+        Ok(context.with_snapshot_admission(admission))
     }
 
     pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<HostedSourceReceipt>> {

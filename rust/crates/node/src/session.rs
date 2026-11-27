@@ -563,7 +563,7 @@ impl Session {
         let token = options.await_token.as_deref().or(self.await_token.as_deref());
         let world_time = self.parameter("bijection.at").map(world_clock).transpose()?;
         let has_await_floor = token.is_some();
-        if options.snapshot_token.is_some() && (has_await_floor || options.snapshot_time.is_some() || world_time.is_some()) {
+        if options.snapshot_token.is_some() && world_time.is_some() {
             return Err(crate::sql_snapshots::unretained());
         }
         let applied = self.service.await_client_token(token, Duration::from_secs(60), &self.cancellation).await?;
