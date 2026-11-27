@@ -118,6 +118,32 @@ mod owner_tests {
     }
 
     #[test]
+    fn borrowed_inline_syntax_binds_raw_metadata_into_the_destination_budget() {
+        let source = r#"XTQL $$(-> (rel [{}] []) (return {:v (regexp-replace "abc" "a" "x")}))$$"#;
+        let syntax_budget = MemoryBudget::new(1 << 20);
+        let parsed = parse_in(source, &syntax_budget).unwrap().remove(0);
+        let syntax_bytes = syntax_budget.used_bytes();
+        assert!(syntax_bytes > 0);
+
+        let options = PrepareOptions::default();
+        let denied = MemoryBudget::new(0);
+        let error = parsed.bind_in(&ScalarCatalog, &options, &denied).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(denied.used_bytes(), 0);
+        assert_eq!(syntax_budget.used_bytes(), syntax_bytes);
+
+        let plan_budget = MemoryBudget::new(1 << 20);
+        let prepared = parsed.bind_in(&ScalarCatalog, &options, &plan_budget).unwrap();
+        assert_eq!(prepared.source, source);
+        assert!(plan_budget.used_bytes() > 0);
+        assert_eq!(syntax_budget.used_bytes(), syntax_bytes);
+        drop(parsed);
+        assert_eq!(syntax_budget.used_bytes(), 0);
+        drop(prepared);
+        assert_eq!(plan_budget.used_bytes(), 0);
+    }
+
+    #[test]
     fn source_without_raw_metadata_and_noncontrol_probes_do_not_acquire_an_eager_scope() {
         let memory = MemoryBudget::new(0);
         assert!(prepare_in("SELECT 1", &ScalarCatalog, &PrepareOptions::default(), &memory).is_ok());

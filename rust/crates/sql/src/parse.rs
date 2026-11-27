@@ -189,13 +189,20 @@ impl ast::VisitorMut for AssignParameters<'_> {
 pub enum StatementKind { Query, Dml, Session }
 
 impl<'input> ParsedStatement<'input> {
-    /// Binds this syntax against the caller's catalog using its original source and raw metadata budget.
     pub fn snapshot_selector(&self) -> Result<rtdb_plan::QuerySettings> {
         self.tree.settings.snapshot_selector()
     }
 
+    /// Binds this syntax against the caller's catalog using its original source and raw metadata budget.
     pub fn bind(self, catalog: &dyn rtdb_plan::Catalog, options: &crate::PrepareOptions) -> Result<rtdb_plan::PreparedStatement> {
-        crate::bind::bind(self, catalog, options)
+        let forms = self.forms;
+        crate::bind::bind(self, catalog, options, forms)
+    }
+
+    /// Binds the original syntax and source locations while allocating the plan's raw metadata in `memory`.
+    /// The caller keeps the parsed syntax and its original charges live for the duration of the bind.
+    pub fn bind_in(&self, catalog: &dyn rtdb_plan::Catalog, options: &crate::PrepareOptions, memory: &Arc<MemoryBudget>) -> Result<rtdb_plan::PreparedStatement> {
+        crate::bind::bind(self, catalog, options, crate::bind::FormAllocation::Tracked(memory))
     }
 
     /// Returns the original text for preparation and execution.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
-use rtdb_plan::{CatalogLookups, ColumnId, Field, RecordingCatalog, Schema, SqlNotice, Statement};
+use rtdb_plan::{Catalog, CatalogLookups, ColumnId, Field, PreparedStatement, RecordingCatalog, Schema, SqlNotice, Statement};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema, SharedPlan, SharedPlanKey};
 use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{SqlArguments, TxOp};
@@ -138,7 +138,10 @@ impl PreparedSql {
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let (query, inferred, kept) = match sharable.then(|| shared_plan(source, context, &options)).transpose()?.flatten() {
+                let shared = if sharable {
+                    shared_plan(source, context, &options, |catalog, budget| parsed.bind_in(catalog, &options, budget))?
+                } else { None };
+                let (query, inferred, kept) = match shared {
                     Some(shared) => {
                         notices.clone_from(&shared.notices);
                         (shared.query.clone(), shared.parameter_types.clone(), Some(KeptPlan::Shared(Arc::downgrade(&shared))))
@@ -407,7 +410,11 @@ impl PreparedSql {
             return query.recharged(&context.memory);
         }
         let options = self.bound_options(&context.timezone, argument_types, execution);
-        if let Some(shared) = self.0.sharable.then(|| shared_plan(&self.0.source, context, &options)).transpose()?.flatten() {
+        let source = self.source();
+        let shared = if self.0.sharable {
+            shared_plan(source, context, &options, |catalog, budget| rtdb_sql::prepare_in(source, catalog, &options, budget))?
+        } else { None };
+        if let Some(shared) = shared {
             let query = shared.query.recharged(&context.memory)?;
             *self.0.plan.lock() = Some(CachedPlan { options, plan: KeptPlan::Shared(Arc::downgrade(&shared)) });
             return Ok(query);
@@ -494,7 +501,10 @@ impl KeptPlan {
 /// The node's shared plan for `source`, planning it into the node's cache on a miss.
 /// Returns `Ok(None)` when no cache is present, the statement is not a sharable query, or the plan exceeds the cache's
 /// per-entry budget; every other planning error propagates directly so the caller does not plan a failing query twice.
-fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -> Result<Option<Arc<SharedPlan>>> {
+fn shared_plan(
+    source: &str, context: &QueryContext, options: &PrepareOptions,
+    prepare: impl FnOnce(&dyn Catalog, &Arc<MemoryBudget>) -> Result<PreparedStatement>,
+) -> Result<Option<Arc<SharedPlan>>> {
     let Some(plans) = context.shared_plans() else { return Ok(None); };
     context.check_cancelled()?;
     let PrepareOptions { search_path, parameter_types, default_timezone, generate_series_end_exclusive } = options;
@@ -503,7 +513,7 @@ fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -
         timezone: default_timezone.clone(), generate_series_end_exclusive: *generate_series_end_exclusive,
     };
     if let Some(shared) = plans.get(&key, &context.catalog)? { return Ok(Some(shared)); }
-    let (lookups, query, inferred, notices) = match plan_for_sharing(source, context, options, &plans.entry_budget()) {
+    let (lookups, query, inferred, notices) = match plan_for_sharing(source, context, &plans.entry_budget(), prepare) {
         Ok(Some(plan)) => plan,
         Ok(None) => return Ok(None),
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => return Ok(None),
@@ -514,10 +524,13 @@ fn shared_plan(source: &str, context: &QueryContext, options: &PrepareOptions) -
 
 type SharablePlan = (Arc<CatalogLookups>, PreparedQuery, std::collections::BTreeMap<usize, LogicalType>, Vec<SqlNotice>);
 
-fn plan_for_sharing(source: &str, context: &QueryContext, options: &PrepareOptions, budget: &Arc<MemoryBudget>) -> Result<Option<SharablePlan>> {
-    let _syntax = admit_sql_syntax(source, budget)?;
+fn plan_for_sharing(
+    source: &str, context: &QueryContext, budget: &Arc<MemoryBudget>,
+    prepare: impl FnOnce(&dyn Catalog, &Arc<MemoryBudget>) -> Result<PreparedStatement>,
+) -> Result<Option<SharablePlan>> {
+    let _planning = admit_sql_syntax(source, budget)?;
     let recording = RecordingCatalog::new(&context.catalog);
-    let mut prepared = rtdb_sql::prepare_in(source, &recording, options, budget)?;
+    let mut prepared = prepare(&recording, budget)?;
     if !matches!(&prepared.statement, Statement::Query(_)) { return Ok(None); }
     let inferred = prepared.parameter_types.clone();
     let notices = std::mem::take(&mut prepared.notices);
@@ -913,19 +926,52 @@ mod shared_plan_tests {
     }
 
     #[test]
+    fn shared_preparation_preserves_a_prepare_childs_batch_offsets() {
+        use rtdb_sql::{BatchExecution, ExecutableSyntax, SqlPrepareChild, parse_statement_batch};
+
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let cache_memory = MemoryBudget::new(1 << 30);
+        let plans = Arc::new(SharedPlans::new(&cache_memory));
+        let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
+        let source = "SELECT 'é';\nPREPARE bad AS XTQL $$(from {:table :docs :db :absent} [v])$$;";
+        let mut batch = parse_statement_batch(source, &context.memory).unwrap();
+        drop(batch.next_for_execution().unwrap());
+        let BatchExecution::Prepare(prepare) = batch.next_for_execution().unwrap() else { panic!("expected PREPARE"); };
+        let (_, SqlPrepareChild::Command { syntax: ExecutableSyntax::Sql(syntax), allocation }) =
+            prepare.into_child().unwrap() else { panic!("expected a query child"); };
+        let start = source.find("XTQL").unwrap();
+        let end = start + syntax.source().len();
+
+        let Err(error) = PreparedSql::prepare_postgres_statement(syntax, &context, vec!["public".into()], &[])
+            else { panic!("expected database resolution to fail"); };
+        assert_eq!(error.code, "xtdb/unknown-db");
+        assert_eq!(error.context["position"], serde_json::json!(start + 1));
+        assert_eq!(error.context["span"], serde_json::json!({"start": start, "end": end}));
+        assert!(cache_memory.peak_bytes() >= rtdb_sql::statement_syntax_estimate(end - start).unwrap());
+        assert_eq!(cache_memory.used_bytes(), 0);
+        drop((allocation, batch));
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn shared_plan_propagates_planning_errors_and_declines_only_on_cache_budget() {
         let state = PartitionState::empty(Default::default()).unwrap();
         let plans = Arc::new(SharedPlans::new(&MemoryBudget::new(1 << 30)));
         let context = session(&[("xtdb", &state)], "xtdb", "UTC", &plans);
-        let error = super::shared_plan("SELECT * FROM (SELECT 1) AS a CROSS JOIN (SELECT 2) AS a", &context, &Default::default())
+        let source = "SELECT * FROM (SELECT 1) AS a CROSS JOIN (SELECT 2) AS a";
+        let options = PrepareOptions::default();
+        let error = super::shared_plan(source, &context, &options, |catalog, budget| rtdb_sql::prepare_in(source, catalog, &options, budget))
             .err().expect("a binder error must propagate instead of being swallowed and re-planned");
         assert!(!error.is(AnomalyKind::ResourceExhausted));
 
         let tiny_node = MemoryBudget::new(1);
         let tiny_plans = Arc::new(SharedPlans::new(&tiny_node));
         let tiny_context = session(&[("xtdb", &state)], "xtdb", "UTC", &tiny_plans);
-        assert!(super::shared_plan("SELECT 1 AS one", &tiny_context, &Default::default()).unwrap().is_none(),
-            "a plan that exceeds the shared cache's entry budget declines sharing rather than failing the query");
+        let local = PreparedSql::prepare("SELECT regexp_replace('abc', 'a', 'x') AS v", &tiny_context, options, ResultSignaturePolicy::Dynamic).unwrap();
+        assert!(matches!(&local.0.plan.lock().as_ref().unwrap().plan, KeptPlan::Own { .. }));
+        assert_eq!(tiny_node.used_bytes(), 0);
+        drop(local);
+        assert_eq!(tiny_context.memory.used_bytes(), 0);
     }
 }
 

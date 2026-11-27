@@ -60,23 +60,23 @@ impl ParsedSettings {
         })
     }
 
-    pub fn bind(self, context: &mut Context<'_>) -> Result<(QuerySettings, Option<TemporalExtent>, Option<TemporalExtent>)> {
+    pub fn bind(&self, context: &mut Context<'_>) -> Result<(QuerySettings, Option<TemporalExtent>, Option<TemporalExtent>)> {
         let mut settings = QuerySettings::default();
         let (mut valid, mut system) = (None, None);
-        for entry in self.entries {
+        for entry in &self.entries {
             match entry {
-                ParsedSetting::Valid(extent) => { context.validate_extent(&extent)?; valid = Some(extent); }
-                ParsedSetting::System(extent) => { context.validate_extent(&extent)?; system = Some(extent); }
-                ParsedSetting::Clock(value) => settings.clock_time = Some(match clock_timestamp_literal(&value)? {
-                    Some(text) => SettingValue::TimestampLiteral(text), None => context.setting_value(&value)?,
+                ParsedSetting::Valid(extent) => { context.validate_extent(extent)?; valid = Some(extent); }
+                ParsedSetting::System(extent) => { context.validate_extent(extent)?; system = Some(extent); }
+                ParsedSetting::Clock(value) => settings.clock_time = Some(match clock_timestamp_literal(value)? {
+                    Some(text) => SettingValue::TimestampLiteral(text), None => context.setting_value(value)?,
                 }),
-                ParsedSetting::Token(value) => settings.snapshot_token = Some(context.setting_value(&value)?),
-                ParsedSetting::Time(value) => settings.snapshot_time = Some(match clock_timestamp_literal(&value)? {
-                    Some(text) => SettingValue::TimestampLiteral(text), None => context.setting_value(&value)?,
+                ParsedSetting::Token(value) => settings.snapshot_token = Some(context.setting_value(value)?),
+                ParsedSetting::Time(value) => settings.snapshot_time = Some(match clock_timestamp_literal(value)? {
+                    Some(text) => SettingValue::TimestampLiteral(text), None => context.setting_value(value)?,
                 }),
             }
         }
-        Ok((settings, valid, system))
+        Ok((settings, valid.cloned(), system.cloned()))
     }
 }
 

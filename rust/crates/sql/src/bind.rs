@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -66,10 +67,10 @@ pub(crate) struct Context<'a> {
     pub options: &'a PrepareOptions,
     pub cast_timezone: Option<&'a str>,
     pub binder: Binder,
-    temporal: Vec<TemporalClause>,
+    temporal: &'a [TemporalClause],
     used_temporal: BTreeSet<usize>,
-    inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
-    pub(crate) wildcard_renames: Vec<crate::wildcard::WildcardRename>,
+    inline_xtql: &'a [crate::inline_xtql::InlineXtql],
+    pub(crate) wildcard_renames: &'a [crate::wildcard::WildcardRename],
     ctes: BTreeMap<String, Cte>,
     next_symbol: u64,
     next_rewrite_symbol: u64,
@@ -77,7 +78,7 @@ pub(crate) struct Context<'a> {
     pub(crate) outer_scopes: Vec<crate::subquery::CorrelationScope>,
     inferred_group_scopes: Vec<InferredGroupScope>,
     pub(crate) next_parameter: usize,
-    period_columns: BTreeSet<String>,
+    period_columns: &'a BTreeSet<String>,
     notices: Vec<SqlNotice>,
     diagnostics: Vec<PlanningDiagnostic>,
     default_valid: Option<TemporalExtent>,
@@ -107,16 +108,18 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), used_temporal: BTreeSet::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: &[], used_temporal: BTreeSet::new(), inline_xtql: &[], wildcard_renames: &[], ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: &BTreeSet::new(), notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     context.admit_expression_literals(expression)?;
     let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
     context.literals.check()?;
     Ok(expression)
 }
 
-pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
-    let source = parsed.source();
-    bind_using(parsed, catalog, options, |context, statement, settings| {
+pub(crate) fn bind<'input>(
+    parsed: impl Borrow<ParsedStatement<'input>>, catalog: &dyn Catalog, options: &PrepareOptions, forms: FormAllocation<'_>,
+) -> Result<PreparedStatement> {
+    let source = parsed.borrow().source();
+    bind_using(parsed, catalog, options, forms, |context, statement, settings| {
         let statement = context.statement(statement).and_then(|statement| {
             context.check_unconsumed_temporal()?;
             Ok(statement)
@@ -149,7 +152,8 @@ pub(crate) fn bind_static_document_source(
 ) -> Result<Option<crate::StaticMutation>> {
     use crate::{StaticMutation, StaticMutationKind};
     if !has_static_document_shape(&parsed) { return Ok(None); }
-    bind_using(parsed, catalog, options, |context, statement, _settings| {
+    let forms = parsed.forms;
+    bind_using(parsed, catalog, options, forms, |context, statement, _settings| {
         if context.literals.has_errors() { return Ok(None); }
         let result = match statement {
             Syntax::Records { patch, table, columns, records } => context.record_rows(*patch, table, columns, records).map(Some),
@@ -169,14 +173,19 @@ pub(crate) fn bind_static_document_source(
     })
 }
 
-fn bind_using<T>(
-    parsed: ParsedStatement<'_>,
+fn bind_using<'input, T>(
+    parsed: impl Borrow<ParsedStatement<'input>>,
     catalog: &dyn Catalog,
     options: &PrepareOptions,
+    forms: FormAllocation<'_>,
     bind: impl FnOnce(&mut Context<'_>, &Syntax, QuerySettings) -> Result<T>,
 ) -> Result<T> {
-    let (input, span, forms) = (parsed.tree.source.input, parsed.span, parsed.forms);
-    bind_parsed(parsed, catalog, options, bind).map_err(|error| grammar_report(error, input, span, forms))
+    let syntax = parsed.borrow();
+    let (input, span) = (syntax.tree.source.input, syntax.span);
+    let result = bind_parsed(syntax, catalog, options, forms, bind);
+    // Consuming binds release inline syntax charges before admitting a grammar report.
+    drop(parsed);
+    result.map_err(|error| grammar_report(error, input, span, forms))
 }
 
 /// Replaces a binder-detected grammar rejection with the reference listener's report when the ported grammar produces one.
@@ -198,22 +207,22 @@ fn grammar_report(error: Anomaly, input: &str, span: SourceSpan, forms: FormAllo
 }
 
 fn bind_parsed<T>(
-    parsed: ParsedStatement<'_>,
+    parsed: &ParsedStatement<'_>,
     catalog: &dyn Catalog,
     options: &PrepareOptions,
+    forms: FormAllocation<'_>,
     bind: impl FnOnce(&mut Context<'_>, &Syntax, QuerySettings) -> Result<T>,
 ) -> Result<T> {
     let next_parameter = parsed.parameter_count();
-    let forms = parsed.forms;
-    let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
+    let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = &parsed.tree;
     let scoped_catalog = TransactionCatalog(catalog);
-    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
-    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, used_temporal: BTreeSet::new(), inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
+    let catalog: &dyn Catalog = if matches!(statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::CreateSearchIndex { .. } | Syntax::DropSearchIndex { .. } | Syntax::CreateOrderedIndex { .. } | Syntax::DropOrderedIndex { .. } | Syntax::CreateVectorIndex { .. } | Syntax::DropVectorIndex { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
+    let mut context = Context { forms, literals: Default::default(), source: source.input, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, used_temporal: BTreeSet::new(), inline_xtql: &parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, next_rewrite_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), diagnostics: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
-    context.admit_statement_literals(&statement)?;
-    bind(&mut context, &statement, settings)
+    context.admit_statement_literals(statement)?;
+    bind(&mut context, statement, settings)
 }
 
 pub(crate) struct InsertRows {
@@ -1123,7 +1132,7 @@ impl Context<'_> {
                     return Err(grammar_rejected("Table arguments"));
                 }
                 if *with_ordinality { return Err(unsupported("WITH ORDINALITY requires a list table")); }
-                if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
+                if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)) {
                     let arguments = inline.parameters.iter().map(|index| (*index,self.options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Nothing))).collect::<Vec<_>>();
                     let relation = self.forms.compile_query(&inline.query,self.catalog,&mut self.binder,&mut self.next_parameter,&arguments,&self.options.default_timezone).map_err(|error| inline.error(error,self.source))?;
                     return match alias { Some(alias) => self.alias(relation,alias),None => Ok(relation) };
@@ -1170,7 +1179,7 @@ impl Context<'_> {
                     requested.push(written_basis.into());
                 }
                 if purpose != TablePurpose::Erase {
-                    for name in &self.period_columns {
+                    for name in self.period_columns {
                         if archive_column(name) && (!matches!(&system_time, TemporalFilter::All)
                             || purpose != TablePurpose::Query || !binding.columns.contains_key(name)) {
                             continue;
