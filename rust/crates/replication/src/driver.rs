@@ -757,7 +757,7 @@ impl ReplicationDriver {
             let placed_open = self.placed_slot.is_some();
             let serving_timed = self.serving_holds_checkpoint();
             let erasure_pending = self.default_erasure.is_some();
-            let ready_source = self.ready_source((self.clock)());
+            let ready_source = self.ready_source();
             let accept_commands = self.leader.as_ref().is_none_or(|leader| {
                 (!waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands())
                     || leader.deferred_commands.len() < 128
@@ -867,10 +867,10 @@ impl ReplicationDriver {
         self.drive_placed_slot()
     }
     /// Whether the leader may resolve its next source record at `now`.
-    fn ready_source(&self, now: Timestamp) -> bool {
+    fn ready_source(&self) -> bool {
         let serving_source_ready = self.default_erasure.is_none() && self.serving.as_ref().is_none_or(NativeServing::source_ready);
         !self.waiting_for_checkpoint() && self.placed_slot.is_none() && serving_source_ready
-            && self.leader.as_ref().is_some_and(|leader| leader.ready_source() && leader.clock_lease_admits(now))
+            && self.leader.as_ref().is_some_and(|leader| leader.ready_source())
     }
     async fn source_polled(&mut self, tail: PartitionReplay, records: Result<TailPoll>) -> Result<()> {
         let Some(leader) = &mut self.leader else { return Ok(()); };
@@ -920,8 +920,7 @@ impl ReplicationDriver {
                 }
             }
             self.prepare_turn().await?;
-            let now = (self.clock)();
-            let ready = self.ready_source(now);
+            let ready = self.ready_source();
             let Some(leader) = &mut self.leader else { return Ok(()); };
             let next = match (leader.source_head, leader.source_batch.front()) {
                 (Some(head), _) => Some(head.metadata),
