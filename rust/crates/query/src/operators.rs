@@ -340,6 +340,21 @@ async fn build_batches_at(
             let apply = BatchApply { input, plan };
             Ok(Some((Box::new(apply), projected)))
         }
+        RelationNode::Apply { arguments, kind: ApplyKind::LeftUnnest, .. } => {
+            let child = runtime.child(0)?;
+            let dependent = runtime.child(1)?;
+            let expansion = BatchFilteredUnnestPlan::new(&child, &dependent, arguments)?;
+            let schema = child.output();
+            let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
+            let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
+            let plan = BatchApplyPlan { dependent, arguments, kind: ApplyKind::Left,
+                document_field: None, comparison: None, execution };
+            let cursor: BoxBatchCursor = match expansion {
+                Some(expansion) => Box::new(BatchFilteredUnnest { input, expansion, fallback: plan }),
+                None => Box::new(BatchApply { input, plan }),
+            };
+            Ok(Some((cursor, projected)))
+        }
         RelationNode::Apply { arguments, kind, .. } => {
             let child = runtime.child(0)?;
             let schema = child.output();
@@ -1154,6 +1169,67 @@ impl BatchUnnest {
         let output = batch.expand_evaluated_lists(runs, &children, self.ordinality.as_deref(), self.outer, context);
         drop((children, inventory));
         output
+    }
+}
+
+struct BatchFilteredUnnestPlan {
+    list: usize,
+    scalar_arguments: Vec<usize>,
+    schema: Schema,
+    predicate: Expr,
+    ordinality: Option<String>,
+}
+
+impl BatchFilteredUnnestPlan {
+    fn new(input: &EmittedRelation, dependent: &EmittedRelation, arguments: &[(usize, Expr)]) -> Result<Option<Self>> {
+        let Some((list, _, ordinality, predicate)) = crate::optimize::filtered_left_unnest_source(
+            input.relation(), dependent.relation(), arguments,
+        ) else { return Ok(None); };
+        let mut scalar_arguments = Vec::new();
+        for (_, expr) in arguments {
+            let Expr::Column { id, data_type } = expr else { return Ok(None); };
+            let Some(position) = input.schema().position(*id) else { return Ok(None); };
+            let actual = &input.schema().fields()[position].data_type;
+            if data_type.join(actual) != *data_type { return Ok(None); }
+            if *id != list.id { scalar_arguments.push(position); }
+        }
+        for (declared, actual) in dependent.relation().schema().fields().iter().zip(dependent.schema().fields()) {
+            let expected = declared.data_type.clone().maybe();
+            if expected.join(&actual.data_type) != expected { return Ok(None); }
+        }
+        let Some(position) = input.schema().position(list.id) else { return Ok(None); };
+        let schema = input.schema().concat(dependent.schema())?;
+        let ordinality = ordinality.map(|field| field.name.clone());
+        Ok(Some(Self { list: position, scalar_arguments, schema, predicate, ordinality }))
+    }
+}
+
+struct BatchFilteredUnnest {
+    input: crate::columnar::BoxBatchCursor,
+    expansion: BatchFilteredUnnestPlan,
+    fallback: BatchApplyPlan,
+}
+
+#[async_trait]
+impl crate::columnar::BatchCursor for BatchFilteredUnnest {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        let execution = &self.fallback.execution;
+        let context = &execution.context;
+        let plan = &self.expansion;
+        loop {
+            context.check_cancelled()?;
+            let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
+            batch.validate_readable(context)?;
+            if batch.len == 0 { continue; }
+            if plan.scalar_arguments.iter().all(|&pos| batch.compatible_unnest_argument(pos, &plan.schema.fields()[pos].data_type))
+                && let Some(output) = batch.expand_filtered_list(plan.list, &plan.schema, &plan.predicate, plan.ordinality.as_deref(), execution).await?
+            {
+                return Ok(Some(output));
+            }
+            if let Some(output) = self.fallback.joined(&Arc::new(batch)).await? {
+                return Ok(Some(output));
+            }
+        }
     }
 }
 

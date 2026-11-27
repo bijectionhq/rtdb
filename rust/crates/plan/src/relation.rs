@@ -119,17 +119,21 @@ impl JoinKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluates the dependent relation for each input row with apply-local argument bindings.
 /// Scalar and Pull reject multiple dependent rows; Scalar, Pull, and PullMany yield null on no rows.
-pub enum ApplyKind { Inner, Left, Single, Semi, Anti, Mark, Scalar, Exists, Pull, PullMany }
+pub enum ApplyKind {
+    Inner, Left, Single, Semi, Anti, Mark, Scalar, Exists, Pull, PullMany,
+    /// Left Apply with page-batched expansion of a captured list when the reached layouts are compatible.
+    LeftUnnest,
+}
 
 impl ApplyKind {
     pub fn result_schema(self, input: &Schema, dependent: &Schema, output: Option<&Field>) -> Result<Schema> {
         let invalid = |message| Anomaly::fault("rtdb.plan/invalid-relation", message);
         match self {
-            Self::Inner | Self::Left | Self::Single | Self::Semi | Self::Anti => {
+            Self::Inner | Self::Left | Self::LeftUnnest | Self::Single | Self::Semi | Self::Anti => {
                 if output.is_some() { return Err(invalid("Relational apply cannot declare a scalar output")); }
                 match self {
                     Self::Inner => input.concat(dependent),
-                    Self::Left | Self::Single => input.concat(&dependent.nullable()?),
+                    Self::Left | Self::LeftUnnest | Self::Single => input.concat(&dependent.nullable()?),
                     _ => Ok(input.clone()),
                 }
             }

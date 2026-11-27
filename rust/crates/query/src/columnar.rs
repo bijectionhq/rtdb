@@ -176,6 +176,7 @@ struct UnnestGroup {
     end: usize,
     parent: usize,
     child: Option<(usize, usize)>,
+    ordinal_start: usize,
 }
 
 pub(crate) struct UnnestRows {
@@ -190,10 +191,15 @@ impl UnnestRows {
 
     pub(crate) fn push(&mut self, parent: usize, child: Option<(usize, Range<usize>)>, ordinality: bool,
         memory: &Arc<MemoryBudget>) -> Result<()> {
-        let count = child.as_ref().map_or(1, |(_, rows)| rows.len());
-        if ordinality && i32::try_from(count).is_err() {
+        if ordinality && child.as_ref().is_some_and(|(_, rows)| i32::try_from(rows.len()).is_err()) {
             return Err(invalid("ordinality-overflow", "List ordinal exceeds signed32 bits"));
         }
+        self.push_run(parent, child, 0, memory)
+    }
+
+    fn push_run(&mut self, parent: usize, child: Option<(usize, Range<usize>)>, ordinal_start: usize,
+        memory: &Arc<MemoryBudget>) -> Result<()> {
+        let count = child.as_ref().map_or(1, |(_, rows)| rows.len());
         let end = self.len().checked_add(count).ok_or_else(size_error)?;
         if self.groups.len() == self.groups.capacity() {
             let capacity = self.groups.capacity().checked_mul(2).ok_or_else(size_error)?.max(1);
@@ -202,7 +208,7 @@ impl UnnestRows {
             self.groups.reserve_exact(capacity - self.groups.len());
             self.reservation = reservation;
         }
-        self.groups.push(UnnestGroup { end, parent, child: child.map(|(source, rows)| (source, rows.start)) });
+        self.groups.push(UnnestGroup { end, parent, child: child.map(|(source, rows)| (source, rows.start)), ordinal_start });
         Ok(())
     }
 
@@ -212,6 +218,56 @@ impl UnnestRows {
 
     fn group_start(&self, group: usize) -> usize {
         group.checked_sub(1).map_or(0, |prev| self.groups[prev].end)
+    }
+}
+
+struct UnnestExpansion {
+    runs: Arc<UnnestRows>,
+    sources: Arc<Vec<Option<StoredVector>>>,
+    custody: Arc<MemoryReservation>,
+}
+
+impl UnnestExpansion {
+    fn elements(&self, runs: &Arc<UnnestRows>) -> Column {
+        let cells = SelectedRows::Expanded {
+            expansion: RowExpansion::UnnestChildren(Arc::clone(runs)), rows: 0..runs.len(), input: None,
+        };
+        Column::Selected(SelectedColumn { sources: Arc::clone(&self.sources), cells })
+    }
+
+    fn survivors(&self, selection: Option<&PredicateSelection>, parents: usize,
+        context: &crate::QueryContext) -> Result<Arc<UnnestRows>> {
+        let memory = &context.memory;
+        let mut output = UnnestRows::new(memory)?;
+        let mut candidates = self.runs.groups.iter().enumerate().peekable();
+        for parent in 0..parents {
+            context.check_cancelled_at(parent)?;
+            let before = output.len();
+            if let Some((index, group)) = candidates.next_if(|(_, group)| group.parent == parent)
+                && let Some(selection) = selection
+                && !selection.is_empty()
+            {
+                let (source, start) = group.child.expect("Candidate runs contain real list elements");
+                let first = self.runs.group_start(index);
+                let mut kept = None;
+                for candidate in first..group.end {
+                    context.check_cancelled_at(candidate)?;
+                    let ordinal = candidate - first;
+                    if selection.contains(candidate) {
+                        kept.get_or_insert(ordinal);
+                    } else if let Some(from) = kept.take() {
+                        output.push_run(parent, Some((source, start + from..start + ordinal)), from, memory)?;
+                    }
+                }
+                if let Some(from) = kept {
+                    output.push_run(parent, Some((source, start + from..start + (group.end - first))), from, memory)?;
+                }
+            }
+            if output.len() == before {
+                output.push_run(parent, None, 0, memory)?;
+            }
+        }
+        Ok(Arc::new(output))
     }
 }
 
@@ -687,6 +743,20 @@ impl ColumnBatch {
 
     pub(crate) fn expand_list(&self, position: usize, ordinality: Option<&str>, outer: bool, context: &crate::QueryContext)
         -> Result<Option<Self>> {
+        let Some(expansion) = self.list_expansion(position, None, ordinality.is_some(), outer, context)? else {
+            return Ok(None);
+        };
+        let runs = Arc::clone(&expansion.runs);
+        if runs.len() == 0 {
+            let width = self.columns.len().checked_add(1 + usize::from(ordinality.is_some())).ok_or_else(size_error)?;
+            return Self::empty_with_width(width, &context.memory).map(Some);
+        }
+        let elements = expansion.elements(&runs);
+        self.finish_unnest(runs, (elements, expansion.custody), ordinality, outer, context).map(Some)
+    }
+
+    fn list_expansion(&self, position: usize, expected: Option<&LogicalType>, narrow_ordinality: bool, outer: bool,
+        context: &crate::QueryContext) -> Result<Option<UnnestExpansion>> {
         let memory = &context.memory;
         let mut selection = memory.reserve(4096)?;
         let mut inputs = HashMap::new();
@@ -707,18 +777,27 @@ impl ColumnBatch {
             let (source, start, count) = match vector {
                 None => (0, 0, 0),
                 Some((array, field, logical, offset, custody)) => {
-                    let Some(logical) = logical else { return Ok(None); };
-                    let layout = (Arc::as_ptr(field), std::ptr::from_ref(logical));
+                    if expected.is_some() && array.as_any().downcast_ref::<ListArray>().is_some_and(|list| {
+                        let offsets = list.value_offsets();
+                        offsets[offset] == offsets[offset + 1]
+                    }) {
+                        continue;
+                    }
+                    let layout = (Arc::as_ptr(field), logical.map(std::ptr::from_ref));
                     if !layouts.contains(&layout) {
                         let lease = Arc::get_mut(&mut selection).expect("Unnest owns the selection reservation");
                         let bytes = field.size().checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
                         lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
-                        if !stable_read_layout(logical, field) || !readable_list_type(logical, field) {
+                        let inferred = if logical.is_none() && expected.is_some() { rtdb_columnar::from_field(field).ok() } else { None };
+                        let Some(logical) = logical.or(inferred.as_ref()) else { return Ok(None); };
+                        if expected.is_some_and(|expected| expected.join(logical) != *expected)
+                            || !stable_read_layout(logical, field) || !readable_list_type(logical, field)
+                        {
                             return Ok(None);
                         }
                         layouts.insert(layout);
                     }
-                    if array.is_null(offset) || *logical == LogicalType::Null {
+                    if array.is_null(offset) || array.data_type() == &DataType::Null {
                         (0, 0, 0)
                     } else {
                         let (field, values, start, count) = match array.data_type() {
@@ -737,6 +816,10 @@ impl ColumnBatch {
                             }
                             _ => return Ok(None),
                         };
+                        if count == 0 {
+                            if outer { runs.push(row, None, narrow_ordinality, memory)?; }
+                            continue;
+                        }
                         let key = (Arc::as_ptr(values).cast::<()>(), Arc::as_ptr(field));
                         let source = if let Some(&source) = inputs.get(&key) {
                             source
@@ -756,31 +839,86 @@ impl ColumnBatch {
             };
             if count != 0 {
                 let end = start.checked_add(count).ok_or_else(size_error)?;
-                runs.push(row, Some((source, start..end)), ordinality.is_some(), memory)?;
+                runs.push(row, Some((source, start..end)), narrow_ordinality, memory)?;
             } else if outer {
-                runs.push(row, None, ordinality.is_some(), memory)?;
+                runs.push(row, None, narrow_ordinality, memory)?;
             }
         }
-        if runs.len() == 0 {
-            let width = self.columns.len().checked_add(1 + usize::from(ordinality.is_some())).ok_or_else(size_error)?;
-            return Self::empty_with_width(width, memory).map(Some);
-        }
-        drop((inputs, layouts));
-        let runs = Arc::new(runs);
-        let expanded = Column::Selected(SelectedColumn {
-            sources: Arc::new(sources),
-            cells: SelectedRows::Expanded { expansion: RowExpansion::UnnestChildren(Arc::clone(&runs)), rows: 0..runs.len(), input: None },
-        });
-        self.finish_unnest(runs, (expanded, selection), ordinality, outer, context).map(Some)
+        Ok(Some(UnnestExpansion { runs: Arc::new(runs), sources: Arc::new(sources), custody: selection }))
     }
 
-    fn finish_unnest(&self, runs: Arc<UnnestRows>, (elements, custody): (Column, Arc<MemoryReservation>),
-        ordinality: Option<&str>, outer: bool, context: &crate::QueryContext) -> Result<Self> {
+    pub(crate) fn compatible_unnest_argument(&self, position: usize, expected: &LogicalType) -> bool {
+        let admits = |field: &ArrowField, logical: Option<&LogicalType>| {
+            let inferred = if logical.is_none() { rtdb_columnar::from_field(field).ok() } else { None };
+            logical.or(inferred.as_ref()).is_some_and(|actual| {
+                expected.join(actual) == *expected && stable_read_layout(actual, field)
+            })
+        };
+        match &self.columns[position] {
+            Column::Arrow { field, logical, .. } => admits(field, logical.as_ref()),
+            Column::Selected(column) => column.sources.iter().flatten().all(|(_, field, logical, _)| admits(field, logical.as_ref())),
+            Column::Values(_) => false,
+        }
+    }
+
+    pub(crate) async fn expand_filtered_list(&self, position: usize, schema: &rtdb_plan::Schema, predicate: &rtdb_plan::Expr,
+        ordinality: Option<&str>, execution: &crate::context::Execution) -> Result<Option<Self>> {
+        let context = &execution.context;
+        let expected = &schema.fields()[position].data_type;
+        let Some(expansion) = self.list_expansion(position, Some(expected), false, false, context)? else {
+            return Ok(None);
+        };
+        let candidates = &expansion.runs;
+        let selection = if candidates.len() == 0 {
+            None
+        } else {
+            let batch = self.finish_filtered_unnest(&expansion, candidates, ordinality, context)?;
+            let selection = predicate_selection(&batch, predicate, schema, execution).await?;
+            if selection.count == candidates.len() && candidates.groups.len() == self.len {
+                return Ok(Some(batch));
+            }
+            Some(selection)
+        };
+        let survivors = expansion.survivors(selection.as_ref(), self.len, context)?;
+        self.finish_filtered_unnest(&expansion, &survivors, ordinality, context).map(Some)
+    }
+
+    fn finish_filtered_unnest(&self, expansion: &UnnestExpansion, runs: &Arc<UnnestRows>, ordinality: Option<&str>,
+        context: &crate::QueryContext) -> Result<Self> {
+        let memory = &context.memory;
+        let mut output = self.expand_unnest_parents(runs, 1 + usize::from(ordinality.is_some()), context)?;
+        output.append_funded_column(expansion.elements(runs), Arc::clone(&expansion.custody), memory)?;
+        if let Some(name) = ordinality {
+            let bytes = runs.len().checked_mul(size_of::<i64>() + 1)
+                .and_then(|bytes| bytes.checked_add(name.len())).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+            let custody = memory.reserve(bytes)?;
+            let mut values = arrow_array::builder::Int64Builder::with_capacity(runs.len());
+            for (index, group) in runs.groups.iter().enumerate() {
+                context.check_cancelled_at(index)?;
+                if group.child.is_none() {
+                    values.append_null();
+                    continue;
+                }
+                for ordinal in 0..group.end - runs.group_start(index) {
+                    context.check_cancelled_at(ordinal)?;
+                    let original = i64::try_from(group.ordinal_start + ordinal + 1)
+                        .map_err(|_| invalid("ordinality-overflow", "List ordinal exceeds signed64 bits"))?;
+                    values.append_value(original);
+                }
+            }
+            let field = Arc::new(ArrowField::new(name, DataType::Int64, true));
+            let logical = Some(LogicalType::Scalar(ScalarType::I64).maybe());
+            output.append_column(Column::Arrow { array: Arc::new(values.finish()), field, logical }, custody, memory)?;
+        }
+        Ok(output)
+    }
+
+    fn expand_unnest_parents(&self, runs: &Arc<UnnestRows>, dependent_width: usize, context: &crate::QueryContext) -> Result<Self> {
         let memory = &context.memory;
         let rows = runs.len();
-        let width = self.columns.len().checked_add(1 + usize::from(ordinality.is_some())).ok_or_else(size_error)?;
+        let width = self.columns.len().checked_add(dependent_width).ok_or_else(size_error)?;
         let mut output = Self::expansion_batch(rows, width, memory)?;
-        let parents = RowExpansion::UnnestParents(Arc::clone(&runs));
+        let parents = RowExpansion::UnnestParents(Arc::clone(runs));
         for (position, column) in self.columns.iter().enumerate() {
             context.check_cancelled()?;
             let (column, charge) = match column {
@@ -793,12 +931,20 @@ impl ColumnBatch {
                     let values = runs.groups.iter().map(|group| values[group.parent].clone()).collect::<Vec<_>>();
                     let (packed, owner) = pack_evaluated_column(&values, memory)?;
                     drop((values, scratch));
-                    expanded_column(&packed, &owner, &RowExpansion::UnnestGroups(Arc::clone(&runs)), rows, memory)?
+                    expanded_column(&packed, &owner, &RowExpansion::UnnestGroups(Arc::clone(runs)), rows, memory)?
                 }
                 column => expanded_column(column, self.column_reservation(position), &parents, rows, memory)?,
             };
             output.append_column(column, charge, memory)?;
         }
+        Ok(output)
+    }
+
+    fn finish_unnest(&self, runs: Arc<UnnestRows>, (elements, custody): (Column, Arc<MemoryReservation>),
+        ordinality: Option<&str>, outer: bool, context: &crate::QueryContext) -> Result<Self> {
+        let memory = &context.memory;
+        let rows = runs.len();
+        let mut output = self.expand_unnest_parents(&runs, 1 + usize::from(ordinality.is_some()), context)?;
         output.append_column(elements, custody, memory)?;
         if let Some(name) = ordinality {
             let bytes = rows.checked_mul(size_of::<i32>() + 1)

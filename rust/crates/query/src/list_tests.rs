@@ -80,6 +80,52 @@ fn direct_unnest_borrows_variable_and_fixed_child_ranges_with_their_original_cus
     assert_eq!(memory.used_bytes(), baseline);
 }
 
+#[tokio::test]
+async fn filtered_unnest_borrows_selected_arrow_spans_and_keeps_original_ordinals() {
+    use arrow_array::{Array, ArrayRef, Int64Array, ListArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field as ArrowField};
+    use crate::columnar::Column;
+    use rtdb_plan::UnaryOp;
+
+    let execution = execution(1);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let item = Arc::new(ArrowField::new("item", DataType::Int64, true));
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(11), None, Some(13), Some(14), Some(21), Some(51)]));
+    let lists = ListArray::new(item, OffsetBuffer::new(vec![0_i32, 4, 5, 5, 6].into()),
+        Arc::clone(&values), Some(NullBuffer::from(vec![true, true, true, false])));
+    let list_field = Arc::new(ArrowField::new("xs", lists.data_type().clone(), true));
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let field = |id, name: &str, data_type| Field {
+        id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type,
+    };
+    let list = field(0, "xs", rtdb_columnar::from_field(&list_field).unwrap());
+    let element = field(1, "v", int.clone().maybe());
+    let ordinal = field(2, "n", int);
+    let predicate = Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::IsNull, element.expression()),
+        Expr::binary(BinaryOp::Eq, ordinal.expression(), Expr::Literal(Value::I64(4))));
+    let schema = Schema::new(vec![list, element, ordinal]).unwrap();
+    let charge = memory.reserve(lists.get_array_memory_size() + 1024).unwrap();
+    let input = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(lists), field: list_field, logical: None }], 4, charge).unwrap();
+    let output = input.expand_filtered_list(0, &schema, &predicate, Some("n"), &execution).await.unwrap().unwrap();
+    drop(input);
+
+    let Column::Selected(elements) = &output.columns[1] else { panic!("Expected borrowed child spans"); };
+    for (result, input) in [(0..1, 1..2), (1..2, 3..4)] {
+        let ((array, _, _), span) = elements.fragment_source(result).unwrap();
+        assert!(Arc::ptr_eq(&array, &values));
+        assert_eq!(span, input);
+    }
+    let actual = rows(&output).into_iter().map(|row| [row[1].clone(), row[2].clone()]).collect::<Vec<_>>();
+    assert_eq!(actual, [
+        [Value::Null, Value::I64(2)], [Value::I64(14), Value::I64(4)],
+        [Value::Null, Value::Null], [Value::Null, Value::Null], [Value::Null, Value::Null],
+    ]);
+    drop(output);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
 #[test]
 fn computed_unnest_keeps_compatible_child_spans_and_gathers_mixed_children_in_order() {
     use crate::columnar::{Column, UnnestRows, pack_evaluated_column};

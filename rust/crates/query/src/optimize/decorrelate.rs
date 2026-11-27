@@ -720,7 +720,7 @@ fn grouped_lateral(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation
 fn column_table(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, outer: bool, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
     match dependent.node() {
         RelationNode::Filter { input: table, predicate } => {
-            if outer { return filtered_left_unnest(input, table, predicate, correlation, ids); }
+            if outer { return filtered_left_unnest(input, dependent, correlation, ids); }
             let Some(unnested) = column_table(input, table, correlation, false, ids)? else { return Ok(None) };
             Ok(Some(Arc::new(unnested.filter(correlation.substitute(predicate.clone()))?)))
         }
@@ -749,28 +749,65 @@ fn column_table(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &
     }
 }
 
-fn filtered_left_unnest(input: &Arc<Relation>, table: &Relation, predicate: &Expr, correlation: &Correlation<'_>, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+fn filtered_left_unnest(input: &Arc<Relation>, dependent: &Arc<Relation>, correlation: &Correlation<'_>, ids: &mut Ids) -> Result<Option<Arc<Relation>>> {
+    let Some((list, element, ordinality, _)) = filtered_left_unnest_source(input, dependent, correlation.arguments)
+        else { return Ok(None); };
+    let RelationNode::Filter { predicate, .. } = dependent.node() else { unreachable!(); };
+    match unnest_input(input) {
+        Some(UnnestInput::PlainLiterals) if total_outer_predicate(predicate, correlation) => {
+            let list = Expr::Case {
+                branches: vec![(correlation.substitute(predicate.clone()), list.expression())],
+                otherwise: Box::new(Expr::Literal(Value::Null)),
+            };
+            return unnest_rows(Arc::clone(input), list, element, ordinality, true, ids).map(Some);
+        }
+        Some(_) => {}
+        None => return Ok(None),
+    }
+    let kind = ApplyKind::LeftUnnest;
+    let schema = kind.result_schema(input.schema(), dependent.schema(), None)?;
+    Ok(Some(Arc::new(Relation::new(schema, RelationNode::Apply {
+        input: Arc::clone(input), dependent: Arc::clone(dependent),
+        arguments: correlation.arguments.to_vec(), kind, output: None,
+    })?)))
+}
+
+pub(crate) fn filtered_left_unnest_source<'a>(
+    input: &'a Relation, dependent: &'a Relation, arguments: &[(usize, Expr)],
+) -> Option<(&'a Field, &'a Field, Option<&'a Field>, Expr)> {
+    let RelationNode::Filter { input: table, predicate } = dependent.node() else { return None; };
     let (column_table, ordinality) = match table.node() {
         RelationNode::Ordinality { input, field, scope: OrdinalityScope::Page } => (input.as_ref(), Some(field)),
-        _ => (table, None),
+        _ => (table.as_ref(), None),
     };
-    let RelationNode::ColumnTable { expr: expr @ Expr::Parameter { index, data_type }, element } = column_table.node() else { return Ok(None) };
-    if !correlation.binds(*index) || !input.schema().ids().is_disjoint(&table.schema().ids()) { return Ok(None); }
-    if !plain_unnest_list(data_type) { return Ok(None); }
-    if !correlation.arguments.iter().all(|(slot, argument)| {
-        slot.checked_add(1).is_some_and(|width| std::alloc::Layout::array::<LogicalType>(width).is_ok())
-            && matches!(argument, Expr::Column { id, data_type: ty } if input.schema().get(*id).is_some_and(|field| field.data_type == *ty)
-            && if slot == index { ty == data_type } else { plain_unnest_scalar(ty) })
-    }) || !total_outer_predicate(predicate, correlation) || !prunable_unnest_input(input) {
-        return Ok(None);
+    let RelationNode::ColumnTable { expr: Expr::Parameter { index, data_type }, element } = column_table.node()
+        else { return None; };
+    let (_, Expr::Column { id, .. }) = arguments.iter().find(|(slot, _)| slot == index)? else { return None; };
+    if !plain_unnest_list(data_type)
+        || !(element.data_type == LogicalType::Nothing || plain_unnest_scalar(&element.data_type))
+        || !input.schema().ids().is_disjoint(&table.schema().ids())
+    {
+        return None;
     }
-
-    // Apply tests the predicate only on actual elements, so only a total predicate can become a list gate.
-    let list = Expr::Case {
-        branches: vec![(correlation.substitute(predicate.clone()), correlation.substitute(expr.clone()))],
-        otherwise: Box::new(Expr::Literal(Value::Null)),
-    };
-    unnest_rows(Arc::clone(input), list, element, ordinality, true, ids).map(Some)
+    let list = input.schema().get(*id)?;
+    for (slot, argument) in arguments {
+        let Expr::Column { id, data_type: ty } = argument else { return None; };
+        if !slot.checked_add(1).is_some_and(|width| std::alloc::Layout::array::<LogicalType>(width).is_ok())
+            || !input.schema().get(*id).is_some_and(|field| field.data_type == *ty)
+            || !(if slot == index { ty == data_type } else { plain_unnest_scalar(ty) })
+        {
+            return None;
+        }
+    }
+    let mut captures_valid = true;
+    predicate.visit(&mut |expr| if let Expr::Parameter { index, data_type } = expr {
+        captures_valid &= arguments.iter().any(|(slot, argument)| slot == index && argument.data_type() == *data_type);
+    });
+    if !captures_valid { return None; }
+    let correlation = Correlation { arguments };
+    let schema = input.schema().concat(table.schema()).ok()?;
+    let predicate = correlation.substitute(predicate.clone());
+    total_unnest_predicate(&predicate, &schema).then_some((list, element, ordinality, predicate))
 }
 
 fn plain_unnest_scalar(ty: &LogicalType) -> bool {
@@ -782,6 +819,39 @@ fn plain_unnest_list(ty: &LogicalType) -> bool {
     let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
     matches!(ty, LogicalType::List { kind: ListKind::List, element }
         if **element == LogicalType::Nothing || plain_unnest_scalar(element))
+}
+
+fn unnest_scalar_operand(expr: &Expr, schema: &Schema) -> bool {
+    match expr {
+        Expr::Literal(value) => plain_unnest_scalar(&value.logical_type()),
+        Expr::Column { id, data_type } => plain_unnest_scalar(data_type)
+            && schema.get(*id).is_some_and(|field| field.data_type == *data_type),
+        _ => false,
+    }
+}
+
+fn total_unnest_predicate(predicate: &Expr, schema: &Schema) -> bool {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match predicate {
+        Expr::Unary { op: UnaryOp::IsNull | UnaryOp::IsNotNull, expr } =>
+            unnest_scalar_operand(expr, schema) || total_unnest_predicate(expr, schema),
+        Expr::Unary { op: UnaryOp::IsTrue | UnaryOp::IsFalse | UnaryOp::IsUnknown | UnaryOp::Not, expr } =>
+            total_unnest_predicate(expr, schema),
+        Expr::Binary { op: BinaryOp::And | BinaryOp::Or, left, right } =>
+            total_unnest_predicate(left, schema) && total_unnest_predicate(right, schema),
+        Expr::Binary { op, left, right } if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::IsDistinctFrom
+            | BinaryOp::IsNotDistinctFrom | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) =>
+        {
+            if !unnest_scalar_operand(left, schema) || !unnest_scalar_operand(right, schema) { return false; }
+            let left = left.data_type();
+            let right = right.data_type();
+            if is_boolean_or_null(&left) && is_boolean_or_null(&right) {
+                matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom)
+            } else {
+                [&left, &right].into_iter().all(|ty| !is_boolean_or_null(ty) || *ty == LogicalType::Null)
+            }
+        }
+        _ => unnest_scalar_operand(predicate, schema) && is_boolean_or_null(&predicate.data_type()),
+    })
 }
 
 fn total_outer_predicate(predicate: &Expr, correlation: &Correlation<'_>) -> bool {
@@ -799,16 +869,19 @@ fn total_outer_predicate(predicate: &Expr, correlation: &Correlation<'_>) -> boo
     })
 }
 
-fn prunable_unnest_input(mut input: &Relation) -> bool {
-    // Apply validates every input cell before binding. Unnest can drop unused projections and skip rejected lists.
+enum UnnestInput { PlainLiterals, Arrow }
+
+fn unnest_input(mut input: &Relation) -> Option<UnnestInput> {
     loop {
         match input.node() {
             RelationNode::Project { input: source, expressions } | RelationNode::Rename { input: source, expressions, .. }
                 if expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id, data_type }
                     if *data_type == named.field.data_type && source.schema().get(*id).is_some_and(|field| field.data_type == *data_type))) => input = source,
-            RelationNode::Values { rows } => return rows.iter().flatten().all(plain_unnest_cell),
-            RelationNode::LiteralPages { pages } => return pages.iter().flatten().flatten().all(plain_unnest_cell),
-            _ => return false,
+            RelationNode::Values { rows } => return rows.iter().flatten().all(plain_unnest_cell).then_some(UnnestInput::PlainLiterals),
+            RelationNode::LiteralPages { pages } =>
+                return pages.iter().flatten().flatten().all(plain_unnest_cell).then_some(UnnestInput::PlainLiterals),
+            RelationNode::ArrowLiteralPages { .. } | RelationNode::Scan(_) => return Some(UnnestInput::Arrow),
+            _ => return None,
         }
     }
 }

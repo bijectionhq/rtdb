@@ -6,6 +6,7 @@ use crate::CatalogSnapshot;
 use rtdb_columnar::MemoryReservation;
 
 mod decorrelate;
+pub(crate) use decorrelate::filtered_left_unnest_source;
 #[cfg(test)]
 mod decorrelate_tests;
 

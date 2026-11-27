@@ -247,6 +247,32 @@ async fn a_left_unnest_on_an_outer_row_test_keeps_real_and_synthetic_nulls_disti
 }
 
 #[tokio::test]
+async fn left_unnest_filters_scan_lists_using_lexical_captures_and_original_ordinals() {
+    let sql = "SELECT nt._id, u.v, u.n FROM nested_table AS nt \
+               LEFT JOIN UNNEST(nt.nest) WITH ORDINALITY AS u(v, n) \
+               ON u.v > nt._id AND u.n <> 2 ORDER BY nt._id, u.n";
+    let context = context();
+    let prepared = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap();
+    let plan = PreparedQuery::from_prepared(prepared, &context.memory).unwrap();
+    fn has_filtered_unnest(relation: &Relation) -> bool {
+        matches!(relation.node(), RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })
+            || relation.children().iter().any(|child| has_filtered_unnest(child))
+    }
+    assert!(has_filtered_unnest(plan.relation()));
+    assert_eq!(query(sql, vec![]).await.unwrap(), [vec![Value::I64(1), Value::I64(3), Value::I64(3)]]);
+}
+
+#[tokio::test]
+async fn left_unnest_filters_nullable_boolean_elements_without_ordinality() {
+    let sql = "SELECT o.id, u.v FROM (VALUES (1, ARRAY[TRUE, NULL, FALSE]), (2, ARRAY[FALSE, NULL])) AS o(id, xs) \
+               LEFT JOIN UNNEST(o.xs) AS u(v) ON u.v ORDER BY o.id";
+    assert_eq!(query(sql, vec![]).await.unwrap(), [
+        vec![Value::I64(1), Value::Bool(true)],
+        vec![Value::I64(2), Value::Null],
+    ]);
+}
+
+#[tokio::test]
 async fn captured_unnest_reads_a_staged_column_and_preserves_external_parameter_ids() {
     let sql = "SELECT v, n FROM (VALUES (?)) AS t(k), UNNEST(ARRAY[k, k+?]) WITH ORDINALITY AS u(v,n)";
     let context = context();

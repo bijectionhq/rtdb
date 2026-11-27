@@ -483,7 +483,7 @@ fn count_nodes(relation: &Relation, matches: &impl Fn(&RelationNode) -> bool) ->
 }
 fn applies(relation: &Relation) -> usize {
     count_nodes(relation, &|node: &RelationNode| {
-        matches!(node, RelationNode::Apply { .. })
+        matches!(node, RelationNode::Apply { kind, .. } if *kind != ApplyKind::LeftUnnest)
             || matches!(node, RelationNode::Mark { arguments, .. } if !arguments.is_empty())
     })
 }
@@ -601,12 +601,12 @@ async fn a_limit_can_consume_a_left_unnest_fallback_without_reading_later_input_
     let input = Arc::new(Relation::new(Schema::new(vec![customer_id(), tags()]).unwrap(), RelationNode::LiteralPages {
         pages: vec![vec![vec![literal(1), list.clone()]], vec![vec![divide, list]]],
     }).unwrap());
-    let relation = left_filtered_tags(&input, Expr::Literal(Value::Bool(false)), Vec::new());
+    let relation = left_filtered_tags(&input, Expr::binary(BinaryOp::Gt, integer(41, "tag").expression(), literal(99)), Vec::new());
     let fields = [0, 41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
     let relation = keep(relation, &fields);
     let limited = Arc::new(Arc::clone(&relation).limit(None, Some(literal(1))).unwrap());
     let (correlated, rewritten) = both_ways(&limited);
-    assert_eq!(applies(rewritten.relation()), 0);
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
     let expected = ["[I64(1), Null, Null]".to_owned()];
     assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
     assert_eq!(run_in_order(&rewritten).await.unwrap(), expected);
@@ -617,21 +617,52 @@ async fn a_limit_can_consume_a_left_unnest_fallback_without_reading_later_input_
 }
 
 #[tokio::test]
-async fn left_unnest_keeps_element_tests_and_effectful_expressions_on_apply() {
+async fn left_unnest_filters_each_parent_by_element_and_original_ordinal() {
     let input = tagged();
     let element = integer(41, "tag");
     let ordinal = typed(42, "n", int());
+    let predicate = Expr::binary(BinaryOp::And, equals(ordinal.expression(), literal(2)),
+        Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::IsNull, element.expression()), equals(element.expression(), literal(20))));
+    let relation = left_filtered_tags(&input, predicate, Vec::new());
+    let fields = [0, 41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
+    let (correlated, rewritten) = both_ways(&keep(relation, &fields));
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
+    let expected = [
+        "[I64(1), I64(20), I64(2)]",
+        "[I64(2), Null, Null]",
+        "[I64(3), Null, Null]",
+        "[I64(4), Null, I64(2)]",
+        "[I64(4), Null, I64(2)]",
+    ];
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_in_order(&rewritten).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn left_unnest_keeps_fallible_or_volatile_on_expressions_on_apply() {
+    let input = tagged();
+    let element = integer(41, "tag");
     let divide = Expr::binary(BinaryOp::Divide, literal(1), literal(0));
     let random = Expr::Call { name: "random".into(), args: Vec::new(), return_type: LogicalType::Scalar(ScalarType::F64) };
     for predicate in [
-        Expr::unary(UnaryOp::IsNull, element.expression()),
-        equals(ordinal.expression(), literal(2)),
-        equals(divide.clone(), literal(1)),
+        equals(divide.clone(), element.expression()),
         Expr::binary(BinaryOp::Gt, random, Expr::Literal(Value::F64(0.5))),
     ] {
-        let relation = left_filtered_tags(&input, predicate, Vec::new());
-        let (_, rewritten) = both_ways(&relation);
+        let (_, rewritten) = both_ways(&left_filtered_tags(&input, predicate, Vec::new()));
         assert_eq!(applies(rewritten.relation()), 1);
+    }
+    let compare = equals(divide.clone(), element.expression());
+    for (predicate, expected) in [
+        (Expr::binary(BinaryOp::And, Expr::Literal(Value::Bool(false)), compare.clone()),
+            Ok(vec!["[Null, Null]".to_owned(); 5])),
+        (compare, Err("xtdb.expression/division-by-zero".to_owned())),
+    ] {
+        let relation = left_filtered_tags(&input, predicate, Vec::new());
+        let fields = [41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
+        let (correlated, rewritten) = both_ways(&keep(relation, &fields));
+        assert_eq!(applies(rewritten.relation()), 1);
+        assert_eq!(run_in_order(&correlated).await, expected);
+        assert_eq!(run_in_order(&rewritten).await, expected);
     }
 
     let relation = left_filtered_tags(&input, Expr::Literal(Value::Bool(false)), vec![(1, divide)]);
@@ -693,12 +724,39 @@ async fn left_unnest_keeps_validation_of_unused_arrow_cells() {
     let input = Arc::new(Relation::new(Schema::new(vec![customer_id(), tags(), uri]).unwrap(), RelationNode::ArrowLiteralPages {
         pages: LiteralArrowPages::new(vec![page]),
     }).unwrap());
-    let relation = left_filtered_tags(&input, Expr::Literal(Value::Bool(false)), Vec::new());
+    let relation = left_filtered_tags(&input, Expr::binary(BinaryOp::Gt, integer(41, "tag").expression(), literal(10)), Vec::new());
     let output = relation.schema().get(ColumnId(41)).unwrap().clone();
     let (correlated, rewritten) = both_ways(&keep(relation, &[output]));
-    assert_eq!(applies(rewritten.relation()), 1);
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
     assert_eq!(run_in_order(&correlated).await, Err(error.clone()));
     assert_eq!(run_in_order(&rewritten).await, Err(error));
+}
+
+#[tokio::test]
+async fn left_unnest_reuses_apply_for_a_page_with_an_incompatible_list_layout() {
+    use arrow_array::{Array, FixedSizeListArray, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use rtdb_columnar::{OwnedBatch, to_field};
+    use rtdb_plan::LiteralArrowPages;
+
+    let item = Arc::new(ArrowField::new("item", DataType::Int64, true));
+    let lists = FixedSizeListArray::new(item, 2, Arc::new(Int64Array::from(vec![Some(10), Some(20), Some(30), None])), None);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        to_field("id", &customer_id().data_type).unwrap(), ArrowField::new("tags", lists.data_type().clone(), true),
+    ]));
+    let record = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(lists)]).unwrap();
+    let page = OwnedBatch::new(record, &context().memory).unwrap();
+    let input = Arc::new(Relation::new(Schema::new(vec![customer_id(), tags()]).unwrap(), RelationNode::ArrowLiteralPages {
+        pages: LiteralArrowPages::new(vec![page]),
+    }).unwrap());
+    let predicate = equals(typed(42, "n", int()).expression(), literal(2));
+    let relation = left_filtered_tags(&input, predicate, Vec::new());
+    let fields = [0, 41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
+    let (correlated, rewritten) = both_ways(&keep(relation, &fields));
+    assert_eq!(count_nodes(rewritten.relation(), &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::LeftUnnest, .. })), 1);
+    let expected = ["[I64(1), I64(20), I64(2)]", "[I64(2), Null, I64(2)]"];
+    assert_eq!(run_in_order(&correlated).await.unwrap(), expected);
+    assert_eq!(run_in_order(&rewritten).await.unwrap(), expected);
 }
 
 #[test]

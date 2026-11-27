@@ -2407,8 +2407,11 @@ surface QueryAccess {
         -- Outer joins track unmatched build positions through partition replay.
         -- Correlated Apply retains dependent Arrow pages as ordered spans with an outer position for each span.
         -- A left, single or scalar Apply with no match retains one outer position with a missing dependent row.
-        -- A decorrelated left lateral UNNEST with a total outer-row predicate yields one row with null dependent columns when the predicate is false or unknown or the list is null or empty.
-        -- When the predicate is true, each element retains its original ordinality, including a null element.
+        -- A left lateral UNNEST with a supported total predicate processes the real candidates of each reached input page and retains each candidate for which the predicate is true.
+        -- Each surviving candidate retains its parent, its original one-based ordinality, and its element value, including a real null element.
+        -- A parent with a null list, an empty list, or zero surviving candidates yields one row with null dependent columns.
+        -- Batched expansion preserves the reached input validation and retains selected child spans under their source owners.
+        -- The dependent Apply evaluates fallible predicates and bindings and handles input layouts outside the batch admission.
         -- Apply builds its document from funded child arrays when their physical fields are admitted.
         -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
         -- UNNEST over compatible Arrow lists retains each selected child span under its source owner and repeats the corresponding parent position for its elements.
