@@ -55,6 +55,7 @@ pub use native_checkpoint::NativeDependentCustodyAuthority;
 pub use dependent_custody::{InheritedAdmission, InheritedAdmissionRegistration, InheritedCarrierBinding, InheritedDisposition, InheritedReadProof, InheritedRegistration, InheritedRelease};
 mod peer;
 mod portable_backup;
+mod provider_http;
 pub use portable_backup::{MULTI_BACKUP_HELP, MultiBackupOptions};
 use activation::ActivationAuthority;
 use catalog::{Status, TransferExport};

@@ -1,79 +1,22 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::BTreeMap;
 
 use rtdb_types::rtdb_v1::{
     NativeCheckpointMember, NativeDependentCustodyDisposition, NativeDependentCustodyEnrollment,
     NativeDependentSourceGeneration,
 };
-use tokio_rustls::rustls::{
-    self, ClientConfig, RootCertStore,
-    client::Resumption,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-};
 use tokio_util::sync::CancellationToken;
-use url::Url;
 use uuid::Uuid;
 
 use super::*;
-use crate::multi::{NativeDependentCustodyAuthority, classic_opening::operator::LeafVerifier};
+use crate::multi::NativeDependentCustodyAuthority;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ConnectionProfile {
-    endpoint: String,
-    ca_file: PathBuf,
-    client_certificate_file: PathBuf,
-    client_private_key_file: PathBuf,
-    server_certificate_sha256: [u8; 32],
-}
-
-pub(super) struct Connection {
-    endpoint: Url,
-    client: reqwest::Client,
-}
+pub(super) struct Connection(provider_http::Connection);
 
 impl Connection {
-    pub(super) fn from_profile(profile: ConnectionProfile) -> Result<Self> {
-        let endpoint = Url::parse(&profile.endpoint).map_err(|_| invalid())?;
-        if endpoint.scheme() != "https"
-            || !endpoint.has_host()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.path() != "/"
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-            || profile.server_certificate_sha256 == [0; 32]
-        {
-            return Err(invalid());
-        }
-        let roots = read_roots(&profile.ca_file)?;
-        let chain = read_chain(&profile.client_certificate_file)?;
-        let key = read_key(&profile.client_private_key_file)?;
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let verifier = LeafVerifier::new(
-            profile.server_certificate_sha256,
-            roots,
-            provider.signature_verification_algorithms,
-        );
-        let mut tls = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|_| invalid())?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_client_auth_cert(chain, key)
-            .map_err(|_| invalid())?;
-        tls.resumption = Resumption::disabled();
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .http1_only()
-            .connect_timeout(DEADLINE)
-            .timeout(DEADLINE)
-            .build()
-            .map_err(|_| invalid())?;
-        Ok(Self { endpoint, client })
+    pub(super) fn from_profile(profile: provider_http::Profile) -> Result<Self> {
+        provider_http::Connection::from_profile(profile, MAX_BYTES, DEADLINE)
+            .map(Self)
+            .map_err(transport_error)
     }
 
     pub(super) async fn post<T: DeserializeOwned>(
@@ -81,74 +24,11 @@ impl Connection {
         path: &str,
         request: &impl Serialize,
     ) -> Result<T> {
-        let request = encode(request)?;
-        let expected = digest(&request);
-        let mut endpoint = self.endpoint.clone();
-        endpoint.set_path(path);
-        let mut response = self
-            .client
-            .post(endpoint)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(request)
-            .send()
+        self.0
+            .post(path, request, VERSION)
             .await
-            .map_err(|_| pending())?;
-        match response.status() {
-            http::StatusCode::OK => (),
-            http::StatusCode::TOO_MANY_REQUESTS | http::StatusCode::SERVICE_UNAVAILABLE => {
-                return Err(pending());
-            }
-            _ => return Err(refused()),
-        }
-        if !json_content_type(response.headers())
-            || response
-                .content_length()
-                .is_some_and(|len| len > MAX_BYTES as u64)
-        {
-            return Err(refused());
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| pending())? {
-            if chunk.len() > MAX_BYTES - bytes.len() {
-                return Err(refused());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let reply: Reply<T> = serde_json::from_slice(&bytes).map_err(|_| refused())?;
-        if reply.version != VERSION || reply.request_sha256 != expected {
-            return Err(refused());
-        }
-        Ok(reply.result)
+            .map_err(transport_error)
     }
-}
-
-pub(super) fn json_content_type(headers: &http::HeaderMap) -> bool {
-    headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-}
-
-pub(super) fn read_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    CertificateDer::pem_slice_iter(&read_file(path)?)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| invalid())
-}
-
-pub(super) fn read_roots(path: &Path) -> Result<RootCertStore> {
-    let mut roots = RootCertStore::empty();
-    for cert in read_chain(path)? {
-        roots.add(cert).map_err(|_| invalid())?;
-    }
-    if roots.is_empty() {
-        return Err(invalid());
-    }
-    Ok(roots)
-}
-
-pub(super) fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_slice(&read_file(path)?).map_err(|_| invalid())
 }
 
 #[derive(Deserialize)]
@@ -160,7 +40,7 @@ pub(super) struct ObserverProfile {
     application_scope: [u8; 32],
     #[serde(default)]
     inherited_reads: bool,
-    connection: ConnectionProfile,
+    connection: provider_http::Profile,
 }
 
 pub(super) struct Observer(BTreeMap<[u8; 16], Commissioned>);

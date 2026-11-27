@@ -218,6 +218,10 @@ pub(in crate::multi::activation) struct Resolution {
 }
 
 impl Resolution {
+    pub(super) fn matches(&self, scope_sha256: [u8; 32], index: u64) -> bool {
+        self.scope_sha256 == scope_sha256 && self.index == index
+    }
+
     fn statement(&self, closure: &Closure, prefix: [u8; 32]) -> Vec<u8> {
         let mut bytes = b"rtdb.activation.funded-resolution/v1\0".to_vec();
         bytes.extend_from_slice(&self.scope_sha256);
@@ -383,7 +387,7 @@ impl Scope {
 }
 
 impl ActivationAuthority {
-    async fn closed_funded_scope(
+    pub(super) async fn closed_funded_scope(
         &self,
         name: &str,
         predecessor: Binding,
@@ -416,6 +420,22 @@ impl ActivationAuthority {
             .find(|scope| scope.scope_sha256 == scope_sha256)
             .ok_or_else(conflict)?;
         Ok((scope, source_fence))
+    }
+
+    pub(super) async fn next_funded_index(&self, scope: &Scope, closure: &Closure) -> Result<Option<u64>> {
+        // An outcome cannot be admitted until its predecessor exists, including across pages.
+        let mut recorded = 0;
+        let mut possible = closure.bookings;
+        while recorded < possible {
+            let index = recorded + (possible - recorded) / 2 + 1;
+            let outcome = scope.outcome(closure, index);
+            if self.outcome_head(outcome.stream).await? >= outcome.at {
+                recorded = index;
+            } else {
+                possible = index - 1;
+            }
+        }
+        Ok(recorded.checked_add(1).filter(|next| *next <= closure.bookings))
     }
 
     pub(in crate::multi::activation) async fn record_funded_outcome(

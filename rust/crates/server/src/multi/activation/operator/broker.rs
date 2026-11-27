@@ -20,7 +20,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, JournalReaders, Request, Source};
+use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, JournalReaders, Request, Source, funded};
 
 use super::super::{BROKER_FRAME_BYTES, ranked::Providers};
 
@@ -42,6 +42,8 @@ struct Config {
     destination_journal_readers: JournalReaders,
     #[serde(default)]
     ranked_providers: Providers,
+    #[serde(default)]
+    funded_issuers: funded::issuer::Settings,
 }
 
 impl Config {
@@ -103,7 +105,9 @@ pub(super) async fn serve(
     configuration: &Path,
     apple_sync: rtdb_storage::AppleSync,
 ) -> Result<()> {
-    let config = Arc::new(Config::read(configuration)?);
+    let mut config = Config::read(configuration)?;
+    let funded_issuers = Arc::new(std::mem::take(&mut config.funded_issuers).connect(open_funded_key)?);
+    let config = Arc::new(config);
     require_directory(&config.authority_tls_dir, 0o022)?;
     if let Some(destination) = &config.destination {
         super::super::require_independent_journals(
@@ -141,13 +145,9 @@ pub(super) async fn serve(
                 let (stream, _) = accepted.map_err(io_error)?;
                 let authority = authority.clone();
                 let config = config.clone();
+                let funded_issuers = funded_issuers.clone();
                 requests.spawn(async move {
-                    handle_peer(
-                        stream, &authority, &config.operator_uids, config.destination.as_ref(),
-                        config.source.as_ref(), &config.destination_attestors,
-                        &config.destination_journal_readers, &config.ranked_providers, apple_sync,
-                    )
-                    .await;
+                    handle_peer(stream, &authority, &config, &funded_issuers, apple_sync).await;
                 });
             }
         }
@@ -159,28 +159,25 @@ pub(super) async fn serve(
 async fn handle_peer(
     mut stream: UnixStream,
     authority: &ActivationAuthority,
-    operator_uids: &BTreeSet<u32>,
-    destination: Option<&Destination>,
-    source: Option<&Source>,
-    attestors: &Attestors,
-    journals: &JournalReaders,
-    ranked: &Providers,
+    config: &Config,
+    funded_issuers: &funded::issuer::Providers,
     apple_sync: rtdb_storage::AppleSync,
 ) {
     let result: Result<Value> = if stream
         .peer_cred()
-        .is_ok_and(|peer| operator_uids.contains(&peer.uid()))
+        .is_ok_and(|peer| config.operator_uids.contains(&peer.uid()))
     {
         match timeout(IO_TIMEOUT, read_frame::<Request>(&mut stream)).await {
             Ok(Ok(request)) => {
                 request
                     .execute(
                         authority,
-                        destination.map(DestinationReader::Broker),
-                        source,
-                        attestors,
-                        journals,
-                        ranked,
+                        config.destination.as_ref().map(DestinationReader::Broker),
+                        config.source.as_ref(),
+                        &config.destination_attestors,
+                        &config.destination_journal_readers,
+                        &config.ranked_providers,
+                        funded_issuers,
                         apple_sync,
                     )
                     .await
@@ -311,6 +308,15 @@ fn require_private_file(file: &File) -> Result<()> {
     }
 }
 
+fn open_funded_key(path: &Path) -> Result<File> {
+    let parent = path.parent().filter(|_| path.is_absolute()).ok_or_else(configuration)?;
+    require_directory(parent, 0o022)?;
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path).map_err(io_error)?;
+    require_private_file(&file)?;
+    Ok(file)
+}
+
 fn configuration() -> Anomaly {
     Anomaly::incorrect(
         "rtdb/activation-broker-configuration",
@@ -358,16 +364,13 @@ mod tests {
                 BTreeSet::new()
             };
             let authority = authority.clone();
+            let config = test_config(&authority, allowed, Attestors::new());
             let job = tokio::spawn(async move {
                 handle_peer(
                     server,
                     &authority,
-                    &allowed,
-                    None,
-                    None,
-                    &Attestors::new(),
-                    &JournalReaders::new(),
-                    &Providers::default(),
+                    &config,
+                    &funded::issuer::Providers::default(),
                     rtdb_storage::AppleSync::default(),
                 )
                 .await;
@@ -432,19 +435,14 @@ pub(super) async fn call_test_peer(
     request: &Request,
 ) -> Result<Value> {
     let (mut client, server) = UnixStream::pair().unwrap();
-    let allowed = BTreeSet::from([effective_uid()]);
-    let journals = JournalReaders::new();
-    let ranked = Providers::default();
+    let config = test_config(authority, BTreeSet::from([effective_uid()]), attestors.clone());
+    let funded_issuers = funded::issuer::Providers::default();
     let (_, result) = tokio::join!(
         handle_peer(
             server,
             authority,
-            &allowed,
-            None,
-            None,
-            attestors,
-            &journals,
-            &ranked,
+            &config,
+            &funded_issuers,
             rtdb_storage::AppleSync::default(),
         ),
         async {
@@ -453,4 +451,20 @@ pub(super) async fn call_test_peer(
         },
     );
     result
+}
+
+#[cfg(test)]
+fn test_config(authority: &ActivationAuthority, operator_uids: BTreeSet<u32>, destination_attestors: Attestors) -> Config {
+    Config {
+        authority_id: authority.identity(),
+        authority_url: String::new(),
+        authority_tls_dir: PathBuf::new(),
+        operator_uids,
+        destination: None,
+        source: None,
+        destination_attestors,
+        destination_journal_readers: JournalReaders::new(),
+        ranked_providers: Providers::default(),
+        funded_issuers: funded::issuer::Settings::default(),
+    }
 }

@@ -15,6 +15,8 @@ use crate::multi::activation::{
     recovery::{Intent, LossPolicy, Operation, SourceCut, Status},
 };
 
+mod issuer;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_seal() {
     const PRINCIPAL: &str = "urn:logkeeper:client:funded-reconciliation";
@@ -174,6 +176,14 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
             .as_ref()
             .to_vec();
     }
+    let original_issuer = issuer::OriginalIssuer::start(
+        enrollment, identity, DATABASE, predecessor, closure.clone(),
+        resolutions.iter().map(|(_, resolution)| resolution.clone()).collect(),
+        serde_json::json!({ "writer_epoch": original.epoch.0 + 1, "sealed_head": original.at }),
+    ).await;
+    let providers = &original_issuer.providers;
+    assert!(providers.reconcile(&authority, DATABASE, predecessor, 0).await.is_err());
+    assert_eq!(original_issuer.requests(), 0);
     let operation = Operation {
         predecessor,
         operation_id: Uuid::new_v4(),
@@ -197,10 +207,11 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
         .freeze_recovery(DATABASE, operation)
         .await
         .unwrap();
-    authority
-        .record_funded_closure(DATABASE, predecessor, closure.clone())
-        .await
-        .unwrap();
+    assert_eq!(providers.reconcile(&authority, DATABASE, predecessor, 0).await.unwrap_err().code,
+        "rtdb/activation-funded-issuer-pending");
+    let closed = serde_json::to_value(providers.reconcile(&authority, DATABASE, predecessor, 0).await.unwrap()).unwrap();
+    assert_eq!(closed["bookings"], closure.bookings);
+    assert_eq!(closed["next_index"], 1);
     let first = resolutions[0].1.clone();
     assert!(
         authority
@@ -264,10 +275,14 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
             .await
             .is_err()
     );
-    let verified = authority
-        .record_funded_outcome(DATABASE, predecessor, first.clone())
-        .await
-        .unwrap();
+    assert_eq!(providers.reconcile(&authority, DATABASE, predecessor, 0).await.unwrap_err().code,
+        "rtdb/activation-funded-issuer-pending");
+    assert_eq!(providers.reconcile(&authority, DATABASE, predecessor, 0).await.unwrap_err().code,
+        "rtdb/activation-funded-issuer-response");
+    assert_eq!(authority.funded_outcome(DATABASE, predecessor, scope.scope_sha256, 1).await.unwrap(), None);
+    let resumed = serde_json::to_value(providers.reconcile(&authority, DATABASE, predecessor, 0).await.unwrap()).unwrap();
+    assert_eq!(resumed["next_index"], 2);
+    let verified = authority.funded_outcome(DATABASE, predecessor, scope.scope_sha256, 1).await.unwrap().unwrap();
     assert_eq!(verified.accepted_through, original.at);
     assert_eq!(
         verified.exclusion_fence,
@@ -301,10 +316,9 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
             .await
             .is_err()
     );
-    authority
-        .record_funded_outcome(DATABASE, predecessor, resolutions[32].1.clone())
-        .await
-        .unwrap();
+    let complete = serde_json::to_value(providers.reconcile(&authority, DATABASE, predecessor, 0).await.unwrap()).unwrap();
+    assert!(complete["next_index"].is_null());
+    assert_eq!(original_issuer.requests(), 6);
     let (_, state) = authority
         .read(authority.stream_id(DATABASE).unwrap())
         .await
@@ -387,6 +401,9 @@ async fn reconciles_funded_bookings_with_original_commitments_and_a_lossless_sea
         .publish_recovery(DATABASE, replacement)
         .await
         .unwrap();
+    let archived = serde_json::to_value(crate::multi::activation::funded::issuer::Providers::default()
+        .reconcile(&authority, DATABASE, predecessor, 0).await.unwrap()).unwrap();
+    assert_eq!(archived, complete);
     assert_eq!(
         authority
             .funded_outcome(DATABASE, predecessor, scope.scope_sha256, 1)

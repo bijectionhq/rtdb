@@ -10,9 +10,10 @@ use super::{
     FUNDED_RECOVERY_PROTOCOL, FUNDED_SETTLEMENT_PROTOCOL, State, conflict, corrupt, unavailable,
 };
 
+pub(super) mod issuer;
 pub(super) mod settlement;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Enrollment {
     pub issuer: Uuid,

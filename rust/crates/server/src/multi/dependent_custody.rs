@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result,
@@ -9,9 +9,8 @@ use rtdb_types::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
 
-use super::MultiRuntime;
+use super::{MultiRuntime, provider_http};
 
 mod client;
 mod inherited;
@@ -71,14 +70,6 @@ pub(super) fn install(runtime: &mut MultiRuntime) -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Reply<T> {
-    version: u32,
-    request_sha256: [u8; 32],
-    result: T,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetadataRequest {
@@ -131,34 +122,21 @@ enum SettlementResult {
     Settled { key: [u8; 32], basis: Basis },
 }
 
-fn digest(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
 fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec(value).map_err(|_| refused())?;
-    if bytes.len() > MAX_BYTES {
-        return Err(refused());
-    }
-    Ok(bytes)
+    provider_http::encode(value, MAX_BYTES).map_err(transport_error)
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    serde_json::from_slice(&read_file(path)?).map_err(|_| invalid())
+    let bytes = provider_http::read_file(path, MAX_CONFIG_BYTES).map_err(transport_error)?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
 }
 
-fn read_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
-    let mut bytes = Zeroizing::new(Vec::new());
-    File::open(path)
-        .and_then(|file| {
-            file.take(MAX_CONFIG_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-        })
-        .map_err(|_| invalid())?;
-    if bytes.is_empty() || bytes.len() > MAX_CONFIG_BYTES {
-        return Err(invalid());
+fn transport_error(error: provider_http::Error) -> Anomaly {
+    match error {
+        provider_http::Error::Configuration => invalid(),
+        provider_http::Error::Unavailable => pending(),
+        provider_http::Error::Refused => refused(),
     }
-    Ok(bytes)
 }
 
 fn invalid() -> Anomaly {

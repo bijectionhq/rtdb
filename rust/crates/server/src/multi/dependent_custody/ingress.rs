@@ -18,14 +18,17 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    client::{json_content_type, read_chain, read_key, read_roots},
     inherited::{
         InheritedAdmissionRequest, InheritedCarrierRequest, InheritedProfile, InheritedReadRequest,
         InheritedReleaseRequest,
     },
     *,
 };
-use crate::multi::{DatabaseOpen, catalog::Status, open_database, retryable};
+use crate::multi::{
+    DatabaseOpen, catalog::Status, open_database,
+    provider_http::{Reply, digest, json_content_type, read_chain, read_key, read_roots},
+    retryable,
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +158,7 @@ impl Ingress {
         }
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(read_roots(&profile.client_ca_file)?),
+            Arc::new(read_roots(&profile.client_ca_file).map_err(transport_error)?),
             Arc::clone(&provider),
         )
         .build()
@@ -165,8 +168,8 @@ impl Ingress {
             .map_err(|_| invalid())?
             .with_client_cert_verifier(clients)
             .with_single_cert(
-                read_chain(&profile.certificate_file)?,
-                read_key(&profile.private_key_file)?,
+                read_chain(&profile.certificate_file).map_err(transport_error)?,
+                read_key(&profile.private_key_file).map_err(transport_error)?,
             )
             .map_err(|_| invalid())?;
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];

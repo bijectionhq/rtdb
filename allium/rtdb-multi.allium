@@ -491,6 +491,8 @@ contract OriginalFundedAdmission {
         -- Activation publication requires a matching signed admission closure and a verified outcome for every booking in every enrolled predecessor scope.
         -- The authority retains the roster and its closures through publication and exposes them by predecessor binding.
         -- Recovery can resume enumeration against the same closure after issuer restart or recovery operation replacement.
+        -- After grants close, the broker contacts the exact enrolled issuer over authenticated transport for the closure and first missing outcome.
+        -- A lost reply resumes at the durable inventory position, and the issuer returns the same signed evidence for each retry.
         -- A closure can be recorded while earlier authorized work still awaits a terminal decision.
 
     @invariant SettlementUsesOriginalEvidence

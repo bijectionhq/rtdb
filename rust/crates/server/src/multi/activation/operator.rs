@@ -37,6 +37,8 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
                  --issuer-key HEX --receiver-certificate-sha256 HEX [--journal-trust FILE]
        rtdb multi-activation funded-scopes DATABASE --authority-socket PATH [--offset N]
                  --expected-incarnation UUID --expected-revision N
+       rtdb multi-activation reconcile-funded DATABASE --authority-socket PATH [--offset N]
+                 --expected-incarnation UUID --expected-revision N
        rtdb multi-activation record-funded-closure DATABASE --authority-socket PATH --closure FILE
                  --expected-incarnation UUID --expected-revision N
        rtdb multi-activation record-funded-outcome DATABASE --authority-socket PATH --outcome FILE
@@ -123,6 +125,10 @@ enum Action {
         journal: Option<funded::settlement::JournalTrust>,
     },
     FundedScopes {
+        predecessor: Binding,
+        offset: usize,
+    },
+    ReconcileFunded {
         predecessor: Binding,
         offset: usize,
     },
@@ -436,6 +442,12 @@ impl Options {
                     .map_err(|_| arguments_error())?.unwrap_or(0),
             },
             #[cfg(unix)]
+            "reconcile-funded" => Action::ReconcileFunded {
+                predecessor: binding(&mut fields)?,
+                offset: fields.remove("--offset").map(|offset| offset.parse()).transpose()
+                    .map_err(|_| arguments_error())?.unwrap_or(0),
+            },
+            #[cfg(unix)]
             "record-funded-closure" => Action::RecordFundedClosure {
                 predecessor: binding(&mut fields)?,
                 closure: read_funded_document(&take(&mut fields, "--closure")?)?,
@@ -519,7 +531,7 @@ impl Options {
         }
 
         if matches!(request.action, Action::CommissionRanked { .. } | Action::RankedOutcomes { .. }
-            | Action::CommissionFunded { .. } | Action::FundedScopes { .. } | Action::RecordFundedClosure { .. }
+            | Action::CommissionFunded { .. } | Action::FundedScopes { .. } | Action::ReconcileFunded { .. } | Action::RecordFundedClosure { .. }
             | Action::RecordFundedOutcome { .. } | Action::FundedOutcome { .. }
             | Action::Recovery { action: RecoveryAction::SealSource | RecoveryAction::RankedOutcomes { .. }, .. })
         {
@@ -601,6 +613,7 @@ impl Options {
                         &Attestors::new(),
                         &JournalReaders::new(),
                         &super::ranked::Providers::default(),
+                        &funded::issuer::Providers::default(),
                         apple_sync,
                     )
                     .await
@@ -706,6 +719,7 @@ impl Request {
         attestors: &Attestors,
         journals: &JournalReaders,
         ranked: &super::ranked::Providers,
+        funded_issuers: &funded::issuer::Providers,
         apple_sync: rtdb_storage::AppleSync,
     ) -> Result<Value> {
         let database = self.database;
@@ -719,6 +733,9 @@ impl Request {
             }
             Action::FundedScopes { predecessor, offset } => {
                 return Ok(json!(authority.funded_scope_page(&database, predecessor, offset).await?));
+            }
+            Action::ReconcileFunded { predecessor, offset } => {
+                return Ok(json!(funded_issuers.reconcile(authority, &database, predecessor, offset).await?));
             }
             Action::RecordFundedClosure { predecessor, closure } => {
                 return Ok(json!(authority.record_funded_closure(&database, predecessor, closure).await?));
@@ -1419,6 +1436,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn funded_reconciliation_arguments_select_a_frozen_scope_without_a_recovery_id() {
+        let incarnation = Uuid::new_v4();
+        let arguments = format!(
+            "reconcile-funded xtdb --authority-socket /tmp/authority.sock --expected-incarnation {incarnation} --expected-revision 7 --offset 2"
+        );
+        let options = Options::parse(arguments.split_whitespace().map(str::to_owned)).unwrap();
+        assert!(matches!(options.0, Command::CallBroker { request: Request {
+            action: Action::ReconcileFunded { predecessor: Binding { incarnation: expected, revision: 7 }, offset: 2 }, ..
+        }, .. } if expected == incarnation));
+    }
+
+    #[test]
     fn publication_requires_exact_predecessor_and_destination() {
         let authority = Uuid::new_v4();
         let predecessor = Uuid::new_v4();
@@ -1523,6 +1553,7 @@ mod tests {
                 &Attestors::new(),
                 &JournalReaders::new(),
                 &super::super::ranked::Providers::default(),
+                &funded::issuer::Providers::default(),
                 rtdb_storage::AppleSync::default(),
             )
             .await
@@ -1553,6 +1584,7 @@ mod tests {
                     &Attestors::new(),
                     &JournalReaders::new(),
                     &super::super::ranked::Providers::default(),
+                    &funded::issuer::Providers::default(),
                     rtdb_storage::AppleSync::default()
                 )
                 .await
