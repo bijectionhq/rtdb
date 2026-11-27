@@ -142,7 +142,7 @@ The current source contains no planner override for that comparator choice; exec
 
 `vec-agg` shares array accumulation and preserves null input cells.
 An empty global input produces an empty vector, while an empty grouped input produces no rows.
-Both families retain allocation reservations for collected cells and release input spills when the cursor ends or is dropped.
+Both families retain allocation reservations for collected cells in memory and release them when the cursor ends or is dropped.
 
 Integer SUM follows the wrapping accumulation in `IntVector.kt` and `LongVector.kt` at the declared accumulator width.
 Integer input narrows through the vector getter before addition, and floating accumulation rounds at the output vector width.

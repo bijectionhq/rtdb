@@ -17,7 +17,8 @@ Each call can append a fresh reservation, including a retry after an unknown out
 The reservation changes transaction bookkeeping only and marks its `xt.txs` metadata with `rtdb_present_reservation`.
 
 `NodeOptions::owned_relations` enables the native owner-scoped relation API.
-`NodeOptions::default` reads no environment: it takes the reference's block-cut defaults from `ReplicationConfig` and half the available processors for compaction. The server configuration passes its startup environment to `NodeOptions::default_compaction_threads`, which reads `XTDB_COMPACTOR_THREADS`, and reads `XTDB_NODE_ID` and `XTDB_PASSWORD` itself.
+`NodeOptions::default` reads no environment: it takes the reference's block-cut defaults from `ReplicationConfig` and half the available processors for compaction.
+The server configuration passes its startup environment to `NodeOptions::default_compaction_threads`, which reads `XTDB_COMPACTOR_THREADS`, and reads `XTDB_NODE_ID` and `XTDB_PASSWORD` itself.
 Enable this mode only on an installation where every serving and replay member supports the owned relation format.
 `TxOp::OwnedInsertDocs` resolves create-only writes in the authenticated principal's namespace.
 `NativeSession::open_owned_point` reads a single entity in that namespace at a store-reserved present.
@@ -57,6 +58,7 @@ Cancellation of an in-progress attach leaves its admitted operations in the node
 Custom resource-factory wrappers must forward closure to their wrapped factory.
 Each native resource factory belongs to one node lifetime; a later node opens a new factory and I/O region while immutable provider configuration and clocks may be shared.
 In-process connections inherit the node's configured time zone, which defaults to the fixed UTC offset `Z`.
+Opening a node fixes the process case locale once through `rtdb_expr::host_defaults()`, falling back to the root Unicode locale if the host locale cannot be read.
 Remote storage requires a shared `DiskCache`, with file keys scoped by database and partition.
 Database names that cannot form a safe single path component use an injective hexadecimal cache-directory encoding.
 Production local-log writers sample the configured clock for source transactions and the system clock for other messages, unless `with_local_log_clock` enables the configured clock for all records.
@@ -97,6 +99,9 @@ The service binds the authenticated identity; transaction options cannot choose 
 
 BEGIN leaves the read basis unpinned.
 The first query awaits the effective await token, then captures the snapshot token and clock unless read-only settings override them.
+Plain SQL snapshot tokens are stateless XTDB `TimeBasis` tokens (base64 protobuf mapping each database with a completed transaction to its partitions' system times), so no server-side registry, hold or expiry is kept and tokens are interchangeable with XTDB.
+Redeeming a token caps each named database's current catalog at its recorded times using the redeeming session's clock and time zone (omitted databases or partitions read through their head, times ahead of the head fail with `xtdb/unindexed-tx`, malformed tokens fail with `xtdb.basis/invalid-basis`, and erased rows stay erased).
+On a placed database with a receipt codec, tokens use the sealed `rtdb-sealed-snapshot-v4:` form bound to the issuing principal, journal history and storage generation, which XTDB refuses as `xtdb.basis/invalid-basis`.
 The pinned query clock retains nanoseconds through later commands and frontend tickets.
 `Clock::query_instant` supplies the exact reading; injected clocks that implement only `now` retain their explicit microsecond precision.
 Typed SQL `CLOCK_TIME` literals resolve after the same statement's timezone option, before Arrow value admission.

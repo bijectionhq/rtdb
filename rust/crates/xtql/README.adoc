@@ -53,7 +53,7 @@ Literal object compatibility, normalization collisions, exact failure signatures
 `vec-agg` preserves input order and null elements and returns an empty vector for an empty global input.
 Grouped empty input produces no result rows.
 Its metadata is a nonnullable list, and the pinned registry has no distinct `vec-agg` factory.
-The plan variant is passive immutable aggregate metadata; execution uses the existing caller-pulled aggregate cursor and its owned spill files.
+The plan variant is passive immutable aggregate metadata; execution uses the existing in-memory caller-pulled aggregate cursor.
 `sql/tests/inline_xtql.rs` retains the value assertions from `xtdb.operator.group-by-test/test-vec-agg` through the public inline XTQL path.
 
 Cast forms accept `#xt/type` scalar, list, set, struct, map, run-end, fixed binary, and timestamp-range targets with decimal `:precision` and `:scale` options.

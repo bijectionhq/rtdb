@@ -17,6 +17,9 @@ Repeated scalar fields retain edition-2023 packed encoding.
 Neither protobuf generation nor compilation has run during Phase 1.
 
 The source and replica envelopes retain the source header, optional term sequence, optional external token, database operation, and transaction payload bytes.
+Log records and block files that depend on RTDB-only features (native `rtdb.v1` transactions, owned relations, retry guards, placed transactions, serving records/checkpoints, derived artefacts, table retirements, later naming epochs, unparseable trie keys, L0 deletions or offloads bound to a publication) are framed so an XTDB node refuses them: source records take header byte `4`, replica records take header byte `4` followed by a leading zero byte, and `Block`/`TableBlock` files begin with a zero byte.
+Every field RTDB adds to XTDB's shared protobuf messages is numbered from `1000`.
+`basis::encode_time_basis` and `basis::decode_time_basis` encode and decode XTDB's `TimeBasis` SQL snapshot tokens, matching Java's `Base64.getDecoder()` leniency on optional padding and trailing bits.
 The Transit codec retains tagged values, legacy error tags, and cache substitutions while decoding MessagePack.
 Budgeted MessagePack decoding admits the packing graph, decoded containers and each cache expansion before allocating them.
 The returned Transit value retains its own reservation after the packing graph is consumed.
@@ -44,7 +47,7 @@ Captured event schemas reject values outside their declared type legs.
 Narrow-scale standard Arrow streams retain their original bytes in regression source.
 These guards do not validate every other Arrow schema kind.
 Event operations are selected by union leg name because type IDs can differ across file schemas.
-The writer uses eight-byte alignment and the JVM's four-byte end marker.
+The writer uses eight-byte alignment and the JVM's four-byte end marker, and the unified native Java-layout stream writer stores dictionary, view, list-view and run-end columns in XTDB's plain layouts.
 The standard Arrow stream and schema APIs retain caller-selected options for Flight transport.
 Schema translation and the initial schema-frame buffer belong to the caller's reserved codec scratch; incremental sinks retain no complete stream.
 Budgeted file writers retain schema and block-inventory reservations and acquire footer scratch before finalization.

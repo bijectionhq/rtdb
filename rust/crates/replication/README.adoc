@@ -10,10 +10,11 @@ Term loss fails the reset receipt, so the maintenance caller cannot delete compa
 
 `ReplicationConfig::default` cuts blocks at the reference library defaults, 102,400 rows or 15 minutes, and the server configuration falls back to the same constants.
 
-A leader's put, delete or erase that fails with an error that is not the caller's writes `crashes/<node-id>/<instant truncated to seconds>/crash.edn` to the database's object store before the failure stops ingestion, as the reference's `CrashLogger` does.
-The EDN map holds the failed operation's `:table`, `:tx-key` and `:tx-op-idx`, a `:msg`, and the anomaly as `#xt/error`.
-The reference's live-table, open-transaction and transaction-operation Arrow and trie dumps are not written.
-A failure to write the log is reported on standard error and never replaces the original error.
+A leader's put, delete or erase that fails with an error that is not the caller's writes `crashes/<node-id>/<instant truncated to seconds>/` to the database's object store before the failure stops ingestion, as the reference's `CrashLogger` does.
+`crash.edn` holds the failed operation's `:table`, `:tx-key` and `:tx-op-idx`, a `:msg`, and the anomaly as `#xt/error`.
+Next to it, the crash log writes `tx-ops.arrow` (the transaction's operations stream re-encoded as an Arrow file), the failed table's `live-trie.binpb` and, when the table has rows, `live-table.arrow`.
+Given a `CrashSite`, it also writes `open-tx-table.arrow`, `open-tx-trie.binpb` and `query-rel.arrow`; the resolver does not yet hand its failed operation over, so the driver currently passes no site.
+Crash-log progress and write failures are reported through `tracing` at `WARN`, never on stderr, and a write failure never replaces the original error.
 
 Disabled indexing retains source submission and recovered state while the driver waits for shutdown without consuming either log.
 An operator-selected skipped transaction saves its source payload under the pinned `skipped-txs` key before staging an aborted `xt.txs` row.

@@ -580,3 +580,6 @@ Nondefault JVM assertions and Clojure numeric/print bindings, process identity a
 The explicit `invalid-type` anomaly retains its category, code, message and canonical `type-spec` object through the existing internal Transit JSON wrappers, with admission before conversion.
 Plain JSON and JSON-LD error transports still require a separate review of their rendering of those internal wrappers.
 `tests/transit_vector_types.rs` records JSON/MessagePack constructor, rendering, equality, failure-order and derived-allocation regressions as unexecuted source.
+
+`UPPER` and `LOWER` (along with Clojure's `upper-case` and `lower-case`) follow the process default locale's case rules (read once from `LC_MESSAGES`, matching `Locale.getDefault()`): Turkish and Azeri apply Turkic `I`/`i` rules, Lithuanian applies soft-dotted rules, and every other locale uses root Unicode rules.
+`host_defaults()` fixes this locale at node startup and falls back to the root locale whenever the host locale cannot be read, so an unreadable host locale never prevents startup.

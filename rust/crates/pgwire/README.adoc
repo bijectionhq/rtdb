@@ -61,7 +61,7 @@ Most kinds mark conditions upstream XTDB has no error for, and report PostgreSQL
 * `ProgramLimitExceeded` (a fixed implementation limit, such as a compiled pattern's size) reports `54000`.
 * `NumericValueOutOfRange` (a number that does not fit its type, such as an integer cell wider than its PostgreSQL type) reports `22003`.
 
-`TableNotFound` keeps upstream's state, as does an error without a kind, so an upstream `incorrect` code outside the table still reports `08P01`, as XTDB does.
+Other kinds (`TableNotFound` and the domain-specific conflict, object, basis, grammar and writer/lease kinds) keep upstream's state, as does an error without a kind, so an upstream `incorrect` code outside the table still reports `08P01`, as XTDB does.
 Every error frame that reaches upstream's fall-through `XX000` branch (memory exhaustion, and the not-found, busy, unavailable and fault categories) is logged at `ERROR` before it is sent, as `ex->pgw-err` does; a conflict reported as `XX000` is not.
 Planning warnings use severity `WARNING` and SQLSTATE `01000` and are sent in occurrence order before ParseComplete, simple-query results, or SQL `PREPARE` completion.
 A nested SQL `PREPARE` emits its terminal child's planning warnings when execution reaches that child.

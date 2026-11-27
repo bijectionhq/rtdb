@@ -107,8 +107,9 @@ An optional `AnomalyKind` says what went wrong for the anomalies callers act on 
 `ProgramLimitExceeded` marks work that outgrew a fixed implementation limit, such as a compiled pattern's size.
 `NumericValueOutOfRange` marks a number that does not fit the type it is stored or sent as.
 `TableNotFound` marks a table name that resolved to no table, so a caller can treat an absent table as empty without reading the code.
+`OptimisticConflict`, `MissingObject`, `CorruptObject`, `InputOutOfOrder`, `GrammarRejected`, `BasisAhead`, `UnknownBasis`, `NoWriter` and `ReadExpired` similarly classify conflict, storage, basis, parser and lease outcomes without matching error-code strings.
 The creation site sets the kind; the category still says whose fault it was, so setting a kind never changes whether a transaction aborts.
-Native serde carries a present kind and omits an absent one.
+Native serde carries a present kind and omits an absent one only in human-readable formats, always writing every field in positional binary formats.
 Formats that carry only the code, such as XTDB's Transit errors, recover the kind from the code with `AnomalyKind::from_wire_code`.
 
 == Checked Clojure collection construction

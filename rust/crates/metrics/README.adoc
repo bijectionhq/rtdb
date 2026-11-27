@@ -35,12 +35,14 @@ The supplied execution budget is exported under the root allocator gauge names; 
 Micrometer's `ProcessorMetrics` gauges come from the operating system: `system.cpu.count`, `process.cpu.usage` from `getrusage`, `system.cpu.usage` from Linux's `/proc/stat` and `system.load.average.1m` from `getloadavg`.
 Both usages are measured since the previous sample and normalised over every processor, as the JDK's beans are; a value the platform cannot report is NaN.
 `block.upload.timer` runs from the leader's block cut to the durable append of its `BlockUploaded`, as upstream's `BlockCutter` times it.
+`xtdb.gc.tries.delete.timer` times each collected trie's data and metadata deletes, as upstream's `TrieGarbageCollector` does.
+Follower replica records are published per database from its first follower observation under upstream's `FollowerLogProcessor` names: `xtdb.replica.process.timer` (tagged `db` and `msg.type` in `ResolvedTx`, `TriesAdded`, `BlockBoundary`, `BlockUploaded`, `TriesDeleted`), `xtdb.replica.block.buffer.timer` (tagged `db`), and the `xtdb.replica.block.buffered.records` distribution summary (tagged `db`).
 The node provider adds upstream's `memory-cache.pinnedBytes`, `memory-cache.evictableBytes` (always zero, as upstream's `MemoryCache` registers it) and `memory-cache.freeBytes` over the cache budget, and a per-database `compactor.jobs.available` gauge.
 `query.warning` counts the queries opened from a prepared plan that carries warnings, once per open, as upstream's `xtdb.query` does.
 `memory-cache-misses` counts the reads any buffer pool on the node's cache budget sends to its store.
 A disk-cache registration adds upstream's `RemoteBufferPool` counters: `disk-cache-misses`, and `buffer-pool.network.read` / `buffer-pool.network.write` in bytes, which count the objects the disk cache downloads, cold scan ranges read around it, and uploads through it.
 These counters step by the growth of totals their caches keep, so they follow the step rules below.
-Upstream's `record-batch-requests` and the follower's `xtdb.replica.*` timers are not published.
+Upstream's `record-batch-requests` has no single RTDB counterpart and is not published.
 
 The Kafka feature implements the existing configuration-warning and source-registration interfaces.
 Kafka source counters and instantaneous gauges retain the reference names and tags.
@@ -90,7 +92,9 @@ They are source only under the implementation execution gate.
 It reads the environment variables upstream's `log4j2.xml` and `xtdb.logging/set-from-env!` read.
 `XTDB_LOG_FORMAT` is `text` (the default) or `json`; any other value refuses startup.
 Text lines follow upstream's `HH:mm:ss | LEVEL logger | message` pattern in local time, with event fields appended as `name=value`.
-JSON lines follow the template `XTDB_LOG_JSON_TEMPLATE` names, out of upstream's bundled three; any other template refuses startup, and an empty value is the default.
+JSON lines follow the Log4j2 `JsonTemplateLayout` event template `XTDB_LOG_JSON_TEMPLATE` names, compiled at startup from one of the three bundled `classpath:` templates or from a `file:` URI (`file:///path`, `file://localhost/path` or `file:/path`, up to 1 MiB); an empty value selects the default.
+Supported resolvers are `timestamp` (`pattern` with UTC or fixed offset, and `epoch`), `level` (`name`, `severity`), `logger`, `thread`, `message`, `mdc` (`key`, `flatten`), `source` (`fileName`, `lineNumber`, `className`; `methodName` absent), `counter` (`start`, `stringified`), `pattern` (a PatternLayout subset), `endOfBatch` (`false`), and `exception` / `exceptionRootCause` / `marker` (always omitted, as `tracing` events carry none).
+An unknown `classpath:` URI, an unreadable or invalid `file:` template, or an unsupported resolver or option refuses startup with `rtdb.logging/json-template`.
 
 [cols="2,3"]
 |===
@@ -103,10 +107,9 @@ JSON lines follow the template `XTDB_LOG_JSON_TEMPLATE` names, out of upstream's
 |`Timestamp`, `Severity`, `Message`, `OperationId` / `ParentId` from a `trace_id` / `span_id` field, and `Attributes` with `log.logger.name`, `thread.name` and `custom.context`
 
 |`classpath:GcpLayout.json`
-|`timestamp`, `severity` (`WARNING` for WARN, `DEBUG` for TRACE), `message`, `logging.googleapis.com/labels`, `/trace`, `/spanId`, `/sourceLocation` (file, line and the Rust module as `function`), `/insertId`, `_thread` and `_logger`
+|Log4j 2.26.1's template verbatim: `timestampSeconds`, `timestampNanos`, `severity` (`WARNING` for WARN, `DEBUG` for TRACE, `EMERGENCY` for FATAL), `message`, `logging.googleapis.com/labels`, `/sourceLocation` (`file`, `line`, `function`), `/trace`, `/spanId`, `/trace_sampled`, `thread` and `logger`
 |===
 
-Event exceptions have no `tracing` counterpart, so no layout writes an exception field.
 `XTDB_LOGGING_LEVEL` sets the `xtdb` logger and `XTDB_LOGGING_LEVEL_<NS>` sets `xtdb.<ns>`, with `_` separating components; values are log4j2 level names, and an unknown one refuses startup.
 A `rtdb_<crate>::<module>` target is the logger `xtdb.<crate>.<module>`, with `_` inside a component written as `-`, so `XTDB_LOGGING_LEVEL_STORAGE_DISK-CACHE=debug` reaches `rtdb_storage::disk_cache`.
 Targets that stand for one of upstream's main loggers also answer to that logger's name, and the more specific configured level of the two applies:
@@ -115,11 +118,21 @@ Targets that stand for one of upstream's main loggers also answer to that logger
 |===
 |Rust target |Upstream logger
 
-|`rtdb_tx`, `rtdb_index` |`xtdb.indexer`
+|`rtdb_tx`, `rtdb_index`, `rtdb_replication` |`xtdb.indexer`
 |`rtdb_maintenance::gc`, `rtdb_maintenance::retention` |`xtdb.garbage-collector`
 |`rtdb_maintenance` (otherwise) |`xtdb.compactor`
 |`rtdb_pgwire` |`xtdb.pgwire`
 |`rtdb_flight_sql` |`xtdb.flight-sql`
+|`rtdb_expr` |`xtdb.expression`
+|`rtdb_columnar` |`xtdb.arrow`
+|`rtdb_plan` |`xtdb.logical-plan`
+|`rtdb_auth` |`xtdb.authn`
+|`rtdb_server::health` |`xtdb.healthz`
+|`rtdb_server::prometheus` |`xtdb.metrics`
+|`rtdb_server::tracing` |`xtdb.tracer`
+|`rtdb_s3` |`xtdb.aws`
+|`rtdb_gcs` |`xtdb.gcp`
+|`rtdb_pg_source` |`xtdb.postgres`
 |===
 
 Every other target is reachable only by its `xtdb.<crate>.<module>` name; lines name the logger by that name.

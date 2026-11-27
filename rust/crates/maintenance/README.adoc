@@ -68,6 +68,7 @@ Collection can resume those intents after restart even when the age policy selec
 L0 recovery files are excluded.
 Block collection removes expired catalog, table-block, and oversized-message objects without replica publication.
 Per-table failures are reported through `CollectionObserver` and isolated from other tables.
+Each deleted trie's deletion duration is reported through `CollectionObserver::trie_deleted` (`xtdb.gc.tries.delete.timer`).
 An administrative awaiter receives a cycle started after its request; automatic signals alone are subject to the enabled flag.
 
 == Reference and qualification
