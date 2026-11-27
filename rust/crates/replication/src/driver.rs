@@ -1459,9 +1459,14 @@ impl ReplicationDriver {
     }
 
     async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
-        if matches!(&record.envelope.message, ReplicaBody::NoOp(message)
-            if message.src_msg_id.is_none() && message.placed_slot_reservation.is_none() && message.serving_record.is_none())
+        if let ReplicaBody::NoOp(message) = &record.envelope.message
+            && message.src_msg_id.is_none()
+            && message.placed_slot_reservation.is_none()
+            && message.serving_record.is_none()
         {
+            if let Some(until) = message.clock_lease_micros {
+                self.clock_lease = self.clock_lease.max(until);
+            }
             return self.record_applied(record.metadata.position);
         }
         if let Some(leader) = &mut self.leader {
