@@ -166,12 +166,73 @@ fn a_large_upload_header_uses_transport_bytes_without_inflating_the_command_gran
 fn update_ack() -> Vec<Result<PutResult, Status>> { vec![Ok(PutResult { app_metadata: DoPutUpdateResult { record_count: -1 }.encode_to_vec().into() })] }
 fn validate_ingest(command: &CommandStatementIngest, database: &str) -> Result<(), Status> {
     if let Some(options) = command.table_definition_options {
-        if options.if_exists != TableExistsOption::Unspecified as i32 && options.if_exists != TableExistsOption::Append as i32 { return Err(invalid("Bulk ingest only supports append-on-exists")); }
-        if options.if_not_exist != TableNotExistOption::Unspecified as i32 && options.if_not_exist != TableNotExistOption::Create as i32 { return Err(invalid("Bulk ingest auto-creates tables and cannot fail-if-not-exist")); }
+        if options.if_exists != TableExistsOption::Unspecified as i32 && options.if_exists != TableExistsOption::Append as i32 {
+            let got = TableExistsOption::try_from(options.if_exists)
+                .map(|option| std::borrow::Cow::Borrowed(option.as_str_name()))
+                .unwrap_or_else(|_| std::borrow::Cow::Owned(options.if_exists.to_string()));
+            return Err(invalid(format!("Bulk ingest only supports append-on-exists for now (got {got})")));
+        }
+        if options.if_not_exist != TableNotExistOption::Unspecified as i32 && options.if_not_exist != TableNotExistOption::Create as i32 {
+            let got = TableNotExistOption::try_from(options.if_not_exist)
+                .map(|option| std::borrow::Cow::Borrowed(option.as_str_name()))
+                .unwrap_or_else(|_| std::borrow::Cow::Owned(options.if_not_exist.to_string()));
+            return Err(invalid(format!("Bulk ingest cannot honour fail-if-not-exist: XTDB auto-creates tables on insert (got {got})")));
+        }
     }
-    if command.catalog.as_deref().is_some_and(|catalog| !catalog.is_empty() && catalog != database) { return Err(invalid("Bulk ingest catalog must match the connection catalog")); }
-    if command.table.contains('.') { return Err(invalid("Bulk ingest table name must not contain '.'; use the schema field")); }
+    if let Some(catalog) = command.catalog.as_deref().filter(|catalog| !catalog.is_empty() && *catalog != database) {
+        return Err(invalid(format!("Bulk ingest catalog must match the connection catalog (got '{catalog}', connection '{database}')")));
+    }
+    if command.table.contains('.') {
+        return Err(invalid(format!("Bulk ingest table name must not contain '.'; use the schema field for schema-qualified targets (got '{}')", command.table)));
+    }
     Ok(())
+}
+
+#[test]
+fn bulk_ingest_validation_messages_match_xtdb() {
+    use arrow_flight::sql::TableDefinitionOptions;
+
+    let valid = CommandStatementIngest {
+        table_definition_options: Some(TableDefinitionOptions {
+            if_exists: TableExistsOption::Append as i32,
+            if_not_exist: TableNotExistOption::Create as i32,
+        }),
+        table: "docs".into(),
+        catalog: Some("xtdb".into()),
+        ..Default::default()
+    };
+    validate_ingest(&valid, "xtdb").unwrap();
+    validate_ingest(&CommandStatementIngest { table: "docs".into(), catalog: Some(String::new()), ..Default::default() }, "xtdb").unwrap();
+
+    for (command, expected) in [
+        (
+            CommandStatementIngest {
+                table_definition_options: Some(TableDefinitionOptions { if_exists: TableExistsOption::Replace as i32, ..Default::default() }),
+                table: "docs".into(),
+                ..Default::default()
+            },
+            "Bulk ingest only supports append-on-exists for now (got TABLE_EXISTS_OPTION_REPLACE)",
+        ),
+        (
+            CommandStatementIngest {
+                table_definition_options: Some(TableDefinitionOptions { if_not_exist: TableNotExistOption::Fail as i32, ..Default::default() }),
+                table: "docs".into(),
+                ..Default::default()
+            },
+            "Bulk ingest cannot honour fail-if-not-exist: XTDB auto-creates tables on insert (got TABLE_NOT_EXIST_OPTION_FAIL)",
+        ),
+        (
+            CommandStatementIngest { table: "docs".into(), catalog: Some("other".into()), ..Default::default() },
+            "Bulk ingest catalog must match the connection catalog (got 'other', connection 'xtdb')",
+        ),
+        (
+            CommandStatementIngest { table: "public.docs".into(), ..Default::default() },
+            "Bulk ingest table name must not contain '.'; use the schema field for schema-qualified targets (got 'public.docs')",
+        ),
+    ] {
+        let error = validate_ingest(&command, "xtdb").unwrap_err();
+        assert_eq!((error.code(), error.message()), (tonic::Code::InvalidArgument, expected));
+    }
 }
 pub(crate) fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
     decode_documents(batch, service.memory(), None, rtdb_columnar::read_execution_value_as)
