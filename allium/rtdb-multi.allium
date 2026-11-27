@@ -56,7 +56,7 @@
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- The target serving protocol uses scoped attempt receipts and a loglet read index.
 -- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
--- An installed deployment may enable direct synchronous SQL commits after its replay consumers support direct outcomes.
+-- An installed deployment uses direct commits for ordinary synchronous SQL.
 -- The native writer journals the ordinary attempt's admission witness and resolved outcome in the same replica record.
 -- Applied read-back supplies the synchronous receipt.
 -- Explicit asynchronous and timed SQL keep the placed receiver reservation protocol.

@@ -1586,7 +1586,7 @@ async fn recover_after_writer_loss(prepare_before_loss: bool, coverage: Recovery
             .data
             .path()
             .join(format!("worker-route-{index}.json"));
-        let mut manifest = json!({
+        let manifest = json!({
             "deployment": record,
             "worker": installed_client(&authority.workers[index], json!({"kind": "worker", "enrollment": authority.enrollments[index]})),
             "custody": (prepare_before_loss || index == 1)
@@ -1596,9 +1596,6 @@ async fn recover_after_writer_loss(prepare_before_loss: bool, coverage: Recovery
             "archive_prefix": "checkpoints",
             "checkpoint_reservations": reservations,
         });
-        if combined_features {
-            manifest["direct_sql_commits"] = json!(true);
-        }
         write_json(&path, &json!([manifest]));
         let control_address = control.local_addr().unwrap();
         let pgwire_port = pgwire.local_addr().unwrap().port();
@@ -1678,22 +1675,16 @@ async fn recover_after_writer_loss(prepare_before_loss: bool, coverage: Recovery
     ));
 
     let initial = common::connect(&sql_address.to_string(), "shop").await;
-    let empty_head = if combined_features {
-        assert_eq!(common::values(&initial, "SELECT 1").await, ["1"]);
-        Some(route(&routing).await.head)
-    } else {
-        None
-    };
+    assert_eq!(common::values(&initial, "SELECT 1").await, ["1"]);
+    let empty_head = route(&routing).await.head;
     initial
         .simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)")
         .await
         .unwrap();
     drop(initial);
     let before = route(&routing).await;
-    if let Some(empty_head) = empty_head {
-        assert_eq!(before.head.next_lsn, empty_head.next_lsn + 1);
-        assert_eq!(before.last_data, Some(before.head));
-    }
+    assert_eq!(before.head.next_lsn, empty_head.next_lsn + 1);
+    assert_eq!(before.last_data, Some(before.head));
     let incumbent = before.writer.grant.unwrap();
     let incumbent_index = authority
         .enrollments

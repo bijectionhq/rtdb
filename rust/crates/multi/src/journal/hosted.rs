@@ -56,8 +56,6 @@ struct Definition {
     archive: crate::deployment::CellStorage,
     archive_prefix: String,
     journal_window_bytes: Option<u64>,
-    #[serde(default)]
-    direct_sql_commits: bool,
     endpoints: Vec<WorkerEndpoint>,
     #[serde(default)]
     checkpoint_reservations: Vec<Reservation>,
@@ -83,7 +81,6 @@ pub(crate) struct Placement {
     archive: crate::deployment::CellStorage,
     archive_prefix: ObjectKey,
     journal_window_bytes: Option<u64>,
-    direct_sql_commits: bool,
     nomination: tokio::sync::Mutex<Option<Request>>,
     retention: retention::Retention,
     reader_opening: parking_lot::Mutex<std::sync::Weak<Held>>,
@@ -285,7 +282,6 @@ impl Routes {
             archive: entry.archive,
             archive_prefix: ObjectKey::new(entry.archive_prefix)?,
             journal_window_bytes: entry.journal_window_bytes,
-            direct_sql_commits: entry.direct_sql_commits,
             custody_work,
             erasure_signer,
             nomination: Default::default(),
@@ -331,7 +327,6 @@ impl Routes {
             deployment, worker, endpoints, custody: None, custody_work: None, erasure_signing_key: None,
             archive: runtime.cell.archive()?, archive_prefix: format!("deployments/{}", scope.deployment),
             journal_window_bytes: None, checkpoint_reservations: Vec::new(),
-            direct_sql_commits: runtime.cell.direct_sql_commits,
         };
         let placement = Self::placement(definition, &runtime.serving, None)?;
         let mut opened = runtime.opened.write();
@@ -1283,7 +1278,6 @@ impl LogFactory for Logs {
             admission,
             attachment.base.checkpoint,
             max_frame,
-            placement.direct_sql_commits,
             cancellation,
         )
         .await

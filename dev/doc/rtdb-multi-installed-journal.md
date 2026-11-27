@@ -32,7 +32,6 @@ The cell file contains the following fields.
 | `keys` | Serving and journal key vault location |
 | `maximum_prefix_bytes`, `maximum_application_frame` | Voter media prefix and application frame sizes for each group |
 | `exchange_ms` | Management deadline in milliseconds, defaulting to 2000 |
-| `direct_sql_commits` | Enables one logical append for ordinary synchronous SQL after all workers in the cell can replay direct outcomes. Defaults to false. |
 | `administrator_pin`, `route_reader_pin`, optional `custodian_pin` | SHA-256 pins encoded as 32-byte arrays |
 | `workers` | Ordered array of configured worker slots with `worker` UUID, `certificate` pin, `control` and `pgwire` addresses |
 | `credentials` | Optional per-role objects `administrator`, `route_reader`, `worker` and `custodian`, each with a PEM `certificate` and `key` path |
@@ -118,11 +117,8 @@ The manifests contain arrays. A node entry includes:
 - `checkpoint_reservations` with preassigned allocation UUIDs, the exact provider fingerprint in `custody.provider`, consecutive revisions starting after the installed checkpoint, and `usable_bytes` for each exact allocation. Fund peak old retention, the new copy and its metadata. Renew the reservation inventory before it runs out. Nodes and replacements must agree on an already prepared allocation.
 - For SQL erasure, `custody_work` supplies the broker domain UUID and the path to the enrolled PKCS#8 `admission_key`. The installed custodian also supplies `erasure_signing_key` with the separate PKCS#8 credential that matches the root's broker-enrolled evidence key. Provide the custody broker route and its privileged token to the custodian.
 - Optionally, `journal_window_bytes` to cap each automatically replenished append window. The actual funded amount is bounded by paid, currently reusable voter space.
-- Optionally, set `direct_sql_commits` to true on the same deployment in every worker's manifest once the workers and offline replay tools understand direct placed outcomes.
-  Upgrade every replay consumer before enabling the flag.
-  The first direct record creates history that older workers cannot replay.
 
-**Direct synchronous SQL.** The writer records the original admission and applied outcome together in its resolved replica record.
+**Ordinary synchronous SQL.** The installed writer records the original admission and applied outcome together in one resolved replica record.
 A lost reply can be retried with the existing scoped idempotency key.
 Gateway private replay permits use the same direct path and check replay markers in the ordered transaction prefix.
 Explicit asynchronous submissions and operations that require a prior receiver reservation keep the original reservation and settlement protocol.

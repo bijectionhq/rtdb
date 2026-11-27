@@ -249,7 +249,6 @@ pub(crate) async fn ordered_opened(
     admission: crate::journal::WriterAdmission,
     checkpoint: Option<rtdb_directory::Checkpoint>,
     maximum_message_bytes: usize,
-    direct_sql_commits: bool,
     cancellation: CancellationToken,
 ) -> Result<OpenedLogs> {
     let epoch = StorageEpoch(record.log_epoch);
@@ -298,7 +297,7 @@ pub(crate) async fn ordered_opened(
             codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
             recovery: ClosedEpochRecovery::Opened(opened),
             placed_receipt_retirement: record.placed_receipt_retirement,
-            direct_sql_commits,
+            admits_direct_commits: true,
         },
         drivers: vec![trimming],
     })
@@ -316,7 +315,7 @@ pub(crate) fn ordered_reader_opened(
         AwaitAuthority::Live {
             codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
             recovery: ClosedEpochRecovery::ReadIndex(index()), placed_receipt_retirement: record.placed_receipt_retirement,
-            direct_sql_commits: false,
+            admits_direct_commits: false,
         }
     };
     let next = checkpoint.map_or(0, |checkpoint| checkpoint.source.saturating_add(1));
@@ -412,7 +411,7 @@ impl LogFactory for LogkeeperLogFactory {
                 ClosedEpochRecovery::ReadIndex(read_index())
             };
             AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery,
-                placed_receipt_retirement: config.placed_receipt_retirement, direct_sql_commits: false }
+                placed_receipt_retirement: config.placed_receipt_retirement, admits_direct_commits: false }
         } else { AwaitAuthority::Frozen };
         let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &config, Arc::clone(&self.holds)).await?);
         let intake_cut = include_placed_debt(config.transfer_intake_cut, config.placed_transfer.as_ref())?;

@@ -864,7 +864,7 @@ impl Node {
             None => (source, None),
         };
         let source = if mode == CommitMode::Sync && matches!(&database.await_authority,
-            AwaitAuthority::Live { direct_sql_commits: true, .. })
+            AwaitAuthority::Live { admits_direct_commits: true, .. })
         {
             source.with_direct_placed_commit()
         } else {
