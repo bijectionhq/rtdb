@@ -464,6 +464,8 @@ The native corpus runs upstream XTDB's own Clojure test Vars against the native 
 The runners put that tree ahead of this repository's test classpath, so neither the RTDB-edited test files nor the edited `xtdb.test-util` load; the runner refuses a namespace whose source resolves elsewhere and stops if `xtdb.test-util` does.
 The harness routes node construction, `tu/query-ra`, `tu/flush-block!` and the connectables to the native engine.
 Selected Flight SQL, pgwire and Healthz tests resolve their listener ports through the native binding, with their original options, fixtures and assertions.
+The two Flight multi-database Vars attach their secondary database with `ATTACH DATABASE` over the native node's pgwire listener and read it back from the native catalog.
+The in-process ADBC Var opens its connection through `xt/open-adbc-conn`, and both Vars keep their original assertions and result rows.
 The latest-completed-transaction fixture uses the native node's transaction status, with the same per-database vectors as the upstream helper.
 Set `XTDB_UPSTREAM_COMMIT` to run another upstream commit and `XTDB_UPSTREAM_REPO` to read it from another clone; when the commit is missing, `git fetch --filter=blob:none https://github.com/xtdb/xtdb.git <commit>` first.
 

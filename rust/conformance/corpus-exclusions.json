@@ -308,14 +308,6 @@
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
-   "var": "xtdb.flight-sql-test/test-adbc-multi-db",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.flight-sql-test/test-flightsql-multi-db",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
    "var": "xtdb.flight-sql.playground-test/catalog-option-creates-the-database",
    "decision": "native-node-config-is-yaml"
   },

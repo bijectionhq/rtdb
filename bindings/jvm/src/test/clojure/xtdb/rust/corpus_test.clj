@@ -6,7 +6,8 @@
             [xtdb.test-util :as tu])
   (:import [java.net URL URLClassLoader]
            [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+           [java.nio.file.attribute FileAttribute]
+           [xtdb.rust NativeDatabase]))
 
 (defn- temp-dir []
   (.toFile (Files/createTempDirectory "corpus-test" (make-array FileAttribute 0))))
@@ -56,6 +57,52 @@
              (adapt 'xtdb.api-flight-sql-test source)))
     (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected upstream listener port call sites"
                             (adapt 'xtdb.api-flight-sql-test "")))))
+
+(t/deftest flight-catalog-adapter-preserves-the-vars-and-their-assertions
+  (let [adapt #'corpus/adapt-flight-catalog
+        test-ns 'xtdb.flight-sql-test
+        adbc-setup "(t/deftest test-adbc-multi-db
+  (let [db-cat (.getDbCatalog ^XtdbInternal tu/*node*)]
+    (.attach db-cat \"other-db\" nil)
+
+    (with-open [conn (.connect ^Xtdb tu/*node*)]"
+        adbc-assertion "
+      (t/is (= \"xtdb\" (.getCurrentCatalog conn))))))\n"
+        flight-setup "(t/deftest test-flightsql-multi-db
+  (let [db-cat (.getDbCatalog ^XtdbInternal tu/*node*)
+        other-db-opts (db-call-opts \"other-db\")]
+    (.attach db-cat \"other-db\" nil)"
+        flight-assertion "
+    (t/is (= -1 (.executeUpdate *client* \"INSERT INTO users (_id) VALUES (1)\" other-db-opts)))))\n"
+        unrelated "(t/deftest jvm-catalog-test
+  (let [db-cat (.getDbCatalog ^XtdbInternal tu/*node*)]
+    (.attach db-cat \"other-db\" nil)))"
+        source (str adbc-setup adbc-assertion flight-setup flight-assertion unrelated)]
+    (t/is (= (str "(t/deftest test-adbc-multi-db
+  (let [node tu/*node*]
+    (xtdb.rust.corpus/native-attach-default-database! node \"other-db\")
+
+    (with-open [conn (xt/open-adbc-conn node)]"
+                  adbc-assertion
+                  "(t/deftest test-flightsql-multi-db
+  (let [other-db-opts (db-call-opts \"other-db\")]
+
+    (xtdb.rust.corpus/native-attach-default-database! tu/*node* \"other-db\")"
+                  flight-assertion
+                  unrelated)
+             (adapt test-ns source)))
+    (doseq [drifted [(str adbc-setup adbc-assertion)
+                     (str flight-setup flight-assertion)
+                     (str source adbc-setup)
+                     (str source flight-setup)]]
+      (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected upstream Flight catalog call sites"
+                              (adapt test-ns drifted))))))
+
+(t/deftest flight-catalog-setup-attaches-a-secondary-to-the-native-node
+  (with-open [^NativeDatabase node (corpus/native-start-node {:flight-sql nil})]
+    (t/is (= #{"xtdb"} (set (.getDatabaseNames node))))
+    (corpus/native-attach-default-database! node "other-db")
+    (t/is (= #{"xtdb" "other-db"} (set (.getDatabaseNames node))))))
 
 (t/deftest a-corpus-namespace-publishes-its-vars-before-outcomes
   (let [root (temp-dir)

@@ -6,6 +6,7 @@
             [clojure.string :as str]
             [clojure.test :as t]
             [jsonista.core :as json]
+            [next.jdbc :as jdbc]
             [xtdb.api :as xt]
             [xtdb.flight-sql :as fsql]
             [xtdb.log :as xt-log]
@@ -192,6 +193,13 @@
     (swap! touched assoc :native true)
     (update-vals (into {} partitions) vec)))
 
+(defn native-attach-default-database! [^NativeDatabase node db-name]
+  (jdbc/execute! node [(str "ATTACH DATABASE \"" (str/replace db-name "\"" "\"\"") "\"")])
+  (when-not (.contains (.getDatabaseNames node) db-name)
+    (throw (ex-info "Attached database is missing from the native catalog" {:db-name db-name})))
+  (swap! touched assoc :native true)
+  nil)
+
 (def ^:private native-connectables
   {:adbc (fn [node f] (f node))
    :pgwire (fn [node f] (f (xt/client {:port (native-listener-port node :pgwire)})))
@@ -312,18 +320,49 @@
                      [1 "(.getServerReadOnlyPort node)" "node" :pgwire-read-only]]
    'xtdb.healthz-test [[9 "(.getHealthzPort node)" "node" :healthz]]})
 
+(defn- replace-upstream-call-site [source test-ns kind expected site replacement]
+  (when-not (= expected (count (re-seq (re-pattern (Pattern/quote site)) source)))
+    (throw (ex-info (str "Unexpected upstream " kind " call sites") {:namespace test-ns :site site})))
+  (str/replace source site replacement))
+
 (defn- adapt-listener-ports [test-ns source]
   (reduce (fn [source [expected site receiver listener]]
-            (when-not (= expected (count (re-seq (re-pattern (Pattern/quote site)) source)))
-              (throw (ex-info "Unexpected upstream listener port call sites" {:namespace test-ns :site site})))
-            (str/replace source site (str "(xtdb.rust.corpus/native-listener-port " receiver " " listener ")")))
+            (replace-upstream-call-site source test-ns "listener port" expected site
+                                        (str "(xtdb.rust.corpus/native-listener-port " receiver " " listener ")")))
           source
           (listener-call-sites test-ns)))
 
+(defn- adapt-flight-catalog [test-ns source]
+  (-> source
+      (replace-upstream-call-site
+       test-ns "Flight catalog" 1
+       "(t/deftest test-adbc-multi-db
+  (let [db-cat (.getDbCatalog ^XtdbInternal tu/*node*)]
+    (.attach db-cat \"other-db\" nil)
+
+    (with-open [conn (.connect ^Xtdb tu/*node*)]"
+       "(t/deftest test-adbc-multi-db
+  (let [node tu/*node*]
+    (xtdb.rust.corpus/native-attach-default-database! node \"other-db\")
+
+    (with-open [conn (xt/open-adbc-conn node)]")
+      (replace-upstream-call-site
+       test-ns "Flight catalog" 1
+       "(t/deftest test-flightsql-multi-db
+  (let [db-cat (.getDbCatalog ^XtdbInternal tu/*node*)
+        other-db-opts (db-call-opts \"other-db\")]
+    (.attach db-cat \"other-db\" nil)"
+       "(t/deftest test-flightsql-multi-db
+  (let [other-db-opts (db-call-opts \"other-db\")]
+
+    (xtdb.rust.corpus/native-attach-default-database! tu/*node* \"other-db\")")))
+
 (defn- load-test-source [test-ns ^File file]
   (if (contains? listener-call-sites test-ns)
-    (with-open [reader (StringReader. (adapt-listener-ports test-ns (slurp file)))]
-      (Compiler/load reader (.getPath file) (.getName file)))
+    (let [source (adapt-listener-ports test-ns (slurp file))
+          source (cond->> source (= 'xtdb.flight-sql-test test-ns) (adapt-flight-catalog test-ns))]
+      (with-open [reader (StringReader. source)]
+        (Compiler/load reader (.getPath file) (.getName file))))
     (load-file (.getPath file))))
 
 (defn- test-vars [^File root ns-sym]
