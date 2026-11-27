@@ -298,4 +298,6 @@ private class FixedWidthRows(private val vec: FixedWidthVector) :
     override fun readAsDouble() = vec.getAsDouble(pos)
     override fun readBytes() = vec.getBytes(pos)
     override fun readObject(keyFn: IKeyFn<*>) = vec.getObject(pos, keyFn)
+    override fun copyIdentityTo(dest: VectorWriter) =
+        vec is DecimalVector && dest is DecimalVector && dest.tryCopyValue(vec, pos)
 }

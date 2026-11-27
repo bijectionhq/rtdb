@@ -87,7 +87,42 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
         else -> throw InvalidWriteObjectException(this, value)
     }
 
-    override fun writeValue0(v: ValueReader) = writeObject(v.readObject())
+    internal fun tryCopyValue(src: MapVector, idx: Int): Boolean {
+        if (src.arrowType != arrowType || src.childFields != childFields || (src.nullable && !nullable)) return false
+        val entries = src.listElements as? StructVector ?: return false
+        if (entries.nullable || entries.keyNames.size != 2) return false
+
+        val keys = src.mapKeys
+        val values = src.mapValues
+        if (keys.nullable || keys.name != MAP_KEYS_NAME || values.name != MAP_VALUES_NAME) return false
+
+        val keyType = keys.arrowType
+        val valueType = values.arrowType
+        when (keyType) {
+            I8_TYPE, I16_TYPE, I32_TYPE, I64_TYPE, UTF8_TYPE -> Unit
+            else -> return false
+        }
+        if (!valueType.hasScalarObjectIdentity() && valueType != UTF8_TYPE) return false
+        if (keys.type.encoding != Encoding.Plain || values.type.encoding != Encoding.Plain) return false
+
+        val start = src.getListStartIndex(idx)
+        val count = src.getListCount(idx)
+        val seen = if (count > 1) HashSet<Any>() else null
+        for (i in start until start + count) {
+            if (keyType == UTF8_TYPE) {
+                if (!keys.isAscii(i) || seen?.add(keys.getBytes(i)) == false) return false
+            } else if (seen?.add(keys.getAsLong(i)) == false) return false
+
+            if (valueType == UTF8_TYPE && !values.isNull(i) && !values.isAscii(i)) return false
+        }
+
+        src.rowCopier(this).copyRow(idx)
+        return true
+    }
+
+    override fun writeValue0(v: ValueReader) {
+        if (!v.copyIdentityTo(this)) writeObject(v.readObject())
+    }
 
     override val listElements get() = listVector.listElements
     override fun getListElements(arrowType: ArrowType, nullable: Boolean) = listVector.getListElements(arrowType, nullable)

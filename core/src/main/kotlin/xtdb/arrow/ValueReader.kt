@@ -32,6 +32,9 @@ interface ValueReader {
     /** Reads one child of the positioned, non-null struct. */
     fun readField(name: String): ValueReader? = readStruct()[name]
 
+    /** Appends the positioned, non-null value if an identity copy is valid. Returns false before any write otherwise. */
+    fun copyIdentityTo(dest: VectorWriter): Boolean = false
+
     class ForVector(private val vec: VectorReader) : RowValueReader {
         override var pos: Int = -1
 
@@ -53,5 +56,7 @@ interface ValueReader {
         override fun readAsDouble() = vec.getAsDouble(pos)
         override fun readBytes() = vec.getBytes(pos)
         override fun readObject(keyFn: IKeyFn<*>) = vec.getObject(pos, keyFn)
+        override fun copyIdentityTo(dest: VectorWriter) =
+            vec is MapVector && dest is MapVector && dest.tryCopyValue(vec, pos)
     }
 }

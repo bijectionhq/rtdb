@@ -136,6 +136,7 @@ class DenseUnionVector private constructor(
                 override fun readList() = rdr.readList()
                 override fun readStruct() = rdr.readStruct()
                 override fun readField(name: String) = rdr.readField(name)
+                override fun copyIdentityTo(dest: VectorWriter) = rdr.copyIdentityTo(dest)
             }
         }
 
@@ -353,6 +354,7 @@ class DenseUnionVector private constructor(
             override fun readList() = legReader.readList()
             override fun readStruct() = legReader.readStruct()
             override fun readField(name: String) = legReader.readField(name)
+            override fun copyIdentityTo(dest: VectorWriter) = legReader.copyIdentityTo(dest)
         }
     }
 

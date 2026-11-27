@@ -2413,6 +2413,8 @@ surface QueryAccess {
         -- Computed records with compatible scalar children evaluate all their fields before writing the record.
         -- A nested field read follows the reached child through each valid ancestor and yields null for a null ancestor.
         -- A compatible PATCH result selects each right-hand field when it supplies a non-null value and otherwise keeps the corresponding left-hand field when present.
+        -- Arrow map value writes retain the declared key-order flag and keep the last value of a repeated key at its first position.
+        -- A positioned decimal identity write retains the original coefficient and scale and applies the destination's declared precision.
 
     @guarantee ColumnarScanProjection
         -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.

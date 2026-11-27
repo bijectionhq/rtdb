@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import org.apache.arrow.vector.types.pojo.ArrowType.Struct.INSTANCE as STRUCT_TYPE
 
@@ -50,6 +51,40 @@ class MapVectorTest {
             mapVec.writeObject(m3)
 
             assertEquals(listOf(m1, m2, m3), mapVec.asList)
+        }
+    }
+
+    @Test
+    fun `value writes copy unique map entries and preserve map decoding`() {
+        for (keysSorted in listOf(false, true)) {
+            val type = VectorType.mapTypeOf(VectorType.I32, VectorType.maybe(VectorType.UTF8), keysSorted)
+            Vector.open(allocator, "src", type).use { src ->
+                src.writeObject(linkedMapOf(1 to "one", 2 to null))
+                val repeated = listOf(3 to "first", 4 to "four", 3 to "last")
+                for ((key, value) in if (keysSorted) repeated.sortedBy { it.first } else repeated) {
+                    src.mapKeys.writeInt(key)
+                    src.mapValues.writeObject(value)
+                    src.listElements.endStruct()
+                }
+                src.endList()
+                src.mapKeys.writeInt(5)
+                src.mapValues.writeBytes(byteArrayOf(0xff.toByte()))
+                src.listElements.endStruct()
+                src.endList()
+
+                Vector.open(allocator, "dst", type).use { dst ->
+                    val reader = src.valueReader()
+                    assertTrue(reader.next().copyIdentityTo(dst))
+                    dst.writeValue(reader.next())
+                    dst.writeValue(reader.next())
+
+                    assertEquals(ArrowType.Map(keysSorted), dst.arrowType)
+                    assertEquals(listOf(1, 2, 3, 4, 5), dst.mapKeys.asList)
+                    assertEquals(listOf("one", null, "last", "four", "\uFFFD"), dst.mapValues.asList)
+                    assertEquals(ByteBuffer.wrap("\uFFFD".toByteArray()), dst.mapValues.getBytes(4))
+                    assertEquals(listOf(2, 2, 1), (0 until dst.valueCount).map(dst::getListCount))
+                }
+            }
         }
     }
 

@@ -12,8 +12,10 @@ import xtdb.api.error.Unsupported
 import xtdb.hash.addDoubles
 import xtdb.util.Hasher
 import java.math.BigDecimal
+import java.nio.ByteOrder
 
 private const val DECIMAL_ERROR_KEY = "xtdb.error/decimal-error"
+private val LITTLE_ENDIAN = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
 
 class DecimalVector private constructor(
     override val al: BufferAllocator,
@@ -79,7 +81,33 @@ class DecimalVector private constructor(
         } else throw InvalidWriteObjectException(this, value)
     }
 
-    override fun writeValue0(v: ValueReader) = writeObject(v.readObject())
+    internal fun tryCopyValue(src: DecimalVector, idx: Int): Boolean {
+        if (arrowType != src.arrowType || precision < 1) return false
+
+        // A coefficient fitting in 3p magnitude bits is smaller than 10^p, including the negative boundary.
+        val signBit = minOf(bitWidth - 1L, 3L * precision).toInt()
+        val signByte = signBit / Byte.SIZE_BITS
+        val offset = idx.toLong() * byteWidth
+        val srcBuffer = src.dataBuffer
+        fun readByte(i: Int): Int {
+            val physicalIndex = if (LITTLE_ENDIAN) i else byteWidth - 1 - i
+            return srcBuffer.getByte(offset + physicalIndex).toInt()
+        }
+
+        val sign = readByte(signByte) shr (signBit % Byte.SIZE_BITS)
+        if (sign != 0 && sign != -1) return false
+        for (i in signByte + 1 until byteWidth) {
+            if (readByte(i) != sign) return false
+        }
+
+        dataBuffer.writeBytes(srcBuffer, offset, byteWidth.toLong())
+        writeNotNull()
+        return true
+    }
+
+    override fun writeValue0(v: ValueReader) {
+        if (!v.copyIdentityTo(this)) writeObject(v.readObject())
+    }
 
     override fun sumInto(outVec: Vector): VectorSummer {
         if (outVec !is DecimalVector) return super.sumInto(outVec)
