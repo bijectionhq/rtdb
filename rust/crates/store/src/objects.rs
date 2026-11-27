@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use rtdb_crypt::{Context, Generation, Kms, Plaintext};
 use rtdb_format::journal::{Manifest, ObjectId, ObjectKind};
+use rtdb_storage::{ObjectObservation, ObjectVersionHold};
 use rtdb_types::{Anomaly, PhysicalObjectPublication, PhysicalObjectVersion, Result};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -235,6 +236,44 @@ pub async fn read_fresh_manifest(
     require_kind(id, ObjectKind::Manifest)?;
     let bytes = store.get_fresh(&key(id)?).await?;
     decode_manifest(id, open(kms, id, &bytes).await?)
+}
+
+/// Reopens the manifest and checks the hold on the provider version that supplied its bytes.
+pub async fn read_held_manifest(
+    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, hold: &dyn ObjectVersionHold,
+) -> Result<(VerifiedManifest, PhysicalObjectVersion)> {
+    require_kind(id, ObjectKind::Manifest)?;
+    let (plaintext, version) = read_held(store, kms, id, usize::MAX, hold).await?;
+    Ok((decode_manifest(id, plaintext)?, version))
+}
+
+/// Authenticates a bounded file and checks the hold on its exact provider version.
+pub async fn read_held_file(
+    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, limit: usize, hold: &dyn ObjectVersionHold,
+) -> Result<(Plaintext, PhysicalObjectVersion)> {
+    require_kind(id, ObjectKind::File)?;
+    read_held(store, kms, id, limit, hold).await
+}
+
+async fn read_held(
+    store: &dyn ObjectStore, kms: &dyn Kms, id: ObjectId, limit: usize, hold: &dyn ObjectVersionHold,
+) -> Result<(Plaintext, PhysicalObjectVersion)> {
+    let key = key(id)?;
+    let (bytes, version) = read_held_bytes(store, &key, limit, hold).await?;
+    Ok((open(kms, id, &bytes).await?, version))
+}
+
+pub(crate) async fn read_held_bytes(
+    store: &dyn ObjectStore, key: &ObjectKey, limit: usize, hold: &dyn ObjectVersionHold,
+) -> Result<(Bytes, PhysicalObjectVersion)> {
+    let size = usize::try_from(store.head_fresh(key).await?.size).ok().filter(|size| *size <= limit)
+        .ok_or_else(|| Anomaly::unsupported("rtdb.store/file-size", "The encrypted object exceeds the read budget"))?;
+    let ObjectObservation { value, version } = store.observe_fresh_exact(key, size).await?;
+    let version = version.ok_or_else(|| Anomaly::unsupported(
+        "rtdb.store/backup-object-version", "The provider did not identify an immutable version of the backup object",
+    ))?;
+    hold.require_held(key, &version).await?;
+    Ok((value, version))
 }
 
 fn decode_manifest(id: ObjectId, plaintext: Plaintext) -> Result<VerifiedManifest> {

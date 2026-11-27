@@ -60,6 +60,13 @@ pub struct ObjectObservation<T> {
     pub version: Option<rtdb_types::PhysicalObjectVersion>,
 }
 
+/// Reads the provider's current hold on a specific physical version.
+#[async_trait]
+pub trait ObjectVersionHold: Send + Sync {
+    async fn require_held(&self, key: &ObjectKey, version: &rtdb_types::PhysicalObjectVersion)
+        -> rtdb_types::Result<()>;
+}
+
 /// The retained and temporary buffers of an object read, excluding provider transport metadata.
 pub struct ObjectReadAllocation {
     pub retained_bytes: usize,

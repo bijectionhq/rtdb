@@ -30,6 +30,8 @@ pub struct TokenKey {
 }
 
 impl TokenKey {
+    pub const MAX_ENCODED_BYTES: usize = FORMAT.len() + 16 + 8 + MAX_WRAPPED_KEY_BYTES;
+
     pub async fn create(kms: &dyn Kms, generation: Generation) -> Result<Self> {
         kms.create(generation).await?;
         let key = aead::random_key()?;
@@ -47,6 +49,12 @@ impl TokenKey {
 
     pub fn generation(&self) -> Generation {
         self.generation
+    }
+
+    /// Verifies the wrapped key under its generation without delivering key material.
+    pub async fn verify_wrapping(&self, kms: &dyn Kms) -> Result<()> {
+        kms.unwrap(self.generation, &self.wrapped, &wrapping_context(self.generation)).await?;
+        kms.check_readable(self.generation).await
     }
 
     pub fn encode(&self) -> Vec<u8> {

@@ -282,6 +282,13 @@ Object Lock allows delete markers and newer versions above a held version. [S3 O
 A legal hold carries a single status per object version. [S3 legal-hold request](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLegalHold.html)
 Operations that share a version need an ordered record of which recovery operations still own its hold and release the provider hold only after the last owner settles.
 
+With the `backup-object-holds` build feature, run `rtdb multi-backup verify-object-holds` against a commissioned portable install staged in the S3 serving allocation.
+Supply the selected archive, destination incarnation, authority and cell, journal reader TLS, destination key vault and S3 bucket.
+The command checks the archive digest, rereads the staged checkpoint, all of its files and the wrapped token key, and requires S3 legal hold `ON` on the exact versions that supplied those bytes.
+It accepts a staged cut whose retained suffix contains the selected checkpoint and ordinary lease records.
+The result reports the checkpoint, journal head and exact held versions for the custodian's recovery records.
+Journal retention, generation-key holds and permission to publish require their own authority.
+
 The installed server opens its generation keys through `FileKms` at `RTDB_KEY_DIRECTORY`.
 A hosted key custodian must retain decryption of the exact copies' generations across worker and verifier loss and order hold placement and release against key retirement.
 Key readability at the time of verification proves one read.

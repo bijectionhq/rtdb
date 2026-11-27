@@ -48,7 +48,7 @@ mod retirement;
 mod store_floor;
 mod store_hold;
 mod timing;
-pub use backup::{BackupFileRelocation, InstalledBackup, PortableBackup, VerifiedBackup};
+pub use backup::{BackupFileRelocation, BackupObjectReadback, InstalledBackup, PortableBackup, VerifiedBackup};
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
 pub use pin::{NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport};
 pub use pipeline::WritePipeline;

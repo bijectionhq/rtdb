@@ -5,12 +5,18 @@ use serde_json::{Value, json};
 
 use super::*;
 
+#[cfg(feature = "backup-object-holds")]
+mod held_objects;
+
 pub const MULTI_BACKUP_HELP: &str = "\
 Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
                                  [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
-Operates on stopped, local RTDB Multi development data. The source key vault
-is supplied separately during restore. Neither command mounts a serving listener.
+       rtdb multi-backup verify-object-holds --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
+                    --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
+Export and restore operate on stopped, local RTDB Multi development data.
+Verify-object-holds reads a staged immutable journal and an S3 allocation.
+It requires the backup-object-holds build feature. These commands run without a serving listener.
 ";
 
 #[derive(Clone, Debug)]
@@ -20,13 +26,23 @@ enum Operation {
 }
 
 #[derive(Clone, Debug)]
-pub struct MultiBackupOptions {
+struct LocalBackupOptions {
     operation: Operation,
     data: PathBuf,
     archive: PathBuf,
     journal: Option<(String, PathBuf)>,
     immutable_streams: bool,
     activation_scope: Option<ActivationScope>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MultiBackupOptions(BackupCommand);
+
+#[derive(Clone, Debug)]
+enum BackupCommand {
+    Local(LocalBackupOptions),
+    #[cfg(feature = "backup-object-holds")]
+    VerifyObjects(held_objects::Verifier),
 }
 
 impl MultiBackupOptions {
@@ -43,6 +59,13 @@ impl MultiBackupOptions {
             if name == "--immutable-streams" || !name.starts_with("--") || value.starts_with("--") || fields.insert(name, value).is_some() {
                 return Err(arguments_error());
             }
+        }
+        if operation == "verify-object-holds" {
+            if immutable_streams { return Err(arguments_error()); }
+            #[cfg(feature = "backup-object-holds")]
+            return Ok(Self(BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?)));
+            #[cfg(not(feature = "backup-object-holds"))]
+            return Err(Anomaly::unsupported("rtdb/backup-object-holds", "Object hold verification requires the backup-object-holds build feature"));
         }
         let data = fields.remove("--data").ok_or_else(arguments_error)?.into();
         let archive = fields.remove("--archive").ok_or_else(arguments_error)?.into();
@@ -80,10 +103,20 @@ impl MultiBackupOptions {
             _ => return Err(arguments_error()),
         };
         if !fields.is_empty() { return Err(arguments_error()); }
-        Ok(Self { operation, data, archive, journal, immutable_streams, activation_scope })
+        Ok(Self(BackupCommand::Local(LocalBackupOptions { operation, data, archive, journal, immutable_streams, activation_scope })))
     }
 
     pub async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
+        match self.0 {
+            BackupCommand::Local(options) => options.run(apple_sync).await,
+            #[cfg(feature = "backup-object-holds")]
+            BackupCommand::VerifyObjects(verifier) => verifier.run().await,
+        }
+    }
+}
+
+impl LocalBackupOptions {
+    async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
         let (incarnation, backup) = match &self.operation {
             Operation::Restore { incarnation, source_key_vault } => {
                 let keys = Arc::new(FileKms::open(source_key_vault, || SystemClock.now().0)?);
@@ -313,7 +346,7 @@ mod tests {
         ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap();
         let stream = database.journal_stream();
         let catalog = StreamId(catalog::identity(b"catalog", incarnation, "").as_u128());
-        let mut options = MultiBackupOptions {
+        let mut options = LocalBackupOptions {
             operation: Operation::Export,
             data,
             archive: home.path().join("cut"),

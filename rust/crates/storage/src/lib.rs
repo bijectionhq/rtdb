@@ -26,4 +26,4 @@ pub use error::{Error, LeaseCutoff, Result};
 pub use remote_version_step::valid_object_version;
 pub use io_region::{HeldView, IoRegion};
 pub use read_lease::ReadLease;
-pub use object_store::{LocalFile, LocalStore, MemoryStore, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, StoredObject, ObjectReadAllocation};
+pub use object_store::{LocalFile, LocalStore, MemoryStore, ObjectKey, ObjectObservation, ObjectStore, ObjectVersionHold, ReadReservation, RetainedBytes, StoredObject, ObjectReadAllocation};

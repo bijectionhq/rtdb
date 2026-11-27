@@ -2,9 +2,11 @@ use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use async_trait::async_trait;
 use rtdb_crypt::{Generation, Kms, tokens::{TokenKey, TokenKeys}};
-use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_storage::{Error, ObjectKey, ObjectStore, ObjectVersionHold};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
 use uuid::Uuid;
+
+use crate::objects::read_held_bytes;
 
 pub struct StoredTokenKeys {
     store: Arc<dyn ObjectStore>,
@@ -33,6 +35,23 @@ impl StoredTokenKeys {
 
     fn path(&self, number: u64) -> Result<ObjectKey> {
         ObjectKey::new(format!("{}/keys/{number:016x}", self.prefix)).map_err(Into::into)
+    }
+
+    /// Checks the held provider version and wrapping of the selected token key envelope.
+    pub async fn check_object_hold(
+        &self, number: u64, kms: &dyn Kms, hold: &dyn ObjectVersionHold,
+    ) -> Result<PhysicalObjectVersion> {
+        let (bytes, version) = read_held_bytes(self.store.as_ref(), &self.path(number)?, TokenKey::MAX_ENCODED_BYTES, hold).await?;
+        self.decode(number, &bytes)?.verify_wrapping(kms).await?;
+        Ok(version)
+    }
+
+    fn decode(&self, number: u64, bytes: &[u8]) -> Result<TokenKey> {
+        let key = TokenKey::decode(bytes)?;
+        if key.generation() != (Generation { database: self.incarnation, number }) {
+            return Err(invalid_metadata());
+        }
+        Ok(key)
     }
 
     pub async fn install(&self, kms: &dyn Kms, number: u64) -> Result<TokenKey> {
@@ -74,18 +93,7 @@ impl TokenKeys for StoredTokenKeys {
 
     async fn get(&self, number: u64) -> Result<Option<TokenKey>> {
         match self.store.get_fresh(&self.path(number)?).await {
-            Ok(bytes) => {
-                let key = TokenKey::decode(&bytes)?;
-                if key.generation()
-                    != (Generation {
-                        database: self.incarnation,
-                        number,
-                    })
-                {
-                    return Err(invalid_metadata());
-                }
-                Ok(Some(key))
-            }
+            Ok(bytes) => self.decode(number, &bytes).map(Some),
             Err(Error::MissingObject(_)) => Ok(None),
             Err(error) => Err(error.into()),
         }

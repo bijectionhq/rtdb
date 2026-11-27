@@ -6,7 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{Error, IoRegion, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, RemoteKeyLayout, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag, valid_object_version}};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectVersionHold, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, RemoteKeyLayout, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag, valid_object_version}};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneCondition, S3TombstoneTarget};
 
 #[path = "never_versioned.rs"]
@@ -41,6 +41,23 @@ pub enum CreateAttemptPublication {
 }
 
 const RETIRED_VERSION_ATTRIBUTE: &str = "rtdb-retired-version";
+
+#[async_trait::async_trait]
+impl ObjectVersionHold for VersionedInventory {
+    async fn require_held(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
+        let path = self.observed_path(key, version)
+            .map_err(|_| unavailable("The hold does not name an immutable version in this allocation"))?;
+        self.inspect((path.to_string(), version.version.clone()), |owner, (path, version)| async move {
+            let reply = owner.client.get_object_legal_hold().bucket(&owner.namespace.bucket)
+                .key(path).version_id(version).set_request_payer(owner.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Reading the S3 legal hold failed: {error}")))?;
+            if reply.legal_hold().and_then(|hold| hold.status()) != Some(&aws_sdk_s3::types::ObjectLockLegalHoldStatus::On) {
+                return Err(unavailable("The exact S3 object version has no legal hold"));
+            }
+            Ok(())
+        }).await
+    }
+}
 
 enum VersionedRetirementHead {
     Live(String),

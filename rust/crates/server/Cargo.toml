@@ -13,6 +13,7 @@ path = "src/main.rs"
 [features]
 default = []
 multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2", "dep:tonic"]
+backup-object-holds = ["multi", "rtdb-s3/versioning"]
 kafka = ["rtdb-node/kafka", "dep:rtdb-kafka", "rtdb-metrics/kafka"]
 kafka-connect = ["kafka", "rtdb-node/kafka-connect"]
 s3 = ["rtdb-node/s3", "dep:rtdb-s3"]

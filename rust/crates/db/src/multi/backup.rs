@@ -4,9 +4,9 @@ use journal_contract::Lsn;
 use rtdb_crypt::{Context, Generation, Kms};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_index::branches::BranchCut;
-use rtdb_store::{ObjectStore, read_file_bounded, read_fresh_manifest};
+use rtdb_store::{ObjectStore, ObjectVersionHold, read_file_bounded, read_fresh_manifest, read_held_file, read_held_manifest};
 use rtdb_tx::transact::{Receipt, TransactState};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -104,6 +104,13 @@ pub struct InstalledBackup {
     destination_basis: Basis,
     manifest_sha256: [u8; 32],
     activation_scope: Option<crate::ActivationScope>,
+}
+
+pub struct BackupObjectReadback {
+    pub installation: InstalledBackup,
+    pub journal_head: Lsn,
+    pub checkpoint: ObjectId,
+    pub versions: Vec<PhysicalObjectVersion>,
 }
 
 impl InstalledBackup {
@@ -295,17 +302,65 @@ impl MultiDatabase {
         self.verify_installed_files().await
     }
 
+    /// Checks provider holds for the commissioned, staged backup's exact object closure.
+    pub async fn check_installed_backup_object_holds(
+        &mut self, archive_sha256: [u8; 32], holds: &dyn ObjectVersionHold,
+    ) -> Result<BackupObjectReadback> {
+        self.refresh().await?;
+        self.require_active()?;
+        let installed = self.applied_backup().filter(|installed| {
+            installed.activation_scope().is_some() && installed.manifest_sha256() == archive_sha256
+        }).ok_or_else(invalid_backup)?;
+        let state = self.state();
+        let head = state.head;
+        let checkpoint = self.installed_backup_checkpoint()?.clone();
+        if state.records.iter().any(|record| !record.permits_fresh_restore()
+            && !matches!(record, Record::Checkpoint(selected) if *selected == checkpoint))
+        {
+            return Err(backup_dependencies());
+        }
+        let store = self.store.as_ref();
+        let kms = self.stream.kms.as_ref();
+        let (manifest, checkpoint_version) = read_held_manifest(store, kms, checkpoint.manifest, holds).await?;
+        if manifest.generation.number != checkpoint.key_generation || !manifest.contents().pins.is_empty() {
+            return Err(invalid_backup());
+        }
+        let members = &manifest.contents().files;
+        let mut versions = Vec::with_capacity(members.len() + 2);
+        versions.push(checkpoint_version);
+        let index_id = state.coordinates.origin.and_then(|origin| origin.portable_file_index);
+        if let Some(index_id) = index_id {
+            if !members.contains(&index_id) {
+                return Err(invalid_backup());
+            }
+            let (index, version) = read_held_file(store, kms, index_id, files::MAX_INDEX_BYTES, holds).await?;
+            let relocations = files::decode_relocations(&index.bytes, installed.source_incarnation(), index_id)?;
+            if relocations.iter().any(|relocation| !members.contains(&relocation.destination_file)) {
+                return Err(invalid_backup());
+            }
+            versions.push(version);
+        }
+        for &file in members {
+            if Some(file) != index_id {
+                let (_, version) = read_held_file(store, kms, file, PortableBackup::MAX_BYTES, holds).await?;
+                versions.push(version);
+            }
+        }
+        versions.push(self.token_keys.check_object_hold(checkpoint.key_generation, kms, holds).await?);
+        self.refresh().await?;
+        if self.state().head != head || self.installed_backup_checkpoint()? != &checkpoint {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-installation-changed",
+                "The staged backup changed during the object hold readback"));
+        }
+        Ok(BackupObjectReadback { installation: installed, journal_head: head, checkpoint: checkpoint.manifest, versions })
+    }
+
     async fn verify_installed_files(&self) -> Result<Vec<BackupFileRelocation>> {
         let state = self.state();
         if self.applied_backup().is_none() {
             return Ok(Vec::new());
         }
-        let checkpoint = state.base.as_ref().map(|base| &base.checkpoint)
-            .or_else(|| state.records.iter().find_map(|record| match record {
-                Record::Checkpoint(checkpoint) if checkpoint.restore => Some(checkpoint),
-                _ => None,
-            }))
-            .ok_or_else(invalid_backup)?;
+        let checkpoint = self.installed_backup_checkpoint()?;
         let manifest = read_fresh_manifest(self.store.as_ref(), self.stream.kms.as_ref(), checkpoint.manifest).await?;
         if manifest.generation.number != checkpoint.key_generation {
             return Err(invalid_backup());
@@ -324,6 +379,16 @@ impl MultiDatabase {
             ).await?;
         }
         Ok(relocations)
+    }
+
+    fn installed_backup_checkpoint(&self) -> Result<&Checkpoint> {
+        let state = self.state();
+        state.base.as_ref().map(|base| &base.checkpoint)
+            .or_else(|| state.records.iter().find_map(|record| match record {
+                Record::Checkpoint(checkpoint) if checkpoint.restore => Some(checkpoint),
+                _ => None,
+            }))
+            .ok_or_else(invalid_backup)
     }
 
     fn applied_backup(&self) -> Option<InstalledBackup> {
