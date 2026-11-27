@@ -16,6 +16,7 @@
 -- the leader checks the storage owner's startup hold and repair anchor before deleting old metadata.
 -- Coordinated native startup retains a shared recovery gate while choosing a checkpoint and admitting the replica cursor.
 -- Native metadata collection needs exclusive access to that gate through unlink.
+-- A local collection cycle attempts one unlink at a time through its root's exclusive gate.
 -- The Default Local writer collects older-term sealed serving images after adopting its own replica upload confirmation.
 -- The admitted confirmation matches the writer's durable upload receipt in the current replica log.
 -- The writer reopens replay at the exact source cut, replica boundary and upload position.

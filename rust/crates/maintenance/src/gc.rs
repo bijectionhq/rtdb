@@ -691,7 +691,9 @@ impl CycleWorker for BlockCollector {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let snapshot = self.snapshots.snapshot();
         let Some(latest) = snapshot.table_catalog().block_index() else { return Ok(()); };
-        let deletes = Arc::new(Semaphore::new(self.config.delete_parallelism));
+        // A local unlink needs the root's exclusive recovery gate, so serialize this cycle's attempts at it.
+        let parallelism = if self.store.local_maintenance_store().is_some() { 1 } else { self.config.delete_parallelism };
+        let deletes = Arc::new(Semaphore::new(parallelism));
         if let Err(error) = self.sweep("blocks", checkpoint_index, latest, cancellation, &deletes, |observer, elapsed| observer.block_file_deleted(elapsed)).await {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
