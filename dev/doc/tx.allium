@@ -21,7 +21,8 @@
 -- Its result reader imports the stream schema once and reuses it for each Arrow array.
 -- Prepared Flight SQL and embedded ADBC queries can bind an Arrow batch row by position.
 -- A v1 Query can bind an admitted batch by position for unencoded scalar fields and nullable Arrow Null fields.
--- Present nonempty List and FixedSizeList cells can bind in Arrow when their fields are unannotated and their required Float32 or Float64 children use the canonical name.
+-- List and positive-width FixedSizeList cells can bind in Arrow when their fields are unannotated and their Float32 or Float64 children use the canonical name.
+-- A tracked v1 Query can use the same Arrow bindings when their representation preserves claim identity.
 -- Unsigned scalar columns share their value and validity buffers with signed columns at the same width during execution.
 -- Other parameter layouts and plans that decline direct binding use the scalar binding path.
 -- Embedded Clojure SQL plans bind compatible positional arguments as one C Data row with their native widths and nulls.
@@ -36,12 +37,14 @@
 -- Bind writes byte strings, UUIDs and supported temporal arguments directly into the inferred Arrow storage.
 -- The argument reservation covers those arrays until the portal takes ownership.
 -- Declared query parameters retain compatible argument columns and cast incompatible columns individually.
+-- A representable integer-width conversion writes the declared width directly to the prepared argument batch.
 -- A packed float list cast used to bind a declared parameter keeps the converted child in the one-row Arrow argument batch.
 -- Unchanged argument buffers retain their original admission for the lifetime of the reader.
 -- Native control evaluation reads reached expressions against positional Arrow parameters.
 -- Time zone and token controls can read bound strings from their selected Arrow cells.
 -- SET can render bound text and selected floating-point lists from their Arrow cells, preserving the width of each component.
 -- A direct floating-point list argument in pgwire EXECUTE is rebound from its selected Arrow cell.
+-- A direct unannotated Boolean, signed integer, float, text or binary argument in pgwire EXECUTE is selected in Arrow.
 -- A computed EXECUTE expression can bind a selected floating-point list from Arrow or use the packed child of a compatible expression result.
 -- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, ResultArrayFunding, copy_array_refs, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, retain_result_array, to_field};
 use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
+use rtdb_types::rtdb_v1::ClaimFootprint;
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::parameters::BoundParameters;
@@ -135,8 +136,7 @@ impl PreparedQuery {
         self.join_statistics.as_ref().is_none_or(|stats| stats.matches(catalog))
     }
 
-    pub fn claim_footprint(&self, context: &QueryContext, arguments: &[Value]) -> rtdb_types::rtdb_v1::ClaimFootprint {
-        use rtdb_types::rtdb_v1::ClaimFootprint;
+    pub fn claim_footprint(&self, context: &QueryContext, arguments: rtdb_expr::Parameters<'_>) -> ClaimFootprint {
         let mut regions = Vec::new();
         let mut pending = vec![&self.relation];
         while let Some(relation) = pending.pop() {
@@ -201,10 +201,15 @@ impl PreparedQuery {
 
     /// Opens the query with one row of a bound Arrow batch.
     pub async fn execute_arrow_columns(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>) -> Result<QueryCursor> {
+        self.execute_arrow_columns_with_claim(context, batch, row, types, text, None).await
+    }
+
+    pub async fn execute_arrow_columns_with_claim(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType],
+                                                  text: Option<&str>, claim: Option<&mut ClaimFootprint>) -> Result<QueryCursor> {
         let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
-            Box::pin(self.open_arrow(context, batch, row, types, text, Batching::Columns))
+            Box::pin(self.open_arrow(context, batch, row, types, text, Batching::Columns, claim))
         });
         measured_open(retention, open).await
     }
@@ -213,7 +218,7 @@ impl PreparedQuery {
         let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
-            Box::pin(self.open_arrow(context, batch, row, types, text, Batching::ColumnRows))
+            Box::pin(self.open_arrow(context, batch, row, types, text, Batching::ColumnRows, None))
         });
         measured_open(retention, open).await
     }
@@ -222,7 +227,7 @@ impl PreparedQuery {
         let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
-            Box::pin(self.open_arrow(context, batch, 0, types, None, Batching::Pages))
+            Box::pin(self.open_arrow(context, batch, 0, types, None, Batching::Pages, None))
         });
         measured_open(retention, open).await
     }
@@ -345,7 +350,8 @@ impl PreparedQuery {
         }).await
     }
 
-    async fn open_arrow(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+    async fn open_arrow(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>,
+                        batching: Batching, claim: Option<&mut ClaimFootprint>) -> Result<QueryCursor> {
         if types.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
         let bound = types.iter().try_fold(self.allocation_bound()?, |bytes, ty| {
             ty.retained_bytes()?.checked_mul(8).and_then(|size| bytes.checked_add(size))
@@ -355,6 +361,7 @@ impl PreparedQuery {
         let execution_types = declared_field_types(&self.declared(types.len(), EmissionMode::Execution)?, types, EmissionMode::Execution);
         let mut parameters = BoundParameters::from_arrow(batch, row, execution_types, &context.memory)?;
         let context = context.reopen_sql_snapshot(&self.settings, parameters.evaluator()).await?;
+        if let Some(claim) = claim { *claim = self.claim_footprint(&context, parameters.evaluator()); }
         self.check_dependencies(&context)?;
         let schema = self.emit_result_schema(&context, &declared_field_types(&self.declared(types.len(), EmissionMode::ArrowFields)?, types, EmissionMode::ArrowFields))?;
         drop(temporary);

@@ -851,25 +851,21 @@ impl Parameters {
                 })
     }
 
-    fn can_bind_arrow(&self) -> bool {
+    fn can_bind_arrow(&self, track: bool) -> bool {
         let batch = self.batch.batch();
         batch.num_columns() != 0
             && batch
                 .schema_ref()
                 .fields()
                 .iter()
-                .zip(batch.columns())
                 .zip(self.types.as_slice())
-                .all(|((field, array), logical)| match field.data_type() {
+                .all(|(field, logical)| match field.data_type() {
                     DataType::Union(..) | DataType::RunEndEncoded(..) => false,
-                    DataType::List(child) => {
-                        plain_float_list(field, child)
-                            && array.is_valid(0)
-                            && array.as_list::<i32>().value_length(0) > 0
-                    }
+                    DataType::List(child) => plain_float_list(field, child),
                     DataType::FixedSizeList(child, width) => {
-                        plain_float_list(field, child) && array.is_valid(0) && *width > 0
+                        plain_float_list(field, child) && *width > 0
                     }
+                    _ if track => tracked_scalar(field),
                     _ => match logical {
                         LogicalType::Scalar(_) | LogicalType::Null => true,
                         LogicalType::Maybe(inner) => {
@@ -908,16 +904,22 @@ impl Parameters {
         &self,
         prepared: &PreparedSql,
         context: &Arc<QueryContext>,
-    ) -> Result<Option<QueryCursor>, Status> {
+        track: bool,
+    ) -> Result<Option<(QueryCursor, ClaimFootprint)>, Status> {
         let types = self.types.as_slice();
+        if track && prepared.parameter_count() != types.len() {
+            return Ok(None);
+        }
         let skip_row_admission = self.binds_arrow_without_row_admission();
         if !skip_row_admission {
-            if prepared.parameter_count() != types.len() || !self.can_bind_arrow() {
+            if prepared.parameter_count() != types.len() || !self.can_bind_arrow(track) {
                 return Ok(None);
             }
-            drop(self.reserve_scalar_row_bound(&context.memory)?);
+            if !track {
+                drop(self.reserve_scalar_row_bound(&context.memory)?);
+            }
         }
-        let result = if skip_row_admission {
+        let result = if skip_row_admission && !track {
             prepared
                 .try_open_query_arrow(Arc::clone(context), &self.batch, types)
                 .await
@@ -938,8 +940,11 @@ impl Parameters {
             } else {
                 None
             };
-            // The prepared plan keeps the declared types. Where it has no declaration, the
-            // cursor falls back to the same observed type it would get from a decoded value.
+            let arguments = signed.as_ref().unwrap_or(&self.batch);
+            if track {
+                return prepared.open_tracked_query_arrow(Arc::clone(context), arguments, types)
+                    .await.map(Some).map_err(error::anomaly);
+            }
             let observed = types
                 .iter()
                 .zip(batch.columns())
@@ -957,12 +962,12 @@ impl Parameters {
             prepared
                 .try_open_query_arrow(
                     Arc::clone(context),
-                    signed.as_ref().unwrap_or(&self.batch),
+                    arguments,
                     &observed,
                 )
                 .await
         };
-        result.map_err(error::anomaly)
+        result.map(|cursor| cursor.map(|cursor| (cursor, ClaimFootprint::default()))).map_err(error::anomaly)
     }
 
     fn signed_batch(&self) -> Option<OwnedBatch> {
@@ -1009,8 +1014,18 @@ fn plain_float_list(field: &Field, child: &Field) -> bool {
     field.metadata().is_empty()
         && child.metadata().is_empty()
         && child.name() == "$data$"
-        && !child.is_nullable()
         && matches!(child.data_type(), DataType::Float32 | DataType::Float64)
+}
+
+fn tracked_scalar(field: &Field) -> bool {
+    // The claim's IID readers must see the same identity as the scalar binding.
+    match (field.data_type(), field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str)) {
+        (DataType::FixedSizeBinary(16), Some("uuid")) | (DataType::Utf8, Some("xt/clj-keyword")) => true,
+        (DataType::Null, None) => field.is_nullable() && field.metadata().is_empty(),
+        (data_type, None) => field.metadata().is_empty()
+            && (data_type.is_integer() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::Float32 | DataType::Float64)),
+        _ => false,
+    }
 }
 
 async fn open_query(
@@ -1021,8 +1036,8 @@ async fn open_query(
 ) -> Result<(QueryCursor, ClaimFootprint), Status> {
     let (row, types, _row_charge) = if let Some(parameters) = parameters {
         parameters.validate_columns(&context.memory)?;
-        if !track && let Some(cursor) = parameters.try_open_arrow(&prepared, &context).await? {
-            return Ok((cursor, ClaimFootprint::default()));
+        if let Some(result) = parameters.try_open_arrow(&prepared, &context, track).await? {
+            return Ok(result);
         }
         let types = parameters.types.as_slice();
         let (row, charge) = wire::first_query_row(parameters.batch.batch(), types, &context.memory)
@@ -1131,14 +1146,14 @@ mod tests {
             ),
             (list(Arc::clone(&item), vec![-0.0, 1.0]), false, true),
             (fixed, false, true),
-            (list(Arc::clone(&item), vec![]), false, false),
+            (list(Arc::clone(&item), vec![]), false, true),
             (
                 list(
                     Arc::new(item.as_ref().clone().with_nullable(true)),
                     vec![1.0],
                 ),
                 false,
-                false,
+                true,
             ),
             (list(item, vec![1.0]), true, false),
         ] {
@@ -1155,7 +1170,8 @@ mod tests {
                 rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
                     .unwrap();
             let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();
-            assert_eq!(parameters.can_bind_arrow(), expected);
+            assert_eq!(parameters.can_bind_arrow(false), expected);
+            assert_eq!(parameters.can_bind_arrow(true), expected && !annotated);
         }
     }
 

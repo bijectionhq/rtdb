@@ -897,11 +897,10 @@ fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<st
     })
 }
 
-pub(crate) fn claim_regions(scan: &Scan, context: &QueryContext, arguments: &[Value]) -> Vec<rtdb_types::rtdb_v1::ClaimRegion> {
+pub(crate) fn claim_regions(scan: &Scan, context: &QueryContext, parameters: rtdb_expr::Parameters<'_>) -> Vec<rtdb_types::rtdb_v1::ClaimRegion> {
     use rtdb_types::rtdb_v1::{ClaimRegion, MAX_REGIONS_PER_TABLE};
 
     let table = &scan.table.name.table;
-    let parameters = rtdb_expr::Parameters::Values(arguments);
     if let Some(iids) = scan.iids.clone().or_else(|| id_selection(scan, parameters)) {
         if iids.is_empty() || iids.len() > MAX_REGIONS_PER_TABLE {
             return vec![ClaimRegion::Table(table.clone())];

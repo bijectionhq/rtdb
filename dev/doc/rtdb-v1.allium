@@ -138,6 +138,7 @@ surface StatelessDatabase {
 
     @guarantee QueryClaim
         -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.
+        -- An Arrow-bound identity parameter selects the same claim region as its scalar value.
         -- The same authority seals the claim and authenticates it when the writer evaluates Unchanged.
         -- The region can name rows, an index interval, a table, or the selected branch.
         -- The authority issues identical claim bytes for the same evidence under one key generation.

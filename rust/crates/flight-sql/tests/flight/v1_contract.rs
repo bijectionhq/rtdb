@@ -675,6 +675,29 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
     assert_eq!(values.value(0).to_bits(), (-0.0_f32).to_bits());
     assert_eq!(values.value(1).to_bits(), single_nan.to_bits());
 
+    let item = Arc::new(Field::new("$data$", DataType::Float32, true));
+    for track in [false, true] {
+        for (components, null_list) in [(vec![Some(-0.0), None], false), (vec![], false), (vec![], true)] {
+            let list = ListArray::new(
+                Arc::clone(&item),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, components.len() as i32])),
+                Arc::new(Float32Array::from(components.clone())),
+                null_list.then(|| arrow_buffer::NullBuffer::new_null(1)),
+            );
+            let mut request = input("SELECT $1 AS n");
+            request.track = track;
+            request.params_ipc = Some(parameter(Arc::new(list)));
+            let (batches, trailer) = query(&mut client, request).await;
+            let batch = &batches[0];
+            assert_eq!(trailer.claim.is_some(), track);
+            assert_eq!(batch.schema_ref().field(0).data_type(), &DataType::List(Arc::clone(&item)));
+            let list = batch.column(0).as_list::<i32>();
+            assert_eq!(list.is_null(0), null_list);
+            assert_eq!(list.value(0).as_primitive::<Float32Type>().iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>(),
+                components.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>());
+        }
+    }
+
     let mut request = input("SELECT 10::BIGINT / $1 AS n");
     request.params_ipc = Some(parameter(Arc::new(UInt64Array::from(vec![u64::MAX]))));
     assert_eq!(ints(&query(&mut client, request).await.0), [-10]);
@@ -714,19 +737,58 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
         ],
     )
     .unwrap();
-    let mut request = input("SELECT 10::BIGINT / $1 AS n, $2 AS address");
-    request.params_ipc = Some(
-        rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap(),
-    );
-    let status = get::<_, v1::QueryTrailer>(&mut client, request)
-        .await
-        .unwrap_err();
-    let detail = error(
-        status,
-        v1::AnomalyCategory::Incorrect,
-        "rtdb/invalid-request",
-    );
-    assert_eq!(detail.message, "Illegal scheme name");
+    for track in [false, true] {
+        let mut request = input("SELECT 10::BIGINT / $1 AS n, $2 AS address");
+        request.track = track;
+        request.params_ipc = Some(
+            rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap(),
+        );
+        let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
+        let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+        assert_eq!(detail.message, "Illegal scheme name");
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn query_parameter_binding_tracks_the_same_row_as_scalar_binding() {
+    use arrow_array::UInt64Array;
+    use rtdb_types::{TableRef, rtdb_v1::{Claim, ClaimRegion}};
+
+    let running = Running::start(Some("secret"), FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    client.update("INSERT INTO bound_claim_rows (_id, n) VALUES (-1, 10), (1, 20)", None).await;
+    let mut bound = input("SELECT n FROM bound_claim_rows WHERE _id = $1");
+    bound.source.as_mut().unwrap().at = Some(v1::At { selection: Some(Selection::Linearizable(())) });
+    bound.track = true;
+    let parameters = |field: Field| {
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(UInt64Array::from(vec![u64::MAX]))]).unwrap();
+        rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap()
+    };
+    let field = Field::new("id", DataType::UInt64, false);
+    bound.params_ipc = Some(parameters(field.clone().with_metadata([("client".into(), "scalar".into())].into())));
+    let (rows, expected) = query(&mut client, bound.clone()).await;
+    assert_eq!(ints(&rows), [10]);
+
+    bound.source.as_mut().unwrap().at = Some(v1::At { selection: expected.basis.clone().map(Selection::Exactly) });
+    bound.params_ipc = Some(parameters(field));
+    let (rows, actual) = query(&mut client, bound.clone()).await;
+    assert_eq!(ints(&rows), [10]);
+    assert_eq!(actual.basis, expected.basis);
+    assert_eq!(actual.claim, expected.claim);
+    let database = running.node.catalog().database("xtdb").unwrap();
+    let authority = database.token_authority().await.unwrap();
+    let evidence = authority.open_claim(&Claim::from_bytes(actual.claim.unwrap().value)).await.unwrap();
+    assert_eq!(evidence.footprint.regions().unwrap(), &[ClaimRegion::Row {
+        table: TableRef::new("public", "bound_claim_rows"),
+        iid: EntityId::Integer(-1).iid(),
+    }].into_iter().collect());
+
+    client.headers.remove("cookie");
+    client.headers.insert("authorization", "Bearer unknown-session".parse().unwrap());
+    let refusal = get::<_, v1::QueryTrailer>(&mut client, bound).await.unwrap_err();
+    assert_eq!(refusal.code(), tonic::Code::Unauthenticated);
     running.stop().await;
 }
 

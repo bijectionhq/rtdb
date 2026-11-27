@@ -640,6 +640,14 @@ async fn execute_arguments(expressions: &[Expr], eval: &EvalContext<'_>, memory:
                 }
             }
         }
+        if let Expr::Parameter { index, .. } = expression
+            && let Some(cell) = eval.parameters.arrow_cell(*index)
+            && let Some((field, array)) = execute_scalar_cell(&name, cell, &mut output)?
+        {
+            fields.push(field);
+            columns.push(array);
+            continue;
+        }
         let schema = Schema::default();
         let invocation = rtdb_expr::ExpressionInvocation::prepare(expression, &schema, eval)?;
         let value = match invocation.evaluate_async_with_arrow_list(&[], eval, |cell| {
@@ -666,6 +674,33 @@ async fn execute_arguments(expressions: &[Expr], eval: &EvalContext<'_>, memory:
     let batch = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), columns, &options)
         .map_err(|error| invalid(error.to_string()))?;
     output.finish(batch)
+}
+
+fn execute_scalar_cell(
+    name: &str, cell: rtdb_columnar::ArrowCell<'_>, output: &mut BatchBuilder,
+) -> Result<Option<(arrow_schema::Field, arrow_array::ArrayRef)>> {
+    use arrow_array::{NullArray, UInt64Array};
+    use arrow_schema::{DataType, Field};
+
+    let data_type = cell.field.data_type();
+    if !cell.field.metadata().is_empty() || !matches!(data_type,
+        DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary
+    ) {
+        return Ok(None);
+    }
+    if cell.is_null()? {
+        let field = Field::new(name, DataType::Null, true);
+        let array = output.column(512, || Ok(Arc::new(NullArray::new(1))))?;
+        return Ok(Some((field, array)));
+    }
+    let field = Field::new(name, data_type.clone(), false);
+    let bound = size(512, cell.payload_bytes()?)?;
+    let array = output.column(bound, || {
+        let index = UInt64Array::from(vec![cell.row as u64]);
+        arrow_select::take::take(cell.array, &index, None).map_err(rtdb_columnar::arrow_error)
+    })?;
+    Ok(Some((field, array)))
 }
 
 fn selected_execute_list(
@@ -793,6 +828,42 @@ mod tests {
         assert!(returned.is_null(1));
         assert_eq!(returned.value(2).to_bits(), (-0.0f32).to_bits());
         assert!(parameters.evaluator().known(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_forwards_selected_scalar_widths_and_nulls_without_decoding() {
+        use arrow_array::Int16Array;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("small", DataType::Int16, false),
+        ])), vec![
+            Arc::new(StringArray::from(vec![Some("café"), None])),
+            Arc::new(Int16Array::from(vec![-7, 19])),
+        ]).unwrap();
+        let types = batch.schema_ref().fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let expressions = [
+            Expr::Parameter { index: 1, data_type: LogicalType::Nothing },
+            Expr::Parameter { index: 0, data_type: LogicalType::Nothing },
+        ];
+        for (row, (integer, text)) in [(-7, Some("café")), (19, None)].into_iter().enumerate() {
+            let parameters = BoundParameters::from_arrow(batch.clone(), row, types.clone(), &memory).unwrap();
+            let allocation = EvaluationScope::new(&memory).unwrap();
+            let eval = EvalContext { parameters: parameters.evaluator(), allocation: Some(&allocation), ..Default::default() };
+            let output = execute_arguments(&expressions, &eval, &memory, &allocation).await.unwrap();
+            let output = output.batch();
+            assert_eq!(output.schema_ref().field(0).name(), "?_0");
+            assert_eq!(output.column(0).as_primitive::<arrow_array::types::Int16Type>().value(0), integer);
+            if let Some(text) = text {
+                assert_eq!(output.column(1).as_string::<i32>().value(0), text);
+            } else {
+                assert_eq!(output.column(1).data_type(), &DataType::Null);
+            }
+            assert!(parameters.evaluator().known(0).is_none());
+            assert!(parameters.evaluator().known(1).is_none());
+        }
     }
 
     #[tokio::test]

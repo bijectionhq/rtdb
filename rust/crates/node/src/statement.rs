@@ -252,14 +252,22 @@ impl PreparedSql {
         if let Some(cursor) = self.try_open_parameter_projection(Arc::clone(&context), arguments, types).await? {
             return Ok(Some(cursor));
         }
-        self.open_arrow(context, arguments, types, true).await.map(Some)
+        self.open_arrow(context, arguments, types, true, None).await.map(Some)
+    }
+
+    pub async fn open_tracked_query_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType])
+        -> Result<(QueryCursor, rtdb_types::rtdb_v1::ClaimFootprint)> {
+        let mut footprint = Default::default();
+        let cursor = self.open_arrow(context, arguments, types, true, Some(&mut footprint)).await?;
+        Ok((cursor, footprint))
     }
 
     pub async fn open_query_arrow_rows(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<QueryCursor> {
-        self.open_arrow(context, arguments, types, false).await
+        self.open_arrow(context, arguments, types, false, None).await
     }
 
-    async fn open_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], columnar: bool) -> Result<QueryCursor> {
+    async fn open_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], columnar: bool,
+                        claim: Option<&mut rtdb_types::rtdb_v1::ClaimFootprint>) -> Result<QueryCursor> {
         if arguments.batch().num_columns() != self.parameter_count() {
             return Err(parameter_error("Argument count differs from the prepared statement"));
         }
@@ -283,9 +291,10 @@ impl PreparedSql {
         };
         let arguments = self.cast_arrow_arguments(arguments, types, &context)?;
         let query = deep(self.source(), || self.bind(&context, types, true))?;
+        if claim.is_some() && !self.notices().is_empty() && let Some(observer) = context.execution_observer() { observer.record_query_warning(); }
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
         let cursor = if columnar {
-            query.execute_arrow_columns(context, arguments, 0, types, Some(self.source())).await?
+            query.execute_arrow_columns_with_claim(context, arguments, 0, types, Some(self.source()), claim).await?
         } else {
             query.execute_arrow_column_rows(context, arguments, 0, types, Some(self.source())).await?
         };
@@ -336,15 +345,20 @@ impl PreparedSql {
                     (field, Arc::new(array), shared)
                 }
                 None => {
-                    allocation.reserve(rtdb_columnar::estimate_read_cell_bytes(field, array.as_ref(), 0)?)?;
-                    let value = rtdb_columnar::read_execution_value_as(source, field, array.as_ref(), 0)?;
-                    let value = rtdb_expr::cast(&value, &target, &context.timezone)?;
-                    allocation.reserve(value.retained_bytes()?)?;
-                    let logical = value.logical_type();
-                    let values = std::slice::from_ref(&value);
-                    allocation.reserve(rtdb_columnar::estimate_builder_bytes(&logical, values)?)?;
-                    let array = rtdb_columnar::copy_array(&logical, values)?;
-                    (rtdb_columnar::to_field(field.name(), &logical)?, array, false)
+                    let (field, array) = if let Some(cast) = cast_arrow_integer(cell, source, &target, &allocation)? {
+                        cast
+                    } else {
+                        allocation.reserve(rtdb_columnar::estimate_read_cell_bytes(field, array.as_ref(), 0)?)?;
+                        let value = rtdb_columnar::read_execution_value_as(source, field, array.as_ref(), 0)?;
+                        let value = rtdb_expr::cast(&value, &target, &context.timezone)?;
+                        allocation.reserve(value.retained_bytes()?)?;
+                        let logical = value.logical_type();
+                        let values = std::slice::from_ref(&value);
+                        allocation.reserve(rtdb_columnar::estimate_builder_bytes(&logical, values)?)?;
+                        let array = rtdb_columnar::copy_array(&logical, values)?;
+                        (rtdb_columnar::to_field(field.name(), &logical)?, array)
+                    };
+                    (field, array, false)
                 }
             };
             fields[index] = Arc::new(field);
@@ -398,7 +412,7 @@ impl PreparedSql {
         let context = context.reopen_sql_snapshot(&self.0.snapshot_selector, rtdb_expr::Parameters::Values(&arguments)).await?;
         let query = deep(self.source(), || self.bind(&context, types, true))?;
         if !self.notices().is_empty() && let Some(observer) = context.execution_observer() { observer.record_query_warning(); }
-        let footprint = if track { query.claim_footprint(&context, &arguments) } else { Default::default() };
+        let footprint = if track { query.claim_footprint(&context, rtdb_expr::Parameters::Values(&arguments)) } else { Default::default() };
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
         let cursor = if columnar {
             query.execute_columns_with_text(context, arguments, Some(self.source())).await?
@@ -686,6 +700,36 @@ fn exactly_one_statement(mut parsed: Vec<ParsedStatement<'_>>) -> Result<ParsedS
     if parsed.len() != 1 { return Err(Anomaly::incorrect("xtdb/sql-error", "A prepared statement must contain exactly one SQL statement")); }
     Ok(parsed.remove(0))
 }
+
+fn cast_arrow_integer(
+    cell: rtdb_columnar::ArrowCell<'_>, source: &LogicalType, target: &LogicalType, allocation: &rtdb_expr::EvaluationScope,
+) -> Result<Option<(arrow_schema::Field, arrow_array::ArrayRef)>> {
+    use arrow_array::{ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};
+    use arrow_schema::{DataType, Field};
+    use rtdb_types::ScalarType;
+
+    fn required(ty: &LogicalType) -> &LogicalType {
+        match ty { LogicalType::Maybe(inner) => inner, ty => ty }
+    }
+    let Some(value) = cell.signed_integer() else { return Ok(None); };
+    if required(source) != &cell.logical_type()? { return Ok(None); }
+
+    macro_rules! cast {
+        ($native:ty, $array:ty, $data:ident) => {{
+            let Ok(value) = <$native>::try_from(value) else { return Ok(None); };
+            allocation.reserve(cell.field.name().len().checked_add(512).ok_or_else(size_error)?)?;
+            (Field::new(cell.field.name(), DataType::$data, false), Arc::new(<$array>::from(vec![value])) as ArrayRef)
+        }};
+    }
+    Ok(Some(match required(target) {
+        LogicalType::Scalar(ScalarType::I8) => cast!(i8, Int8Array, Int8),
+        LogicalType::Scalar(ScalarType::I16) => cast!(i16, Int16Array, Int16),
+        LogicalType::Scalar(ScalarType::I32) => cast!(i32, Int32Array, Int32),
+        LogicalType::Scalar(ScalarType::I64) => cast!(i64, Int64Array, Int64),
+        _ => return Ok(None),
+    }))
+}
+
 fn parameter_error(message: &str) -> Anomaly { Anomaly::incorrect("xtdb/parameter-count-mismatch", message) }
 fn kind_error() -> Anomaly { Anomaly::incorrect("rtdb.node/statement-kind", "Prepared statement has the wrong execution kind") }
 fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.node/preparation-size", "Prepared statement retained size exceeds usize").with_kind(rtdb_types::AnomalyKind::ProgramLimitExceeded) }
@@ -1251,7 +1295,7 @@ mod shared_plan_tests {
 #[cfg(test)]
 mod argument_cast_tests {
     use super::*;
-    use arrow_array::{Array, FixedSizeListArray, Float64Array, RecordBatch, StringArray, cast::AsArray, types::{Float32Type, Int32Type}};
+    use arrow_array::{Array, FixedSizeListArray, Float64Array, Int64Array, RecordBatch, StringArray, cast::AsArray, types::{Float32Type, Int16Type, Int32Type}};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
     use rtdb_storage::{MemoryStore, cache::BufferPool};
@@ -1272,11 +1316,12 @@ mod argument_cast_tests {
             parameter_types: [
                 (0, LogicalType::list(LogicalType::Scalar(ScalarType::F32))),
                 (2, LogicalType::Scalar(ScalarType::I32)),
+                (3, LogicalType::Scalar(ScalarType::I16)),
             ].into(),
             ..Default::default()
         };
         let prepared = PreparedSql::prepare(
-            "SELECT $1 AS xs, $2 AS kept, $3 AS converted", &context, options, ResultSignaturePolicy::Dynamic,
+            "SELECT $1 AS xs, $2 AS kept, $3 AS converted, $4 AS narrowed", &context, options, ResultSignaturePolicy::Dynamic,
         ).unwrap();
         let source_element = Arc::new(ArrowField::new("client-child", DataType::Float64, true));
         let vectors = FixedSizeListArray::try_new(source_element, 3,
@@ -1288,11 +1333,13 @@ mod argument_cast_tests {
             ArrowField::new("client-vector", vectors.data_type().clone(), false),
             kept_field.clone(),
             ArrowField::new("client-number", DataType::Utf8, false),
+            ArrowField::new("client-integer", DataType::Int64, true),
         ]));
         let input = RecordBatch::try_new(schema, vec![
             Arc::new(vectors),
             Arc::new(StringArray::from(vec![text.as_str()])),
             Arc::new(StringArray::from(vec!["17"])),
+            Arc::new(Int64Array::from(vec![i64::from(i16::MIN)])),
         ]).unwrap();
         let input = OwnedBatch::new(input, &source_memory).unwrap();
         let kept_ptr = input.batch().column(1).as_string::<i32>().value(0).as_ptr();
@@ -1300,9 +1347,21 @@ mod argument_cast_tests {
             LogicalType::List { kind: ListKind::FixedSizeList(3), element: Box::new(LogicalType::Scalar(ScalarType::F64).maybe()) },
             LogicalType::Scalar(ScalarType::Utf8),
             LogicalType::Scalar(ScalarType::Utf8),
+            LogicalType::Scalar(ScalarType::I64).maybe(),
         ];
 
         let before = memory.used_bytes();
+        let mut overflowing = input.batch().columns().to_vec();
+        overflowing[3] = Arc::new(Int64Array::from(vec![i64::from(i16::MAX) + 1]));
+        let overflowing = RecordBatch::try_new(input.batch().schema(), overflowing).unwrap();
+        let overflowing = OwnedBatch::new(overflowing, &source_memory).unwrap();
+        let error = prepared.cast_arrow_arguments(overflowing, &types, &context).unwrap_err();
+        let scalar_error = rtdb_expr::cast(&Value::I64(i64::from(i16::MAX) + 1), &LogicalType::Scalar(ScalarType::I16), "UTC").unwrap_err();
+        assert_eq!(error.code, scalar_error.code);
+        assert_eq!(error.message, scalar_error.message);
+        assert_eq!(error.kind, scalar_error.kind);
+        assert_eq!(memory.used_bytes(), before);
+
         let output = prepared.cast_arrow_arguments(input, &types, &context).unwrap();
         let record = output.batch();
         assert_eq!(record.num_rows(), 1);
@@ -1317,6 +1376,8 @@ mod argument_cast_tests {
             .map(|cell| cell.map(f32::to_bits)).collect::<Vec<_>>(),
             [Some((-0.0f32).to_bits()), None, Some(8.5f32.to_bits())]);
         assert_eq!(record.column(2).as_primitive::<Int32Type>().value(0), 17);
+        assert_eq!(record.schema_ref().field(3), &ArrowField::new("client-integer", DataType::Int16, false));
+        assert_eq!(record.column(3).as_primitive::<Int16Type>().value(0), i16::MIN);
 
         let kept = Arc::clone(record.column(1));
         let cast = Arc::clone(record.column(0));
