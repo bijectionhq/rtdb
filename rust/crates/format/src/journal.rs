@@ -5,7 +5,7 @@ mod wire;
 use std::{fmt, str::FromStr};
 
 use prost::Message;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, rtdb_v1::Basis};
 use uuid::Uuid;
 
 const RECORD_HEADER: &[u8] = b"RTDBR\x01";
@@ -170,6 +170,11 @@ pub enum Record {
     },
     /// Establishes the activation scope of a fresh immutable application history.
     Commissioned,
+    /// Store versions are transaction positions in `since`'s incarnation.
+    StorePurgeFloor {
+        since: Basis,
+        keep_from: u64,
+    },
 }
 
 impl Record {

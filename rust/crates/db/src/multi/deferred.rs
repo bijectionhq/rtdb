@@ -30,6 +30,7 @@ pub struct CheckpointCapture {
     generation: u64,
     through: Lsn,
     coordinates: JournalCoordinates,
+    store_purge_floor: u64,
     transactions: TransactState,
     closure: ClosureInputs,
     slot: ReservedManifest,
@@ -80,10 +81,10 @@ impl CheckpointBuilder {
         timing.mark("reachability");
         // Serializing the whole state is the longest step; keep it off the
         // runtime's worker threads.
-        let (transactions, until, coordinates, binary) =
-            (capture.transactions, capture.lease.until, capture.coordinates, capture.binary);
+        let (transactions, until, coordinates, store_purge_floor, binary) =
+            (capture.transactions, capture.lease.until, capture.coordinates, capture.store_purge_floor, capture.binary);
         let payload = tokio::task::spawn_blocking(move || {
-            Committed::checkpoint_payload_in(&transactions, until, false, coordinates, binary)
+            Committed::checkpoint_payload_in(&transactions, until, false, coordinates, store_purge_floor, binary)
         })
         .await
         .map_err(|error| Anomaly::fault("rtdb/checkpoint-build", error.to_string()))??;
@@ -140,6 +141,7 @@ impl MultiDatabase {
             return Ok(None);
         }
         let (through, generation, coordinates) = (state.head, state.generation, state.coordinates);
+        let store_purge_floor = state.store_purge_floor;
         let closure = state.closure_inputs();
         let transactions = self.durable_transactions().clone();
         let slot = self.writer.as_mut().ok_or_else(no_writer)?.objects.reserve_manifest()?;
@@ -150,6 +152,7 @@ impl MultiDatabase {
             generation,
             through,
             coordinates,
+            store_purge_floor,
             transactions,
             closure,
             slot,

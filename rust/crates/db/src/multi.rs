@@ -911,6 +911,7 @@ impl MultiDatabase {
                 lease.until,
                 false,
                 self.state().coordinates,
+                self.state().store_purge_floor,
                 self.binary_checkpoints,
             )?,
         };

@@ -93,6 +93,11 @@
 -- A Multi byte-store floor preflight checks the settled writer prefix and requires the plan's basis to name a readable transaction cut in that incarnation.
 -- Each opaque guard range must be unchanged after that cut, including when a key written in the range is now absent.
 -- An advancing candidate is refused while a checkpoint pin, scoped hold or surviving native branch ancestry can retain affected history.
+-- A Multi writer orders an advancing store floor in the next journal slot of the checked prefix under its current writer fence.
+-- The floor bounds reclamation to store versions strictly below it.
+-- Replay advances the floor monotonically within the retained incarnation.
+-- Checkpoints preserve the floor at their captured cut, and fresh restores start with a floor of zero in their new incarnation.
+-- Reclamation requires closure of the affected history, including its retained recovery and reader obligations.
 -- Branch Transact submissions with operations append the canonical request and its authenticated admission context to the source log.
 -- The admission context preserves the receipt namespace, label scope, verified claims and any sealed custody request digest.
 -- Nodes that submit or resolve branch requests share the database's source admission key through its private object store.

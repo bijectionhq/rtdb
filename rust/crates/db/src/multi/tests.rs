@@ -369,6 +369,10 @@ async fn store_purge_preflight_checks_exact_absence_guards_after_checkpoint_trim
     let error = writer.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err();
     assert_eq!(error.code, "rtdb.store/purge-guard");
     assert_eq!(error.context.get("read").and_then(|read| read.as_u64()), Some(1));
+    let head = writer.stream.head().await.unwrap();
+    assert_eq!(writer.publish_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code,
+        "rtdb.store/purge-guard");
+    assert_eq!(writer.stream.head().await.unwrap(), head);
     let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
     assert_eq!(follower.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code, "rtdb/no-writer");
     cluster.at(200);
@@ -401,13 +405,13 @@ async fn store_purge_preflight_checks_committed_bases_and_preserves_native_reten
     let control = writer.state().coordinates.position(writer.state().head).unwrap();
     let control = Basis::new(current.incarnation(), control);
     assert_eq!(writer.check_store_purge_floor(control, floor, &reads).await.unwrap_err().code, "rtdb/unknown-basis");
-    assert_eq!(writer.check_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-pin");
+    assert_eq!(writer.publish_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-pin");
     writer.release_pin(id).await.unwrap();
 
     writer.transact(&request(3, Op::Fork {
         child: "held".into(), from: (MAIN_BRANCH.into(), old), writable: false, expires_at: None,
     })).await.unwrap();
-    assert_eq!(writer.check_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-retention");
+    assert_eq!(writer.publish_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-retention");
     let dropped = writer.transact(&request(4, Op::DropBranch { branch: "held".into() })).await.unwrap().basis;
     let head = writer.stream.head().await.unwrap();
     writer.check_store_purge_floor(dropped, dropped.position(), &reads).await.unwrap();
@@ -416,6 +420,87 @@ async fn store_purge_preflight_checks_committed_bases_and_preserves_native_reten
     let replay = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap();
     assert_eq!(replay.basis, old);
     assert!(replay.replayed);
+}
+
+#[tokio::test]
+async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = cluster.node(1, faults.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let first = writer.transact(&store_write(1, b"a", Some(b"first"))).await.unwrap().basis;
+    writer.publish_store_purge_floor(first, first.position(), &[]).await.unwrap();
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+
+    let second = writer.transact(&store_write(2, b"a", Some(b"second"))).await.unwrap().basis;
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(writer.publish_store_purge_floor(second, second.position(), &[]).await.unwrap_err().category,
+        AnomalyCategory::Interrupted);
+    assert!(matches!(writer.tick(&live(1)).await.unwrap(), Role::Writer(_)));
+    let publication = writer.state().head;
+    assert_eq!(writer.state().transactions.index().head().basis, second);
+    assert_eq!(first_record(&writer, publication).await, Record::StorePurgeFloor {
+        since: second, keep_from: second.position(),
+    });
+    writer.publish_store_purge_floor(second, second.position(), &[]).await.unwrap();
+    writer.publish_store_purge_floor(second, first.position(), &[]).await.unwrap();
+    assert_eq!(writer.stream.head().await.unwrap(), publication);
+
+    writer.announce_checkpoint(prepared).await.unwrap().manifest().unwrap();
+    let mut reader = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    reader.fresh_index().await.unwrap();
+    assert_eq!(reader.state().store_purge_floor, second.position());
+
+    let pin = Uuid::from_u128(9);
+    writer.pin_checkpoint_at(pin, first, None).await.unwrap();
+    let mut writer = writer.with_binary_checkpoints(false);
+    writer.checkpoint(Vec::new()).await.unwrap();
+    assert!(writer.retained_floor().unwrap() > publication);
+    let mut reader = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    assert_eq!(reader.fresh_index().await.unwrap().exact(first).unwrap().basis, first);
+    assert_eq!(reader.state().store_purge_floor, second.position());
+    let export = reader.open_export(pin).await.unwrap();
+    let destination = Uuid::from_u128(7);
+    let mut restored = cluster.node_for(destination, 2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    restored.create().await.unwrap();
+    restored.tick(&live(2)).await.unwrap();
+    let cut = restored.restore_export(&export).await.unwrap();
+    assert_eq!(cut.basis, Basis::new(*destination.as_bytes(), first.position()));
+    assert_eq!(restored.state().store_purge_floor, 0);
+}
+
+#[tokio::test]
+async fn store_purge_floor_append_is_fenced_after_admission() {
+    use rtdb_index::branches::store::KeyRange;
+
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = cluster.node(1, gate.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let basis = writer.transact(&store_write(1, b"a", Some(b"first"))).await.unwrap().basis;
+    let reads = [KeyRange { start: b"h".to_vec(), end: Some(b"i".to_vec()) }];
+
+    gate.arm.store(true, Ordering::SeqCst);
+    let publish = writer.publish_store_purge_floor(basis, basis.position(), &reads);
+    tokio::pin!(publish);
+    tokio::select! {
+        result = &mut publish => panic!("the floor returned before its append: {result:?}"),
+        reached = tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()) => reached.unwrap(),
+    }
+    cluster.at(200);
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    assert!(matches!(successor.tick(&live(2)).await.unwrap(), Role::Writer(_)));
+    successor.transact(&store_write(2, b"held", Some(b"hold"))).await.unwrap();
+    gate.release.notify_one();
+    assert_eq!(publish.await.unwrap_err().code, "rtdb/writer-fenced");
+    assert_eq!(successor.publish_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code,
+        "rtdb.store/purge-guard");
+    assert_eq!(successor.state().store_purge_floor, 0);
 }
 
 async fn text_at(node: &mut MultiDatabase, branch: &str, id: i64) -> Option<Value> {

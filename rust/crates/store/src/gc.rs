@@ -115,6 +115,7 @@ impl Reachability {
                 | Record::DeploymentRetirement { .. }
                 | Record::Recovered { .. }
                 | Record::Commissioned
+                | Record::StorePurgeFloor { .. }
                 | Record::KeyRotate { .. }
                 | Record::KeyRetirement { .. }
                 | Record::Settle { .. }

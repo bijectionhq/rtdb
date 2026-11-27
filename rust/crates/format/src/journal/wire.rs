@@ -1,12 +1,12 @@
 use prost::{Message, Oneof};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, rtdb_v1::Basis};
 use uuid::Uuid;
 
 use super::{ObjectKind, invalid, require_kind};
 
 #[derive(Message)]
 pub(super) struct Record {
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15")]
     kind: Option<Kind>,
 }
 
@@ -40,6 +40,8 @@ enum Kind {
     Recovered(Recovered),
     #[prost(message, tag = "14")]
     Commissioned(Commissioned),
+    #[prost(message, tag = "15")]
+    StorePurgeFloor(StorePurgeFloor),
 }
 
 #[derive(Message)]
@@ -132,6 +134,14 @@ struct Recovered {
 }
 
 #[derive(Message)]
+struct StorePurgeFloor {
+    #[prost(bytes, tag = "1")]
+    since: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    keep_from: u64,
+}
+
+#[derive(Message)]
 struct TimedDecision {
     #[prost(uint64, tag = "1")]
     tx_lsn: u64,
@@ -193,6 +203,10 @@ impl TryFrom<&super::Record> for Record {
             DeploymentRetirement { lease_until } => Kind::DeploymentRetirement(self::Lease { until: *lease_until }),
             Recovered { head, epoch, time } => Kind::Recovered(self::Recovered { head: *head, epoch: *epoch, time: *time }),
             Commissioned => Kind::Commissioned(self::Commissioned {}),
+            StorePurgeFloor { since, keep_from } => Kind::StorePurgeFloor(self::StorePurgeFloor {
+                since: since.to_bytes().to_vec(),
+                keep_from: *keep_from,
+            }),
         };
         Ok(Self { kind: Some(kind) })
     }
@@ -257,6 +271,11 @@ impl TryFrom<Record> for super::Record {
                     time: recovered.time,
                 },
                 Kind::Commissioned(_) => Self::Commissioned,
+                Kind::StorePurgeFloor(floor) => Self::StorePurgeFloor {
+                    since: Basis::from_bytes(&floor.since)
+                        .map_err(|_| invalid("The store purge floor has an invalid basis"))?,
+                    keep_from: floor.keep_from,
+                },
             },
         )
     }

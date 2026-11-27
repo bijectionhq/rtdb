@@ -59,6 +59,10 @@ fn record_kinds_round_trip_with_fixed_tags() {
             time: i64::MIN,
         },
         Record::Commissioned,
+        Record::StorePurgeFloor {
+            since: Basis::new([0xab; 16], u64::MAX),
+            keep_from: u64::MAX - 1,
+        },
     ];
     for (i, record) in records.into_iter().enumerate() {
         let encoded = record.encode().unwrap();
@@ -77,8 +81,11 @@ fn malformed_record_envelopes_are_refused() {
     assert!(Record::decode(&bytes).is_err());
 
     let mut unknown = RECORD_HEADER.to_vec();
-    unknown.extend_from_slice(&[0x7a, 0]);
+    unknown.extend_from_slice(&[0x82, 0x01, 0]);
     assert!(Record::decode(&unknown).is_err());
+    let mut missing_floor_basis = RECORD_HEADER.to_vec();
+    missing_floor_basis.extend_from_slice(&[0x7a, 0]);
+    assert!(Record::decode(&missing_floor_basis).is_err());
     assert!(
         Record::Checkpoint(Checkpoint {
             manifest: object(ObjectKind::File),

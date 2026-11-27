@@ -21,6 +21,7 @@ const CHECKPOINT_SOURCE: u8 = 4;
 const BINARY_STATE: u8 = 8;
 const PORTABLE_BACKUP_SOURCE: u8 = 16;
 const PORTABLE_FILE_INDEX: u8 = 32;
+const STORE_PURGE_FLOOR: u8 = 64;
 
 pub struct AppliedEffects {
     pub cut: BranchCut,
@@ -251,6 +252,7 @@ pub(crate) struct Committed {
     pub(crate) effects: Vec<AppliedEffects>,
     pub(crate) rotation: Option<Rotation>,
     pub(crate) coordinates: JournalCoordinates,
+    pub(crate) store_purge_floor: u64,
     /// The latest retained recovery record.
     pub(crate) recovery: Option<JournalRecovery>,
     /// The digest of the journal bytes at `head`, when this state read them.
@@ -273,6 +275,7 @@ impl Committed {
             effects: Vec::new(),
             rotation: None,
             coordinates: JournalCoordinates::default(),
+            store_purge_floor: 0,
             recovery: None,
             tail: None,
         }
@@ -604,6 +607,21 @@ impl Committed {
                 }
                 self.generation
             }
+            Record::StorePurgeFloor { since, keep_from } => {
+                if *keep_from <= self.store_purge_floor
+                    || self.lease.map(|(epoch, _)| epoch) != Some(entry.epoch)
+                    || entry.generation != self.generation
+                    || self.transactions.recover_pending().is_some()
+                    || self.transactions.pending_erasure().is_some()
+                {
+                    return Err(invalid("The store purge floor must advance at a settled writer cut"));
+                }
+                let index = self.transactions.index();
+                index.check_store_purge_guards(*since, *keep_from, &[])?;
+                index.check_store_purge_branch_retention(*keep_from)?;
+                self.store_purge_floor = *keep_from;
+                self.generation
+            }
             Record::KeyRotate { generation, at } => {
                 if *at != self.head.0
                     || !matches!(self.records.last(), Some(Record::Checkpoint(checkpoint))
@@ -741,7 +759,7 @@ impl Committed {
         let system_time = Timestamp(i64::from_be_bytes(header[8..16].try_into().unwrap()));
         let until = i64::from_be_bytes(header[16..24].try_into().unwrap());
         let flags = header[24];
-        if flags & !(ROTATING_CHECKPOINT | RESTORED_HISTORY | CHECKPOINT_SOURCE | BINARY_STATE | PORTABLE_BACKUP_SOURCE | PORTABLE_FILE_INDEX) != 0
+        if flags & !(ROTATING_CHECKPOINT | RESTORED_HISTORY | CHECKPOINT_SOURCE | BINARY_STATE | PORTABLE_BACKUP_SOURCE | PORTABLE_FILE_INDEX | STORE_PURGE_FLOOR) != 0
             || flags & (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE) != 0 && flags & RESTORED_HISTORY == 0
             || flags & (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE) == (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE)
             || flags & PORTABLE_FILE_INDEX != 0 && flags & PORTABLE_BACKUP_SOURCE == 0
@@ -809,6 +827,18 @@ impl Committed {
         } else if checkpoint.restore {
             return Err(invalid("The restored checkpoint has no origin"));
         }
+        let store_purge_floor = if flags & STORE_PURGE_FLOOR != 0 {
+            let (floor, rest) = bytes.split_first_chunk::<8>()
+                .ok_or_else(|| invalid("The checkpoint has no store purge floor"))?;
+            let floor = u64::from_be_bytes(*floor);
+            if checkpoint.restore || floor == 0 || floor > position {
+                return Err(invalid("The store purge floor is outside its checkpoint history"));
+            }
+            bytes = rest;
+            floor
+        } else {
+            0
+        };
         if flags & ROTATING_CHECKPOINT != 0 {
             if checkpoint.restore { return Err(invalid("A restored checkpoint cannot stage a rotation")); }
             if deferred { return Err(invalid("A deferred checkpoint cannot stage a rotation")); }
@@ -836,6 +866,7 @@ impl Committed {
         } else {
             TransactState::decode_checkpoint(bytes, expected)?
         };
+        self.store_purge_floor = store_purge_floor;
         self.lease = Some((epoch, until));
         Ok(())
     }
@@ -846,7 +877,7 @@ impl Committed {
         rotating: bool,
         coordinates: JournalCoordinates,
     ) -> Result<Vec<u8>> {
-        Self::checkpoint_payload_in(transactions, until, rotating, coordinates, false)
+        Self::checkpoint_payload_in(transactions, until, rotating, coordinates, 0, false)
     }
 
     /// The checkpoint payload with the transaction state in CBOR when
@@ -856,6 +887,7 @@ impl Committed {
         until: i64,
         rotating: bool,
         coordinates: JournalCoordinates,
+        store_purge_floor: u64,
         binary: bool,
     ) -> Result<Vec<u8>> {
         let cut = transactions.index().head();
@@ -868,9 +900,11 @@ impl Committed {
             | if coordinates.origin.is_some() { RESTORED_HISTORY } else { 0 }
             | if source.is_some() { CHECKPOINT_SOURCE } else { 0 }
             | if backup.is_some() { PORTABLE_BACKUP_SOURCE } else { 0 }
-            | if portable_file_index.is_some() { PORTABLE_FILE_INDEX } else { 0 };
+            | if portable_file_index.is_some() { PORTABLE_FILE_INDEX } else { 0 }
+            | if store_purge_floor != 0 { STORE_PURGE_FLOOR } else { 0 };
         let extra = coordinates.origin.map_or(0, |_| 48) + source.map_or(0, |_| 48) + backup.map_or(0, |_| 40)
-            + portable_file_index.as_ref().map_or(0, |key| 2 + key.len());
+            + portable_file_index.as_ref().map_or(0, |key| 2 + key.len())
+            + if store_purge_floor != 0 { 8 } else { 0 };
         let mut payload = Vec::with_capacity(25 + extra + bytes.len());
         payload.extend_from_slice(&cut.basis.position().to_be_bytes());
         payload.extend_from_slice(&cut.system_time.0.to_be_bytes());
@@ -895,6 +929,9 @@ impl Committed {
             let length = u16::try_from(key.len()).map_err(|_| invalid("The portable file index key is too long"))?;
             payload.extend_from_slice(&length.to_be_bytes());
             payload.extend_from_slice(key.as_bytes());
+        }
+        if store_purge_floor != 0 {
+            payload.extend_from_slice(&store_purge_floor.to_be_bytes());
         }
         payload.extend_from_slice(&bytes);
         Ok(payload)
