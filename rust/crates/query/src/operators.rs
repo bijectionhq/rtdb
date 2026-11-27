@@ -766,6 +766,14 @@ async fn materialize_columns(
     let memory = &execution.context.memory;
     let size = || invalid("table-size", "Table column allocation overflow");
     let _inventory = memory.reserve(width.checked_mul(256).and_then(|size| size.checked_add(4096)).ok_or_else(size)?)?;
+    if rows.len() > 1 && width != 0 {
+        match materialize_bound_rows(rows, width, execution) {
+            Ok(Some(batch)) => return Ok(Some(batch)),
+            Ok(None) => {}
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {},
+            Err(error) => return Err(error),
+        }
+    }
     let bytes = rows.len().checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size)?;
     let mut columns = (0..width).map(|_| {
         let reservation = memory.reserve(bytes)?;
@@ -814,6 +822,82 @@ async fn materialize_columns(
         let (column, reservation) = pack_evaluated_column(&values, memory)?;
         drop((values, scratch));
         output.append_column(column, reservation, memory)?;
+    }
+    Ok(Some(output))
+}
+
+fn materialize_bound_rows(rows: &[Vec<Expr>], width: usize, execution: &Execution) -> Result<Option<crate::columnar::ColumnBatch>> {
+    use arrow_array::{Array, cast::AsArray};
+    use arrow_schema::{DataType, Field};
+    use crate::columnar::{Column, ColumnBatch};
+
+    let cell = |expression: &Expr| {
+        let Expr::Parameter { index, .. } = expression else { return None; };
+        let (source, row) = execution.parameters.arrow_input(*index)?;
+        let array = source.batch().column(*index);
+        let field = source.batch().schema_ref().field(*index);
+        if field.data_type() != array.data_type() || !field.metadata().is_empty() || !array.is_valid(row)
+            || !matches!(array.data_type(), DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
+                | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary)
+            || &rtdb_columnar::from_field(field).ok()? != execution.parameters.types().get(*index)?
+        {
+            return None;
+        }
+        Some((array, row))
+    };
+    for (index, row) in rows.iter().enumerate() {
+        execution.context.check_cancelled_at(index)?;
+        if row.len() != width || row.iter().zip(&rows[0]).any(|(expression, first)| {
+            cell(expression).zip(cell(first)).is_none_or(|((array, _), (first, _))| array.data_type() != first.data_type())
+        }) {
+            return Ok(None);
+        }
+    }
+
+    let memory = &execution.context.memory;
+    let size = || invalid("table-size", "Table column allocation overflow");
+    let input = Schema::default();
+    for (index, row) in rows.iter().enumerate() {
+        execution.context.check_cancelled_at(index)?;
+        let scope = execution.scope()?;
+        for expression in row {
+            let invocation = execution.prepare_expression(expression, &input, &scope)?;
+            let Expr::Parameter { index, .. } = expression else { unreachable!("Admitted Arrow parameter"); };
+            if invocation.data_type() != &execution.parameters.types()[*index] { return Ok(None); }
+        }
+    }
+
+    let mut output = ColumnBatch::settled(Vec::new(), rows.len(), memory.reserve(256)?)?;
+    for position in 0..width {
+        let picks = || rows.iter().map(|row| cell(&row[position]).expect("Admitted Arrow parameter"));
+        let mut payload = 0usize;
+        for (index, (array, row)) in picks().enumerate() {
+            execution.context.check_cancelled_at(index)?;
+            let bytes = match array.data_type() {
+                DataType::Utf8 => array.as_string::<i32>().value(row).len(),
+                DataType::Binary => array.as_binary::<i32>().value(row).len(),
+                _ => 0,
+            };
+            payload = payload.checked_add(bytes).ok_or_else(size)?;
+        }
+        if i32::try_from(payload).is_err() { return Ok(None); }
+        let bytes = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(payload))
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size)?;
+        let reservation = memory.reserve(bytes)?;
+        let array = {
+            let mut arrays = Vec::with_capacity(rows.len());
+            let mut positions = Vec::with_capacity(rows.len());
+            for (index, (array, row)) in picks().enumerate() {
+                execution.context.check_cancelled_at(index)?;
+                arrays.push(array.as_ref());
+                positions.push((index, row));
+            }
+            rtdb_columnar::copy_selected_cells(&arrays, &positions)?
+        };
+        execution.context.check_cancelled()?;
+        let field = Arc::new(Field::new("value", array.data_type().clone(), false));
+        let logical = Some(rtdb_columnar::from_field(&field)?);
+        output.append_column(Column::Arrow { array, field, logical }, reservation, memory)?;
     }
     Ok(Some(output))
 }
@@ -1817,6 +1901,56 @@ mod template_tests {
         let storage = Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20));
         let database = crate::DatabaseSnapshot { partitions: vec![], storage };
         crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap()
+    }
+
+    #[tokio::test]
+    async fn uniform_multi_row_values_gather_bound_cells_with_order_and_duplicates() {
+        use arrow_array::{BinaryArray, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use crate::{columnar::Column, parameters::BoundParameters};
+        use rtdb_expr::ParameterLookup;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let context = crate::QueryContext::new(catalog(), Arc::clone(&memory), rtdb_types::Timestamp(0),
+            "UTC", Default::default(), &tokio_util::sync::CancellationToken::new()).unwrap();
+        let argument_fields = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Utf8, false), ArrowField::new("b", DataType::Binary, false),
+            ArrowField::new("c", DataType::Utf8, false), ArrowField::new("d", DataType::Binary, false),
+            ArrowField::new("n", DataType::Utf8, true),
+        ]);
+        let types = argument_fields.fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
+        let arguments = RecordBatch::try_new(Arc::new(argument_fields), vec![
+            Arc::new(StringArray::from(vec!["unused", "é"])),
+            Arc::new(BinaryArray::from_vec(vec![b"x", b"\0\xff"])),
+            Arc::new(StringArray::from(vec!["ignored", ""])),
+            Arc::new(BinaryArray::from_vec(vec![b"y", b""])),
+            Arc::new(StringArray::from(vec![Some("ignored"), None])),
+        ]).unwrap();
+        let bound = rtdb_columnar::OwnedBatch::new(arguments, &memory).unwrap();
+        let execution = Execution {
+            parameters: Arc::new(BoundParameters::from_arrow(bound, 1, types.clone(), &memory).unwrap()),
+            outer: crate::context::OuterRows::empty(&memory).unwrap(),
+            context,
+            bindings: None,
+            analysis: None,
+        };
+        let param = |index: usize| Expr::Parameter { index, data_type: types[index].clone() };
+        let rows = vec![vec![param(2), param(1)], vec![param(0), param(3)], vec![param(2), param(1)]];
+        let batch = materialize_columns(&rows, 2, &execution).await.unwrap().unwrap();
+        assert!((0..4).all(|slot| execution.parameters.known_value(slot).is_none()));
+        let nulls = materialize_columns(&[vec![param(0)], vec![param(4)]], 1, &execution).await.unwrap().unwrap();
+        let Column::Arrow { field, .. } = &nulls.columns[0] else { panic!("Expected packed text"); };
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert!(field.is_nullable());
+        assert_eq!(nulls.columns[0].value(1).unwrap(), Value::Null);
+        assert_eq!(execution.parameters.known_value(0), Some(&Value::Utf8("é".into())));
+        drop(execution);
+        assert_eq!(batch.columns[0].value(0).unwrap(), Value::Utf8("".into()));
+        assert_eq!(batch.columns[0].value(1).unwrap(), Value::Utf8("é".into()));
+        assert_eq!(batch.columns[0].value(2).unwrap(), Value::Utf8("".into()));
+        assert_eq!(batch.columns[1].value(0).unwrap(), Value::Binary(vec![0, 255]));
+        assert_eq!(batch.columns[1].value(1).unwrap(), Value::Binary(vec![]));
+        assert_eq!(batch.columns[1].value(2).unwrap(), Value::Binary(vec![0, 255]));
     }
 
     /// `$1` as `a`, extended with `a IS NULL` as `b`, under two stacked filters and a reordering projection.
