@@ -10,14 +10,19 @@ pub(crate) mod render;
 
 /// The case rules of the process's default locale, which upstream's `UPPER` and `LOWER` get from `String.toUpperCase()`
 /// and `toLowerCase()`; read once, as the JVM fixes `Locale.getDefault()` at startup.
+/// Never fails: the `Result` is kept for the evaluator's callers.
 pub(crate) fn case_language() -> Result<rtdb_types::CaseLanguage> {
-    static LANGUAGE: std::sync::OnceLock<Result<rtdb_types::CaseLanguage>> = std::sync::OnceLock::new();
-    LANGUAGE.get_or_init(|| rtdb_java_date::process_language().map(|language| rtdb_types::CaseLanguage::of(&language))).clone()
+    static LANGUAGE: std::sync::OnceLock<rtdb_types::CaseLanguage> = std::sync::OnceLock::new();
+    Ok(*LANGUAGE.get_or_init(|| language_or_root(rtdb_java_date::process_language())))
 }
 
-/// Reads the process defaults the evaluator fixes at startup, as the JVM does, so that a host without them fails to
-/// start rather than failing its first UPPER or LOWER.
-pub fn host_defaults() -> Result<()> { case_language().map(drop) }
+/// A host locale the JVM cannot read leaves `Locale.getDefault()` at the root locale rather than refusing to start.
+fn language_or_root(language: Result<String>) -> rtdb_types::CaseLanguage {
+    language.map_or(rtdb_types::CaseLanguage::Root, |language| rtdb_types::CaseLanguage::of(&language))
+}
+
+/// Fixes the process defaults the evaluator reads at startup, as the JVM does.
+pub fn host_defaults() { let _ = case_language(); }
 
 pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Option<Result<Value>> {
     if matches!(name,"like" | "ilike") { return Some(pattern::like(&args[0],&args[1],None,name == "ilike",false,context)); }
@@ -213,4 +218,18 @@ fn illegal(message: &str) -> Anomaly { Anomaly::incorrect("xtdb.expression/illeg
 
 pub(crate) fn float_text(value: f64, single: Option<f32>) -> String {
     single.map_or_else(|| rtdb_types::java_f64_text(value), rtdb_types::java_f32_text)
+}
+
+#[cfg(test)]
+mod host_locale_tests {
+    use super::language_or_root;
+    use rtdb_types::{Anomaly, CaseLanguage};
+
+    #[test]
+    fn an_unreadable_host_locale_falls_back_to_the_root_locale() {
+        let unreadable = Err(Anomaly::incorrect("rtdb.date/invalid-date-environment", "Host locale identifier is not UTF-8"));
+        assert_eq!(language_or_root(unreadable), CaseLanguage::Root);
+        assert_eq!(language_or_root(Ok("tr".into())), CaseLanguage::Turkic);
+        assert_eq!(language_or_root(Ok("en".into())), CaseLanguage::Root);
+    }
 }

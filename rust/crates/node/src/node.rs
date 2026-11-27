@@ -314,7 +314,7 @@ impl Node {
             return Err(Anomaly::incorrect("rtdb.node/invalid-options", "Node capacities must be positive"));
         }
         options.default_timezone = rtdb_expr::normalize_timezone(&options.default_timezone)?;
-        rtdb_expr::host_defaults()?;
+        rtdb_expr::host_defaults();
         let catalog = DatabaseCatalog::new(options.membership.clone());
         let read_fence = services.read_fence.clone();
         let scan_fragmenter = services.scan_fragmenter.clone();

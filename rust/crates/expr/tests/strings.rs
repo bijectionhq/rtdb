@@ -297,7 +297,7 @@ fn batch_output_container_budget_is_checked_before_any_row_is_evaluated() {
 
 #[test]
 fn upper_and_lower_use_the_process_default_locale_case_rules() {
-    rtdb_expr::host_defaults().unwrap();
+    rtdb_expr::host_defaults();
     // Every default language upper-cases the sharp s to two letters.
     assert_eq!(call("upper", &[text("straße")]), text("STRASSE"));
 }
