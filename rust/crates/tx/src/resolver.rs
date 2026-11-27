@@ -728,11 +728,14 @@ impl TxResolver {
     fn supplied_time(&self, requested: Option<Timestamp>, tx_id: TxId) -> Result<std::result::Result<Option<Timestamp>, Anomaly>> {
         let Some(requested) = requested else { return Ok(Ok(None)) };
         match self.resolved_head() {
-            Some(head) if !crate::system_time::advances(Some(head.system_time.0), requested.0) => Ok(Err(
-                Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
-                    .with_context("tx-key", tx_key_context(TransactionKey { tx_id, system_time: requested })?)
-                    .with_context("latest-completed-tx", tx_key_context(head)?),
-            )),
+            Some(head) if !crate::system_time::advances(Some(head.system_time.0), requested.0) => {
+                tracing::warn!("specified system-time '{requested:?}' not later than current tx '{head:?}'");
+                Ok(Err(
+                    Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
+                        .with_context("tx-key", tx_key_context(TransactionKey { tx_id, system_time: requested })?)
+                        .with_context("latest-completed-tx", tx_key_context(head)?),
+                ))
+            }
             _ => Ok(Ok(Some(requested))),
         }
     }
