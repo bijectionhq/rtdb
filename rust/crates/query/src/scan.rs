@@ -424,15 +424,21 @@ pub(crate) async fn primary_point_events(
         }
     }
     let mut file = DataFileReader::new(request.storage, ObjectKey::new(slug.data_key(trie))?);
+    let point_iid = keys.filter(|keys| keys.len() == 1).and_then(|keys| keys.iter().next());
     let mut inspected = 0usize;
-    let mut visit_page = |page: usize, batch: &EventBatch| -> Result<bool> {
+    let mut visit_page = |page: usize, batch: &EventBatch, cached: Option<&CachedPage>| -> Result<bool> {
         let page = u32::try_from(page).map_err(|error| invalid("point-page", error))?;
         if batch.is_empty() { return Ok(true); }
+        let (ordinals, filter) = match cached.zip(point_iid) {
+            Some((cached, iid)) => (cached.point_ordinals(iid)?, None),
+            None => (0..batch.len(), keys),
+        };
         let iids = batch.iids()?;
-        for row in 0..batch.len() {
-            let iid = iids.get(row)?;
-            if keys.is_some_and(|keys| !keys.contains(&iid)) { continue; }
-            let event = crate::LocatedHistoryEvent { header: batch.header(row)?, origin: batch.origin(row)?, witness: None,
+        for row in ordinals {
+            if let Some(filter) = filter
+                && !filter.contains(&iids.get(row)?) { continue; }
+            let header = match cached { Some(cached) => cached.batch.header(row)?, None => batch.header(row)? };
+            let event = crate::LocatedHistoryEvent { header, origin: batch.origin(row)?, witness: None,
                 location: crate::SearchRowLocation::Persisted { trie: trie.clone(), page,
                     row: u32::try_from(row).map_err(|error| invalid("point-row", error))? } };
             if !visit(event, batch.entity_key(row)?)? { return Ok(false); }
@@ -448,14 +454,14 @@ pub(crate) async fn primary_point_events(
             if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
             file.storage.record_batch_requested();
             if let Some(held) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
-                return Ok((held.batch.view().clone(), memory.reserve(held.bound)?));
+                return Ok((held.batch.view().clone(), memory.reserve(held.bound)?, Some(held)));
             }
             let (batch, charge) = file.decode_opened_event_page(page, memory, DataProjection::PutColumns(&[]), true).await?;
-            Ok((EventBatch::new(batch)?, charge))
-        }), |page, (batch, _charge)| {
+            Ok((EventBatch::new(batch)?, charge, None))
+        }), |page, (batch, _charge, held)| {
             if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
             inspected = inspected.saturating_add(batch.len());
-            visit_page(page, &batch)
+            visit_page(page, &batch, held.as_deref())
         }).await?;
         return Ok(complete.then_some(inspected));
     }
@@ -472,7 +478,7 @@ pub(crate) async fn primary_point_events(
             if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
             if rows > remaining { return Ok(None); }
         }
-        let (batch, _charged) = match held {
+        let (batch, _charged) = match &held {
             Some(held) => {
                 file.storage.record_batch_requested();
                 (held.batch.view().clone(), memory.reserve(held.bound)?)
@@ -493,7 +499,7 @@ pub(crate) async fn primary_point_events(
             }
         }
         inspected += rows;
-        if !visit_page(page, &batch)? { return Ok(None); }
+        if !visit_page(page, &batch, held.as_deref())? { return Ok(None); }
     }
     Ok(Some(inspected))
 }
@@ -3325,6 +3331,15 @@ impl Cached for CachedLayout {}
 
 /// A decoded data page, whose batch retains the pool's reservation, and the bound a query admits for it.
 struct CachedPage { batch: Arc<IndexBatch>, bound: usize }
+impl CachedPage {
+    /// The scan checks IID order before it caches a primary page.
+    fn point_ordinals(&self, iid: Iid) -> Result<std::ops::Range<usize>> {
+        let rows = ActiveRows::File(Arc::clone(&self.batch));
+        let start = rows.seek(0, |header| header.iid < iid)?;
+        let end = rows.seek(start, |header| header.iid == iid)?;
+        Ok(start..end)
+    }
+}
 impl Cached for CachedPage { fn in_use(&self) -> bool { Arc::strong_count(&self.batch) > 1 } }
 
 fn invalid_iid_path() -> Anomaly { invalid("iid-path", "Trie path exceeds 64 base-four buckets") }
@@ -4807,11 +4822,34 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_primary_points_surface_a_page_fault_only_when_the_visitor_reaches_it() {
+        use rtdb_format::{data::build_event_batch_with_recency, metadata::MetadataBuilder};
+
         let (state, table, events, store, _) = persisted_page_fixture().await;
         let value = state.value();
         let entry = value.table_catalog().entry(&table).unwrap();
         let trie = TrieKey::l0(value.live().block_index()).unwrap();
         let key = ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
+        let metadata_key = ObjectKey::new(entry.slug.metadata_key(&trie)).unwrap();
+        let put_fields = value.live().tables()[&table].column_types().clone();
+        let mut first = events[..2].to_vec();
+        for event in &mut first { event.recency = Some(Timestamp(100)); }
+        let mut second = events[0].clone();
+        second.system_from = Timestamp(75);
+        second.recency = Some(Timestamp::MAX);
+        let pages = [
+            build_event_batch_with_recency(&first, Some(put_fields.clone()), None, true).unwrap(),
+            build_event_batch_with_recency(&[second], Some(put_fields), None, true).unwrap(),
+        ];
+        let mut metadata = MetadataBuilder::new(true, false);
+        let first_leaf = metadata.write_leaf(&pages[0]).unwrap();
+        let second_leaf = metadata.write_leaf(&pages[1]).unwrap();
+        metadata.write_recency_branch(vec![(Timestamp(100), first_leaf), (Timestamp::MAX, second_leaf)]).unwrap();
+        let (metadata, _) = metadata.finish().unwrap();
+        store.delete(&metadata_key).await.unwrap();
+        store.put(&metadata_key, metadata.write().unwrap().into()).await.unwrap();
+        store.delete(&key).await.unwrap();
+        store.put(&key, write_file(pages[0].schema().as_ref(), &pages).unwrap().into()).await.unwrap();
+
         let storage = Arc::new(BufferPool::new(store.clone(), 8 << 20));
         let snapshot = value.snapshot();
         let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
@@ -4833,14 +4871,22 @@ mod tests {
         store.delete(&key).await.unwrap();
         store.put(&key, bytes.into()).await.unwrap();
 
-        let keys = events.iter().map(|event| event.iid).collect::<BTreeSet<_>>();
+        let keys = [events[0].iid].into();
         let scope = Some(crate::IidScope::Set(&keys));
-        for (continue_after_first, read_ahead) in [(false, true), (true, true), (true, false)] {
-            let mut visited = Vec::new();
-            let result = primary_point_events(&request, &entry.slug, &trie, scope, usize::MAX, read_ahead,
-                |event, _| { visited.push(event.header.iid); Ok(continue_after_first) }).await;
-            assert_eq!(visited, [events[0].iid]);
-            if continue_after_first { assert!(result.is_err()); } else { assert_eq!(result.unwrap(), None); }
+        for cached in [false, true] {
+            if cached {
+                let mut reader = DataFileReader::new(&storage, key.clone());
+                let (batch, charge) = reader.decode_scan_page(0, &memory, Vec::new).await.unwrap();
+                let bound = charge.unwrap().bytes();
+                assert!(storage.insert_view(&key, View::Page(0), Arc::new(CachedPage { batch, bound })));
+            }
+            for (continue_after_first, read_ahead) in [(false, true), (true, true), (true, false)] {
+                let mut visited = Vec::new();
+                let result = primary_point_events(&request, &entry.slug, &trie, scope, usize::MAX, read_ahead,
+                    |event, _| { visited.push(event.header.iid); Ok(continue_after_first) }).await;
+                assert_eq!(visited, [events[0].iid]);
+                if continue_after_first { assert!(result.is_err()); } else { assert_eq!(result.unwrap(), None); }
+            }
         }
     }
 
@@ -4871,12 +4917,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_points_keep_the_origins_locations_and_exact_keys_of_colliding_rows() {
+    async fn primary_point_reads_keep_the_origins_locations_and_exact_keys_of_colliding_rows() {
         let (state, table, events, store, _) = persisted_page_fixture().await;
         let value = state.value();
         let entry = value.table_catalog().entry(&table).unwrap();
         let trie = TrieKey::l0(value.live().block_index()).unwrap();
-        let origins = [0, 1].map(|row| rtdb_types::EventOrigin::at([1; 16], row, trie.block_index()));
+        let origins = [0, 1, 2].map(|row| rtdb_types::EventOrigin::at([1; 16], row, trie.block_index()));
         let mut first = events[0].clone();
         first.entity_key = Some(vec![1].into());
         first.origin = Some(origins[0]);
@@ -4884,13 +4930,17 @@ mod tests {
         second.entity_key = Some(vec![2].into());
         second.origin = Some(origins[1]);
         second.system_from = Timestamp(75);
+        let mut other = first.clone();
+        other.iid = Iid([0x20; 16]);
+        other.entity_key = Some(vec![3].into());
+        other.origin = Some(origins[2]);
         let puts = value.live().tables()[&table].column_types().clone();
-        let page = build_event_batch(&[first, second], Some(puts), None).unwrap();
+        let page = build_event_batch(&[first, second, other], Some(puts), None).unwrap();
         let data = write_file(page.schema().as_ref(), &[page]).unwrap();
         let key = ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
         store.delete(&key).await.unwrap();
         store.put(&key, data.into()).await.unwrap();
-        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let storage = Arc::new(BufferPool::new(store, 16 << 20));
         let snapshot = value.snapshot();
         let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
         let search_queries = SearchQueries::default();
@@ -4903,17 +4953,48 @@ mod tests {
             current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
             constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
         let keys = [events[0].iid].into();
-        let mut recorded = Vec::new();
-        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(crate::IidScope::Set(&keys)), usize::MAX, false, |event, key| {
-            let crate::SearchRowLocation::Persisted { trie: actual, page, row } = event.location else {
-                panic!("Expected a persisted point location");
-            };
-            assert_eq!(actual, trie);
-            recorded.push((page, row, event.origin, key.unwrap().to_vec()));
-            Ok(true)
-        }).await.unwrap(), Some(2));
-        assert_eq!(recorded, [(0, 0, Some(origins[0]), vec![1]), (0, 1, Some(origins[1]), vec![2])]);
-        assert!(crate::table_point_rows(&request, &keys).await.unwrap().is_none());
+        let scope = Some(crate::IidScope::Set(&keys));
+        for cached in [false, true] {
+            if cached {
+                let mut reader = DataFileReader::new(&storage, key.clone());
+                let (batch, charge) = reader.decode_scan_page(0, &memory, Vec::new).await.unwrap();
+                let bound = charge.unwrap().bytes();
+                assert!(storage.insert_view(&key, View::Page(0), Arc::new(CachedPage { batch, bound })));
+            }
+            assert_eq!(primary_point_events(&request, &entry.slug, &trie, scope, 2, false, |_, _| {
+                panic!("The entire page must fit before it visits any rows")
+            }).await.unwrap(), None);
+            let mut recorded = Vec::new();
+            assert_eq!(primary_point_events(&request, &entry.slug, &trie, scope, usize::MAX, false, |event, key| {
+                let crate::SearchRowLocation::Persisted { trie: actual, page, row } = event.location else {
+                    panic!("Expected a persisted point location");
+                };
+                assert_eq!(actual, trie);
+                recorded.push((page, row, event.origin, key.unwrap().to_vec()));
+                Ok(true)
+            }).await.unwrap(), Some(3));
+            assert_eq!(recorded, [(0, 0, Some(origins[0]), vec![1]), (0, 1, Some(origins[1]), vec![2])]);
+            assert!(crate::table_point_rows(&request, &keys).await.unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn cached_primary_point_page_seeks_the_entire_equal_iid_run() {
+        let (state, table, mut events) = live_table();
+        let put_fields = state.value().live().tables()[&table].column_types().clone();
+        let mut earlier = events[1].clone();
+        earlier.system_from = Timestamp(75);
+        events.insert(2, earlier);
+        let memory = MemoryBudget::new(1 << 20);
+        for layout in [None, Some(rtdb_types::RunEndWidth::I16)] {
+            let batch = build_event_batch(&events, Some(put_fields.clone()), layout).unwrap();
+            let cached = CachedPage { batch: IndexBatch::new(batch, &memory).unwrap(), bound: 0 };
+            assert_eq!(cached.point_ordinals(events[1].iid).unwrap(), 1..3);
+            assert_eq!(cached.point_ordinals(events[0].iid).unwrap(), 0..1);
+            assert_eq!(cached.point_ordinals(events[3].iid).unwrap(), 3..4);
+            assert!(cached.point_ordinals(Iid([32; 16])).unwrap().is_empty());
+            assert!(cached.point_ordinals(Iid([255; 16])).unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

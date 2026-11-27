@@ -2504,6 +2504,7 @@ surface QueryAccess {
         -- The scan retains the event headers and exact entity keys required for temporal resolution.
         -- A point in both time dimensions selects the same visible fragment as history resolution, including its valid-time endpoints and the effects of deletes and erases.
         -- A located point read checks ambiguous event identities before returning the event that determines visibility.
+        -- A point read for one IID can seek its complete range in a cached primary page after the page's IID order has been checked.
         -- An eligible range predicate on a local scan reads its referenced columns from the resolved rows, and payload projection gathers only the positions the predicate keeps.
         -- An ordinary scan can apply a bound, total scalar predicate to its referenced columns after bitemporal resolution and gather other columns from the surviving positions.
         -- When every resolved row in a group passes, the scan can reuse the predicate's gathered columns and their charges for matching output fields.
