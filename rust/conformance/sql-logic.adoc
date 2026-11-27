@@ -112,3 +112,15 @@ Optional `--selection` flags choose original task groups; `--query-limit` is rec
 Python regression sources are `test_sql_logic_records.py` and `test_sql_logic_results.py`.
 Native regression sources are in `conformance/tests/sql_logic.rs` and the formatter module.
 The pinned JVM adapter regression task is `rtdbConformanceSqlLogicAdapterTest` through `reference.init.gradle`.
+
+== Native-only source expectations
+
+`run_sql_logic_native.py` checks the selected original SLT expectations using a Cargo-built `rtdb-conformance` executable.
+The default reference SHA lives in `upstream-commit.txt`, and the earlier C84 comparison remains available by explicit SHA.
+Every selected statement and query appears once in the denominator, including the same source file when the upstream suite invokes it with different options.
+Directives are outside the denominator.
+Each script reports `assertions = passed + failed + excluded`, with unobserved assertions included in `failed`.
+A partial process contributes its validated observation prefix and reports the missing tail as unobserved.
+The exclusion dispositions correspond to upstream runner conditions and suppressions or an explicitly requested query limit.
+Parse errors and harness gaps count as failures.
+The summary records the upstream SHA and binary digest, and a nonzero exit identifies assertion failures or incomplete evidence.
