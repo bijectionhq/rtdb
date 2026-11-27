@@ -84,7 +84,7 @@ fn parse_decimal(text: &str) -> Result<DecimalValue> {
     crate::numeric::parse(text)?.into_decimal()
 }
 
-fn bytea(text: &str) -> Result<Cow<'_, [u8]>> {
+pub(super) fn bytea(text: &str) -> Result<Cow<'_, [u8]>> {
     let Some(hex) = text.strip_prefix("\\x") else { return Ok(Cow::Borrowed(text.as_bytes())); };
     if hex.len() % 2 != 0 { return Err(invalid("Odd-length bytea hexadecimal value")); }
     let bytes = hex.as_bytes().chunks_exact(2).map(|pair| {
@@ -94,13 +94,13 @@ fn bytea(text: &str) -> Result<Cow<'_, [u8]>> {
     Ok(Cow::Owned(bytes))
 }
 
-fn local_timestamp_micros(text: &str) -> Result<i64> {
+pub(super) fn local_timestamp_micros(text: &str) -> Result<i64> {
     let (value, timezone) = rtdb_types::parse_sql_timestamp_micros(text)?;
     if timezone.is_some() { return Err(invalid("Invalid PostgreSQL local timestamp")); }
     Ok(value)
 }
 
-fn zoned_timestamp_micros(text: &str) -> Result<(i64, String)> {
+pub(super) fn zoned_timestamp_micros(text: &str) -> Result<(i64, String)> {
     let (value, zone) = rtdb_types::parse_sql_timestamp_micros(text)?;
     let zone = zone.ok_or_else(|| invalid("Zoned timestamp requires an offset or region"))?;
     Ok((value, rtdb_expr::normalize_timezone(&zone)?))
@@ -111,7 +111,7 @@ fn timestamp(text: &str) -> Result<Value> {
     Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some(zone) })
 }
 
-fn interval_type(days: i32, nanoseconds: i64) -> ScalarType {
+pub(super) fn interval_type(days: i32, nanoseconds: i64) -> ScalarType {
     if nanoseconds % 1000 != 0 { ScalarType::Interval(IntervalUnit::MonthDayNano) }
     else if nanoseconds != 0 || days != 0 { ScalarType::IntervalMonthDayMicro }
     else { ScalarType::Interval(IntervalUnit::YearMonth) }
@@ -340,7 +340,7 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
         T::Symbol(_) => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-symbol", "Source symbols have no Arrow document value type")),
     })
 }
-fn parse_uuid(text: &str) -> Result<[u8; 16]> {
+pub(super) fn parse_uuid(text: &str) -> Result<[u8; 16]> {
     Ok(*uuid::Uuid::parse_str(text).map_err(invalid)?.as_bytes())
 }
 

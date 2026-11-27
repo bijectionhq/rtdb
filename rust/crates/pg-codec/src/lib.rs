@@ -1,4 +1,5 @@
 mod binary;
+mod bind;
 mod float_array;
 mod interval;
 mod numeric;
@@ -68,6 +69,9 @@ pub fn decode_argument(
     use arrow_schema::DataType;
 
     let mut charge = memory.reserve(decode_bound(bytes)?)?;
+    if let Some((field, array)) = bind::read_scalar(name, ty, format, bytes)? {
+        return Ok((field, array, charge));
+    }
     match ty {
         PgType::Numeric => {
             let value = match format {

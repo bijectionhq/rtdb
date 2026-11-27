@@ -23,22 +23,22 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
         PgType::Bool => Value::Bool(boolean(&mut input)?),
         PgType::Numeric => numeric_read(&mut input)?.into_value()?,
         PgType::Timestamp | PgType::TimestampTz => Value::Timestamp {
-            value: input.i64()?.wrapping_add(PG_EPOCH_MICROS),
+            value: input.timestamp_micros()?,
             unit: TimeUnit::Microsecond,
             timezone: (ty == PgType::TimestampTz).then(|| "Z".into()),
         },
-        PgType::Date => Value::DateDay(input.i32()?.checked_add(PG_EPOCH_DAYS).ok_or_else(|| invalid("Date exceeds Arrow Date32 range"))?),
-        PgType::Time => { let micros = input.i64()?; if !(0..86_400_000_000).contains(&micros) { return Err(invalid("Time is outside a day")); } Value::Time { value: micros * 1000, unit: TimeUnit::Nanosecond, bit_width: 64 } },
-        PgType::Interval => { let nanoseconds = input.i64()?.checked_mul(1000).ok_or_else(|| invalid("Interval overflow"))?; let days = input.i32()?; let months = input.i32()?; if nanoseconds == 0 && days == 0 { Value::IntervalYearMonth(months) } else { Value::IntervalMonthDayMicro { months, days, nanoseconds } } },
+        PgType::Date => Value::DateDay(input.date_days()?),
+        PgType::Time => Value::Time { value: input.time_nanos()?, unit: TimeUnit::Nanosecond, bit_width: 64 },
+        PgType::Interval => { let (months, days, nanoseconds) = input.interval_parts()?; if nanoseconds == 0 && days == 0 { Value::IntervalYearMonth(months) } else { Value::IntervalMonthDayMicro { months, days, nanoseconds } } },
         PgType::Bytes => Value::Binary(bytes.to_vec()),
-        PgType::Uuid => Value::Uuid(input.take(16)?.try_into().map_err(invalid)?),
+        PgType::Uuid => Value::Uuid(input.uuid()?),
         PgType::Float4s | PgType::Float8s => return crate::float_array::read_value(ty, crate::Format::Binary, bytes),
         PgType::Int4s | PgType::Int8s | PgType::Texts => array_read(ty, &mut input)?,
         PgType::Jsonb => { if input.take(1)?[0] != 1 { return Err(Anomaly::incorrect("xtdb.pgwire/unsupported-jsonb-version", "Unsupported binary jsonb version")); } return crate::text::read_text(114, std::str::from_utf8(input.0).map_err(invalid)?); },
         PgType::Json | PgType::JsonLd | PgType::Transit | PgType::TsTzRange => return crate::text::read_text(ty.descriptor().oid as u32, std::str::from_utf8(bytes).map_err(invalid)?),
         PgType::Duration | PgType::Oid | PgType::RegClass | PgType::RegProc => return Err(Anomaly::unsupported("xtdb.pgwire/unsupported-binary-type", "This PostgreSQL type has no binary reader")),
     };
-    if !matches!(ty, PgType::Default | PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword | PgType::Bytes | PgType::Numeric) && !input.0.is_empty() { return Err(invalid("Trailing bytes in PostgreSQL binary value")); }
+    if !matches!(ty, PgType::Default | PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword | PgType::Bytes | PgType::Numeric) { input.end()?; }
     Ok(value)
 }
 
@@ -216,10 +216,47 @@ impl NumericPayload {
     }
 }
 
-struct Input<'a>(&'a [u8]);
+pub(super) fn read_fixed<'a, T>(bytes: &'a [u8], read: impl FnOnce(&mut Input<'a>) -> Result<T>) -> Result<T> {
+    let mut input = Input(bytes);
+    let value = read(&mut input)?;
+    input.end()?;
+    Ok(value)
+}
+
+pub(super) struct Input<'a>(&'a [u8]);
 impl<'a> Input<'a> {
     fn take(&mut self, length: usize) -> Result<&'a [u8]> { let (head, tail) = self.0.split_at_checked(length).ok_or_else(|| invalid("Truncated PostgreSQL binary value"))?; self.0 = tail; Ok(head) }
     fn i16(&mut self) -> Result<i16> { Ok(i16::from_be_bytes(self.take(2)?.try_into().map_err(invalid)?)) }
     fn i32(&mut self) -> Result<i32> { Ok(i32::from_be_bytes(self.take(4)?.try_into().map_err(invalid)?)) }
     fn i64(&mut self) -> Result<i64> { Ok(i64::from_be_bytes(self.take(8)?.try_into().map_err(invalid)?)) }
+
+    fn end(&self) -> Result<()> {
+        if !self.0.is_empty() { return Err(invalid("Trailing bytes in PostgreSQL binary value")); }
+        Ok(())
+    }
+
+    pub(super) fn timestamp_micros(&mut self) -> Result<i64> {
+        Ok(self.i64()?.wrapping_add(PG_EPOCH_MICROS))
+    }
+
+    pub(super) fn date_days(&mut self) -> Result<i32> {
+        self.i32()?.checked_add(PG_EPOCH_DAYS).ok_or_else(|| invalid("Date exceeds Arrow Date32 range"))
+    }
+
+    pub(super) fn time_nanos(&mut self) -> Result<i64> {
+        let micros = self.i64()?;
+        if !(0..86_400_000_000).contains(&micros) { return Err(invalid("Time is outside a day")); }
+        Ok(micros * 1000)
+    }
+
+    pub(super) fn interval_parts(&mut self) -> Result<(i32, i32, i64)> {
+        let nanoseconds = self.i64()?.checked_mul(1000).ok_or_else(|| invalid("Interval overflow"))?;
+        let days = self.i32()?;
+        let months = self.i32()?;
+        Ok((months, days, nanoseconds))
+    }
+
+    pub(super) fn uuid(&mut self) -> Result<[u8; 16]> {
+        self.take(16)?.try_into().map_err(invalid)
+    }
 }

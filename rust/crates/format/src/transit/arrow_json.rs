@@ -155,6 +155,26 @@ fn cell_stringable(cell: ArrowCell<'_>, typed_structs: bool) -> Result<bool> {
     if cell.structure().is_some() || cell.sequence_kind().is_some() {
         return Ok(false);
     }
+    let ArrowCell { field, array, row } = cell;
+    match (field.data_type(), field.extension_type_name()) {
+        (DataType::Utf8, Some("xt/clj-keyword"))
+        | (DataType::FixedSizeBinary(16), Some("uuid"))
+        | (DataType::FixedSizeBinary(_), None) => return Ok(true),
+        (DataType::Utf8, Some("uri")) => {
+            rtdb_types::UriParts::parse(array.as_string::<i32>().value(row))?;
+            return Ok(true);
+        }
+        (DataType::Int32, Some("xt/oid" | "xt/regclass" | "xt/regproc")) => return Ok(false),
+        (DataType::Binary, Some("xt/transit+msgpack")) => {
+            let value = super::decode_msgpack(array.as_binary::<i32>().value(row))?;
+            return Ok(stringable(&value));
+        }
+        (DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..), None) => {
+            rtdb_columnar::decimal_field_parameters(field)?;
+            return Ok(true);
+        }
+        _ => {}
+    }
     Ok(match primitive(cell, typed_structs) {
         Some(value) => value.stringable(),
         None => stringable(&read_leaf(cell)?),

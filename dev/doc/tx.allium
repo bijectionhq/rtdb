@@ -33,6 +33,8 @@
 -- Pgwire Bind publishes a portal with one Arrow argument row.
 -- Numeric Bind writes the coefficient at its inferred Decimal128 or Decimal256 width and preserves the logical scale.
 -- Integer and text array Bind write their inferred Arrow child layout, offsets and validity.
+-- Bind writes byte strings, UUIDs and supported temporal arguments directly into the inferred Arrow storage.
+-- The argument reservation covers those arrays until the portal takes ownership.
 -- Declared query parameters retain compatible argument columns and cast incompatible columns individually.
 -- A packed float list cast used to bind a declared parameter keeps the converted child in the one-row Arrow argument batch.
 -- Unchanged argument buffers retain their original admission for the lifetime of the reader.
@@ -59,11 +61,13 @@
 -- A pgwire query portal validates each new result schema before writing its rows.
 -- Equal result schemas within a pgwire query portal reuse its last admitted logical layout, including across Execute suspension.
 -- A pgwire portal writes supported primitive, temporal, interval, duration, range, and PostgreSQL reference cells from their Arrow positions into DataRow.
+-- Pgwire writes keyword names from their Arrow string buffers and validates unsigned integers against the declared PostgreSQL width.
 -- The portal selects active dense union legs before writing their payloads.
 -- A pgwire portal writes JSON and JSON-LD structures and their scalar leaves into the reserved DataRow buffer.
 -- A pgwire portal writes Numeric payloads from Arrow coefficients into the reserved DataRow buffer.
 -- Binary Numeric writes negative-scale padding in bounded chunks.
 -- A pgwire portal can encode Transit results from their Arrow cells.
+-- Transit chooses its simple or compound map representation from supported Arrow key layouts, validating URI keys in the order they are reached.
 -- Pgwire accepts one-dimensional real and double precision arrays with nullable elements in text and binary format.
 -- Pgwire emits floating-point list results from Arrow components with PostgreSQL array framing.
 -- Transit JSON and MessagePack readers collect floating-point components in typed buffers and resolve tags and cache references in wire order.

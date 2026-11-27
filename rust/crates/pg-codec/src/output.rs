@@ -122,13 +122,19 @@ pub fn integer_in_range(ty: PgType, integer: i128) -> Result<()> {
 }
 
 fn integer_bytes(ty: PgType, format: Format, integer: i128) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    write_integer(ty, format, integer, &mut output)?;
+    Ok(output)
+}
+
+fn write_integer(ty: PgType, format: Format, integer: i128, output: &mut impl Write) -> Result<()> {
     integer_in_range(ty, integer)?;
-    if format == Format::Text { return Ok(integer.to_string().into_bytes()); }
-    Ok(match ty {
-        PgType::Int2 => (integer as i16).to_be_bytes().to_vec(),
-        PgType::Int4 => (integer as i32).to_be_bytes().to_vec(),
-        _ => (integer as i64).to_be_bytes().to_vec(),
-    })
+    if format == Format::Text { return write!(output, "{integer}").map_err(write_error); }
+    match ty {
+        PgType::Int2 => write_bytes(output, &(integer as i16).to_be_bytes()),
+        PgType::Int4 => write_bytes(output, &(integer as i32).to_be_bytes()),
+        _ => write_bytes(output, &(integer as i64).to_be_bytes()),
+    }
 }
 
 fn date_binary(days: i64) -> Result<[u8; 4]> {

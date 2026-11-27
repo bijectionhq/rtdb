@@ -38,7 +38,7 @@ fn wire_json_rejects_unmatched_keys_invalid_references_and_trailing_values() {
 fn jvm_arrow_leaves_stream_the_existing_transit_json_bytes() {
     use rtdb_columnar::{ArrowCell, copy_array, to_field};
     use rtdb_format::transit::{encode_json, encode_msgpack, value_to_transit, write_arrow_json};
-    use rtdb_types::{Keyword, TimeUnit, Value};
+    use rtdb_types::{DecimalValue, Keyword, TimeUnit, Value};
 
     let embedded_transit = V::Map(vec![(V::Keyword("map-key".into()), V::Bytes(vec![0xFE, 0x81]))]);
     let controls: String = (0_u8..32).map(char::from).collect();
@@ -59,6 +59,13 @@ fn jvm_arrow_leaves_stream_the_existing_transit_json_bytes() {
         Value::Map { entries: vec![(Value::Keyword(Keyword::from_name("map-key")), Value::DateDay(-1))], sorted: false },
         Value::Map { entries: vec![(Value::Utf8(text.clone()), Value::Keyword(keyword.clone()))], sorted: false },
         Value::Map { entries: vec![(Value::Uri(uri.into()), Value::Keyword(keyword))], sorted: false },
+        Value::Map { sorted: false, entries: vec![
+            (Value::Uuid([13; 16]), Value::I64(1)),
+            (Value::FixedSizeBinary(vec![0xfe]), Value::I64(2)),
+            (Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 20, 2, 128).unwrap()), Value::I64(3)),
+            (Value::Transit(encode_msgpack(&V::Keyword("nested/key".into())).unwrap()), Value::I64(4)),
+        ] },
+        Value::Map { entries: vec![(Value::RegClass(41), Value::I64(1))], sorted: false },
         Value::Map { entries: vec![(Value::list(vec![Value::Utf8(text)]), Value::Uri(uri.into()))], sorted: false },
         Value::Transit(encode_msgpack(&embedded_transit).unwrap()),
     ];
@@ -76,7 +83,10 @@ fn jvm_arrow_leaves_stream_the_existing_transit_json_bytes() {
 
 #[test]
 fn arrow_transit_rejects_invalid_uri_before_writing_its_tag() {
-    use arrow_array::StringArray;
+    use std::sync::Arc;
+    use arrow_array::{Array, Int64Array, MapArray, StringArray, StructArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field};
     use rtdb_columnar::{ArrowCell, to_field};
     use rtdb_format::transit::write_arrow_json;
     use rtdb_types::{LogicalType, ScalarType, UriParts};
@@ -86,6 +96,18 @@ fn arrow_transit_rejects_invalid_uri_before_writing_its_tag() {
     let array = StringArray::from(vec![invalid]);
     let cell = ArrowCell { field: &field, array: &array, row: 0 };
     let mut output = Vec::new();
+    assert_eq!(write_arrow_json(&mut output, cell).unwrap_err(), UriParts::parse(invalid).unwrap_err());
+    assert!(output.is_empty());
+
+    let entries = StructArray::new(
+        vec![field.with_name("key"), Field::new("value", DataType::Int64, false)].into(),
+        vec![Arc::new(StringArray::from(vec!["https://example.com/good", invalid])), Arc::new(Int64Array::from(vec![1, 2]))],
+        None,
+    );
+    let entry_field = Field::new("entries", entries.data_type().clone(), false);
+    let map = MapArray::try_new(Arc::new(entry_field), OffsetBuffer::new(vec![0, 2].into()), entries, None, false).unwrap();
+    let field = Field::new("map", map.data_type().clone(), false);
+    let cell = ArrowCell { field: &field, array: &map, row: 0 };
     assert_eq!(write_arrow_json(&mut output, cell).unwrap_err(), UriParts::parse(invalid).unwrap_err());
     assert!(output.is_empty());
 }

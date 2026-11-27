@@ -7,7 +7,7 @@ use arrow_schema::Field;
 use rtdb_columnar::BatchBuilder;
 use rtdb_types::{LogicalType, Result, ScalarType};
 
-use super::{Input, boolean, invalid};
+use super::{Input, boolean, invalid, read_fixed};
 
 /// Builds a direct binary column under the snapshot batch's reservation.
 pub fn read_source_binary_column<'a>(
@@ -43,7 +43,7 @@ pub fn read_source_binary_column<'a>(
             ScalarType::Bool => {
                 let mut builder = BooleanBuilder::with_capacity(count);
                 for row in 0..count {
-                    builder.append_option(cell(row)?.map(|bytes| parse(bytes, boolean)).transpose()?);
+                    builder.append_option(cell(row)?.map(|bytes| read_fixed(bytes, boolean)).transpose()?);
                 }
                 Arc::new(builder.finish())
             }
@@ -61,7 +61,7 @@ pub fn read_source_binary_column<'a>(
                 let mut builder = FixedSizeBinaryBuilder::with_capacity(count, 16);
                 for row in 0..count {
                     if let Some(bytes) = cell(row)? {
-                        let uuid = parse(bytes, |input| input.take(16))?;
+                        let uuid = read_fixed(bytes, |input| input.take(16))?;
                         builder.append_value(uuid).map_err(invalid)?;
                     } else {
                         builder.append_null();
@@ -90,14 +90,7 @@ fn primitive<'a, T: ArrowPrimitiveType>(
 ) -> Result<ArrayRef> {
     let mut builder = PrimitiveBuilder::<T>::with_capacity(count);
     for row in 0..count {
-        builder.append_option(cell(row)?.map(|bytes| parse(bytes, &mut read)).transpose()?);
+        builder.append_option(cell(row)?.map(|bytes| read_fixed(bytes, &mut read)).transpose()?);
     }
     Ok(Arc::new(builder.finish()))
-}
-
-fn parse<'a, T>(bytes: &'a [u8], read: impl FnOnce(&mut Input<'a>) -> Result<T>) -> Result<T> {
-    let mut input = Input(bytes);
-    let value = read(&mut input)?;
-    if !input.0.is_empty() { return Err(invalid("Trailing bytes in PostgreSQL binary value")); }
-    Ok(value)
 }
