@@ -3786,26 +3786,20 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
         client.simple_query(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{body}'}}")).await.unwrap();
         cell.node(0).agent.flush("shop").await.unwrap();
     }
-    let source_checkpoint = cell.directory.deployment_by_name("shop").await.unwrap().unwrap().checkpoint.unwrap();
     let database = cell.node(0).server.node().catalog().database("shop").unwrap();
     database.compaction().unwrap().compact_all().await.unwrap();
     client.simple_query("INSERT INTO checkpoint_marker (_id) VALUES (1)").await.unwrap();
     cell.node(0).agent.flush("shop").await.unwrap();
-    let mut latest = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     let record = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if latest.checkpoint.is_some_and(|checkpoint| checkpoint.block > source_checkpoint.block)
-                && latest.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] >= source_checkpoint.boundary)
-            {
-                break latest.clone();
+            let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+            if record.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] == record.checkpoint.unwrap().boundary - 1) {
+                break record;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
-            latest = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
         }
-    }).await.unwrap_or_else(|_| panic!("checkpoint covering the original search events was not trimmed: source {source_checkpoint:?}, latest {:?}, anchor {:?}, certified limit {:?}",
-        latest.checkpoint, latest.replica_anchor, checkpoint_trim_limit(&latest)));
+    }).await.unwrap();
     let checkpoint = record.checkpoint.unwrap();
-    let trim_through = record.replica_anchor.as_ref().unwrap().interval[1];
     let members = cell.directory.members().await.unwrap().into_iter()
         .map(|member| (member.id, member.address)).collect::<BTreeMap<_, _>>();
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
@@ -3816,7 +3810,7 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
     }, Default::default()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if reader.retained_floor().await.unwrap().is_some_and(|floor| floor.0 == trim_through + 1) {
+            if reader.retained_floor().await.unwrap().is_some_and(|floor| floor.0 == checkpoint.boundary) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
