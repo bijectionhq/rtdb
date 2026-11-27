@@ -2130,7 +2130,7 @@ contract XtdbRefusesRtdbExtensionRecords {
 
     @invariant ExtensionSourceRecords
         -- The source framing header is 4 (RTDB_EXTENSION_LOG_HEADER) for a ServingTransactMessage, an ArtefactsAddedMessage, an ArtefactsRemovedMessage,
-        -- a TxMessage carrying an idempotency, replay or bounded-retry guard or a placed attempt seed, or whose operations use a layout the reference does not write (dictionary, view, list view, run-end),
+        -- a TxMessage carrying an idempotency, replay or bounded-retry guard or a placed attempt seed,
         -- and a TriesAddedMessage naming a trie of a naming epoch above 0, of an RTDB-only table, or carrying artefacts.
         -- Its protobuf body is the one the plain header (3) would carry.
         -- XTDB's source decoder accepts only the headers 0xff, 2 and 3, and fails on any other with "Unknown message type: 4".
@@ -2148,6 +2148,11 @@ contract XtdbRefusesRtdbExtensionRecords {
         -- A block catalog carrying a naming epoch above 0, a serving checkpoint, or a table entry of an RTDB-only table, and a table block carrying search runs, term or entity directories, a relation retirement, or a trie of a naming epoch above 0 or carrying artefacts,
         -- is stored with XTDB_REFUSAL_PREFIX before its protobuf, so XTDB's Block.parseFrom and TableBlock.parseFrom fail with the same invalid-tag error when a node opens the store or follows a block upload.
         -- An RTDB reader strips a leading zero byte, which no encoded protobuf message starts with; digests cover the stored bytes, prefix included.
+
+    @invariant PlainArrowLayouts
+        -- Every Arrow stream RTDB writes into a log record, transaction operations and SQL arguments included, is in the layouts XTDB writes:
+        -- a dictionary, view, list-view or run-end column is written in the plain layout holding the same values, so no layout frames a record.
+        -- Flight SQL ingest refuses dictionary and view columns before they reach the log.
 
     @invariant UnparseableTrieKeys
         -- A trie key that does not parse counts as RTDB-only wherever a trie's naming epoch is checked, so a record naming one is framed rather than let through.

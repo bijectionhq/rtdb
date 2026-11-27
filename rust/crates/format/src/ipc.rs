@@ -22,6 +22,7 @@ mod event_projection;
 mod java_layout;
 mod java_stream;
 mod nulls;
+mod plain_layout;
 mod projection;
 mod record_spans;
 mod undefined;
@@ -2078,31 +2079,23 @@ pub fn write_uncompressed_stream_from_buffers(
 /// Writes pages without buffering the complete stream, with metadata in the reference's Java layout; the sink owns and enforces its allocation bound.
 /// The caller reserves the schema translation and initial encoded schema frame through this call.
 /// A page with different native field metadata is rejected before encoding; the sink may already contain a valid prefix.
+/// Dictionary, view, list-view and run-end columns, which XTDB never writes, are written in the plain layout holding the same values,
+/// so every stream stays readable by XTDB.
 pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
     if java_stream::supports(schema) {
-        java_stream::write_stream(schema, pages, sink)
-    } else {
-        write_rewritten_stream_to(schema, pages, sink)
+        return java_stream::write_stream(schema, pages, sink);
     }
-}
-
-/// Whether every field of `schema` has a layout the reference writes: dictionaries, views, list views and run-end encoding do not,
-/// so a log record carrying them is RTDB-only.
-pub fn is_reference_layout(schema: &Schema) -> bool { java_stream::supports(schema) }
-
-/// arrow-rs's stream, decimal-patched and rewritten into the Java layout as it passes, for the layouts `java_stream` leaves out.
-fn write_rewritten_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
-    let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
-    let sink = FirstSchemaWriter { inner: java_layout::JavaLayout::new_stream(sink), schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
-    let mut writer = StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
-    for page in pages { decimal_schema.validate_batch(page)?; writer.write(page).map_err(invalid)?; }
-    writer.finish().map_err(invalid)?;
-    let mut sink = writer.into_inner().map_err(invalid)?;
-    if sink.pending.as_slice() != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
-    sink.inner.write_all(&[0; 4]).map_err(invalid)?;
-    sink.inner.flush().map_err(invalid)?;
-    if !sink.inner.complete { return Err(invalid("Arrow stream ended before its schema")); }
-    Ok(sink.inner.inner.inner)
+    let plain = Arc::new(plain_layout::plain_schema(schema));
+    if !java_stream::supports(&plain) {
+        return Err(invalid(format!("Arrow layout XTDB does not write: {schema}")));
+    }
+    let pages = pages.into_iter().map(|page| {
+        if page.schema_ref().as_ref() != schema {
+            return Err(Anomaly::incorrect("rtdb.format/arrow-schema", "Arrow page schema differs from its declared stream schema"));
+        }
+        plain_layout::plain_page(&plain, page)
+    }).collect::<Result<Vec<_>>>()?;
+    java_stream::write_stream(&plain, &pages, sink)
 }
 
 struct TailWriter<W> { inner: W, pending: Vec<u8> }

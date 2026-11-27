@@ -481,8 +481,9 @@ impl SourceTransaction {
             bounded_retry,
             placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec().into()),
         };
-        // `source_uses_extension` classifies these fields; an operations layout the reference does not write is RTDB-only too.
-        let extension = rtdb_format::envelope::tx_uses_extension(&tx) || !rtdb_format::ipc::is_reference_layout(batch.batch().schema_ref());
+        // `source_uses_extension` classifies these fields. The operations are always in a layout XTDB writes: the stream
+        // writer stores dictionary, view and run-end columns in their plain layouts.
+        let extension = rtdb_format::envelope::tx_uses_extension(&tx);
         let tail_len = tx.encoded_len();
         let ops_prefix_len = key_len(TX_OPS_TAG) + encoded_len_varint(ops_len as u64);
         let tx_len = ops_len.checked_add(ops_prefix_len)
@@ -3775,6 +3776,55 @@ mod tests {
         };
         assert_eq!(arguments.single_arrow_page().unwrap().batch().num_rows(), 2);
         assert_eq!(arguments.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    /// A plain Flight SQL / ADBC upload stays XTDB-readable whatever Arrow layout the client sends: ingest refuses dictionary
+    /// and view columns (`rtdb/arrow-type`) before they reach the log, and the run-end columns it admits, as documents or as
+    /// SQL arguments, reach the log in their plain layout, in a record XTDB reads.
+    #[test]
+    fn an_uploaded_encoded_layout_reaches_the_log_plain_and_unframed() {
+        use arrow_array::{DictionaryArray, Int32Array, Int64Array, RunArray, StringArray, StringViewArray, types::Int32Type};
+
+        let memory = budget();
+        let upload = |column: ArrayRef| {
+            let fields = vec![Field::new("_id", DataType::Int64, false), Field::new("v", column.data_type().clone(), false)];
+            let page = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![Arc::new(Int64Array::from(vec![1, 2, 3])), column]).unwrap();
+            OwnedBatch::new(page, &memory).unwrap()
+        };
+        for column in [
+            Arc::new(DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 0, 1]), Arc::new(StringArray::from(vec!["a", "b"]))).unwrap()) as ArrayRef,
+            Arc::new(StringViewArray::from(vec!["a", "b", "c"])),
+        ] {
+            let page = upload(column);
+            assert!(ArrowDocuments::from_batch(&page, &memory).unwrap().is_none());
+            assert!(ArrowDocuments::from_ingest_batch(&page, &memory).is_err());
+            assert!(SqlArguments::from_arrow(page, &memory).is_err());
+        }
+
+        let runs = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2, 3]), &Int64Array::from(vec![7, 8])).unwrap();
+        let page = upload(Arc::new(runs));
+        let documents = ArrowDocuments::from_batch(&page, &memory).unwrap().unwrap();
+        let arguments = SqlArguments::from_arrow(page, &memory).unwrap();
+        let source = SourceTransaction::new(vec![
+            TxOp::PutArrowDocs { table: TableRef::new("public", "docs"), documents },
+            TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (?, ?)".into(), args: Some(arguments) },
+        ], SubmitOptions::default(), &memory).unwrap();
+        let encoded = source.encode().unwrap();
+        assert_eq!(encoded.as_slice()[0], PROTOBUF_LOG_HEADER, "an ordinary upload is not framed for XTDB to refuse");
+
+        let Some(SourceMessage::Protobuf(SourceBody::Tx(tx))) = SourceMessage::decode(encoded.as_slice()).unwrap() else {
+            panic!("expected a transaction");
+        };
+        let (operations, _) = rtdb_format::ipc::read_stream(tx.tx_ops.unwrap().to_vec().into()).unwrap();
+        assert!(!format!("{operations:?}").contains("RunEndEncoded"), "{operations:?}");
+        let replayed = roundtrip(&source);
+        let Operation::Public(TxOp::Sql { args: Some(arguments), .. }) = &replayed.operations[1] else {
+            panic!("Expected SQL arguments");
+        };
+        let schema = arguments.first_arrow_page().unwrap().batch().schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+        let values = arguments.rows().map(|row| row.unwrap().get(1).cloned()).collect::<Vec<_>>();
+        assert_eq!(values, [Some(Value::I64(7)), Some(Value::I64(7)), Some(Value::I64(8))]);
     }
 
     #[test]

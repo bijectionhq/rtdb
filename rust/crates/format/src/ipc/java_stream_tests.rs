@@ -8,7 +8,24 @@ use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionFields,
 use rtdb_types::{LogicalType, ScalarType};
 
 use super::{supports, write_stream};
-use crate::ipc::{write_rewritten_stream_to, write_stream_to};
+use crate::ipc::{ArrowStream, FirstSchemaWriter, TailWriter, invalid, java_layout::JavaLayout, write_options, write_stream_to};
+
+/// The oracle the native writer must match byte for byte: arrow-rs's stream, decimal-patched and rewritten into the
+/// reference's Java layout as it passes.
+fn write_rewritten_stream_to(schema: &Schema, pages: &[RecordBatch], sink: Vec<u8>) -> rtdb_types::Result<Vec<u8>> {
+    use std::io::Write;
+    let decimal_schema = Arc::new(crate::ipc_decimal::DecimalSchema::new(schema)?);
+    let sink = FirstSchemaWriter { inner: JavaLayout::new_stream(sink), schema: Arc::clone(&decimal_schema), pending: Vec::new(), expected: None, complete: false };
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, &decimal_schema.wire, write_options()?).map_err(invalid)?;
+    for page in pages { decimal_schema.validate_batch(page)?; writer.write(page).map_err(invalid)?; }
+    writer.finish().map_err(invalid)?;
+    let mut sink = writer.into_inner().map_err(invalid)?;
+    if sink.pending.as_slice() != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
+    sink.inner.write_all(&[0; 4]).map_err(invalid)?;
+    sink.inner.flush().map_err(invalid)?;
+    if !sink.inner.complete { return Err(invalid("Arrow stream ended before its schema")); }
+    Ok(sink.inner.inner.inner)
+}
 
 /// xorshift64*, so that a failing case is reproducible from its seed.
 struct Rng(u64);
@@ -254,12 +271,48 @@ fn native_streams_reject_what_the_rewritten_stream_rejects() {
     }
 }
 
+/// XTDB never writes dictionary, view, list-view or run-end columns, so a stream holding them is written in the plain layout
+/// with the same values: the bytes a plain page of those values gives, which XTDB reads.
 #[test]
-fn layouts_the_native_writer_leaves_out_keep_the_rewritten_stream() {
-    let dictionary = Schema::new(vec![Field::new("d", DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)), true)]);
-    let view = Schema::new(vec![Field::new("s", DataType::Struct(vec![Arc::new(Field::new("v", DataType::Utf8View, true))].into()), true)]);
-    for schema in [dictionary, view] {
-        assert!(!supports(&schema));
-        assert_eq!(write_stream_to(&schema, &[], Vec::new()).unwrap(), write_rewritten_stream_to(&schema, &[], Vec::new()).unwrap());
-    }
+fn layouts_xtdb_does_not_write_are_written_in_their_plain_layout() {
+    use arrow_array::{
+        BinaryArray, DictionaryArray, Int32Array, Int64Array, ListArray, ListViewArray, RunArray, StringArray, StringViewArray, StructArray,
+        types::Int32Type,
+    };
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
+    let keys = Int32Array::from(vec![Some(1), None, Some(0), Some(1)]);
+    let dictionary = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(StringArray::from(vec!["a", "b"]))).unwrap();
+    let views = StringViewArray::from(vec![Some("a string longer than twelve bytes"), Some("b"), None, Some("c")]);
+    let view_struct = StructArray::from(vec![(Arc::new(Field::new("v", DataType::Utf8View, true)), Arc::new(views) as ArrayRef)]);
+    let runs = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![1, 4]), &Int64Array::from(vec![Some(7), None])).unwrap();
+    let item = Arc::new(Field::new("$data$", DataType::Int64, true));
+    let list_view = ListViewArray::try_new(Arc::clone(&item), ScalarBuffer::from(vec![2, 0, 0, 1]), ScalarBuffer::from(vec![1, 2, 0, 1]),
+        Arc::new(Int64Array::from(vec![10, 11, 12])), Some(vec![true, true, false, true].into())).unwrap();
+    let binary_views = arrow_array::BinaryViewArray::from(vec![Some(&b"x"[..]), None, Some(&b"yz"[..]), Some(&b""[..])]);
+    let encoded: Vec<ArrayRef> = vec![Arc::new(dictionary), Arc::new(view_struct), Arc::new(runs), Arc::new(list_view), Arc::new(binary_views)];
+    let schema = Arc::new(Schema::new(encoded.iter().enumerate()
+        .map(|(index, column)| Field::new(format!("c{index}"), column.data_type().clone(), index != 2)).collect::<Vec<_>>()));
+    let page = RecordBatch::try_new(Arc::clone(&schema), encoded).unwrap();
+    assert!(!supports(&schema));
+
+    let plain_columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![Some("b"), None, Some("a"), Some("b")])),
+        Arc::new(StructArray::from(vec![(Arc::new(Field::new("v", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("a string longer than twelve bytes"), Some("b"), None, Some("c")])) as ArrayRef)])),
+        Arc::new(Int64Array::from(vec![Some(7), None, None, None])),
+        Arc::new(ListArray::try_new(item, OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 3, 3, 4])),
+            Arc::new(Int64Array::from(vec![12, 10, 11, 11])), Some(vec![true, true, false, true].into())).unwrap()),
+        Arc::new(BinaryArray::from(vec![Some(&b"x"[..]), None, Some(&b"yz"[..]), Some(&b""[..])])),
+    ];
+    let plain_schema = Arc::new(Schema::new(plain_columns.iter().enumerate()
+        .map(|(index, column)| Field::new(format!("c{index}"), column.data_type().clone(), true)).collect::<Vec<_>>()));
+    let plain = RecordBatch::try_new(Arc::clone(&plain_schema), plain_columns).unwrap();
+    assert!(supports(&plain_schema));
+
+    let written = write_stream_to(&schema, [&page, &page.slice(1, 2)], Vec::new()).unwrap();
+    assert_eq!(written, write_stream(&plain_schema, [&plain, &plain.slice(1, 2)], Vec::new()).unwrap());
+    let read = ArrowStream::open(written.into(), None).unwrap().collect::<rtdb_types::Result<Vec<_>>>().unwrap();
+    assert_eq!(read.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(), [4, 2]);
+    assert_eq!(write_stream_to(&schema, &[], Vec::new()).unwrap(), write_stream(&plain_schema, &[], Vec::new()).unwrap());
 }

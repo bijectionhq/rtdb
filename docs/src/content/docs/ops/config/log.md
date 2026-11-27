@@ -162,12 +162,10 @@ Receipt-table cleanup in Multi mode
 
 : The replica-log record that deletes an L0 file, which XTDB never deletes.
 
-Transaction operations in an Arrow layout XTDB does not write
-
-: A transaction whose operations use dictionary, view, list-view or run-end-encoded columns.
-
 A workload that uses none of these keeps writing exactly the records and files XTDB writes, and stays readable by XTDB.
+That includes the Arrow layout a client sends: RTDB writes run-end-encoded columns in the plain layout XTDB writes, and Flight SQL ingest refuses dictionary and view columns, so no client layout makes a record XTDB-unreadable.
 RTDB also adds four annotations that XTDB loses nothing by ignoring, and which therefore mark nothing: the block-file digest on block uploads, the object versions of published data files, the payload digest on offloaded records, and the table-block digests in each block.
+Every field RTDB adds to XTDB's protobuf messages is numbered from 1000, well clear of the numbers XTDB gives its own new fields, so a later XTDB release cannot read an RTDB field as one of its own.
 
 What the XTDB node reports:
 
