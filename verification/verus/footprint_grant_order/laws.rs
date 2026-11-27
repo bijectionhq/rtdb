@@ -97,17 +97,21 @@ pub fn strict_age_rotation_bounds_older_waiters(
     }
 }
 
-/// Every competing writer — both Flight and SQL — is excluded from mutating an
-/// overlapping footprint while a durable grant is live, while non-overlapping
-/// writes and the active holder attempt are admitted.
+/// Every competing writer whose commit label dominates the held commit label —
+/// both Flight and SQL — is excluded from mutating an overlapping footprint
+/// while a durable grant is live, while non-dominating writers (below or beside
+/// the held label, round-4 T3 non-interference), non-overlapping writes, and
+/// the active holder attempt are admitted.
 pub fn all_writers_fenced_flight_and_sql(writer: WriterKind)
     ensures true,
 {
-    let competing = footprint_grant::writer_may_apply(writer, true, true, false);
-    let holder = footprint_grant::writer_may_apply(writer, true, true, true);
-    let disjoint = footprint_grant::writer_may_apply(writer, false, true, false);
-    let inactive = footprint_grant::writer_may_apply(writer, true, false, false);
-    assert(!competing);
+    let competing_dominating = footprint_grant::writer_may_apply(writer, true, true, true, false);
+    let non_dominating = footprint_grant::writer_may_apply(writer, true, false, true, false);
+    let holder = footprint_grant::writer_may_apply(writer, true, true, true, true);
+    let disjoint = footprint_grant::writer_may_apply(writer, false, true, true, false);
+    let inactive = footprint_grant::writer_may_apply(writer, true, true, false, false);
+    assert(!competing_dominating);
+    assert(non_dominating);
     assert(holder);
     assert(disjoint);
     assert(inactive);

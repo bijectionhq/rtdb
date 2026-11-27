@@ -47,12 +47,30 @@
       "min_verified_functions": 9
     },
     "unfenced_sql_writer": {
-      "defect": "Allow SQL writers to bypass an overlapping active durable footprint grant.",
+      "defect": "Allow SQL writers whose commit label dominates the held grant to bypass an overlapping active durable footprint grant.",
       "mutate": [
         {
           "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
-          "find": "        WriterKind::Sql => !overlapping || !grant_active || matches_active_holder,",
+          "find": "        WriterKind::Sql => {\n            !overlapping || !writer_dominates_grant || !grant_active || matches_active_holder\n        }",
           "replace": "        WriterKind::Sql => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "function": "writer_may_apply",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "holds_non_dominating_writer": {
+      "defect": "Hold a writer whose commit label does not dominate the held grant, creating a high-to-low interference channel forbidden by round-4 T3.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/footprint_grant.rs",
+          "find": "        WriterKind::Flight => {\n            !overlapping || !writer_dominates_grant || !grant_active || matches_active_holder\n        }",
+          "replace": "        WriterKind::Flight => {\n            let _ = writer_dominates_grant;\n            !overlapping || !grant_active || matches_active_holder\n        }"
         }
       ],
       "expect": [
