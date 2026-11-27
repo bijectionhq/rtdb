@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "inventory_revision": "0b9fa440f23d2165250d215209f7fa9bd7c26a6f",
+  "historical_loader_sha256": "b83798b2dda042be31f598702317177a7e45739b0eb1be3f57ae5652bab1dcec",
+  "historical_queries_sha256": "e63403c26e1d3a2c528430d3affb5ead5a743cdf39bb870bfc4307b950fa97bb",
+  "scalars": [
+    {"id": "sqrt2", "expression": "SQRT(2.0E0)", "policy": {"kind": "exact_bits", "bits": "3ff6a09e667f3bcd"}},
+    {"id": "power_integer", "expression": "POWER(2, 10)", "policy": {"kind": "exact_bits", "bits": "4090000000000000"}},
+    {"id": "sin_negative_zero", "expression": "SIN(CAST('-0.0' AS DOUBLE PRECISION))", "policy": {"kind": "exact_bits", "bits": "8000000000000000"}},
+    {"id": "ln_zero", "expression": "LN(0.0E0)", "policy": {"kind": "exact_bits", "bits": "fff0000000000000"}},
+    {"id": "ln_negative", "expression": "LN(-1.0E0)", "policy": {"kind": "nan"}},
+    {"id": "sqrt_negative", "expression": "SQRT(-1.0E0)", "policy": {"kind": "nan"}},
+    {"id": "power_unit_infinite", "expression": "POWER(1.0E0, CAST('Infinity' AS DOUBLE PRECISION))", "policy": {"kind": "nan"}},
+    {"id": "sin", "expression": "SIN(1.0E0)", "policy": {"kind": "platform_ulp", "bits": "3feaed548f090cee", "max_ulps": 1}},
+    {"id": "cos", "expression": "COS(1.0E0)", "policy": {"kind": "platform_ulp", "bits": "3fe14a280fb5068c", "max_ulps": 1}},
+    {"id": "tan", "expression": "TAN(1.0E0)", "policy": {"kind": "platform_ulp", "bits": "3ff8eb245cbee3a6", "max_ulps": 1}},
+    {"id": "asin", "expression": "ASIN(0.5E0)", "policy": {"kind": "platform_ulp", "bits": "3fe0c152382d7366", "max_ulps": 1}},
+    {"id": "exp", "expression": "EXP(1.0E0)", "policy": {"kind": "platform_ulp", "bits": "4005bf0a8b145769", "max_ulps": 1}},
+    {"id": "ln", "expression": "LN(10.0E0)", "policy": {"kind": "platform_ulp", "bits": "40026bb1bbb55516", "max_ulps": 1}},
+    {"id": "power_fractional", "expression": "POWER(3.0E0, 2.25E0)", "policy": {"kind": "platform_ulp", "bits": "4027b07813c56f93", "max_ulps": 1}},
+    {"id": "log_ratio", "expression": "LOG(10, 1000)", "policy": {"kind": "platform_ulp", "bits": "4008000000000000", "max_ulps": 3}},
+    {"id": "division_by_zero", "expression": "1 / 0", "policy": {"kind": "sql_error", "sqlstate": "08P01", "category": "incorrect", "code": "xtdb.expression/division-by-zero", "message": "data exception - division by zero"}}
+  ],
+  "join": {
+    "seed": 42,
+    "account_rows": 100000,
+    "customer_rows": 1000,
+    "transaction_rows": 1000,
+    "tiers": ["bronze", "silver", "gold", "platinum"],
+    "schemas": {
+      "accounts": [["_id", 20], ["cust", 20], ["balance", 701]],
+      "customers": [["_id", 20], ["tier", 25]],
+      "aggregate": [["tier", 25], ["_column_2", 20], ["_column_3", 701]]
+    },
+    "input_projections": {
+      "accounts": {"rows": 100000, "sha256": "1ad452393dc77c09ccd859a333c87bbbb614e79e16d7007c18eff1bfe4a5bef2"},
+      "customers": {"rows": 1000, "sha256": "f741573a7ea1641ef8b92ade2b60f2e829054cc608c6822848ffd053314d293d"}
+    },
+    "groups": {
+      "bronze": {"count": 25185, "sum_cents": 12545282511},
+      "silver": {"count": 24884, "sum_cents": 12480621672},
+      "gold": {"count": 25160, "sum_cents": 12508391392},
+      "platinum": {"count": 24771, "sum_cents": 12403543865}
+    },
+    "queries": [
+      {"id": "join_big_small_cust", "sql": "SELECT c.tier, COUNT(*), SUM(a.balance) FROM acc100000 a JOIN cust100000 c ON a.cust = c._id GROUP BY c.tier"},
+      {"id": "join_small_big_cust", "sql": "SELECT c.tier, COUNT(*), SUM(a.balance) FROM cust100000 c JOIN acc100000 a ON a.cust = c._id GROUP BY c.tier"}
+    ]
+  }
+}

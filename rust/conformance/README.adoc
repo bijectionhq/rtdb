@@ -363,6 +363,51 @@ Missing evidence or disagreement among one engine's declared, DoGet and batch sc
 The comparison covers the selected wire observations.
 Embedded parser cause compatibility remains a separate obligation.
 
+== Numeric differential trace
+
+`run_numeric.py` captures SQL-13 scalar math and T11 Float SUM against the existing packaged JVM reference at `c84f9334eb060ceb92d28ecdd4a06e6b625932fd` and the native package built from the implementation checkout.
+The numeric fixture also records the upstream inventory baseline at `0b9fa440f23d2165250d215209f7fa9bd7c26a6f`.
+The historical T11 observation used the XTDB 2.2.0 release at `c6c19623d`.
+The package manifests, binaries, runtime images, local-node configuration, client source and image, runtime platform logs, and per-engine shutdown receipts identify the later comparison.
+
+After Phase 2 authorization, use clean implementation and packaged-reference checkouts, their respective standalone server `package.json` manifests with retained artifacts and loaded images, and a fresh output directory outside both checkouts.
+Use a native Linux Docker worker with at least 12 GiB available for each sequential engine run.
+The local configurations retain the historical 8 GiB engine settings (4 GiB heap and 4 GiB direct memory on the JVM, and an 8 GiB native engine limit).
+
+[source,shell]
+----
+python3 rust/conformance/run_numeric.py --phase-two \
+  --reference /absolute/path/to/c84-reference \
+  --reference-package /absolute/path/to/jvm/package.json \
+  --native-package /absolute/path/to/rust/package.json \
+  --output /absolute/new/numeric
+----
+
+The client preserves binary pgwire field names, OIDs, format flags, raw cell bytes and row positions.
+The T11 fixture transcribes the historical generator's seed, all columns, transaction boundaries and both FROM orders at 100,000 accounts and 1,000 customers.
+Separate ordered projections verify the selected join key and balance bytes.
+The account digest uses consecutive network-order int64 ID, int64 customer and binary64 balance fields.
+The customer digest uses consecutive network-order int64 ID and UTF-8 tier terminated by a newline.
+The unmodified aggregate queries return four groups with unspecified delivery order.
+Comparison indexes their rows by tier, requires exact group keys and counts, and reports bit differences both across engines and across query forms.
+The FROM order identifies the submitted SQL, while the delivered row positions describe the result.
+Neither prescribes the physical accumulation sequence.
+
+The scalar fixture requires exact bits for correctly rounded or specified results, including signed zero and infinity.
+NaN cases require a NaN and retain its sign and payload in the trace.
+The selected finite platform cases independently check each engine against a correctly rounded oracle within one binary64 step, with three steps for the composed LOG ratio.
+The fixture's rounded points come from high-precision values of the mathematical functions at the exact inputs, including the sine and cosine series at 1, the arcsine of 0.5 as `pi / 6`, and the exact ratio `log(1000) / log(10) = 3`.
+The per-case limits apply to these inputs and are grounded in the link:https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Math.html[Java 21 Math contracts].
+The SUM bound uses the exact positive cent total multiplied by `n / (2^53 - n)` for a tier with `n` rows.
+This accounts for rounding each supplied amount to binary64 and up to `n - 1` rounded additions along an accumulation path.
+The integer division control requires its SQLSTATE, error category, code and message.
+Unexpected SQL errors, nonfinite join sums, missing groups, schema mismatches and out-of-bound values fail qualification.
+
+`comparison.json` reports SQL-13 and T11 independently with the applied policies and references to both raw traces.
+Exit status 1 means an observed case failed its checks.
+Infrastructure or cleanup errors retain failure evidence and exit nonzero.
+The trace provides evidence for this fixture and platform pair.
+
 == Mixed plain and run-end IID reference
 
 After Phase 2 opens, the reference observer selects the original mixed-IID test in the clean C84 checkout through Jovial.
