@@ -265,6 +265,16 @@ impl ActivationAuthority {
         self.identity
     }
 
+    #[cfg(feature = "backup-object-holds")]
+    pub(super) fn connection_digest(&self) -> Result<[u8; 32]> {
+        self.connection_sha256.ok_or_else(configuration)
+    }
+
+    #[cfg(any(feature = "s3", feature = "backup-object-holds"))]
+    pub(super) async fn connect_reader(url: &str, credentials: super::Credentials, identity: Uuid) -> Result<Arc<Self>> {
+        Self::connect(url, credentials, identity, Access::ConsensusReader).await
+    }
+
     pub(super) fn scope(&self, name: &str) -> Result<rtdb_db::ActivationScope> {
         rtdb_db::ActivationScope::for_cell(self.identity, name, self.serving_cell)
     }
@@ -1150,7 +1160,7 @@ mod tests {
 
 }
 
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "backup-object-holds"))]
 pub(super) async fn installed(
     database_url: &str,
     immutable_streams: bool,
@@ -1165,7 +1175,7 @@ pub(super) async fn installed(
         ));
     }
     require_independent_journals(&url, database_url)?;
-    let mut authority = ActivationAuthority::connect(&url, credentials, identity, Access::ConsensusReader).await?;
+    let mut authority = ActivationAuthority::connect_reader(&url, credentials, identity).await?;
     Arc::get_mut(&mut authority).expect("just connected").serving_cell = cell;
     Ok(Some(authority))
 }

@@ -27,7 +27,7 @@ pub(super) type Attestors = BTreeMap<Uuid, [u8; 32]>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Intent {
+pub(in crate::multi) struct Intent {
     pub authority_id: Uuid,
     pub database: String,
     pub expected: Binding,
@@ -36,11 +36,11 @@ pub(super) struct Intent {
 }
 
 impl Intent {
-    pub(super) fn scope(&self) -> Result<ActivationScope> {
+    pub(in crate::multi) fn scope(&self) -> Result<ActivationScope> {
         ActivationScope::for_cell(self.authority_id, &self.database, self.cell)
     }
 
-    pub(super) fn candidate(&self) -> Result<Uuid> {
+    pub(in crate::multi) fn candidate(&self) -> Result<Uuid> {
         successor_incarnation(
             self.authority_id,
             &self.database,
@@ -48,6 +48,58 @@ impl Intent {
             self.operation_id,
             self.cell,
         )
+    }
+
+    fn evidence(&self, cut: SourceCut, manifest_sha256: [u8; 32], key: Option<KeyEvidence>) -> Result<Evidence> {
+        Ok(Evidence {
+            version: if key.is_some() { HELD_KEY_VERSION } else { VERSION },
+            intent: self.clone(),
+            candidate: self.candidate()?,
+            source_position: cut.position,
+            source_system_time: cut.system_time,
+            source_lsn: cut.lsn,
+            manifest_sha256,
+            key,
+        })
+    }
+
+    #[cfg(feature = "backup-object-holds")]
+    pub(in crate::multi) fn archive_key_hold(&self, archive: &rtdb_db::VerifiedBackup, key: KeyEvidence) -> Result<RecoveryKeyHold> {
+        if archive.source_basis().incarnation() != *self.expected.incarnation.as_bytes() {
+            return Err(invalid());
+        }
+        let cut = SourceCut {
+            lsn: archive.source_lsn().0,
+            position: archive.source_basis().position(),
+            system_time: archive.source_system_time().0,
+        };
+        self.evidence(cut, archive.manifest_sha256(), Some(key))?.key_hold()?.ok_or_else(invalid)
+    }
+
+    #[cfg(feature = "backup-object-holds")]
+    pub(in crate::multi) fn installed_key_hold(&self, installed: &rtdb_db::InstalledBackup, key: KeyEvidence) -> Result<RecoveryKeyHold> {
+        self.installed_evidence(installed.manifest_sha256(), installed, Some(key))?.key_hold()?.ok_or_else(invalid)
+    }
+
+    fn installed_evidence(
+        &self, manifest_sha256: [u8; 32], installed: &rtdb_db::InstalledBackup, key: Option<KeyEvidence>,
+    ) -> Result<Evidence> {
+        let candidate = self.candidate()?;
+        if self.cell.is_none()
+            || installed.activation_scope() != Some(self.scope()?)
+            || installed.source_incarnation() != self.expected.incarnation
+            || installed.destination_basis().incarnation() != *candidate.as_bytes()
+            || installed.destination_basis().position() != installed.source_basis().position()
+            || installed.manifest_sha256() != manifest_sha256
+        {
+            return Err(invalid());
+        }
+        let cut = SourceCut {
+            lsn: installed.source_lsn().0,
+            position: installed.source_basis().position(),
+            system_time: installed.source_system_time().0,
+        };
+        self.evidence(cut, manifest_sha256, key)
     }
 }
 
@@ -69,7 +121,7 @@ struct Evidence {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct KeyEvidence {
+pub(in crate::multi) struct KeyEvidence {
     pub generation: u64,
     pub authority_sha256: [u8; 32],
 }
@@ -117,7 +169,7 @@ impl Evidence {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Attestation {
+pub(in crate::multi) struct Attestation {
     evidence: Evidence,
     signature: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,34 +188,14 @@ impl Attestation {
     }
 
     #[cfg(unix)]
-    pub(super) fn sign_installation(
+    pub(in crate::multi) fn sign_installation(
         intent: Intent,
         manifest_sha256: [u8; 32],
         installed: &rtdb_db::InstalledBackup,
         key_custody: Option<KeyEvidence>,
         signing_key: &Ed25519KeyPair,
     ) -> Result<Self> {
-        let candidate = intent.candidate()?;
-        if intent.cell.is_none()
-            || installed.activation_scope() != Some(intent.scope()?)
-            || installed.source_incarnation() != intent.expected.incarnation
-            || installed.destination_basis().incarnation() != *candidate.as_bytes()
-            || installed.destination_basis().position() != installed.source_basis().position()
-            || installed.manifest_sha256() != manifest_sha256
-        {
-            return Err(invalid());
-        }
-        let evidence = Evidence {
-            version: if key_custody.is_some() { HELD_KEY_VERSION } else { VERSION },
-            intent,
-            candidate,
-            source_position: installed.source_basis().position(),
-            source_system_time: installed.source_system_time().0,
-            source_lsn: installed.source_lsn().0,
-            manifest_sha256,
-            key: key_custody,
-        };
-        Self::signed(evidence, signing_key)
+        Self::signed(intent.installed_evidence(manifest_sha256, installed, key_custody)?, signing_key)
     }
 
     #[cfg(unix)]
@@ -182,7 +214,7 @@ impl Attestation {
     }
 
     #[cfg(unix)]
-    pub(super) fn held_key(&self) -> Result<(&Intent, RecoveryKeyHold)> {
+    pub(in crate::multi) fn held_key(&self) -> Result<(&Intent, RecoveryKeyHold)> {
         if self.evidence.candidate != self.evidence.intent.candidate()? {
             return Err(invalid());
         }

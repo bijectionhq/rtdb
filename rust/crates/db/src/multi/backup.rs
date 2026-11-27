@@ -1,7 +1,7 @@
 use std::{ops::AsyncFnOnce, sync::Arc};
 
 use journal_contract::Lsn;
-use rtdb_crypt::{Context, Generation, Kms};
+use rtdb_crypt::{Context, Generation, Kms, RecoveryKeyHold};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_index::branches::BranchCut;
 use rtdb_store::{ObjectStore, ObjectVersionHold, read_file_bounded, read_fresh_manifest, read_held_file, read_held_manifest};
@@ -88,6 +88,10 @@ impl VerifiedBackup {
         self.source.through_lsn
     }
 
+    pub fn source_system_time(&self) -> Timestamp {
+        self.source.cut.system_time
+    }
+
     pub fn manifest_sha256(&self) -> [u8; 32] {
         self.manifest_sha256
     }
@@ -110,6 +114,7 @@ pub struct BackupObjectReadback {
     pub installation: InstalledBackup,
     pub journal_head: Lsn,
     pub checkpoint: ObjectId,
+    pub generation: Generation,
     pub versions: Vec<PhysicalObjectVersion>,
 }
 
@@ -228,6 +233,21 @@ impl MultiDatabase {
     }
 
     pub async fn install_portable_backup(&mut self, backup: VerifiedBackup) -> Result<InstalledBackup> {
+        self.install_portable_backup_with_custody(backup, None).await
+    }
+
+    /// Retains the destination generation for the selected authority and recovery operation before writing a commissioned backup.
+    /// A fresh install requires the destination writer lease.
+    /// A retry of an installed backup requires the original active hold.
+    pub async fn install_portable_backup_holding_key(
+        &mut self, backup: VerifiedBackup, hold: RecoveryKeyHold,
+    ) -> Result<InstalledBackup> {
+        self.install_portable_backup_with_custody(backup, Some(hold)).await
+    }
+
+    async fn install_portable_backup_with_custody(
+        &mut self, backup: VerifiedBackup, hold: Option<RecoveryKeyHold>,
+    ) -> Result<InstalledBackup> {
         Box::pin(async move {
             let VerifiedBackup { source, manifest_sha256, mut transactions, files, source_kms, source_generation } = backup;
             if source.cut.basis.incarnation() == self.incarnation() {
@@ -238,6 +258,10 @@ impl MultiDatabase {
             if let Some(installed) = self.applied_backup() {
                 if installed.manifest_sha256 == manifest_sha256 && installed.source == source {
                     self.verify_installed_files().await?;
+                    if let Some(hold) = hold {
+                        self.check_backup_key_hold(hold, self.staged_backup_checkpoint()?.key_generation)?;
+                        self.stream.kms.require_recovery_key(hold).await?;
+                    }
                     return Ok(installed);
                 }
                 return Err(nonempty());
@@ -256,6 +280,10 @@ impl MultiDatabase {
             }
             source_kms.check_readable(source_generation).await?;
             transactions.restore_in(self.incarnation())?;
+            if let Some(hold) = hold {
+                self.check_backup_key_hold(hold, state.generation)?;
+                self.stream.kms.retain_recovery_key(hold).await?;
+            }
             let (portable_file_index, destination_files) = match files {
                 Some(files) => {
                     let mut relocations = Vec::with_capacity(files.entries().len());
@@ -289,6 +317,15 @@ impl MultiDatabase {
         }).await
     }
 
+    fn check_backup_key_hold(&self, hold: RecoveryKeyHold, generation: u64) -> Result<()> {
+        if self.stream.activation_scope.is_none()
+            || hold.generation != (Generation { database: self.options.database, number: generation })
+        {
+            return Err(invalid_backup());
+        }
+        Ok(())
+    }
+
     pub async fn installed_backup(&mut self) -> Result<Option<InstalledBackup>> {
         self.refresh().await?;
         self.require_active()?;
@@ -313,12 +350,7 @@ impl MultiDatabase {
         }).ok_or_else(invalid_backup)?;
         let state = self.state();
         let head = state.head;
-        let checkpoint = self.installed_backup_checkpoint()?.clone();
-        if state.records.iter().any(|record| !record.permits_fresh_restore()
-            && !matches!(record, Record::Checkpoint(selected) if *selected == checkpoint))
-        {
-            return Err(backup_dependencies());
-        }
+        let checkpoint = self.staged_backup_checkpoint()?.clone();
         let store = self.store.as_ref();
         let kms = self.stream.kms.as_ref();
         let (manifest, checkpoint_version) = read_held_manifest(store, kms, checkpoint.manifest, holds).await?;
@@ -348,11 +380,14 @@ impl MultiDatabase {
         }
         versions.push(self.token_keys.check_object_hold(checkpoint.key_generation, kms, holds).await?);
         self.refresh().await?;
-        if self.state().head != head || self.installed_backup_checkpoint()? != &checkpoint {
+        if self.state().head != head || self.staged_backup_checkpoint()? != &checkpoint {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-installation-changed",
                 "The staged backup changed during the object hold readback"));
         }
-        Ok(BackupObjectReadback { installation: installed, journal_head: head, checkpoint: checkpoint.manifest, versions })
+        Ok(BackupObjectReadback {
+            installation: installed, journal_head: head, checkpoint: checkpoint.manifest,
+            generation: manifest.generation, versions,
+        })
     }
 
     async fn verify_installed_files(&self) -> Result<Vec<BackupFileRelocation>> {
@@ -389,6 +424,16 @@ impl MultiDatabase {
                 _ => None,
             }))
             .ok_or_else(invalid_backup)
+    }
+
+    fn staged_backup_checkpoint(&self) -> Result<&Checkpoint> {
+        let checkpoint = self.installed_backup_checkpoint()?;
+        if self.state().records.iter().any(|record| !record.permits_fresh_restore()
+            && !matches!(record, Record::Checkpoint(selected) if selected == checkpoint))
+        {
+            return Err(backup_dependencies());
+        }
+        Ok(checkpoint)
     }
 
     fn applied_backup(&self) -> Option<InstalledBackup> {

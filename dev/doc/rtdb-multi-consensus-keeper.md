@@ -282,10 +282,22 @@ Object Lock allows delete markers and newer versions above a held version. [S3 O
 A legal hold carries a single status per object version. [S3 legal-hold request](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLegalHold.html)
 Operations that share a version need an ordered record of which recovery operations still own its hold and release the provider hold only after the last owner settles.
 
+With the `backup-object-holds` build feature, use `rtdb multi-backup stage` to install a portable `xtdb` backup into the S3 serving allocation for a pending recovery with a destination cell.
+Configure the independent activation reader using the `RTDB_ACTIVATION_*` settings above.
+Supply the predecessor incarnation and revision, recovery operation ID, source archive and vault, destination vault, destination journal writer TLS and versioned S3 bucket.
+The activation journal selects the destination incarnation and cell.
+Lossless staging requires the archive to end at the predecessor's sealed final journal position.
+The destination vault retains the exact generation before the staging writer puts the relocated files or publishes their checkpoint.
+Save the stage result with the archive.
+It reports the destination and the key hold bound to the same consensus trust and installation coordinates used by the activation proof.
+A retry before the authority records the installation reopens the original checkpoint and checks its active key hold.
+The object custodian places legal holds on the staged versions before readback.
+
 With the `backup-object-holds` build feature, run `rtdb multi-backup verify-object-holds` against a commissioned portable install staged in the S3 serving allocation.
 Supply the selected archive, destination incarnation, authority and cell, journal reader TLS, destination key vault and S3 bucket.
 The command checks the archive digest, rereads the staged checkpoint, all of its files and the wrapped token key, and requires S3 legal hold `ON` on the exact versions that supplied those bytes.
 It accepts a staged cut whose retained suffix contains the selected checkpoint and ordinary lease records.
+Supply `--stage-receipt FILE` to reconstruct the hold from the installed checkpoint and check that the original vault still holds that exact generation.
 Save the JSON result with the archive and the custodian's recovery records.
 Pass it back with `--readback FILE` and the same archive and destination settings to reopen the recorded versions, including when a delete marker or a newer version masks a held object.
 The command checks the complete inventory and journal cut against the saved readback and obtains fresh legal-hold status from S3.
@@ -294,7 +306,8 @@ Reading the current object names uses `s3:GetObject` and reopening from a saved 
 Reserve permission to change a legal hold or delete a version for the object custodian.
 In the loopback MinIO qualification, the version reader could also read the current object name.
 The pinned verifier always supplies the recorded version ID.
-Journal retention, generation-key holds and permission to publish require their own authority.
+Journal retention, hosted provider enrollment and permission to publish require their own authority.
+The custody owner releases the original hold after the activation journal orders publication with a serving custody handoff or supersession.
 
 The installed server opens its generation keys through `FileKms` at `RTDB_KEY_DIRECTORY`.
 A hosted key custodian must retain decryption of the exact copies' generations across worker and verifier loss and order hold placement and release against key retirement.

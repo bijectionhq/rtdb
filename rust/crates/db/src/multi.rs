@@ -1201,7 +1201,9 @@ impl MultiDatabase {
         Ok(receipt)
     }
 
-    pub(super) async fn shutdown_writer(&mut self) -> Result<()> {
+    /// Attempts an ordered lease release and withdraws this process's writer ownership.
+    /// Call before closing the database's storage.
+    pub async fn shutdown_writer(&mut self) -> Result<()> {
         let result = async {
             let Ok(lease) = self.authority() else {
                 return Ok(());

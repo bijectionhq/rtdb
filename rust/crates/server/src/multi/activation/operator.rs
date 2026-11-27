@@ -13,7 +13,7 @@ use crate::{
     multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime},
 };
 
-mod attestation;
+pub(in crate::multi) mod attestation;
 #[cfg(unix)]
 mod broker;
 

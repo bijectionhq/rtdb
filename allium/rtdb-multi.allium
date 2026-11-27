@@ -1185,6 +1185,14 @@ contract PortableApplicationBackup {
         -- An independent destination verifier checks its scoped committed install and dependency closure before signing the authority, database, predecessor binding, operation, destination cell, candidate, archive digest and exact source cut.
         -- Verification at the authority uses the registered destination public key and the selected recovery intent. It can complete without reading destination resources.
         -- Destination custody retains the staged journal, objects and keys until activation or an authority decision that supersedes the recovery intent.
+
+    @invariant HostedStaging
+        -- The independent activation journal supplies the pending recovery and its destination cell and incarnation.
+        -- The archive identifies the recovery predecessor and, for a lossless recovery, the sealed final source journal position.
+        -- The destination key provider retains the exact generation for the authority connection, operation and installation proof before the staging writer publishes relocated files or the checkpoint.
+        -- The staged installation receipt requires both the original active key hold and the pending recovery to remain observable after checkpoint publication.
+        -- A retry of the installed archive verifies the original hold and reopens the checkpoint without advancing the destination journal.
+        -- A combined object and key readback requires the original active key hold on the generation of the authenticated checkpoint.
 }
 
 ------------------------------------------------------------

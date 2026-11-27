@@ -7,18 +7,25 @@ use super::*;
 
 #[cfg(feature = "backup-object-holds")]
 mod held_objects;
+#[cfg(feature = "backup-object-holds")]
+mod staged;
 
 pub const MULTI_BACKUP_HELP: &str = "\
 Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
                                  [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
+       rtdb multi-backup stage --archive FILE --source-key-vault DIR --operation-id UUID
+                    --expected-incarnation UUID --expected-revision REVISION
+                    --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
        rtdb multi-backup verify-object-holds --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
-                    [--readback FILE]
+                    [--readback FILE] [--stage-receipt FILE]
 Export and restore operate on stopped, local RTDB Multi development data.
+Stage installs a pending activation's backup in S3 and holds its destination key.
 Verify-object-holds reads a staged immutable journal and an S3 allocation.
 Pass a saved readback to reopen and verify its exact S3 versions.
-It requires the backup-object-holds build feature. These commands run without a serving listener.
+Stage and verify-object-holds require the backup-object-holds build feature.
+These commands run without a serving listener.
 ";
 
 #[derive(Clone, Debug)]
@@ -44,6 +51,8 @@ pub struct MultiBackupOptions(BackupCommand);
 enum BackupCommand {
     Local(LocalBackupOptions),
     #[cfg(feature = "backup-object-holds")]
+    Stage(staged::Stage),
+    #[cfg(feature = "backup-object-holds")]
     VerifyObjects(held_objects::Verifier),
 }
 
@@ -62,12 +71,16 @@ impl MultiBackupOptions {
                 return Err(arguments_error());
             }
         }
-        if operation == "verify-object-holds" {
+        if matches!(operation.as_str(), "stage" | "verify-object-holds") {
             if immutable_streams { return Err(arguments_error()); }
             #[cfg(feature = "backup-object-holds")]
-            return Ok(Self(BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?)));
+            return Ok(Self(if operation == "stage" {
+                BackupCommand::Stage(staged::Stage::parse(fields)?)
+            } else {
+                BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?)
+            }));
             #[cfg(not(feature = "backup-object-holds"))]
-            return Err(Anomaly::unsupported("rtdb/backup-object-holds", "Object hold verification requires the backup-object-holds build feature"));
+            return Err(Anomaly::unsupported("rtdb/backup-object-holds", "Hosted staging and object hold verification require the backup-object-holds build feature"));
         }
         let data = fields.remove("--data").ok_or_else(arguments_error)?.into();
         let archive = fields.remove("--archive").ok_or_else(arguments_error)?.into();
@@ -112,9 +125,46 @@ impl MultiBackupOptions {
         match self.0 {
             BackupCommand::Local(options) => options.run(apple_sync).await,
             #[cfg(feature = "backup-object-holds")]
+            BackupCommand::Stage(stage) => stage.run().await,
+            #[cfg(feature = "backup-object-holds")]
             BackupCommand::VerifyObjects(verifier) => verifier.run().await,
         }
     }
+}
+
+#[cfg(feature = "backup-object-holds")]
+#[derive(Clone, Debug)]
+struct HostedDestination {
+    journal_url: String,
+    journal_tls: PathBuf,
+    key_vault: PathBuf,
+    objects: rtdb_s3::S3Config,
+}
+
+#[cfg(feature = "backup-object-holds")]
+impl HostedDestination {
+    fn parse(fields: &mut BTreeMap<String, String>) -> Result<Self> {
+        let journal_url = backup_field(fields, "--journal-url")?;
+        if !journal_url.starts_with(CONSENSUS_SCHEME) {
+            return Err(arguments_error());
+        }
+        let journal_tls = backup_field(fields, "--tls-dir")?.into();
+        let key_vault = backup_field(fields, "--key-vault")?.into();
+        let mut objects = rtdb_s3::S3Config::new(backup_field(fields, "--bucket")?);
+        objects.region = fields.remove("--region");
+        objects.endpoint = fields.remove("--s3-endpoint");
+        Ok(Self { journal_url, journal_tls, key_vault, objects })
+    }
+}
+
+#[cfg(feature = "backup-object-holds")]
+fn backup_field(fields: &mut BTreeMap<String, String>, name: &str) -> Result<String> {
+    fields.remove(name).ok_or_else(arguments_error)
+}
+
+#[cfg(feature = "backup-object-holds")]
+fn backup_uuid(value: &str) -> Result<Uuid> {
+    Uuid::parse_str(value).ok().filter(|id| !id.is_nil()).ok_or_else(arguments_error)
 }
 
 impl LocalBackupOptions {
