@@ -275,6 +275,28 @@ async fn count_of_changed_float_values_in_a_temporal_self_join_matches_across_sp
             join_build_rows, ..Default::default()
         }, &CancellationToken::new()).unwrap();
         assert_eq!(collect(&query, &context).await.unwrap(), [vec![Value::I64(1)]]);
+        assert_eq!(context.spill_peak_bytes() > 0, join_build_rows == 1);
         assert_eq!(context.spill_bytes(), 0);
     }
+}
+
+#[tokio::test]
+async fn hashed_probe_reads_the_selected_keys_of_another_join_in_output_order() {
+    let build = measured(0, &[(2, Some(20.0)), (1, Some(10.0)), (2, Some(21.0))]);
+    let probe = numbers(2, "probe_key", &[2, 1]);
+    let condition = Expr::binary(BinaryOp::Eq, build.schema().fields()[0].expression(), probe.schema().fields()[0].expression());
+    let selected = Arc::new(Relation::join(build, probe, JoinKind::Inner, Some(condition)).unwrap());
+    let limited = Arc::new(Relation::new(selected.schema().clone(), RelationNode::Limit {
+        input: selected, offset: None, fetch: Some(Expr::Literal(Value::I64(3))),
+    }).unwrap());
+    let build = numbers(3, "second_build_key", &[1, 2]);
+    let condition = Expr::binary(BinaryOp::Eq, build.schema().fields()[0].expression(), limited.schema().fields()[2].expression());
+    let query = join(build, limited, JoinKind::Inner, condition);
+
+    let rows = collect(&query, &context(&CancellationToken::new())).await.unwrap();
+    assert_eq!(rows, [
+        vec![Value::I64(2), Value::I64(2), Value::F64(20.0), Value::I64(2)],
+        vec![Value::I64(2), Value::I64(2), Value::F64(21.0), Value::I64(2)],
+        vec![Value::I64(1), Value::I64(1), Value::F64(10.0), Value::I64(1)],
+    ]);
 }

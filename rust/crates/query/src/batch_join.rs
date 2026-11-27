@@ -17,7 +17,7 @@ use crate::operators::{BatchOutput, build_batch_input};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
 use crate::scalar_key::ScalarKey;
-use crate::set_keys::{Key, direct_key_equal};
+use crate::set_keys::{Key, KeyColumns, TypedKeys, direct_key_equal};
 
 /// For each equality, whether its first operand is the build side's key.
 pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
@@ -218,6 +218,12 @@ struct Table {
     _inventory: Arc<MemoryReservation>,
 }
 
+struct HashedProbe<'a> {
+    keys: TypedKeys<'a>,
+    hashes: Vec<u32>,
+    _reservation: Arc<MemoryReservation>,
+}
+
 impl Table {
     fn position(&self, ordinal: usize) -> (usize, usize) {
         let batch = self.starts.partition_point(|&start| start <= ordinal) - 1;
@@ -393,9 +399,17 @@ impl Spec {
         let mut starts = Vec::with_capacity(batches.len());
         for batch in &batches {
             starts.push(hashes.len());
-            for row in 0..batch.len {
-                context.check_cancelled_at(row)?;
-                hashes.push(self.key_hash(batch, row, 0)?);
+            if batch.len == 0 { continue; }
+            if !self.build_keys.is_empty()
+                && let Some(keys) = KeyColumns::projection(batch, &self.build_keys).bind_typed(context)? {
+                let start = hashes.len();
+                hashes.resize(start.checked_add(batch.len).ok_or_else(size_error)?, 0);
+                keys.hash_vector_into(&mut hashes[start..], context)?;
+            } else {
+                for row in 0..batch.len {
+                    context.check_cancelled_at(row)?;
+                    hashes.push(self.key_hash(batch, row, 0)?);
+                }
             }
         }
         let index = HashIndex::new(&hashes, &context.memory)?;
@@ -437,6 +451,25 @@ impl Spec {
         Key::for_columns(batch, row, self.projected[side], positions, &self.execution.context)
     }
 
+    fn hash_probe<'a>(&'a self, probe: &'a ColumnBatch) -> Result<Option<HashedProbe<'a>>> {
+        if self.kind == JoinKind::Anti || probe.len == 0 || self.probe_keys.is_empty() { return Ok(None); }
+        let context = &self.execution.context;
+        let Some(keys) = KeyColumns::projection(probe, &self.probe_keys).bind_typed(context)? else { return Ok(None); };
+        let reservation = context.memory.reserve(probe.len.checked_mul(size_of::<u32>()).ok_or_else(size_error)?)?;
+        let mut hashes = vec![0; probe.len];
+        keys.hash_vector_into(&mut hashes, context)?;
+        Ok(Some(HashedProbe { keys, hashes, _reservation: reservation }))
+    }
+
+    fn hashed_probe_key<'a>(&'a self, probe: &'a ColumnBatch, row: usize, hashed: Option<&'a HashedProbe<'_>>) -> Result<(u32, Key<'a>)> {
+        if let Some(hashed) = hashed {
+            Ok((hashed.hashes[row], hashed.keys.key(row, self.projected[1])))
+        } else {
+            let key = self.key(probe, row, 1)?;
+            Ok((key.vector_hash()?, key))
+        }
+    }
+
     async fn probe_batch(&self, table: &mut Table, probe: ColumnBatch) -> Result<Option<ColumnBatch>> {
         let context = &self.execution.context;
         probe.validate_readable(context)?;
@@ -446,12 +479,13 @@ impl Spec {
             JoinKind::Left | JoinKind::Right | JoinKind::Full | JoinKind::Single => return self.probe_outer(table, &probe, residual.as_ref()).await,
             _ => {}
         }
+        let hashed = self.hash_probe(&probe)?;
         let mut matches = InnerMatches::new(self.count_only);
         if self.theta.is_empty() && residual.is_none() {
-            self.probe_arrow_keys(table, &probe, &mut matches)?;
+            self.probe_arrow_keys(table, &probe, hashed.as_ref(), &mut matches)?;
         } else if let Some(predicates) = self.residual.as_ref().filter(|predicates| residual.is_some()
             && (self.projected == [false, false] || predicates.schema.fields().iter().all(|field| date_free(&field.data_type))))
-            && self.probe_residual_columns(table, &probe, predicates, &mut matches).await.is_ok()
+            && self.probe_residual_columns(table, &probe, hashed.as_ref(), predicates, &mut matches).await.is_ok()
         {
         } else {
             // The row path also reports the error a failed column-wise pass met, as it would have met it first.
@@ -459,13 +493,14 @@ impl Spec {
             let equality = self.execution.scope()?;
             for row in 0..probe.len {
                 context.check_cancelled_at(row)?;
-                self.matching_build_rows(table, &probe, row, &equality, residual.as_ref(), |_, position| {
+                self.matching_build_rows(table, &probe, hashed.as_ref(), row, &equality, residual.as_ref(), |_, position| {
                     matches.push(position, &context.memory)?;
                     Ok(ControlFlow::Continue(()))
                 }).await?;
                 matches.end_row(row, &context.memory)?;
             }
         }
+        drop(hashed);
         match matches {
             InnerMatches::Count(0) => Ok(None),
             InnerMatches::Count(rows) => ColumnBatch::settled(Vec::new(), rows, context.memory.reserve(256)?).map(Some),
@@ -480,8 +515,9 @@ impl Spec {
     /// An inner join's residual over the key-matched pairs of a probe batch, column-wise, a bounded run of probe rows at a time.
     /// As in the row path, a pair meets each conjunct until one is false; an unknown key or conjunct lets it go on,
     /// for the later conjuncts' errors, but it never matches.
-    async fn probe_residual_columns(&self, table: &Table, probe: &ColumnBatch, residual: &Residual, matches: &mut InnerMatches)
-        -> Result<()> {
+    async fn probe_residual_columns(
+        &self, table: &Table, probe: &ColumnBatch, hashed: Option<&HashedProbe<'_>>, residual: &Residual, matches: &mut InnerMatches,
+    ) -> Result<()> {
         const PAIRS_PER_PASS: usize = 1 << 16;
         let context = &self.execution.context;
         let memory = &context.memory;
@@ -492,7 +528,10 @@ impl Spec {
         let mut first_row = 0;
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
-            let hash = self.key(probe, row, 1)?.vector_hash()?;
+            let hash = match hashed {
+                Some(hashed) => hashed.hashes[row],
+                None => self.key_hash(probe, row, 1)?,
+            };
             for (candidate, ordinal) in table.index.candidates(hash).enumerate() {
                 context.check_cancelled_at(candidate)?;
                 let (batch, offset) = table.position(ordinal);
@@ -560,9 +599,10 @@ impl Spec {
         let mut span = 0..0;
         let mut selected = JoinPositions::new();
         let equality = self.execution.scope()?;
+        let hashed = self.hash_probe(&probe)?;
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
-            let matched = self.matching_build_rows(table, &probe, row, &equality, residual, |_, _| Ok(ControlFlow::Break(()))).await?;
+            let matched = self.matching_build_rows(table, &probe, hashed.as_ref(), row, &equality, residual, |_, _| Ok(ControlFlow::Break(()))).await?;
             if matched != (self.kind == JoinKind::Semi) { continue; }
             if span.is_empty() {
                 span = row..row + 1;
@@ -578,6 +618,7 @@ impl Spec {
                 selected.push((0, row), memory)?;
             }
         }
+        drop(hashed);
         if span.is_empty() { return Ok(None); }
         let width = self.widths[1];
         if span == (0..probe.len) && width == probe.columns.len()
@@ -597,15 +638,15 @@ impl Spec {
         ColumnBatch::take_rows(&[&probe], &selected.rows, &columns, memory).map(Some)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn matching_build_rows(
-        &self, table: &Table, probe: &ColumnBatch, row: usize, equality: &rtdb_expr::EvaluationScope,
+        &self, table: &Table, probe: &ColumnBatch, hashed_probe: Option<&HashedProbe<'_>>, row: usize, equality: &rtdb_expr::EvaluationScope,
         residual: Option<&PreparedResidual<'_>>,
         mut accept: impl FnMut(usize, (usize, usize)) -> Result<ControlFlow<()>>,
     ) -> Result<bool> {
         let mut key = None;
         let mut hashed = if self.kind != JoinKind::Anti {
-            let probe_key = self.key(probe, row, 1)?;
-            let hash = probe_key.vector_hash()?;
+            let (hash, probe_key) = self.hashed_probe_key(probe, row, hashed_probe)?;
             key = Some(probe_key);
             Some(table.index.candidates(hash))
         } else {
@@ -721,11 +762,12 @@ impl Spec {
         let mut build = JoinPositions::new();
         let mut runs = ProbeRuns::new();
         let equality = self.execution.scope()?;
+        let hashed = self.hash_probe(probe)?;
         let mut unmatched = table.unmatched.take();
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
             let mut matched_once = false;
-            let matched = self.matching_build_rows(table, probe, row, &equality, residual, |ordinal, position| {
+            let matched = self.matching_build_rows(table, probe, hashed.as_ref(), row, &equality, residual, |ordinal, position| {
                 if matched_once && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
                 matched_once = true;
                 if let Some((unmatched, _)) = &mut unmatched { unmatched[ordinal] = 0; }
@@ -735,6 +777,7 @@ impl Spec {
             if !matched && self.preserves_probe() { build.push_outer(None, &context.memory)?; }
             runs.end_row(row, build.rows.len(), &context.memory)?;
         }
+        drop(hashed);
         table.unmatched = unmatched;
         self.gather_matches(build.rows.len(), Some((probe, runs)), |position| {
             gather_nullable_column(|batch| &table.batches[batch], &build.rows, position, &context.memory)
@@ -784,12 +827,11 @@ impl Spec {
         ColumnBatch::settled(columns, count, reservation).map(Some)
     }
 
-    fn probe_arrow_keys(&self, table: &Table, probe: &ColumnBatch, matches: &mut InnerMatches) -> Result<()> {
+    fn probe_arrow_keys(&self, table: &Table, probe: &ColumnBatch, hashed: Option<&HashedProbe<'_>>, matches: &mut InnerMatches) -> Result<()> {
         let context = &self.execution.context;
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
-            let probe_key = self.key(probe, row, 1)?;
-            let hash = probe_key.vector_hash()?;
+            let (hash, probe_key) = self.hashed_probe_key(probe, row, hashed)?;
             for (candidate, ordinal) in table.index.candidates(hash).enumerate() {
                 context.check_cancelled_at(candidate)?;
                 let (batch_index, build_row) = table.position(ordinal);
