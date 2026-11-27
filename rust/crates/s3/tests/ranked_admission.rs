@@ -337,38 +337,156 @@ async fn ranked_admission_closure_drains_only_the_recorded_multipart_upload() {
 #[tokio::test]
 #[ignore = "requires a disposable versioned S3-compatible loopback bucket"]
 async fn a_new_writer_epoch_drains_the_previous_ranked_upload_without_closing_the_scope() {
-    use rtdb_storage::ranked_admission::RankedAttempt;
+    use aws_sdk_s3::{
+        error::ProvideErrorMetadata, primitives::ByteStream, types::ChecksumAlgorithm,
+    };
     use ring::digest::{SHA256, digest};
+    use rtdb_storage::ranked_admission::{RankedAdmissionWriter, RankedAttempt};
 
     let config = loopback_config();
     let client = loopback_client(&config).await;
     let root = ObjectKey::new("multi").unwrap();
-    let scope = RankedAdmissionScope { incarnation: Uuid::new_v4(), activation_sha256: [9; 32] };
-    let io = IoRegion::new();
-    let writer = config.ranked_admission(&root, &BTreeMap::new(), Arc::clone(&io), scope).await.unwrap();
+    let scope = RankedAdmissionScope {
+        incarnation: Uuid::new_v4(),
+        activation_sha256: [9; 32],
+    };
+    let writer_io = IoRegion::new();
+    let writer = config
+        .ranked_admission(&root, &BTreeMap::new(), Arc::clone(&writer_io), scope)
+        .await
+        .unwrap();
     writer.commission().await.unwrap();
     let bytes = bytes::Bytes::from_static(b"ranked epoch transition");
     let object = ObjectId {
         database: scope.incarnation,
         kind: ObjectKind::File,
-        epoch: 1,
+        epoch: 2,
         seq: 1,
         digest: digest(&SHA256, &bytes).as_ref().try_into().unwrap(),
     };
-    let attempt = RankedAttempt { epoch: 1, position: 2, system_time: 3, key_generation: 4 };
-    let stalled = writer.reserve_staging(attempt, object).await.unwrap();
-    let next = ObjectId { epoch: 2, ..object };
-    let replacement = writer.reserve_staging(RankedAttempt { epoch: 2, ..attempt }, next).await.unwrap();
-    assert!(writer.complete_staging(stalled, bytes.clone()).await.is_err());
-    let uploads = client.list_multipart_uploads().bucket(&config.bucket)
-        .prefix(format!("{root}/{object}")).send().await.unwrap();
-    assert!(uploads.uploads().is_empty());
+    let attempt = RankedAttempt {
+        epoch: object.epoch,
+        position: 2,
+        system_time: 3,
+        key_generation: 4,
+    };
+    let completed = writer.stage(attempt, object, bytes.clone()).await.unwrap();
+    let interrupted = ObjectId { seq: 2, ..object };
+    let stalled = writer.reserve_staging(attempt, interrupted).await.unwrap();
+    let key = format!("{root}/{interrupted}");
+    let uploads = client
+        .list_multipart_uploads()
+        .bucket(&config.bucket)
+        .prefix(&key)
+        .send()
+        .await
+        .unwrap();
+    let [upload] = uploads.uploads() else {
+        panic!("expected one recorded upload")
+    };
+    assert_eq!(upload.key(), Some(key.as_str()));
+    let upload_id = upload.upload_id().unwrap();
+    client
+        .upload_part()
+        .bucket(&config.bucket)
+        .key(&key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .body(ByteStream::from(bytes.clone()))
+        .send()
+        .await
+        .unwrap();
+    drop(writer);
+    writer_io.close_and_wait().await;
+
+    let replacement_io = IoRegion::new();
+    let writer = config
+        .ranked_admission(&root, &BTreeMap::new(), Arc::clone(&replacement_io), scope)
+        .await
+        .unwrap();
+    for epoch in 1..=attempt.epoch {
+        assert_eq!(
+            writer
+                .reserve_staging(
+                    RankedAttempt { epoch, ..attempt },
+                    ObjectId {
+                        epoch,
+                        ..interrupted
+                    }
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "rtdb.storage/ranked-staging-busy"
+        );
+    }
+    let partial = client
+        .list_parts()
+        .bucket(&config.bucket)
+        .key(&key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(partial.parts().len(), 1);
+    let next = ObjectId { epoch: 3, ..object };
+    let replacement = writer
+        .reserve_staging(
+            RankedAttempt {
+                epoch: next.epoch,
+                ..attempt
+            },
+            next,
+        )
+        .await
+        .unwrap();
+    assert!(
+        writer
+            .complete_staging(stalled, bytes.clone())
+            .await
+            .is_err()
+    );
+    let absent = client
+        .list_parts()
+        .bucket(&config.bucket)
+        .key(&key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        absent.as_service_error().and_then(|error| error.code()),
+        Some("NoSuchUpload")
+    );
     let version = writer.complete_staging(replacement, bytes).await.unwrap();
     let closed = writer.close().await.unwrap();
-    let staged = writer.staging_page(closed, 0, 1).await.unwrap();
-    assert_eq!(staged.objects[0].object, next);
-    assert_eq!(staged.objects[0].physical, version);
-    io.close_and_wait().await;
+    assert_eq!(closed.admitted, 0);
+    assert!(
+        writer
+            .outcomes(closed, 0)
+            .await
+            .unwrap()
+            .catalogues
+            .is_empty()
+    );
+    let staged = writer.staging_page(closed, 0, 2).await.unwrap();
+    let [prior, current] = staged.objects.as_slice() else {
+        panic!("expected two completed versions")
+    };
+    assert_eq!(prior.object, object);
+    assert_eq!(prior.physical, completed);
+    assert_eq!(current.object, next);
+    assert_eq!(current.physical, version);
+    client
+        .head_object()
+        .bucket(&config.bucket)
+        .key(&completed.key)
+        .version_id(&completed.version)
+        .send()
+        .await
+        .unwrap();
+    replacement_io.close_and_wait().await;
 }
 
 #[cfg(feature = "versioning")]

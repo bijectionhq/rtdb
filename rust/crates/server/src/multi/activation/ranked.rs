@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
+#[cfg(feature = "backup-object-holds")]
+use rtdb_format::journal::RankedCatalog;
 use rtdb_storage::ranked_admission::{ClosedRankedAdmission, RankedAdmissionScope};
+#[cfg(feature = "backup-object-holds")]
+use rtdb_storage::ranked_admission::RankedStagedObject;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -384,14 +388,7 @@ async fn read_outcomes(
         let provider = open_provider(config, receipt.scope, io.clone()).await?;
         let page = provider.outcome_page(receipt, after.min(receipt.admitted), 32).await?;
         let staging = provider.staging_page(receipt, after.min(receipt.staging.completed), 32).await?;
-        let catalogues = page.catalogues.into_iter().map(|entry| serde_json::json!({
-            "manifest": entry.manifest.to_string(), "position": entry.position,
-            "system_time": entry.system_time, "key_generation": entry.key_generation,
-        })).collect::<Vec<_>>();
-        let staged = staging.objects.into_iter().map(|entry| serde_json::json!({
-            "object": entry.object.to_string(), "attempt": entry.attempt, "physical": entry.physical,
-        })).collect::<Vec<_>>();
-        ranked_outcome_frame(receipt, after, catalogues, staged)
+        ranked_outcome_frame(receipt, after, page.catalogues, staging.objects)
     }.await;
     io.close_and_wait().await;
     result
@@ -399,19 +396,42 @@ async fn read_outcomes(
 
 #[cfg(feature = "backup-object-holds")]
 fn ranked_outcome_frame(
-    receipt: ClosedRankedAdmission, after: u64, mut catalogues: Vec<Value>, mut staged: Vec<Value>,
+    receipt: ClosedRankedAdmission,
+    after: u64,
+    catalogues: Vec<RankedCatalog>,
+    staged: Vec<RankedStagedObject>,
 ) -> Result<Value> {
+    let mut catalogues: Vec<_> = catalogues
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "manifest": entry.manifest.to_string(), "position": entry.position,
+                "system_time": entry.system_time, "key_generation": entry.key_generation,
+            })
+        })
+        .collect();
+    let mut staged: Vec<_> = staged.into_iter().map(|entry| serde_json::json!({
+        "object": entry.object.to_string(), "attempt": entry.attempt, "physical": entry.physical,
+    })).collect();
     let mut count = catalogues.len().max(staged.len());
     loop {
         let position = after.saturating_add(count as u64);
-        let next_after = (position < receipt.admitted.max(receipt.staging.completed)).then_some(position);
+        let next_after =
+            (position < receipt.admitted.max(receipt.staging.completed)).then_some(position);
         let frame = serde_json::json!({ "scope": receipt, "catalogues": &catalogues, "staged": &staged, "next_after": next_after });
         let reply: Result<&Value> = Ok(&frame);
-        if serde_json::to_vec(&reply).map_err(|_| provider_unavailable())?.len() <= super::BROKER_FRAME_BYTES {
+        if serde_json::to_vec(&reply)
+            .map_err(|_| provider_unavailable())?
+            .len()
+            <= super::BROKER_FRAME_BYTES
+        {
             return Ok(frame);
         }
         if count <= 1 {
-            return Err(Anomaly::fault("rtdb/activation-ranked-provider", "The original ranked outcome exceeds the activation broker's frame limit"));
+            return Err(Anomaly::fault(
+                "rtdb/activation-ranked-provider",
+                "The original ranked outcome exceeds the activation broker's frame limit",
+            ));
         }
         count /= 2;
         catalogues.truncate(count);
@@ -466,24 +486,102 @@ mod tests {
     #[cfg(feature = "backup-object-holds")]
     #[test]
     fn ranked_outcomes_share_a_cursor_and_fit_the_broker_frame() {
+        use rtdb_format::journal::{ObjectId, ObjectKind};
+        use rtdb_storage::ranked_admission::{RankedAttempt, RankedStagingInventory};
+        use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace};
+
         let receipt = ClosedRankedAdmission {
-            scope: RankedAdmissionScope { incarnation: Uuid::new_v4(), activation_sha256: [1; 32] },
-            admitted: 8,
+            scope: RankedAdmissionScope {
+                incarnation: Uuid::new_v4(),
+                activation_sha256: [1; 32],
+            },
+            admitted: 39,
             inventory_sha256: [2; 32],
-            staging: rtdb_storage::ranked_admission::RankedStagingInventory { completed: 32, inventory_sha256: [3; 32] },
+            staging: RankedStagingInventory {
+                completed: 67,
+                inventory_sha256: [3; 32],
+            },
         };
-        let catalogues = (1..=8).map(|position| serde_json::json!({ "position": position })).collect();
-        let staged = (1..=32).map(|sequence| serde_json::json!({
-            "sequence": sequence,
-            "physical": { "version": "v".repeat(1024) },
-        })).collect();
-        let frame = ranked_outcome_frame(receipt, 0, catalogues, staged).unwrap();
-        let reply: Result<&Value> = Ok(&frame);
-        assert!(serde_json::to_vec(&reply).unwrap().len() <= super::super::BROKER_FRAME_BYTES);
-        let next = frame["next_after"].as_u64().unwrap();
-        assert_eq!(frame["staged"].as_array().unwrap().len(), next as usize);
-        assert_eq!(frame["catalogues"].as_array().unwrap().len(), next.min(receipt.admitted) as usize);
-        assert_eq!(frame["staged"][next as usize - 1]["sequence"], next);
+        let object = |kind, seq| ObjectId {
+            database: receipt.scope.incarnation,
+            kind,
+            seq,
+            epoch: 1234,
+            digest: [0x6c; 32],
+        };
+        let physical = |object: ObjectId| PhysicalObjectVersion {
+            namespace: S3ObjectNamespace {
+                bucket: "rtdb-nonproduction-ranked-archive".into(),
+                endpoint: None,
+                region: Some("eu-west-1".into()),
+            },
+            key: format!("deployments/primary-cell/multi/{object}"),
+            version: format!("f84a7ae8-3a42-4b99-aec5-{:012x}", object.seq),
+        };
+        let system_time = 1_795_809_600_000_000;
+        let mut after = 0;
+        loop {
+            let catalogues = (after + 1..=receipt.admitted)
+                .take(32)
+                .map(|position| RankedCatalog {
+                    manifest: object(ObjectKind::Manifest, position),
+                    position,
+                    system_time,
+                    key_generation: 14,
+                })
+                .collect();
+            let staged = (after + 1..=receipt.staging.completed)
+                .take(32)
+                .map(|position| {
+                    let object = object(ObjectKind::File, position);
+                    RankedStagedObject {
+                        object,
+                        attempt: RankedAttempt {
+                            epoch: object.epoch,
+                            position,
+                            system_time,
+                            key_generation: 14,
+                        },
+                        physical: physical(object),
+                    }
+                })
+                .collect();
+            let frame = ranked_outcome_frame(receipt, after, catalogues, staged).unwrap();
+            let reply: Result<&Value> = Ok(&frame);
+            assert!(serde_json::to_vec(&reply).unwrap().len() <= super::super::BROKER_FRAME_BYTES);
+            let staged = frame["staged"].as_array().unwrap();
+            assert!(!staged.is_empty());
+            if after == 0 {
+                assert!(staged.len() < 32);
+            }
+            let end = after + staged.len() as u64;
+            let catalogues = frame["catalogues"].as_array().unwrap();
+            assert_eq!(
+                catalogues.len() as u64,
+                end.min(receipt.admitted) - after.min(receipt.admitted)
+            );
+            for (position, catalogue) in (after + 1..).zip(catalogues) {
+                assert_eq!(
+                    catalogue["manifest"],
+                    object(ObjectKind::Manifest, position).to_string()
+                );
+            }
+            for (position, staged) in (after + 1..).zip(staged) {
+                let object = object(ObjectKind::File, position);
+                assert_eq!(staged["object"], object.to_string());
+                assert_eq!(staged["attempt"]["position"], position);
+                assert_eq!(
+                    staged["physical"],
+                    serde_json::to_value(physical(object)).unwrap()
+                );
+            }
+            if end == receipt.staging.completed {
+                assert!(frame["next_after"].is_null());
+                break;
+            }
+            assert_eq!(frame["next_after"], end);
+            after = end;
+        }
     }
 
     #[cfg(feature = "backup-object-holds")]
