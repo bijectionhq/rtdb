@@ -44,6 +44,9 @@ pub trait SessionService: Send + Sync {
             None => self.submit(database, operations, options, cancellation).await,
         }
     }
+    async fn submit_scheduled_async(&self, database: &str, operations: Vec<ScheduledOperation>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        self.submit_scheduled(database, operations, options, None, cancellation).await
+    }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult>;
     async fn await_submission(&self, database: &str, submitted: &SubmittedTx, cancellation: &CancellationToken) -> Result<(TransactionResult, Option<String>)> {
         Ok((self.await_transaction(database, submitted.tx_id, cancellation).await?, None))
@@ -708,7 +711,10 @@ impl Session {
             Submission::Replay(permit) => Some(permit),
             Submission::Ordinary | Submission::PresentReservation => None,
         };
-        let submitted = self.service.submit_scheduled(&database, operations, options, permit, &self.cancellation).await.inspect_err(|_| {
+        let submitted = match mode {
+            CommitMode::Async => self.service.submit_scheduled_async(&database, operations, options, &self.cancellation).await,
+            CommitMode::Sync => self.service.submit_scheduled(&database, operations, options, permit, &self.cancellation).await,
+        }.inspect_err(|_| {
             if let Some(observer) = &observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
         })?;
         let token = if let Some(receipt) = &submitted.placed_receipt {

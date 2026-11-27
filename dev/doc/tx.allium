@@ -540,6 +540,8 @@
 --        crosses this boundary (submit when async, execute-and-await when sync). The
 --        async/sync choice is the commit's own COMMIT SYNC / COMMIT ASYNC if it states one,
 --        else the transaction's begin-time async flag.
+-- A single-journal standalone attachment accepts synchronous SQL submissions.
+-- Asynchronous SQL submission requires a durable handoff and is rejected before queuing on that attachment.
 -- Above: the Frontend (pgwire / ADBC / Flight SQL client) that decodes the wire protocol and feeds SQL strings and transaction API calls into the Connection.
 -- A trusted frontend may supply a private replay permit for the synchronous commit of exactly one buffered write operation.
 -- The permit names the command's effective key and exclusive submission cutoff.

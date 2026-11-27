@@ -130,6 +130,10 @@ fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
 }
 
 impl MemoryLog {
+    pub(super) fn append_owned(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+        self.enqueue_at(payload.len(), || payload, |payload| self.shared.timestamps.timestamp(payload, timestamp))
+    }
+
     fn append_record(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         self.enqueue_at(payload.len(), || Bytes::copy_from_slice(&payload), |payload| self.shared.timestamps.timestamp(payload, timestamp))
     }

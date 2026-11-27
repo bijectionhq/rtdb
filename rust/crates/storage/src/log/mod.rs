@@ -1,9 +1,11 @@
 mod guarded_sample;
+mod intake;
 pub(crate) mod journal_file;
 pub(crate) mod local;
 mod memory;
 mod read_only;
 
+pub use intake::IntakeLog;
 pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
 pub use memory::MemoryLog;
 pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
@@ -367,6 +369,7 @@ pub trait Log: Send + Sync {
     async fn holds_writer_grant(&self) -> Result<bool> { Ok(true) }
     /// The reopened journal retains its synced prefix, and reads expose only that durable history.
     fn retains_synced_history(&self) -> bool { false }
+    fn is_volatile_intake(&self) -> bool { false }
     /// The provider's fixed size limit for one append, before any provider-specific wrapping.
     /// Absence means callers cannot admit an inline-only write using this provider.
     fn maximum_append_bytes(&self) -> Option<usize> { None }

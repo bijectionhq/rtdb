@@ -5,7 +5,6 @@
 //! A submission the holder had not yet resolved when it stopped was never acknowledged, and its client retries it.
 
 use std::{ops::AsyncFn, sync::Arc};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,7 +16,7 @@ use rtdb_format::{catalog::BlockCatalog, envelope::{ReplicaBody, ReplicaEnvelope
 use rtdb_logkeeper::{QuorumLog, StreamConfig};
 use rtdb_node::{AwaitAuthority, ClosedEpochRecovery, LogAccess, LogFactory, OpenedLogs, PlacedReceiptCodec, ReplicaReadIndex};
 use rtdb_replication::{TermFence, Verdict};
-use rtdb_storage::log::{AppendReceipt, GuardedAppend, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
+use rtdb_storage::log::{AppendReceipt, GuardedAppend, IntakeLog, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, object_store::ReadReservation};
 use rtdb_types::{Anomaly, BlockIndex, JournalEndpoint, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -238,7 +237,7 @@ pub(crate) fn frozen_checkpoint(
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/checkpoint-boundary", "Invalid frozen checkpoint boundary"));
     let replica = Arc::new(MemoryLog::starting_at(maximum_message_bytes, LogOffset(end(checkpoint.boundary)?)));
     let start = end(checkpoint.source)?;
-    let intake = Arc::new(IntakeLog::new(maximum_message_bytes, start));
+    let intake = Arc::new(IntakeLog::new(maximum_message_bytes, LogOffset(start)));
     Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
         placed_transfer: None, await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
 }
@@ -278,7 +277,7 @@ pub(crate) async fn ordered_opened(
     }));
     let placed_transfer = terminal.map(rtdb_directory::CheckpointTransferTerminal::placed_transfer);
     let next = next_source_offset_from_cut(replica.as_ref(), epoch, include_placed_debt(intake_cut, placed_transfer.as_ref())?).await?;
-    let intake = Arc::new(IntakeLog::new(maximum_message_bytes, next));
+    let intake = Arc::new(IntakeLog::new(maximum_message_bytes, LogOffset(next)));
     let trimming = {
         let intake = Arc::clone(&intake);
         async move {
@@ -320,7 +319,7 @@ pub(crate) fn ordered_reader_opened(
     let next = checkpoint.map_or(0, |checkpoint| checkpoint.source.saturating_add(1));
     let replica_read_index = Some(index());
     let replica: Arc<dyn Log> = journal;
-    Ok(OpenedLogs { source: Arc::new(IntakeLog::new(maximum, next)), replica, source_epoch: epoch,
+    Ok(OpenedLogs { source: Arc::new(IntakeLog::new(maximum, LogOffset(next))), replica, source_epoch: epoch,
         replica_epoch: epoch, placed_transfer: None, replica_read_index, await_authority, drivers: Vec::new() })
 }
 
@@ -422,7 +421,7 @@ impl LogFactory for LogkeeperLogFactory {
             next = next.max(floor);
         }
         if config.transfer_intake_cut.is_some() { SourcePosition::from_epoch_offset(epoch, next)?; }
-        let intake = Arc::new(IntakeLog::new(self.maximum_message_bytes, next));
+        let intake = Arc::new(IntakeLog::new(self.maximum_message_bytes, LogOffset(next)));
         let trimming = {
             let intake = Arc::clone(&intake);
             async move {
@@ -848,48 +847,6 @@ impl LogRange for SealedRange {
     }
 }
 
-/// The holder's in-process source log keeps pending bytes until their replica outcomes are installed.
-pub struct IntakeLog { log: MemoryLog, consumed: AtomicI64, start: i64 }
-
-impl IntakeLog {
-    fn new(maximum_message_bytes: usize, start: i64) -> Self {
-        let capacity = maximum_message_bytes.saturating_mul(2).max(16 * 1024 * 1024);
-        Self {
-            log: MemoryLog::bounded_starting_at(maximum_message_bytes, LogOffset(start), capacity),
-            consumed: AtomicI64::new(start - 1),
-            start,
-        }
-    }
-
-    fn trim(&self) {
-        let boundary = self.consumed.load(Ordering::Acquire).saturating_add(1);
-        if boundary > self.log.first_retained().0
-            && let Err(error) = self.log.truncate_before(LogOffset(boundary))
-        {
-            tracing::warn!(boundary, error = %error, "Failed to trim intake log");
-        }
-    }
-}
-
-#[async_trait]
-impl Log for IntakeLog {
-    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
-        self.trim();
-        self.log.enqueue(payload, timestamp).await
-    }
-    fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
-    fn record_applied(&self, through: LogOffset) {
-        self.consumed.fetch_max(through.0, Ordering::AcqRel);
-    }
-    async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
-        // Positions below the intake's start were never assigned to it, so a reader asking for them starts at the start; trimmed positions above it still fail as unavailable.
-        let after = LogOffset(after.0.max(self.start - 1));
-        self.log.tail(after).await
-    }
-    async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> { self.log.range(from, to).await }
-    async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,23 +1145,5 @@ mod tests {
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(cut)).await.unwrap(), 1002);
         let earlier = TransferIntakeCut { replica_through: 499, ..cut };
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(earlier)).await.unwrap(), 1004);
-    }
-
-    #[tokio::test]
-    async fn the_intake_releases_applied_records_and_keeps_pending_records() {
-        let intake = IntakeLog::new(1 << 20, 10);
-        for payload in [b"applied".as_slice(), b"pending".as_slice()] {
-            intake.enqueue(Bytes::from_static(payload), Timestamp(0)).await.unwrap().durable().await.unwrap();
-        }
-        let mut tail = intake.tail(LogOffset(-1)).await.unwrap();
-        assert_eq!(tail.poll(Duration::from_millis(10)).await.unwrap().len(), 2);
-        intake.trim();
-        assert_eq!(intake.log.first_retained(), LogOffset(10));
-        intake.record_applied(LogOffset(10));
-        intake.trim();
-        assert_eq!(intake.log.first_retained(), LogOffset(11));
-        assert!(intake.tail(LogOffset(9)).await.is_err());
-        let pending = intake.read_range(LogOffset(11), LogOffset(12)).await.unwrap();
-        assert_eq!(pending[0].payload.as_ref(), b"pending");
     }
 }

@@ -156,7 +156,14 @@ impl PartitionLogs {
     pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
     pub fn store(&self) -> &Arc<dyn ObjectStore> { &self.store }
     pub(crate) fn local_recovery_store(&self) -> Option<&rtdb_storage::LocalStore> {
-        if self.retains_recovery_history() { self.store.local_maintenance_store() } else { None }
+        if self.retains_recovery_history()
+            || (self.source.is_volatile_intake() && self.replica.journal_lineage().is_some()
+                && self.replica.retains_synced_history() && self.store.syncs_checkpoints())
+        {
+            self.store.local_maintenance_store()
+        } else {
+            None
+        }
     }
     pub(crate) fn recovery_block_store(&self, file_size_target: i64) -> Result<Arc<crate::BlockStore>> {
         crate::BlockStore::new(Arc::clone(&self.store), Arc::clone(&self.cache), Arc::clone(&self.memory), file_size_target)
@@ -203,6 +210,7 @@ impl PartitionLogs {
     pub fn retains_recovery_history(&self) -> bool {
         self.source.retains_synced_history() && self.replica.retains_synced_history() && self.store.syncs_checkpoints()
     }
+    pub fn uses_volatile_intake(&self) -> bool { self.source.is_volatile_intake() }
     pub fn source_position(&self, metadata: LogMetadata) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, metadata.offset.0) }
     pub fn latest_source_position(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, latest(self.source.as_ref())?.0) }
     pub fn latest_replica_position(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, latest(self.replica.as_ref())?.0) }
@@ -229,7 +237,9 @@ impl PartitionLogs {
         {
             return Err(invalid());
         }
-        self.source_replay(source).await?;
+        if !self.source.is_volatile_intake() {
+            self.source_replay(source).await?;
+        }
         self.replica_replay(boundary).await?;
         self.replica_replay(upload).await?;
         Ok(())

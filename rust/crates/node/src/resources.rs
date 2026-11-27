@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
-use rtdb_storage::{AppleSync, IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
+use rtdb_storage::{AppleSync, IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, IntakeLog, LocalLog, LocalLogOptions, Log, LogOffset, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -262,6 +262,7 @@ pub struct NativeResources {
     local_log_clock: Arc<TransactionClock>,
     local_log_uses_clock_for_non_transactions: bool,
     apple_sync: AppleSync,
+    single_journal: bool,
     serving_authorities: NativeServingAuthorities,
 }
 
@@ -270,13 +271,19 @@ impl Default for NativeResources {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
             log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, local_checkpoint_vault: None, kafka_checkpoint_vault: None, io: IoRegion::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false,
-            apple_sync: AppleSync::Full,
+            apple_sync: AppleSync::Full, single_journal: false,
             serving_authorities: BTreeMap::new() }
     }
 }
 
 impl NativeResources {
     pub fn with_apple_sync(mut self, apple_sync: AppleSync) -> Self { self.apple_sync = apple_sync; self }
+
+    /// Opens local history initialized with one durable replica journal and volatile intake.
+    pub fn with_single_journal(mut self) -> Self {
+        self.single_journal = true;
+        self
+    }
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
     pub fn with_token_kms(mut self, kms: Arc<dyn rtdb_crypt::Kms>) -> Self {
         self.token_kms = Some(kms);
@@ -396,7 +403,7 @@ pub(crate) fn validate_database_shape(name: &str, configuration: &DatabaseConfig
 
 #[async_trait]
 impl ResourceFactory for NativeResources {
-    fn supports_default_local_restore(&self) -> bool { self.classic_vault.is_none() && self.native_checkpoint_kms.is_none() }
+    fn supports_default_local_restore(&self) -> bool { !self.single_journal && self.classic_vault.is_none() && self.native_checkpoint_kms.is_none() }
     fn apple_sync(&self) -> AppleSync { self.apple_sync }
     fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { self.token_kms.clone() }
 
@@ -421,6 +428,12 @@ impl ResourceFactory for NativeResources {
     async fn close(&self) -> Result<()> { if let Some(cache) = &self.disk_cache { cache.close_and_wait().await; } self.io.close_and_wait().await; Ok(()) }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
         validate_database_shape(name, configuration)?;
+        if self.single_journal && (self.classic_vault.is_some() || configuration.external_source.is_some()
+            || !matches!(&configuration.log, Some(database_config::Log::LocalLog(_)))
+            || !matches!(&configuration.storage, Some(database_config::Storage::LocalStorage(_))))
+        {
+            return Err(invalid("A single local journal requires local storage and native transaction intake"));
+        }
         if self.maximum_log_message_bytes == 0 || self.maximum_log_message_bytes > i32::MAX as usize || self.log_queue_capacity == 0 { return Err(invalid("Invalid local log message or queue capacity")); }
         match &configuration.log {
             Some(database_config::Log::InMemoryLog(log)) => { SourcePosition::from_epoch_offset(StorageEpoch(log.epoch.unwrap_or(0)), -1)?; }
@@ -609,9 +622,39 @@ impl NativeResources {
             }
             Some(database_config::Log::LocalLog(log)) => {
                 let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
-                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io), storage.store.local_erasure_custody().is_some())?;
-                let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(io), bind_lineage)?;
                 let epoch = StorageEpoch(log.epoch.unwrap_or(0));
+                if self.single_journal {
+                    if access == LogAccess::SourceWriter {
+                        return Err(invalid("A single local journal requires the local replica writer for submissions"));
+                    }
+                    let (replica, replica_driver) = self.local_log(
+                        path.join("REPLICA_LOG"), false, access.replica_read_only(),
+                        log_cancellation.clone(), Arc::clone(io), true,
+                    )?;
+                    // Each consumed source position needs a replica frame, whose byte offset advances by more than one.
+                    // New intake therefore starts above all durable source positions without scanning the replica.
+                    let start = replica.latest()?.0.checked_add(1).ok_or_else(|| invalid("The local journal has no remaining source positions"))?;
+                    SourcePosition::from_epoch_offset(epoch, start)?;
+                    let source = Arc::new(IntakeLog::new(self.maximum_log_message_bytes, LogOffset(start)));
+                    let trimming = {
+                        let source = Arc::clone(&source);
+                        async move {
+                            loop {
+                                tokio::select! {
+                                    _ = log_cancellation.cancelled() => return Ok(()),
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => source.trim(),
+                                }
+                            }
+                        }.boxed()
+                    };
+                    return Ok(OpenedLogs {
+                        source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
+                        placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition,
+                        drivers: replica_driver.into_iter().chain([trimming]).collect(),
+                    });
+                }
+                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io), storage.store.local_erasure_custody().is_some())?;
+                let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation, Arc::clone(io), bind_lineage)?;
                 Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition,
                     drivers: source_driver.into_iter().chain(replica_driver).collect() })
             }
@@ -720,6 +763,53 @@ async fn native_search_lineage_follows_the_journal_after_its_directory_moves() -
     assert_ne!(new_journal.replica.journal_lineage().unwrap(), lineage);
     drop((moved_journal, new_journal));
     moved_storage.io.close_and_wait().await;
+    storage.io.close_and_wait().await;
+    native.close().await
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn single_local_journal_reopens_intake_after_its_committed_prefix() -> Result<()> {
+    use bytes::Bytes;
+    use rtdb_format::database::proto::{LocalLog as LocalLogConfig, LocalStorage};
+
+    let files = tempfile::tempdir().unwrap();
+    let logs = files.path().join("journal");
+    let native = NativeResources::default().with_single_journal();
+    let config = DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLogConfig {
+            path: Some(logs.to_str().unwrap().to_owned()), epoch: Some(0),
+        })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage {
+            path: Some(files.path().join("objects").to_str().unwrap().to_owned()), epoch: Some(0),
+        })),
+        ..Default::default()
+    };
+    let storage = native.open_storage("xtdb", &config).await?;
+    let stop = CancellationToken::new();
+    let mut opened = native.open_logs("xtdb", &config, LogAccess::ReadWrite, stop.clone(), &storage).await?;
+    let drivers = std::mem::take(&mut opened.drivers).into_iter().map(tokio::spawn).collect::<Vec<_>>();
+    let original_source = opened.source.enqueue(Bytes::from_static(b"request"), Timestamp(0)).await?.durable().await?;
+    opened.replica.enqueue(Bytes::from_static(b"term"), Timestamp(0)).await?.durable().await?;
+    let terminal = opened.replica.enqueue(Bytes::from_static(b"decision"), Timestamp(0)).await?.durable().await?;
+    let lineage = opened.replica.journal_lineage();
+    assert_eq!(original_source.offset, LogOffset(0));
+    assert_eq!(opened.source.latest()?, LogOffset(0));
+    assert!(lineage.is_some());
+    stop.cancel();
+    for driver in drivers {
+        driver.await.unwrap()?;
+    }
+    drop(opened);
+
+    let reopened = native.open_logs("xtdb", &config, LogAccess::ReadWrite, CancellationToken::new(), &storage).await?;
+    assert!(!logs.join("LOG").exists());
+    assert_eq!(reopened.replica.journal_lineage(), lineage);
+    assert_eq!(reopened.source.latest()?, terminal.offset);
+    let next = reopened.source.enqueue(Bytes::from_static(b"next"), Timestamp(0)).await?.durable().await?;
+    assert_eq!(next.offset, LogOffset(terminal.offset.0 + 1));
+    assert!(next.offset > original_source.offset);
+    drop(reopened);
     storage.io.close_and_wait().await;
     native.close().await
 }

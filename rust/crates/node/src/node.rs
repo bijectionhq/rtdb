@@ -37,6 +37,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::session::CommitMode;
 use crate::{AwaitAuthority, Clock, Database, DatabaseAccess, DatabaseCatalog, ExternalSources, Membership, NativeResources, NodeOptions, PreparedSql, QueryBasis, ResourceFactory, ResultSignaturePolicy, Session, SessionIdentity, SessionService, SystemClock,
     catalog::CatalogCommand, database::{DatabaseDriver, DatabaseFactory, OpenedDatabase}, placed_receipts::{PlacedToken, invalid_token, is_placed_token}, statement::prepare_query};
 
@@ -807,7 +808,7 @@ impl Node {
         rtdb_storage::IoRegion::leased(lease, rtdb_query::evaluate_fragment_with_arguments(context, fragment, arguments)).await
     }
 
-    async fn submit(&self, database: &str, operations: Vec<ScheduledOperation>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+    async fn submit(&self, database: &str, operations: Vec<ScheduledOperation>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, mode: CommitMode, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
         if self.factory.resources.journal_native_sql() {
             return Err(Anomaly::unsupported("rtdb.multi/sql-write", "Multi writes use rtdb.v1.Transact"));
@@ -818,6 +819,11 @@ impl Node {
             return Err(owned_relations_disabled());
         }
         let database = self.attached_database(database, placement)?;
+        if mode == CommitMode::Async && database.logs.uses_volatile_intake()
+            && matches!(database.await_authority, AwaitAuthority::SourcePosition)
+        {
+            return Err(Anomaly::unsupported("rtdb/single-journal-async", "Asynchronous submission requires durable intake"));
+        }
         let admission = if self.catalog.is_placed() {
             Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
         } else { None };
@@ -4562,14 +4568,17 @@ impl SessionService for NativeSessionService {
         Ok(())
     }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
-        self.submit_scheduled(database, operations.into_iter().map(ScheduledOperation::from).collect(), options, None, cancellation).await
+        self.submit_scheduled_async(database, operations.into_iter().map(ScheduledOperation::from).collect(), options, cancellation).await
     }
     async fn submit_replay(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, permit: crate::ReplaySubmissionPermit, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.submit_scheduled(database, operations.into_iter().map(ScheduledOperation::from).collect(), options, Some(permit), cancellation).await
     }
 
     async fn submit_scheduled(&self, database: &str, operations: Vec<ScheduledOperation>, options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
-        self.node.submit(database, operations, options, permit, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+        self.node.submit(database, operations, options, permit, CommitMode::Sync, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
+    }
+    async fn submit_scheduled_async(&self, database: &str, operations: Vec<ScheduledOperation>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> {
+        self.node.submit(database, operations, options, None, CommitMode::Async, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
     }
     async fn await_transaction(&self, database: &str, tx_id: TxId, cancellation: &CancellationToken) -> Result<TransactionResult> { self.node.await_transaction_result(database, tx_id, None, self.identity.as_ref(), self.placement.as_ref(), cancellation).await }
     async fn await_submission(&self, database: &str, submitted: &SubmittedTx, cancellation: &CancellationToken) -> Result<(TransactionResult, Option<String>)> {
