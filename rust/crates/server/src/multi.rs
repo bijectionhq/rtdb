@@ -1827,7 +1827,7 @@ struct PlacementSource {
 const PLACEMENT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The Multi journal's operator-recovery counters: the recoveries this
-/// process's writers acknowledged before resuming, and the recovery faults
+/// process's writers acknowledged with an atomic marker, and the recovery faults
 /// it reported by code. They are process-wide, like the journal backends.
 const RECOVERIES_ACKNOWLEDGED: &str = "rtdb.multi.journal.recoveries.acknowledged";
 const RECOVERY_FAULTS: &str = "rtdb.multi.journal.recovery.faults";

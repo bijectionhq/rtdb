@@ -61,9 +61,10 @@ For a legacy mutable stream that loses two of its three voters, an operator can 
 The stream then ends at the survivor's head, and records acknowledged after it may be lost.
 Every seal returns `JournalError::Recovered { head }` until a writer or an administrator acknowledges the recovery.
 
-- **Resuming.** The Multi node that would take the writer role logs a `rtdb/journal-recovered` error event, counts it in `rtdb_db::journal_recoveries_acknowledged`, acknowledges the recovery and seals above the recovery's fence.
-  It replays the recovered journal from its floor, writes its lease and then a `Recovered { head, epoch, time }` journal record, before any transaction.
-  When several nodes acknowledge at once, the epoch fence leaves one writer, and a node that finds the journal already records the recovery's head does not record it again.
+- **Resuming.** A Multi writer candidate that encounters the recovery logs a `rtdb/journal-recovered` error event and attempts to acknowledge it.
+  With atomic markers, the candidate replays the recovered journal from its floor, and the journal accepts a single `Recovered { head, epoch, time }` marker as it clears the recovery fence.
+  The accepting candidate's process counts the acknowledgement as soon as the journal confirms its marker, before the next seal.
+  With older journals, the candidate uses the separate acknowledgement, and the writer records the recovery after its lease if the journal has no record for that head.
 - **Why the journal.** The record is ordered with the history it describes and reaches every replica and reader through replay.
   It stays until a checkpoint trims past it; checkpoint images do not carry it, and the error event and counter remain the operator's record after that.
   RTDB's own object-store metadata has no order relative to the journal, and a reader would have to consult it on every catch-up to learn that its state is stale.
@@ -73,7 +74,8 @@ Every seal returns `JournalError::Recovered { head }` until a writer or an admin
   Either way the node logs the loss and rebuilds its state from the journal floor.
 - **Holding writes.** With `multiJournal: {holdWritesAfterRecovery: true}` the node instead refuses the writer role with `rtdb/journal-recovered` until someone else acknowledges the recovery, and records nothing.
 - **Metrics.** The Multi server's registry exports both process-wide counts on `/metrics`: `rtdb_multi_journal_recoveries_acknowledged_total`, and `rtdb_multi_journal_recovery_faults_total` by `code` (`rtdb/journal-recovered`, `rtdb/journal-shortened`, `rtdb/journal-rewritten`).
-  A rising `rtdb/journal-recovered` count without acknowledgements means a held writer or a recovery nobody acknowledged; the other two codes count followers and readers that rebuilt.
+  The acknowledgement metric covers atomic markers because the legacy acknowledgement returns the head even if another caller already cleared the fence.
+  The fault metric counts reported anomalies, including held writes and readers that found a shortened or rewritten history.
 - **Tested on real keepers.** `multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild` runs on Logkeeper's `LocalCluster::start_spared`: five keepers in three domains and the catalog keeper.
   Voter 1 stops after the first commit, the other two voters acknowledge two more and are retired, and `recover-stream` runs on voter 1.
   The next writer acknowledges and records the recovery, and the old writer, both followers and a new reader all hold the first commit and the new ones, never the lost ones.

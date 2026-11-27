@@ -39,6 +39,7 @@
 -- The stream driver submits contiguous append groups in LSN order and acknowledges the group after every record in it commits.
 -- An unavailable append can leave a committed prefix, which the driver recovers from the journal before resuming writes.
 -- After an operator recovery cuts a legacy consensus stream back to its survivor's head, the next writer acknowledges the recovery, records it in the journal before any transaction, and resumes, unless its node is configured to hold writes until someone else acknowledges it.
+-- A candidate's process counts an acknowledgement when the journal confirms that candidate's atomic recovery marker.
 -- A node whose replayed state the recovered journal no longer holds rebuilds it from the journal floor.
 -- A cluster of the opt-in stream driver runs one node role per process and takes one journal URL with a client identity and trust bundle.
 -- A development process opens FileJournal and a filesystem object store under its selected data directory.

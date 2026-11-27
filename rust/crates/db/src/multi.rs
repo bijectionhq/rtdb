@@ -20,11 +20,9 @@ use crate::{
     replay::{ChangeHistory, Committed, JournalCoordinates, JournalRecovery, ReplayBase, ReplayError},
 };
 
-/// Operator recoveries this process's Multi writers acknowledged on their own.
 static RECOVERIES_ACKNOWLEDGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The number of operator journal recoveries that Multi writers in this
-/// process acknowledged before resuming writes.
+/// Operator journal recoveries acknowledged with an atomic marker by this process's Multi writers.
 pub fn journal_recoveries_acknowledged() -> u64 {
     RECOVERIES_ACKNOWLEDGED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -429,9 +427,8 @@ impl MultiDatabase {
                     tracing::error!(
                         database = %self.options.database, code = "rtdb/journal-recovered", head = head.0,
                         epoch = attempt.epoch.0,
-                        "An operator recovered the Multi journal after it lost two of its three voters; commits acknowledged after its head may be lost. The writer acknowledges the recovery, records it in the journal and resumes",
+                        "An operator recovered the Multi journal after it lost two of its three voters. Commits acknowledged after the recovered head may be lost",
                     );
-                    RECOVERIES_ACKNOWLEDGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let after = match self.acknowledge_recovery_with_record(head).await? {
                         Some(after) => after,
                         None => {
@@ -477,8 +474,10 @@ impl MultiDatabase {
     async fn acknowledge_recovery_with_record(&mut self, head: Lsn) -> Result<Option<Lsn>> {
         let fence = match self.stream.recovery_fence().await {
             Ok(Some(fence)) => fence,
-            // Another node or an administrator already acknowledged it.
-            Ok(None) => return Ok(Some(self.stream.head().await?)),
+            Ok(None) => {
+                tracing::debug!(database = %self.options.database, head = head.0, "The journal recovery fence is already clear");
+                return Ok(Some(self.stream.head().await?));
+            }
             Err(JournalError::Unsupported) => return Ok(None),
             Err(error) => return Err(journal_error(error)),
         };
@@ -497,11 +496,15 @@ impl MultiDatabase {
         };
         let marker = self.stream.encode(at, &entry).await?;
         match self.stream.acknowledge_recovery_with_marker(fence, marker).await {
-            Ok(at) => Ok(Some(at)),
-            // Another node lifted this fence first; its acknowledgement
-            // stands, and this node records the recovery after sealing if
-            // the journal does not hold a record of it.
-            Err(JournalError::Conflict { .. }) => Ok(Some(self.stream.head().await?)),
+            Ok(at) => {
+                RECOVERIES_ACKNOWLEDGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(at))
+            }
+            Err(JournalError::Conflict { head: current }) => {
+                tracing::debug!(database = %self.options.database, head = head.0, epoch = fence.epoch.0,
+                    current_head = current.0, "The journal recovery fence changed before the marker was accepted");
+                Ok(Some(self.stream.head().await?))
+            }
             Err(JournalError::Unsupported) => Ok(None),
             Err(error) => Err(journal_error(error)),
         }

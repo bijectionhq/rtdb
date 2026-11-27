@@ -87,7 +87,7 @@ fn metric_help(name: &str) -> &'static str {
         "xtdb.replica.process.timer" => "Time spent processing replica log records, by message type",
         "xtdb.replica.block.buffer.timer" => "Time the follower spends buffering records between BlockBoundary and BlockUploaded",
         "xtdb.replica.block.buffered.records" => "Number of records buffered while a follower waits for BlockUploaded",
-        "rtdb.multi.journal.recoveries.acknowledged" => "Operator journal recoveries that this process's Multi writers acknowledged before resuming writes",
+        "rtdb.multi.journal.recoveries.acknowledged" => "Operator journal recoveries acknowledged with an atomic marker by this process's Multi writers",
         "rtdb.multi.journal.recovery.faults" => "Multi journal recovery faults this process reported, by anomaly code",
         // Micrometer uses a single space when a meter has no description.
         _ => " ",

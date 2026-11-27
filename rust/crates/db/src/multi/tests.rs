@@ -1340,7 +1340,6 @@ async fn multi_driver_acknowledges_a_journal_recovery_records_it_and_resumes_wri
     let stream = writer.journal_stream();
     drop(writer);
     journal.recover(stream, kept).await;
-    let recoveries = journal_recoveries_acknowledged();
 
     // The follower outlives the lost writer's lease, notices the recovery when
     // it seals, acknowledges it, seals above the recovery's fence and records
@@ -1348,7 +1347,6 @@ async fn multi_driver_acknowledges_a_journal_recovery_records_it_and_resumes_wri
     cluster.at(10 + LEASE + DRIFT + 1);
     assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(RECOVERY_FENCE.0 + 1)));
     assert_eq!(journal.acknowledgements.load(Ordering::SeqCst), 1);
-    assert!(journal_recoveries_acknowledged() > recoveries);
     let recovery = follower.journal_recovery().unwrap();
     assert_eq!((recovery.head, recovery.epoch, recovery.time), (kept, Epoch(RECOVERY_FENCE.0 + 1), Timestamp(10 + LEASE + DRIFT + 1)));
     assert!(recovery.at > kept);
@@ -1482,11 +1480,18 @@ async fn multi_resumes_after_a_real_keeper_recovery_and_followers_rebuild() {
     // and records the loss before it commits past the lost positions.
     let recoveries = journal_recoveries_acknowledged();
     let faults = crate::journal::journal_recovery_faults();
-    let mut successor = cluster.node(3, handle(&keepers, NODE_3_IDENTITY));
     cluster.at(10 + LEASE + DRIFT + 1);
+    let restricted = keepers.journal_config(8 << 30, 1);
+    let journal = keepers.journal(&keeper_principal(&NODE_3_IDENTITY), &restricted).unwrap();
+    let mut candidate = cluster.node(3, Arc::new(journal));
+    let error = candidate.tick(&live(3)).await.unwrap_err();
+    assert_eq!(error.code, "rtdb/journal-record-too-large");
+    assert_eq!(journal_recoveries_acknowledged(), recoveries);
+
+    let mut successor = cluster.node(3, handle(&keepers, NODE_3_IDENTITY));
     let role = successor.tick(&live(3)).await.unwrap();
     assert_eq!(role, Role::Writer(Epoch(report.epoch.0 + 1)));
-    assert!(journal_recoveries_acknowledged() > recoveries);
+    assert_eq!(journal_recoveries_acknowledged(), recoveries + 1);
     // The keeper wrote the record with the acknowledgement, right after the
     // recovered head and under the recovery's fence.
     let recovery = successor.journal_recovery().unwrap();
