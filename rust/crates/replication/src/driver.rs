@@ -1668,7 +1668,8 @@ impl ReplicationDriver {
                                 if record.kind() == rtdb_format::entity_directory::RECORD_KIND { return None; }
                                 slug.recorded_artefact_key(trie, record).ok()
                             }));
-                            for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<BTreeSet<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
+                            let keys = keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<BTreeSet<_>>();
+                            self.forget_cached(keys).await;
                         }
                     }
                     self.record_applied(record.metadata.position)?;
@@ -1815,7 +1816,7 @@ impl ReplicationDriver {
                         let deletions = BTreeMap::from([(table, keys)]);
                         self.partition.delete_tries(&deletions);
                         // Every node holds its own cached copies, and the leader's delete reached only the remote store.
-                        for key in cached { let _ = self.resolve.storage.invalidate(&key).await; }
+                        self.forget_cached(cached).await;
                         if let Some(leader) = &mut self.leader && leader.term == record.envelope.term
                             && let Some(sequence) = record.envelope.term_sequence
                             && let Some(write) = leader.pending.iter().find(|write| write.sequence() == Some(sequence))
@@ -2334,6 +2335,16 @@ impl ReplicationDriver {
         }
         Ok(())
     }
+    /// Drops this node's cached copies of objects the log records as deleted.
+    /// XTDB keeps no such copies to drop; a copy left behind costs only local disk, so a failure is reported rather than raised.
+    async fn forget_cached(&self, keys: impl IntoIterator<Item = rtdb_storage::ObjectKey>) {
+        for key in keys {
+            if let Err(error) = self.resolve.storage.invalidate(&key).await {
+                tracing::warn!(%key, %error, "Could not drop this node's cached copy of a deleted object");
+            }
+        }
+    }
+
     async fn cut(&mut self) -> Result<()> {
         if self.placed_slot.is_some() || self.serving_holds_checkpoint()
             || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
