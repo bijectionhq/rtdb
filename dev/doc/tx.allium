@@ -217,6 +217,7 @@
 -- Each outer row frame retains its source position, the emitted schema owner, and its parent frame in nesting order.
 -- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
 -- Joined Apply retains dependent pages in order and uses the same outer position across each page.
+-- Joined and document Apply can reuse completed dependent pages for an admitted lookup within the current outer page.
 -- Apply documents retain compatible dependent fields and arrays in field-name order.
 -- A document Apply with no dependent rows returns null.
 -- A dependent row with zero fields contributes a present empty document.

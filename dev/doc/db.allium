@@ -2510,10 +2510,12 @@ surface QueryAccess {
         -- A parent with a null list, an empty list, or zero surviving candidates yields one row with null dependent columns.
         -- Batched expansion preserves the reached input validation and retains selected child spans under their source owners.
         -- The dependent Apply evaluates fallible predicates and bindings and handles input layouts outside the batch admission.
+        -- A column table over a compatible captured Arrow list of plain signed integers, Booleans or UTF-8 can lend its elements as one dependent page under the source owner.
         -- Apply builds its document from funded child arrays when their physical fields are admitted.
-        -- A document Apply can replay a completed dependent result within its current outer page when the captured scan key or lexical reference is the same.
+        -- A document whose fields all match their declared scalar layouts can retain the child arrays when a field's logical type is absent from the page.
+        -- A joined or document Apply can replay a completed dependent result within its current outer page when the captured scan key or lexical reference is the same.
         -- At the page's reuse limit, a newly completed key takes the place of the least recently used key.
-        -- Reuse binds each reached outer row and preserves dependent document order, duplicates, null results and the single-document cardinality check.
+        -- Reuse binds each reached outer row and preserves dependent row order, duplicates, null extension and cardinality checks.
         -- A bounded literal outer-join rewrite preserves one null-extended row per unmatched outer occurrence when the dependent preserved side has one row.
         -- Keyed collection over bounded literal relations groups real dependent rows and retains an outer result for each occurrence.
         -- Collection preserves source order for unordered aggregates and among peers in an explicitly ordered aggregate.

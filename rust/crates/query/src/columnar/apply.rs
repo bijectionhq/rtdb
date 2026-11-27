@@ -9,7 +9,7 @@ use rtdb_types::{LogicalType, Result};
 
 use super::{
     Column, ColumnBatch, RowExpansion, SelectedColumn, SelectedRows, StoredVector, expanded_column, expansion_source,
-    gather_column_cells, pack_evaluated_column, size_error, stable_read_layout,
+    copyable, gather_column_cells, pack_evaluated_column, plain_scalar, size_error, stable_read_layout,
 };
 use crate::invalid;
 
@@ -382,6 +382,7 @@ impl ColumnBatch {
     ) -> Result<Option<(Vec<ArrowField>, Vec<ArrayRef>)>> {
         let mut fields = Vec::with_capacity(positions.len());
         let mut arrays = Vec::with_capacity(positions.len());
+        let mut all_declared_scalars = None;
         for (&position, output) in positions.iter().zip(schema.fields()) {
             let owner = self.column_reservation(position);
             let (array, field, logical, custody) = match &self.columns[position] {
@@ -411,7 +412,20 @@ impl ColumnBatch {
                     (array, field, logical, charge)
                 }
             };
-            if !logical.as_ref().is_some_and(|ty| *ty != LogicalType::Nothing && stable_read_layout(ty, &field)) {
+            let compatible = match logical.as_ref() {
+                Some(ty) => *ty != LogicalType::Nothing && stable_read_layout(ty, &field),
+                // A missing logical type used to send every child through declared conformance.
+                None => *all_declared_scalars.get_or_insert_with(|| positions.iter().zip(schema.fields()).all(|(&position, output)| {
+                    matches!(&self.columns[position], Column::Arrow { array, field, logical }
+                        if field.metadata().is_empty() && array.data_type() == field.data_type() && array.len() == self.len
+                            && (field.is_nullable() || array.null_count() == 0)
+                            && logical.as_ref().is_none_or(|ty| *ty == output.data_type)
+                            && plain_scalar(&output.data_type).is_some_and(copyable)
+                            && stable_read_layout(&output.data_type, field)
+                            && rtdb_columnar::to_field(field.name(), &output.data_type).is_ok_and(|declared| declared == **field))
+                })),
+            };
+            if !compatible {
                 return Ok(None);
             }
             let descriptors = array.get_array_memory_size().saturating_sub(array.get_buffer_memory_size());
@@ -508,6 +522,33 @@ mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use rtdb_types::{ScalarType, Value};
+
+    #[test]
+    fn apply_document_conforms_a_scalar_without_cached_logical_metadata_by_sharing() {
+        let memory = MemoryBudget::new(1 << 20);
+        let source_memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::Scalar(ScalarType::I64).maybe();
+        let field = Arc::new(rtdb_columnar::to_field("value", &logical).unwrap());
+        let array = Int64Array::from(vec![Some(17), None, Some(19)]);
+        let values_ptr = array.values().as_ptr();
+        let source = ColumnBatch::settled(vec![Column::Arrow { array: Arc::new(array), field, logical: None }],
+            3, source_memory.reserve(4096).unwrap()).unwrap();
+        let schema = Schema::new(vec![Field {
+            id: rtdb_plan::ColumnId(0), name: "value".into(), data_type: logical,
+            qualifier: None, qualified_only: false, unnamed: false,
+        }]).unwrap();
+        let document = source.apply_document(&[0], &schema, &memory).unwrap();
+        drop(source);
+        let [Column::Arrow { array, .. }] = document.columns.as_slice() else { panic!("Expected a document array"); };
+        let array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let child = array.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(child.values().as_ptr(), values_ptr);
+        assert_eq!(child.iter().collect::<Vec<_>>(), [Some(17), None, Some(19)]);
+        assert!(source_memory.used_bytes() > 0);
+        drop(document);
+        assert_eq!(source_memory.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn dependent_columns_share_page_spans_across_slicing_and_source_drop() {

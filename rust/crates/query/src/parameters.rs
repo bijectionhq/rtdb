@@ -173,6 +173,17 @@ impl rtdb_expr::ParameterLookup for BoundParameters {
 }
 
 impl BoundParameters {
+    pub(crate) fn captured_arrow_cell(&self, index: usize) -> Option<crate::columnar::FundedArrowCell<'_>> {
+        if index >= self.types().len() { return None; }
+        let Input::Overlay { outer, values, .. } = &self.input else { return None; };
+        match values.iter().rev().find(|(slot, _)| *slot == index) {
+            Some((_, OverlayValue::Arrow(binding))) => binding.batch.columns[binding.column]
+                .funded_arrow_cell(binding.row, binding.batch.column_reservation(binding.column))?,
+            Some((_, OverlayValue::Scalar(_))) => None,
+            None => outer.captured_arrow_cell(index),
+        }
+    }
+
     pub(crate) fn arrow_input(&self, index: usize) -> Option<(&OwnedBatch, usize)> {
         if index >= self.types().len() { return None; }
         match &self.input {

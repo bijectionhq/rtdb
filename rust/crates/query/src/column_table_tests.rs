@@ -88,6 +88,49 @@ async fn open(
     Ok((build_column_pages(emitted, execution.clone()).await?.unwrap(), output))
 }
 
+#[tokio::test]
+async fn captured_arrow_list_lends_one_semantic_page_and_retains_the_source_charge() {
+    use arrow_array::{Array, RecordBatch, cast::AsArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_columnar::{OwnedBatch, build_array, to_field};
+
+    use crate::{columnar::{Column, ColumnBatch}, context::ApplyArguments};
+
+    let execution = execution(1, vec![]);
+    let source_memory = MemoryBudget::new(1 << 20);
+    let ty = LogicalType::list(LogicalType::Scalar(ScalarType::I64).maybe());
+    let outer = Field {
+        id: ColumnId(1), name: "items".into(), data_type: ty.clone(),
+        qualifier: None, qualified_only: false, unnamed: false,
+    };
+    let items = [Value::I64(1), Value::Null, Value::I64(3), Value::I64(4), Value::I64(5)];
+    let array = build_array(&ty, &[Value::list(vec![Value::I64(20)]), Value::list(items.to_vec())]).unwrap();
+    let list = array.as_list::<i32>();
+    let child = list.values().slice(1, items.len());
+    let child_ptr = child.as_primitive::<arrow_array::types::Int64Type>().values().as_ptr();
+    drop(child);
+    let schema = Arc::new(ArrowSchema::new(vec![to_field("items", &ty).unwrap()]));
+    let record = RecordBatch::try_new(schema, vec![array]).unwrap();
+    let source = Arc::new(ColumnBatch::from_owned(OwnedBatch::new(record, &source_memory).unwrap()).unwrap());
+    let schema = Schema::new(vec![outer.clone()]).unwrap();
+    let schema = RuntimeSchema::fixed(&schema, &execution.context.memory).unwrap();
+    let arguments = ApplyArguments::new(schema, vec![(0, outer.expression())]);
+    let bound = arguments.bind(&execution, source, 1).await.unwrap();
+    let mut cursor = crate::column_table::open_arrow(&bound, 0).unwrap().unwrap();
+    drop(bound);
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(cursor);
+
+    let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected an Arrow slice"); };
+    assert_eq!(array.len(), items.len());
+    assert_eq!(array.as_primitive::<arrow_array::types::Int64Type>().values().as_ptr(), child_ptr);
+    assert_eq!((0..page.len).map(|row| page.columns[0].value(row).unwrap()).collect::<Vec<_>>(), items);
+    assert!(source_memory.used_bytes() > 0);
+    drop(page);
+    assert_eq!(source_memory.used_bytes(), 0);
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     cases: Vec<Assertion>,

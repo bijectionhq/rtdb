@@ -636,6 +636,48 @@ async fn document_reuse_still_reaches_the_first_multirow_single_document_key() {
 }
 
 #[tokio::test]
+async fn joined_apply_reuses_completed_pages_with_each_outer_position() {
+    let rows = |keys: &[(i64, Option<i64>)]| keys.iter().map(|&(position, key)| {
+        vec![literal(position), Expr::Literal(key.map_or(Value::Null, Value::I64))]
+    }).collect();
+    let position = integer(18, "position");
+    let probes = Arc::new(Relation::new(Schema::new(vec![position, customer_id()]).unwrap(), RelationNode::LiteralPages {
+        pages: vec![rows(&[(10, Some(1)), (20, None), (30, Some(1)), (40, None), (50, Some(2))]),
+            rows(&[(60, Some(1)), (70, Some(1)), (80, Some(2))])],
+    }).unwrap());
+
+    for kind in [ApplyKind::Inner, ApplyKind::Left] {
+        let relation = materialized(orders(), |reference| {
+            let selected = select(reference, equals(order_customer().expression(), parameter(0, &customer_id())));
+            apply(&probes, keep(selected, &[order_amount()]), by_customer(), kind, None)
+        });
+        let (prepared, _) = both_ways(&relation);
+        let context = context();
+        let (tracer, mut spans) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 128, true, true).unwrap();
+        let actual = run_with_context(&prepared, context.with_tracer(Some(tracer.clone()), None)).await.unwrap();
+        let mut expected = vec![
+            "[I64(10), I64(1), I64(100)]", "[I64(10), I64(1), I64(150)]",
+            "[I64(30), I64(1), I64(100)]", "[I64(30), I64(1), I64(150)]", "[I64(50), I64(2), Null]",
+            "[I64(60), I64(1), I64(100)]", "[I64(60), I64(1), I64(150)]",
+            "[I64(70), I64(1), I64(100)]", "[I64(70), I64(1), I64(150)]", "[I64(80), I64(2), Null]",
+        ];
+        if kind == ApplyKind::Left {
+            expected.insert(2, "[I64(20), Null, Null]");
+            expected.insert(5, "[I64(40), Null, Null]");
+        }
+        assert_eq!(actual, expected, "{kind:?}");
+        tracer.close();
+        let mut opens = Vec::new();
+        while let Some(span) = spans.next().await {
+            for (name, value) in span.attributes() {
+                if name == "cursor.apply.inner_executions" { opens.push(value.parse::<u64>().unwrap()); }
+            }
+        }
+        assert_eq!(opens, [5], "{kind:?}");
+    }
+}
+
+#[tokio::test]
 async fn repeated_document_keys_open_a_snapshot_scan_once_per_distinct_key() {
     let key = order_customer();
     let scan = rtdb_plan::Scan {
@@ -882,6 +924,34 @@ async fn left_unnest_keeps_fallible_or_volatile_on_expressions_on_apply() {
     let error = Err("xtdb.expression/division-by-zero".to_owned());
     assert_eq!(run_in_order(&correlated).await, error);
     assert_eq!(run_in_order(&rewritten).await, error);
+}
+
+#[tokio::test]
+async fn left_unnest_fallback_keeps_matched_nulls_and_errors_on_the_next_reached_page() {
+    let denominator = customer_region();
+    let rows = |id, denominator, items| vec![literal(id), literal(denominator), Expr::Literal(Value::list(items))];
+    let schema = Schema::new(vec![customer_id(), denominator.clone(), tags()]).unwrap();
+    let input = Arc::new(Relation::new(schema, RelationNode::LiteralPages { pages: vec![
+        vec![rows(1, 2, vec![Value::I64(12), Value::Null, Value::I64(6), Value::I64(6)]),
+             rows(2, 2, vec![Value::I64(11)]), rows(3, 0, vec![])],
+        vec![rows(4, 0, vec![Value::I64(1)])],
+    ] }).unwrap());
+    let element = integer(41, "tag");
+    let quotient = Expr::binary(BinaryOp::Divide, literal(12), parameter(1, &denominator));
+    let predicate = Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::IsNull, element.expression()),
+        equals(quotient, element.expression()));
+    let relation = left_filtered_tags(&input, predicate, vec![(1, denominator.expression())]);
+    let fields = [0, 41, 42].map(|id| relation.schema().get(ColumnId(id)).unwrap().clone());
+    let relation = keep(relation, &fields);
+    let limited = Arc::new(Arc::clone(&relation).limit(None, Some(literal(5))).unwrap());
+    let prepared = PreparedQuery::new(limited).unwrap();
+    assert_eq!(applies(prepared.relation()), 1);
+    assert_eq!(run_in_order(&prepared).await.unwrap(), [
+        "[I64(1), Null, I64(2)]", "[I64(1), I64(6), I64(3)]", "[I64(1), I64(6), I64(4)]",
+        "[I64(2), Null, Null]", "[I64(3), Null, Null]",
+    ]);
+    let prepared = PreparedQuery::new(relation).unwrap();
+    assert_eq!(run_in_order(&prepared).await, Err("xtdb.expression/division-by-zero".to_owned()));
 }
 
 #[tokio::test]

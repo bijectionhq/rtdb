@@ -353,9 +353,9 @@ async fn build_batches_at(
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
             let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
             let plan = BatchApplyPlan { dependent, arguments, kind: ApplyKind::Mark,
-                document_field: None, comparison: Some((comparison, comparison_schema)),
+                document_field: None, comparison: Some((comparison, comparison_schema)), reuse: None,
                 inner_executions: apply_open_counter(&execution.context), execution };
-            let apply = BatchApply { input, plan, document_reuse: None };
+            let apply = BatchApply { input, plan };
             Ok(Some((Box::new(apply), projected)))
         }
         RelationNode::Apply { arguments, kind: ApplyKind::LeftUnnest, .. } => {
@@ -366,7 +366,7 @@ async fn build_batches_at(
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
             let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
             let plan = BatchApplyPlan { dependent, arguments, kind: ApplyKind::Left,
-                document_field: None, comparison: None,
+                document_field: None, comparison: None, reuse: None,
                 inner_executions: apply_open_counter(&execution.context), execution };
             let cursor: BoxBatchCursor = match expansion {
                 Some(expansion) => Box::new(BatchFilteredUnnest {
@@ -375,7 +375,7 @@ async fn build_batches_at(
                     counts: plan.inner_executions.as_ref().map(|_| FilteredUnnestCounts::default()),
                     fallback: plan,
                 }),
-                None => Box::new(BatchApply { input, plan, document_reuse: None }),
+                None => Box::new(BatchApply { input, plan }),
             };
             Ok(Some((cursor, projected)))
         }
@@ -386,12 +386,17 @@ async fn build_batches_at(
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
             let document_field = matches!(kind, ApplyKind::Pull | ApplyKind::PullMany)
                 .then(|| runtime.schema().fields().last().cloned()).flatten();
-            let document_reuse = document_field.as_ref()
-                .and_then(|_| DocumentReuse::admit(dependent.relation(), schema.schema(), arguments));
+            let reuse = if matches!(kind, ApplyKind::Inner | ApplyKind::Left | ApplyKind::Single | ApplyKind::Scalar
+                | ApplyKind::Pull | ApplyKind::PullMany)
+            {
+                ApplyReuse::admit(dependent.relation(), schema.schema(), arguments)
+            } else {
+                None
+            };
             let arguments = crate::context::ApplyArguments::new(schema, arguments.clone());
-            let plan = BatchApplyPlan { dependent, arguments, kind: *kind, document_field, comparison: None,
+            let plan = BatchApplyPlan { dependent, arguments, kind: *kind, document_field, comparison: None, reuse,
                 inner_executions: apply_open_counter(&execution.context), execution };
-            let apply = BatchApply { input, plan, document_reuse };
+            let apply = BatchApply { input, plan };
             Ok(Some((Box::new(apply), projected)))
         }
         RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } => {
@@ -1284,13 +1289,12 @@ impl crate::columnar::BatchCursor for BatchFilteredUnnest {
 struct BatchApply {
     input: crate::columnar::BoxBatchCursor,
     plan: BatchApplyPlan,
-    document_reuse: Option<DocumentReuse>,
 }
 
 #[derive(Clone, Copy)]
-enum DocumentReuse { Uncorrelated, I64Column(usize) }
+enum ApplyReuse { Uncorrelated, I64Column(usize) }
 
-impl DocumentReuse {
+impl ApplyReuse {
     fn admit(mut dependent: &Relation, outer: &Schema, arguments: &[(usize, Expr)]) -> Option<Self> {
         use rtdb_plan::{BinaryOp, TemporalFilter};
         let i64_type = LogicalType::Scalar(rtdb_types::ScalarType::I64);
@@ -1312,7 +1316,9 @@ impl DocumentReuse {
         };
         loop {
             match dependent.node() {
-                RelationNode::Scan(scan) if scan.matches.is_empty() && scan.top_k.is_none() && scan.ordered_top_k.is_none()
+                RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table)
+                    && crate::system_schema::definition(&scan.table.name.table).is_none()
+                    && scan.matches.is_empty() && scan.top_k.is_none() && scan.ordered_top_k.is_none()
                     && matches!(scan.valid_time, TemporalFilter::Default | TemporalFilter::All)
                     && matches!(scan.system_time, TemporalFilter::Default | TemporalFilter::All) =>
                     return match (parameter, scan.predicates.as_slice()) {
@@ -1357,6 +1363,34 @@ impl DocumentReuse {
     }
 }
 
+struct CompletedApplies {
+    reuse: ApplyReuse,
+    spans: std::collections::VecDeque<(Option<i64>, std::ops::Range<usize>)>,
+    _reservation: Arc<rtdb_columnar::MemoryReservation>,
+}
+
+impl CompletedApplies {
+    const KEYS: usize = 16;
+
+    fn new(reuse: ApplyReuse, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Option<Self> {
+        let reservation = memory.reserve(1024).ok()?;
+        Some(Self { reuse, spans: std::collections::VecDeque::with_capacity(Self::KEYS), _reservation: reservation })
+    }
+
+    fn lookup(&mut self, key: Option<i64>) -> Option<std::ops::Range<usize>> {
+        let index = self.spans.iter().position(|(previous, _)| *previous == key)?;
+        let entry = self.spans.remove(index).expect("The completed key is cached");
+        let spans = entry.1.clone();
+        self.spans.push_back(entry);
+        Some(spans)
+    }
+
+    fn remember(&mut self, key: Option<i64>, spans: std::ops::Range<usize>) {
+        if self.spans.len() == Self::KEYS { self.spans.pop_front(); }
+        self.spans.push_back((key, spans));
+    }
+}
+
 fn apply_open_counter(context: &crate::QueryContext) -> Option<AtomicU64> {
     crate::trace::operator_evidence_enabled(context).then(|| AtomicU64::new(0))
 }
@@ -1367,6 +1401,7 @@ struct BatchApplyPlan {
     kind: ApplyKind,
     document_field: Option<rtdb_plan::Field>,
     comparison: Option<(Expr, Schema)>,
+    reuse: Option<ApplyReuse>,
     inner_executions: Option<AtomicU64>,
     execution: Execution,
 }
@@ -1401,9 +1436,12 @@ impl BatchApplyPlan {
         input.ok_or_else(|| invalid("apply-input", "Dependent plan cannot open as Arrow"))
     }
 
-    async fn documents(&self, batch: Arc<crate::columnar::ColumnBatch>, output: &rtdb_plan::Field, reuse: Option<DocumentReuse>) -> Result<crate::columnar::ColumnBatch> {
-        use std::collections::VecDeque;
+    fn completed(&self, rows: usize) -> Option<CompletedApplies> {
+        self.reuse.filter(|_| rows > 1)
+            .and_then(|reuse| CompletedApplies::new(reuse, &self.execution.context.memory))
+    }
 
+    async fn documents(&self, batch: Arc<crate::columnar::ColumnBatch>, output: &rtdb_plan::Field) -> Result<crate::columnar::ColumnBatch> {
         use crate::columnar::{apply::ApplyPages, poll_nested_batch};
 
         let context = &self.execution.context;
@@ -1426,22 +1464,15 @@ impl BatchApplyPlan {
         } else {
             None
         };
-        const REUSE_KEYS: usize = 16;
-        let reuse = reuse.filter(|_| batch.len > 1);
-        let cache_charge = reuse.and_then(|_| memory.reserve(1024).ok());
-        let mut completed: VecDeque<(Option<i64>, std::ops::Range<usize>)> =
-            VecDeque::with_capacity(if cache_charge.is_some() { REUSE_KEYS } else { 0 });
+        let mut completed = self.completed(batch.len);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
             let bound = self.bind(&batch, row).await?;
-            let key = reuse.filter(|_| cache_charge.is_some()).and_then(|reuse| reuse.key(&batch, row));
+            let mut cached = completed.as_mut().and_then(|cache| Some((cache.reuse.key(&batch, row)?, cache)));
             let before = pages.len();
-            let hit = key.and_then(|key| completed.iter().rposition(|(previous, _)| *previous == key))
-                .and_then(|index| completed.remove(index));
-            if let Some((key, spans)) = hit {
+            if let Some(spans) = cached.as_mut().and_then(|(key, cache)| cache.lookup(*key)) {
                 drop(bound);
-                pages.repeat(row, spans.clone(), context)?;
-                completed.push_back((key, spans));
+                pages.repeat(row, spans, context)?;
             } else {
                 let mut input = self.open_dependent(bound).await?;
                 let first = pages.span_count();
@@ -1453,11 +1484,8 @@ impl BatchApplyPlan {
                     let doc = page.apply_document(&positions, &schema, memory)?;
                     pages.push(row, Some(doc))?;
                 }
-                if let Some(key) = key {
-                    if completed.len() == REUSE_KEYS {
-                        completed.pop_front();
-                    }
-                    completed.push_back((key, first..pages.span_count()));
+                if let Some((key, cache)) = cached {
+                    cache.remember(key, first..pages.span_count());
                 }
             }
             let found = before < pages.len();
@@ -1468,6 +1496,7 @@ impl BatchApplyPlan {
                 pages.push(row, None)?;
             }
         }
+        drop(completed);
         context.check_cancelled()?;
         let mut batch = Arc::try_unwrap(batch).map_err(|_| invalid("apply-input", "Apply document input remains borrowed"))?;
         if let Some((offsets, valid, reservation)) = list {
@@ -1484,10 +1513,19 @@ impl BatchApplyPlan {
         let context = &self.execution.context;
         let mut pages = ApplyPages::new(&context.memory)?;
         let single = matches!(self.kind, ApplyKind::Single | ApplyKind::Scalar);
+        let mut completed = self.completed(batch.len);
         for source_row in 0..batch.len {
             context.check_cancelled_at(source_row)?;
-            let mut cursor = self.dependent_batches(batch, source_row).await?;
+            let bound = self.bind(batch, source_row).await?;
+            let mut cached = completed.as_mut().and_then(|cache| Some((cache.reuse.key(batch, source_row)?, cache)));
+            if let Some(spans) = cached.as_mut().and_then(|(key, cache)| cache.lookup(*key)) {
+                drop(bound);
+                pages.repeat(source_row, spans, context)?;
+                continue;
+            }
+            let mut cursor = self.open_dependent(bound).await?;
             let before = pages.len();
+            let first = pages.span_count();
             while let Some(output) = poll_nested_batch(cursor.as_mut()).await? {
                 if output.len == 0 { continue; }
                 output.validate_readable(context)?;
@@ -1495,7 +1533,11 @@ impl BatchApplyPlan {
                 pages.push(source_row, Some(output))?;
             }
             if pages.len() == before && (self.kind == ApplyKind::Left || single) { pages.push(source_row, None)?; }
+            if let Some((key, cache)) = cached {
+                cache.remember(key, first..pages.span_count());
+            }
         }
+        drop(completed);
         if pages.len() == 0 { return Ok(None); }
         pages.joined(batch, self.dependent.schema().len(), context).map(Some)
     }
@@ -1517,7 +1559,7 @@ impl crate::columnar::BatchCursor for BatchApply {
             let Some(batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
             batch.validate_readable(context)?;
             let batch = Arc::new(batch);
-            if let Some(field) = &plan.document_field { return plan.documents(batch, field, self.document_reuse).await.map(Some); }
+            if let Some(field) = &plan.document_field { return plan.documents(batch, field).await.map(Some); }
             if matches!(plan.kind, ApplyKind::Inner | ApplyKind::Left | ApplyKind::Single | ApplyKind::Scalar) {
                 if let Some(output) = plan.joined(&batch).await? { return Ok(Some(output)); }
                 continue;

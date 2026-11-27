@@ -1476,16 +1476,15 @@ impl ColumnBatch {
     }
 
     pub(crate) fn from_list_parameter(
-        source: &rtdb_columnar::OwnedBatch, position: usize, row: usize,
+        cell: FundedArrowCell<'_>,
         parameter_type: &LogicalType, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<Self>> {
         use arrow_array::cast::AsArray;
-        let field = &source.batch().schema_ref().fields()[position];
+        let FundedArrowCell { array, field, owner, row, .. } = cell;
         let mut reservation = memory.reserve(field.size().checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?)?;
         if !stable_read_layout(parameter_type, field) || !readable_list_type(parameter_type, field) {
             return Ok(None);
         }
-        let array = source.batch().column(position);
         if array.is_null(row) || *parameter_type == LogicalType::Null {
             return Self::settled(vec![Column::Values(Vec::new())], 0, memory.reserve(256)?).map(Some);
         }
@@ -1509,7 +1508,7 @@ impl ColumnBatch {
             let Ok(compacted) = compact_arrow_rows(array.as_ref(), child, 0..len, memory) else { return Ok(None); };
             compacted
         } else {
-            (array, Arc::clone(source.reservation()))
+            (array, Arc::clone(owner))
         };
         let columns = vec![Column::Arrow { field: Arc::clone(child), array, logical: Some(logical) }];
         Ok(Some(Self { columns, len, reservation, appended: vec![custody] }))

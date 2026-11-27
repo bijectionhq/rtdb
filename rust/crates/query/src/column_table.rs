@@ -1,7 +1,7 @@
 use crate::{
     QueryContext,
     columnar::{
-        BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_list_pages, retain_list_spans,
+        BatchCursor, BoxBatchCursor, Column, ColumnBatch, FundedArrowCell, gather_list_pages, retain_list_spans,
         single_batch,
     },
     context::Execution,
@@ -24,10 +24,27 @@ use rtdb_types::{LogicalType, Result};
 use std::sync::Arc;
 
 pub(crate) fn open_arrow(execution: &Execution, position: usize) -> Result<Option<BoxBatchCursor>> {
-    let Some((input, row)) = execution.parameters.arrow_input(position) else { return Ok(None); };
-    let output = ColumnBatch::from_list_parameter(
-        input, position, row, &execution.parameters.types()[position], &execution.context.memory,
-    )?;
+    let cell = if let Some((input, row)) = execution.parameters.arrow_input(position) {
+        FundedArrowCell {
+            field: &input.batch().schema_ref().fields()[position],
+            array: input.batch().column(position),
+            logical: None,
+            owner: input.reservation(),
+            row,
+        }
+    } else if let Some(cell) = execution.parameters.captured_arrow_cell(position) {
+        let (DataType::List(child) | DataType::FixedSizeList(child, _)) = cell.field.data_type() else { return Ok(None); };
+        // The list expression path also validates computed elements and normalizes dates.
+        if !cell.field.metadata().is_empty() || !child.metadata().is_empty() || !matches!(child.data_type(),
+            DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Utf8)
+        {
+            return Ok(None);
+        }
+        cell
+    } else {
+        return Ok(None);
+    };
+    let output = ColumnBatch::from_list_parameter(cell, &execution.parameters.types()[position], &execution.context.memory)?;
     Ok(output.map(|output| single_batch(Some(output), Arc::clone(&execution.context))))
 }
 
