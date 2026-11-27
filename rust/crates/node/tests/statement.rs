@@ -827,8 +827,16 @@ fn query_rebinding_admits_syntax_in_the_reached_budget_through_plan_admission() 
     let dml = PreparedSql::prepare("DELETE FROM docs", &initial, options.clone(), ResultSignaturePolicy::Dynamic).unwrap();
     let origin_retained = origin.used_bytes();
 
+    // `PreparedSql::prepare` caches the initial `"UTC"` plan; bind in another timezone so the
+    // cached plan misses and `bind` actually enters the rebinding path.
+    let rebound_context = |memory: &Arc<MemoryBudget>| {
+        let mut reached = context(None, memory);
+        Arc::make_mut(&mut reached).timezone = "America/New_York".into();
+        reached
+    };
+
     let short = MemoryBudget::new(syntax_bytes - 1);
-    let reached = context(None, &short);
+    let reached = rebound_context(&short);
     assert_eq!(dml.result_schema(&reached, &[]).err().unwrap().code, "rtdb.node/statement-kind");
     assert_eq!(statement.result_schema(&reached, &[LogicalType::Null]).err().unwrap().code, "xtdb/parameter-count-mismatch");
     assert_eq!(statement.result_schema(&reached, &[]).err().unwrap().code, "rtdb/memory-budget-exceeded");
@@ -838,8 +846,9 @@ fn query_rebinding_admits_syntax_in_the_reached_budget_through_plan_admission() 
     assert_eq!(short.used_bytes(), 0);
 
     let probe = MemoryBudget::new(1 << 20);
-    let reached = context(None, &probe);
-    let raw = rtdb_sql::prepare_in(source, &reached.catalog, &options, &probe).unwrap();
+    let reached = rebound_context(&probe);
+    let rebound_options = PrepareOptions { default_timezone: "America/New_York".into(), ..options };
+    let raw = rtdb_sql::prepare_in(source, &reached.catalog, &rebound_options, &probe).unwrap();
     let plan = rtdb_query::PreparedQuery::from_prepared(raw, &probe).unwrap();
     let plan_bytes = probe.used_bytes();
     let schema = plan.result_schema(&reached).unwrap();
@@ -848,7 +857,7 @@ fn query_rebinding_admits_syntax_in_the_reached_budget_through_plan_admission() 
     assert_eq!(probe.used_bytes(), 0);
 
     let plan_short = MemoryBudget::new(syntax_bytes + plan_bytes - 1);
-    let error = statement.result_schema(&context(None, &plan_short), &[]).err().unwrap();
+    let error = statement.result_schema(&rebound_context(&plan_short), &[]).err().unwrap();
     assert_eq!(error.code, "rtdb/memory-budget-exceeded");
     assert_eq!(plan_short.peak_bytes(), syntax_bytes);
     assert_eq!(plan_short.used_bytes(), 0);
@@ -856,8 +865,11 @@ fn query_rebinding_admits_syntax_in_the_reached_budget_through_plan_admission() 
     let schema = statement.result_schema(&reached, &[]).unwrap();
     assert_eq!(schema.schema().fields()[0].name, "value");
     assert_eq!(probe.used_bytes(), schema_bytes);
-    assert!(origin.used_bytes() > origin_retained, "the statement keeps the plan it bound, charged to its own budget");
-    drop(schema);
+    assert_eq!(origin.used_bytes(), origin_retained, "the statement replaces its cached plan in its own budget");
+    let reused = statement.result_schema(&rebound_context(&plan_short), &[]).unwrap();
+    assert_eq!(reused.schema().fields()[0].name, "value");
+    drop((reused, schema));
+    assert_eq!(plan_short.used_bytes(), 0);
     drop((statement, dml));
     assert_eq!(probe.used_bytes(), 0);
     assert_eq!(origin.used_bytes(), 0);
