@@ -1,7 +1,9 @@
 (ns xtdb.rust.corpus-test
   (:require [clojure.java.io :as io]
             [clojure.test :as t]
-            [xtdb.rust.corpus :as corpus])
+            [xtdb.api :as xt]
+            [xtdb.rust.corpus :as corpus]
+            [xtdb.test-util :as tu])
   (:import [java.net URL URLClassLoader]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
@@ -40,19 +42,19 @@
         (.setContextClassLoader thread original)))))
 
 (t/deftest flight-port-adapter-preserves-server-options-and-assertions
-  (let [adapt #'corpus/adapt-flight-ports
+  (let [adapt #'corpus/adapt-listener-ports
         source "(t/is (anomalous? [:incorrect :xtdb/unknown-db]
                   (fsql/open-conn {:port (.getFlightSqlPort ^Xtdb *node*), :dbname \"no-such-db\"})))
                 (fsql/open-conn {:port (.getFlightSqlPort ^Xtdb *node*)})
                 (fsql/open-conn {:port (.getFlightSqlPort node)})
                 (fsql/open-conn {:port (.getFlightSqlPort node)})"]
     (t/is (= "(t/is (anomalous? [:incorrect :xtdb/unknown-db]
-                  (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port *node*), :dbname \"no-such-db\"})))
-                (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port *node*)})
-                (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port node)})
-                (fsql/open-conn {:port (xtdb.rust.corpus/native-flight-sql-port node)})"
+                  (fsql/open-conn {:port (xtdb.rust.corpus/native-listener-port *node* :flight-sql), :dbname \"no-such-db\"})))
+                (fsql/open-conn {:port (xtdb.rust.corpus/native-listener-port *node* :flight-sql)})
+                (fsql/open-conn {:port (xtdb.rust.corpus/native-listener-port node :flight-sql)})
+                (fsql/open-conn {:port (xtdb.rust.corpus/native-listener-port node :flight-sql)})"
              (adapt 'xtdb.api-flight-sql-test source)))
-    (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected upstream Flight SQL port call sites"
+    (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected upstream listener port call sites"
                             (adapt 'xtdb.api-flight-sql-test "")))))
 
 (t/deftest a-corpus-namespace-publishes-its-vars-before-outcomes
@@ -75,3 +77,11 @@
         (t/is (= {:event "namespace-complete"} (peek @seen)))
         (finally
           (.setContextClassLoader thread original))))))
+
+(t/deftest corpus-fixture-reads-latest-completed-tx-from-native-node
+  (#'corpus/with-native-engine
+   (fn []
+     (with-open [node (corpus/native-start-node {:server nil :flight-sql nil})]
+       (t/is (= {"xtdb" [nil]} (tu/latest-completed-txs node)))
+       (let [tx (xt/execute-tx node [[:put-docs :docs {:xt/id 1}]])]
+         (t/is (= {"xtdb" [tx]} (tu/latest-completed-txs node))))))))

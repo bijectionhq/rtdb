@@ -463,7 +463,8 @@ The native corpus runs upstream XTDB's own Clojure test Vars against the native 
 `upstream_tests.sh` extracts `src/test/clojure`, `src/test/resources`, `src/testFixtures/clojure` and `src/testFixtures/resources` at the pinned upstream commit (`0b9fa440f23d2165250d215209f7fa9bd7c26a6f` in `upstream-commit.txt`) into `<out-dir>/.upstream-tests`, read-only, with a `MANIFEST` of blob ids and a `.commit` marker.
 The runners put that tree ahead of this repository's test classpath, so neither the RTDB-edited test files nor the edited `xtdb.test-util` load; the runner refuses a namespace whose source resolves elsewhere and stops if `xtdb.test-util` does.
 The harness routes node construction, `tu/query-ra`, `tu/flush-block!` and the connectables to the native engine.
-The two upstream Flight SQL test files also resolve their listener port through the native binding, with their original options, fixtures and assertions.
+Selected Flight SQL, pgwire and Healthz tests resolve their listener ports through the native binding, with their original options, fixtures and assertions.
+The latest-completed-transaction fixture uses the native node's transaction status, with the same per-database vectors as the upstream helper.
 Set `XTDB_UPSTREAM_COMMIT` to run another upstream commit and `XTDB_UPSTREAM_REPO` to read it from another clone; when the commit is missing, `git fetch --filter=blob:none https://github.com/xtdb/xtdb.git <commit>` first.
 
 [source,shell]

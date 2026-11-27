@@ -135,7 +135,10 @@
          opts (cond-> opts
                 (contains? opts :xtdb.pgwire/server)
                 (-> (update :server merge (:xtdb.pgwire/server opts)) (dissoc :xtdb.pgwire/server)))
-         opts (merge {:server {:port 0} :flight-sql {:port 0}} opts)
+         opts (merge {:server {} :flight-sql {}} opts)
+         opts (reduce (fn [opts listener]
+                        (update opts listener #(if (map? %) (merge {:port 0} %) %)))
+                      opts [:server :flight-sql])
          config (yaml opts)]
      (try
        (doto (if (instance? InstantSource clock)
@@ -175,16 +178,25 @@
 
 (def ^:private touched (atom {}))
 
-(defn native-flight-sql-port ^long [^NativeDatabase node]
-  (let [port (.getFlightSqlPort node)]
+(defn native-listener-port ^long [^NativeDatabase node listener]
+  (let [port (case listener
+               :pgwire (.getServerPort node)
+               :pgwire-read-only (.getServerReadOnlyPort node)
+               :flight-sql (.getFlightSqlPort node)
+               :healthz (.getHealthzPort node))]
     (swap! touched assoc :wire true)
     port))
 
+(defn- native-latest-completed-txs [^NativeDatabase node]
+  (let [partitions (.latestCompletedTxs node)]
+    (swap! touched assoc :native true)
+    (update-vals (into {} partitions) vec)))
+
 (def ^:private native-connectables
   {:adbc (fn [node f] (f node))
-   :pgwire (fn [^NativeDatabase node f] (swap! touched assoc :wire true) (f (xt/client {:port (.getServerPort node)})))
+   :pgwire (fn [node f] (f (xt/client {:port (native-listener-port node :pgwire)})))
    :flight-sql (fn [node f]
-                 (with-open [conn (fsql/open-conn {:port (native-flight-sql-port node)})]
+                 (with-open [conn (fsql/open-conn {:port (native-listener-port node :flight-sql)})]
                    (f conn)))})
 
 (defn- with-root [v value f]
@@ -209,7 +221,12 @@
                                      (if (instance? NativeDatabase node)
                                        (.syncAll ^NativeDatabase node timeout)
                                        (jvm-sync-node node timeout))))]
-    (with-redefs [tu/query-ra (let [run (observing :native native-query-ra)]
+    (with-redefs [tu/latest-completed-txs (let [jvm-latest-completed-txs @#'tu/latest-completed-txs]
+                                          (fn [node]
+                                            (if (instance? NativeDatabase node)
+                                              (native-latest-completed-txs node)
+                                              (jvm-latest-completed-txs node))))
+                  tu/query-ra (let [run (observing :native native-query-ra)]
                                 (fn ([query] (run query {}))
                                     ([query options] (run query options))))
                   tu/flush-block! (fn ([^NativeDatabase node] (.flushAll node (Duration/ofSeconds 5)))
@@ -219,8 +236,7 @@
 (defn- port-fixture [port-var server-var]
   (fn [f]
     (let [^NativeDatabase node tu/*node*]
-      (swap! touched assoc :wire true)
-      (with-bindings (cond-> {(resolve port-var) (.getServerPort node)}
+      (with-bindings (cond-> {(resolve port-var) (native-listener-port node :pgwire)}
                        server-var (assoc (resolve server-var) node))
         (f)))))
 
@@ -287,22 +303,26 @@
                  (or (> (+ fail error) (count problems)) (some #(str/ends-with? % "…") problems))
                  (assoc :failures-truncated true)))))))
 
-(def ^:private flight-port-call-sites
-  {'xtdb.api-flight-sql-test [[2 "(.getFlightSqlPort ^Xtdb *node*)" "*node*"]
-                             [2 "(.getFlightSqlPort node)" "node"]]
-   'xtdb.flight-sql-test [[1 "(.getFlightSqlPort ^Xtdb tu/*node*)" "tu/*node*"]]})
+(def ^:private listener-call-sites
+  {'xtdb.api-flight-sql-test [[2 "(.getFlightSqlPort ^Xtdb *node*)" "*node*" :flight-sql]
+                             [2 "(.getFlightSqlPort node)" "node" :flight-sql]]
+   'xtdb.flight-sql-test [[1 "(.getFlightSqlPort ^Xtdb tu/*node*)" "tu/*node*" :flight-sql]]
+   'xtdb.pgwire-test [[6 "(.getServerPort node)" "node" :pgwire]
+                     [2 "(.getServerPort tu/*node*)" "tu/*node*" :pgwire]
+                     [1 "(.getServerReadOnlyPort node)" "node" :pgwire-read-only]]
+   'xtdb.healthz-test [[9 "(.getHealthzPort node)" "node" :healthz]]})
 
-(defn- adapt-flight-ports [test-ns source]
-  (reduce (fn [source [expected site receiver]]
+(defn- adapt-listener-ports [test-ns source]
+  (reduce (fn [source [expected site receiver listener]]
             (when-not (= expected (count (re-seq (re-pattern (Pattern/quote site)) source)))
-              (throw (ex-info "Unexpected upstream Flight SQL port call sites" {:namespace test-ns :site site})))
-            (str/replace source site (str "(xtdb.rust.corpus/native-flight-sql-port " receiver ")")))
+              (throw (ex-info "Unexpected upstream listener port call sites" {:namespace test-ns :site site})))
+            (str/replace source site (str "(xtdb.rust.corpus/native-listener-port " receiver " " listener ")")))
           source
-          (flight-port-call-sites test-ns)))
+          (listener-call-sites test-ns)))
 
 (defn- load-test-source [test-ns ^File file]
-  (if (contains? flight-port-call-sites test-ns)
-    (with-open [reader (StringReader. (adapt-flight-ports test-ns (slurp file)))]
+  (if (contains? listener-call-sites test-ns)
+    (with-open [reader (StringReader. (adapt-listener-ports test-ns (slurp file)))]
       (Compiler/load reader (.getPath file) (.getName file)))
     (load-file (.getPath file))))
 

@@ -380,15 +380,7 @@
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
-   "var": "xtdb.healthz-test/test-healthz-endpoints",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
    "var": "xtdb.healthz-test/test-indexer-error",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.healthz-test/test-started-catchup-4273",
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
@@ -417,10 +409,6 @@
   },
   {
    "var": "xtdb.indexer-test/can-ingest-ts-devices-mini-with-stop-start-and-reach-same-state",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.indexer-test/can-stop-node-without-writing-blocks",
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
@@ -746,18 +734,6 @@
    "decision": "jvm-node-system-map"
   },
   {
-   "var": "xtdb.pgwire-test/execute-two-transactions-4809",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.pgwire-test/pg-authentication",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.pgwire-test/pg-user-list-authentication",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
    "var": "xtdb.pgwire-test/psql-interactive-test",
    "decision": "redefines-jvm-pgwire-implementation",
    "note": "redefines xtdb.pgwire/cmd-exec-query; later reads see the native results of those statements"
@@ -775,10 +751,6 @@
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
-   "var": "xtdb.pgwire-test/ssl-test",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
    "var": "xtdb.pgwire-test/test-current-time",
    "decision": "jvm-node-system-map"
   },
@@ -787,20 +759,8 @@
    "decision": "jvm-node-system-map"
   },
   {
-   "var": "xtdb.pgwire-test/test-pg-port",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
    "var": "xtdb.pgwire-test/test-playground",
    "decision": "native-node-config-is-yaml"
-  },
-  {
-   "var": "xtdb.pgwire-test/test-remote-client",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.pgwire-test/test-ro-server-4043",
-   "decision": "native-database-is-not-a-jvm-node"
   },
   {
    "var": "xtdb.pgwire.authz-test/role-membership-managed-on-primary-only",
@@ -1032,18 +992,6 @@
   },
   {
    "var": "xtdb.trie-catalog-test/test-reset-rebuilds-l0-from-object-store",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.ts-devices-small-test/test-busiest-low-battery-devices",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.ts-devices-small-test/test-min-max-battery-levels-per-hour",
-   "decision": "native-database-is-not-a-jvm-node"
-  },
-  {
-   "var": "xtdb.ts-devices-small-test/test-recent-battery-temperatures",
    "decision": "native-database-is-not-a-jvm-node"
   },
   {
