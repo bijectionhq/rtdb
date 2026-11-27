@@ -88,7 +88,7 @@ impl CompiledReplacement {
                 Ok(message) => ReplacementFailure::Java(JavaReplacementFailure { kind, message, replacement: self.replacement.clone() }),
                 Err(error) => ReplacementFailure::Resource(error),
             },
-            ExpansionFailure::Native(error) if error.code == "rtdb/memory-budget-exceeded" => ReplacementFailure::Resource(error),
+            ExpansionFailure::Native(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => ReplacementFailure::Resource(error),
             ExpansionFailure::Native(error) => match RetainedAnomaly::retain(error, context) {
                 Ok(error) => ReplacementFailure::Native(NativeReplacementFailure { replacement: self.replacement.clone(), error }),
                 Err(error) => ReplacementFailure::Resource(error),

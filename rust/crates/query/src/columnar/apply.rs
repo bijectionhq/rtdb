@@ -380,12 +380,9 @@ impl ColumnBatch {
                         };
                         (array, Arc::clone(field), logical.clone(), Arc::clone(custody.as_ref().unwrap_or(owner)))
                     } else {
-                        match selected.fragment_vector(0..self.len, memory) {
-                            Ok(((array, field, logical), charge)) => (array, field, logical, charge),
-                            Err(error) if error.code == "rtdb.query/fragment-layout" => {
-                                return Ok(None);
-                            }
-                            Err(error) => return Err(error),
+                        match selected.uniform_fragment_vector(0..self.len, memory)? {
+                            Some(((array, field, logical), charge)) => (array, field, logical, charge),
+                            None => return Ok(None),
                         }
                     }
                 }
@@ -473,13 +470,13 @@ impl ApplyPages {
             unreachable!("Apply documents are Arrow structs");
         };
         if self.pages.iter().all(|page| stable(&page.columns[0])) {
-            match selected.fragment_vector(0..self.len(), memory) {
-                Ok(((array, field, _), charge)) => {
+            match selected.uniform_fragment_vector(0..self.len(), memory) {
+                Ok(Some(((array, field, _), charge))) => {
                     let field = Arc::new(field.as_ref().clone().with_name(item.name()));
                     return Ok((field, retain_array(array, &charge)?));
                 }
-                Err(error)
-                    if matches!(error.code.as_str(), "rtdb.query/fragment-layout" | "rtdb/memory-budget-exceeded") => {}
+                Ok(None) => {}
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {}
                 Err(error) => return Err(error),
             }
         }

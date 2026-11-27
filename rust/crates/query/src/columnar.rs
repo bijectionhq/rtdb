@@ -400,11 +400,17 @@ impl SelectedColumn {
 
     pub(crate) fn fragment_vector(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>)
         -> Result<(ArrowVector, Arc<MemoryReservation>)> {
+        self.uniform_fragment_vector(rows, memory)?.ok_or_else(|| invalid("fragment-layout", "Fragment rows differ in layout"))
+    }
+
+    /// As `fragment_vector`, `Ok(None)` where the rows' sources differ in layout.
+    pub(crate) fn uniform_fragment_vector(&self, rows: Range<usize>, memory: &Arc<MemoryBudget>)
+        -> Result<Option<(ArrowVector, Arc<MemoryReservation>)>> {
         let layout = |source: usize| self.sources[source].as_ref().map(|(_, field, logical, _)| (field, logical));
         let cells = rows.clone().map(|row| self.cells.get(row).expect("A fragment has this row"));
         if let Some((first, _)) = cells.clone().next()
             && cells.clone().any(|(source, _)| layout(source) != layout(first)) {
-            return Err(invalid("fragment-layout", "Fragment rows differ in layout"));
+            return Ok(None);
         }
         let first = cells.clone().next().and_then(|(source, _)| self.sources[source].as_ref());
         let Some((_, field, logical, _)) = first else {
@@ -412,7 +418,7 @@ impl SelectedColumn {
             let array = Arc::new(arrow_array::NullArray::new(rows.len())) as ArrayRef;
             let field = Arc::new(ArrowField::new(name, DataType::Null, true));
             let reservation = memory.reserve(array.get_array_memory_size())?;
-            return Ok(((array, field, Some(LogicalType::Null)), reservation));
+            return Ok(Some(((array, field, Some(LogicalType::Null)), reservation)));
         };
 
         let sources = self.sources.len().min(cells.len());
@@ -440,7 +446,7 @@ impl SelectedColumn {
         let output = copy_selected_cells(&inputs, &picks)?;
         let lease = Arc::get_mut(&mut reservation).expect("A fragment vector owns its reservation");
         lease.shrink_to(output.get_array_memory_size())?;
-        Ok(((output, Arc::clone(field), logical.clone()), reservation))
+        Ok(Some(((output, Arc::clone(field), logical.clone()), reservation)))
     }
 
     fn null_test(&self, is_null: bool) -> Option<Vec<Option<bool>>> {
@@ -1039,7 +1045,7 @@ impl ColumnBatch {
         let schema = rtdb_plan::Schema::new(vec![child_field])?;
         let record = if self.len == 0 { None } else { match self.physical_record(&schema, memory) {
             Ok(record) => record,
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => None,
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => None,
             Err(error) => return Err(error),
         } };
         let (child, item, mut reservation) = match record {
@@ -1111,10 +1117,9 @@ impl ColumnBatch {
         for (column, output) in self.columns.iter().zip(schema.fields()) {
             let (vector, _scratch) = match column {
                 Column::Arrow { array, field, logical } => ((Arc::clone(array), Arc::clone(field), logical.clone()), None),
-                Column::Selected(selected) => match selected.fragment_vector(0..self.len, memory) {
-                    Ok((vector, scratch)) => (vector, Some(scratch)),
-                    Err(error) if error.code == "rtdb.query/fragment-layout" => return Ok(None),
-                    Err(error) => return Err(error),
+                Column::Selected(selected) => match selected.uniform_fragment_vector(0..self.len, memory)? {
+                    Some((vector, scratch)) => (vector, Some(scratch)),
+                    None => return Ok(None),
                 },
                 Column::Values(values) => {
                     let (column, scratch) = pack_evaluated_column(values, memory)?;
@@ -1273,7 +1278,7 @@ impl ColumnBatch {
             match self.select_key_span(start..end, memory) {
                 Ok(Some(keys)) => return Ok(keys),
                 Ok(None) => {}
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1281,7 +1286,7 @@ impl ColumnBatch {
         if rows.len() < self.len {
             match Self::take_rows_with_custody(&[self], rows, &positions, false, memory) {
                 Ok(output) => return Ok(output),
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1754,11 +1759,7 @@ pub(crate) async fn retain_list_spans(
         .and_then(|bytes| bytes.checked_mul(pages.len()))
         .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?;
     let bound = span_bytes.checked_add(source_bytes).ok_or_else(size_error)?;
-    let mut charge = match memory.reserve(bound) {
-        Ok(charge) => charge,
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
-        Err(error) => return Err(error),
-    };
+    let Some(mut charge) = memory.try_reserve(bound) else { return Ok(None) };
     let reservation = Arc::get_mut(&mut charge).expect("List spans own their metadata").split_off(span_bytes)?;
     let mut ends = Vec::with_capacity(pages.len());
     let mut sources = Vec::with_capacity(pages.len());
@@ -5256,7 +5257,7 @@ impl BatchCursor for BatchExpressions {
                         }
                         lease.shrink_to(retained)?;
                     }
-                    Err(error) if matches!(kernel, rtdb_plan::Expr::List(_)) && error.code == "rtdb/memory-budget-exceeded" => {},
+                    Err(error) if matches!(kernel, rtdb_plan::Expr::List(_)) && error.is(rtdb_types::AnomalyKind::ResourceExhausted) => {},
                     Err(error) => return Err(error),
                 }
             }
@@ -5343,7 +5344,7 @@ impl BatchCursor for BatchExpressions {
                         drop(scratch);
                         columns.push(column);
                     }
-                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => columns.push(Column::Values(values)),
+                    Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => columns.push(Column::Values(values)),
                     Err(error) => return Err(error),
                 }
             } else {
@@ -5511,7 +5512,7 @@ async fn evaluate_score_column(
     let retained = lease.bytes();
     match lease.grow_to(retained.checked_add(bound).ok_or_else(size_error)?) {
         Ok(()) => (),
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(None),
         Err(error) => return Err(error),
     }
 
@@ -5555,7 +5556,7 @@ pub(crate) fn scalar_result(values: &[Value], memory: &Arc<MemoryBudget>) -> Res
     let Some(ty) = scalar_result_type(values.iter()) else { return Ok(None); };
     match pack_scalar_values(values, ty, memory) {
         Ok(column) => Ok(Some(column)),
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -6191,7 +6192,7 @@ pub(crate) mod projection {
             Ok((column, charge))
         });
         match selection {
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => Ok(None),
             result => result.map(Some),
         }
     }

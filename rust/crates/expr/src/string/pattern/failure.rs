@@ -28,7 +28,7 @@ pub(super) enum Description<'a> { Static(&'static str), Points { prefix: &'stati
 
 impl CompileFailure {
     pub(super) fn retain(error: Anomaly, pattern: JavaText<'_>, adapter_point: Option<usize>, syntax: Option<Syntax<'_>>, context: &EvalContext<'_>) -> Self {
-        if error.code == "rtdb/memory-budget-exceeded" { return Self::Resource(error); }
+        if error.is(rtdb_types::AnomalyKind::ResourceExhausted) { return Self::Resource(error); }
         match PatternFailure::retain(error, pattern, adapter_point, syntax, context) {
             Ok(failure) => Self::Pattern(failure),
             Err(error) => Self::Resource(error),
