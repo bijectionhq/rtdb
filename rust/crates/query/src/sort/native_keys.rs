@@ -11,6 +11,7 @@ use crate::columnar::{Column, ColumnBatch};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Kind {
+    Null,
     Number,
     Text,
     Keyword,
@@ -28,9 +29,13 @@ pub(crate) enum Kind {
 impl Kind {
     pub(crate) fn of(ty: &LogicalType) -> Option<Self> {
         let mut kind = None;
+        let mut nullable = false;
         for leg in ty.legs() {
             let next = match leg {
-                LogicalType::Null => continue,
+                LogicalType::Null => {
+                    nullable = true;
+                    continue;
+                }
                 LogicalType::Scalar(
                     ScalarType::I8
                     | ScalarType::I16
@@ -68,7 +73,7 @@ impl Kind {
             }
             kind = Some(next);
         }
-        kind
+        kind.or(nullable.then_some(Self::Null))
     }
 
     fn orders_totally(self, ty: &LogicalType) -> bool {
@@ -104,8 +109,11 @@ impl Kind {
         field: &Field,
         logical: Option<&LogicalType>,
     ) -> bool {
+        if array.data_type() != field.data_type() {
+            return false;
+        }
         if array.data_type() == &DataType::Null {
-            return field.is_nullable() && logical != Some(&LogicalType::Nothing);
+            return self.accepts_field(field) && logical.is_none_or(|ty| *ty == LogicalType::Null);
         }
         let logical_kind = logical.map_or_else(
             || {
@@ -127,7 +135,9 @@ impl Kind {
             .get(rtdb_columnar::EXTENSION_NAME_KEY)
             .map(String::as_str);
         match (self, field.data_type(), extension) {
-            (_, DataType::Null, _) => field.is_nullable(),
+            (_, DataType::Null, None) => {
+                field.is_nullable() && rtdb_columnar::from_field(field).is_ok_and(|ty| ty == LogicalType::Null)
+            }
             (_, DataType::Union(fields, UnionMode::Dense), None) => {
                 fields.iter().all(|(_, field)| self.accepts_field(field))
             }
@@ -288,7 +298,8 @@ fn time_unit(unit: &ArrowTime) -> TimeUnit {
     }
 }
 
-enum Key<'a> {
+#[derive(Clone, Copy)]
+pub(super) enum Key<'a> {
     Null,
     Integer(i64),
     Float(f64),
@@ -426,7 +437,7 @@ impl NativeOrder {
         matches!(self.keys.first(), Some((_, Kind::Text | Kind::Keyword | Kind::Binary)))
     }
 
-    fn leading_key<'a>(&self, batch: &'a ColumnBatch, row: usize) -> Key<'a> {
+    pub fn leading_key<'a>(&self, batch: &'a ColumnBatch, row: usize) -> Key<'a> {
         let (column, kind) = self.keys[0];
         kind.read(&batch.columns[column], row)
     }
@@ -473,6 +484,21 @@ impl NativeOrder {
         order: &[SortExpr],
     ) -> rtdb_types::Result<Ordering> {
         self.compare_from(0, left, left_row, right, right_row, order)
+    }
+
+    pub fn compare_leading(
+        &self,
+        (left, left_row, left_key): (&ColumnBatch, usize, Key<'_>),
+        (right, right_row, right_key): (&ColumnBatch, usize, Key<'_>),
+        order: &[SortExpr],
+    ) -> rtdb_types::Result<Ordering> {
+        let first = &order[0];
+        let comparison = left_key.compare(right_key, first.descending, first.nulls_first)?;
+        if comparison.is_eq() {
+            self.compare_from(1, left, left_row, right, right_row, order)
+        } else {
+            Ok(comparison)
+        }
     }
 
     fn compare_from(
@@ -590,6 +616,24 @@ fn borrowed_sort_keys_follow_selected_arrow_positions_and_missing_sources() {
 }
 
 #[test]
+fn native_null_sort_key_accepts_sql_nulls_and_rejects_bottom_storage() {
+    use arrow_array::NullArray;
+    use std::sync::Arc;
+
+    let kind = Kind::of(&LogicalType::Null).unwrap();
+    let column = |nullable, logical| Column::Arrow {
+        array: Arc::new(NullArray::new(2)),
+        field: Arc::new(Field::new("key", DataType::Null, nullable)),
+        logical: Some(logical),
+    };
+    let nulls = column(true, LogicalType::Null);
+    assert!(kind.accepts(&nulls));
+    assert!(matches!(kind.read(&nulls, 1), Key::Null));
+    assert!(!kind.accepts(&column(false, LogicalType::Nothing)));
+    assert!(!kind.accepts(&Column::Values(vec![Value::I64(1)])));
+}
+
+#[test]
 fn arrow_wave4_native_sort_matches_scalar_order_for_index_key_families() {
     use rtdb_plan::{ColumnId, Expr};
 
@@ -600,6 +644,9 @@ fn arrow_wave4_native_sort_matches_scalar_order_for_index_key_families() {
             Value::F64(f64::NAN),
             Value::F32(f32::NAN),
             Value::I64(9),
+            Value::I64(9_007_199_254_740_992),
+            Value::I64(9_007_199_254_740_993),
+            Value::F64(9_007_199_254_740_992.0),
         ],
         vec![Value::U64(u64::MAX), Value::U64(1), Value::I64(i64::MIN)],
         vec![

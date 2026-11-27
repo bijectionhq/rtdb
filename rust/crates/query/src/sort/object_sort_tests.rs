@@ -274,6 +274,42 @@ mod limited {
     }
 
     #[tokio::test]
+    async fn mixed_timestamp_sort_preserves_checked_units_and_stable_peers_through_spill() {
+        use rtdb_types::TimeUnit;
+
+        let timestamp = |value, unit, zoned| Value::Timestamp {
+            value,
+            unit,
+            timezone: if zoned { Some("America/New_York".into()) } else { None },
+        };
+        let values = [
+            Value::Null,
+            timestamp(-1, TimeUnit::Millisecond, true),
+            timestamp(-1_000_000, TimeUnit::Nanosecond, false),
+            timestamp(9_007_199_254_740_993, TimeUnit::Nanosecond, true),
+            timestamp(9_007_199_254_740_992, TimeUnit::Nanosecond, true),
+        ];
+        let types: Vec<_> = values.iter().map(Value::logical_type).collect();
+        let key = field(0, "key", LogicalType::join_all(&types));
+        let rows: Vec<_> = values.iter().cloned().cycle().take(335).collect();
+        for sort_memory_bytes in [usize::MAX, 1] {
+            let execution = budgeted(1 << 24, sort_memory_bytes, 64);
+            let order = SortExpr { expr: key.expression(), descending: false, nulls_first: false };
+            let mut expected: Vec<_> = (0..rows.len()).collect();
+            expected.sort_by(|&left, &right| ordered_compare_in_timezone(&rows[left], &rows[right], false, "UTC").unwrap());
+            assert_eq!(sorted(&execution, key.clone(), &rows, order.clone(), 7).await.unwrap(), expected[..7]);
+            assert_eq!(sorted(&execution, key.clone(), &rows, order, u64::MAX).await.unwrap(), expected);
+            assert_eq!(execution.context.spill_peak_bytes() > 0, sort_memory_bytes == 1);
+        }
+
+        let overflow = [timestamp(i64::MAX, TimeUnit::Millisecond, true), values[3].clone()];
+        let expected = ordered_compare_in_timezone(&overflow[1], &overflow[0], false, "UTC").unwrap_err();
+        let order = SortExpr { expr: key.expression(), descending: false, nulls_first: false };
+        let error = sorted(&execution(usize::MAX), key, &overflow, order, 1).await.unwrap_err();
+        assert_eq!(error.code, expected.code);
+    }
+
+    #[tokio::test]
     async fn byte_key_top_k_and_multi_pass_merge_preserve_exact_secondary_order_and_stable_ties() {
         let key = field(0, "key", LogicalType::Scalar(ScalarType::Binary).maybe());
         let secondary = field(1, "secondary", LogicalType::Scalar(ScalarType::I64));

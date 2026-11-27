@@ -2,19 +2,19 @@
 use std::{mem::size_of, sync::Arc};
 
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_plan::{Expr, Schema, SortExpr};
-use rtdb_types::{ObjectSort, Result, Value};
+use rtdb_types::{LogicalType, ObjectSort, Result, ScalarType, Value};
 
 use crate::{
-    columnar::{BatchCursor, BoxBatchCursor, ColumnBatch},
+    columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch},
     context::Execution,
     invalid,
     spill::{SpillFile, SpillReader, SpillWriter},
 };
 
 use super::{
-    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::{ByteKey, BytePrefix, NativeOrder}, orders_consistently, select,
+    BLOCK_ROWS, KeyTypes, MERGE_FAN_IN, SortPlan, legacy, native_keys::{self, ByteKey, BytePrefix, NativeOrder}, orders_consistently, select,
     size_error, timsort,
 };
 
@@ -306,19 +306,19 @@ impl BatchSort {
                     if run.batch.is_none() { continue; }
                     if let Some(first) = winner {
                         let other = &mut preceding[first];
-                        let comparison = if let Some(order) = prefixed.filter(|_| run.native && other.native) {
-                            let rows = (run.row, other.row);
-                            let cached = &mut comparisons[lane][first];
-                            match *cached {
-                                Some((previous, comparison)) if previous == rows => comparison,
-                                _ => {
-                                    let comparison = order.compare_prefixed(run.head(order), other.head(order), &plan.order, None)?;
-                                    *cached = Some((rows, comparison));
-                                    comparison
-                                }
+                        let rows = (run.row, other.row);
+                        let cached = &mut comparisons[lane][first];
+                        let comparison = match *cached {
+                            Some((previous, comparison)) if previous == rows => comparison,
+                            _ => {
+                                let comparison = if let Some(order) = prefixed.filter(|_| run.native && other.native) {
+                                    order.compare_prefixed(run.head(order), other.head(order), &plan.order, None)?
+                                } else {
+                                    run.compare(other, plan, key_columns, native)?
+                                };
+                                *cached = Some((rows, comparison));
+                                comparison
                             }
-                        } else {
-                            run.compare(other, plan, key_columns, native)?
                         };
                         if !comparison.is_lt() {
                             continue;
@@ -517,9 +517,20 @@ impl Block {
                     Some((a.tail, b.tail)),
                 )
             })?
+        } else if let Some(order) = native.filter(|_| selects) {
+            let _temporary = context.memory.reserve(select::scratch_bytes::<native_keys::Key<'_>>(limit)?)?;
+            select::first(len, limit, |index| {
+                let (batch, row) = row_at(index);
+                order.leading_key(batch, row)
+            }, |left, &a, right, &b| {
+                context.check_cancelled_at(comparisons)?;
+                comparisons += 1;
+                let (left, left_row) = row_at(left);
+                let (right, right_row) = row_at(right);
+                order.compare_leading((left, left_row, a), (right, right_row, b), &plan.order)
+            })?
         } else {
             let bytes = match algorithm {
-                ObjectSort::TimSort if selects => select::scratch_bytes::<()>(limit)?,
                 ObjectSort::TimSort => timsort::scratch_bytes(len)?,
                 ObjectSort::LegacyMergeSort => legacy::scratch_bytes(len)?,
             };
@@ -530,27 +541,22 @@ impl Block {
                 comparisons += 1;
                 let (left, left_row) = row_at(left_index);
                 let (right, right_row) = row_at(right_index);
-                if !self.native {
-                    return compare_scalar_keys(&mut keys, left_index, right_index, plan, |index| {
+                if let Some(keys) = &mut keys {
+                    return keys.compare(left_index, right_index, plan, &|index| {
                         let (batch, row) = row_at(index);
-                        scalar_key(batch, row, plan, key_columns, projected).map(Key::for_comparison)
+                        scalar_key(batch, row, plan, key_columns, projected, KeyRead::Comparison)
                     });
                 }
                 native.expect("only an admitted sort can borrow its keys")
                     .compare(left, left_row, right, right_row, &plan.order)
             };
-            if selects {
-                let mut compare = compare;
-                select::first(len, limit, |_| (), |left, _, right, _| compare(left, right))?
-            } else {
-                let mut order: Vec<_> = (0..len).collect();
-                match algorithm {
-                    ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
-                    ObjectSort::LegacyMergeSort => legacy::sort(&mut order, compare)?,
-                }
-                order.truncate(limit);
-                order
+            let mut order: Vec<_> = (0..len).collect();
+            match algorithm {
+                ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
+                ObjectSort::LegacyMergeSort => legacy::sort(&mut order, compare)?,
             }
+            order.truncate(limit);
+            order
         };
         let Self {
             mut batches,
@@ -596,12 +602,50 @@ impl Block {
 fn observe_scalar_keys(
     batch: &ColumnBatch, columns: &[usize], projected: bool, types: &mut KeyTypes, plan: &SortPlan,
 ) -> Result<()> {
+    let context = &plan.execution.context;
+    if columns.len() == types.values.len() && columns.iter().zip(&types.values).all(|(&column, known)| {
+        covered_arrow_key(&batch.columns[column], batch.len, known, &context.memory)
+    }) {
+        return context.check_cancelled();
+    }
     for row in 0..batch.len {
-        plan.execution.context.check_cancelled_at(row)?;
-        let key = scalar_key(batch, row, plan, columns, projected)?;
+        context.check_cancelled_at(row)?;
+        let key = scalar_key(batch, row, plan, columns, projected, KeyRead::Observation)?;
         types.observe(&key.values, plan)?;
     }
     Ok(())
+}
+
+fn covered_arrow_key(column: &Column, rows: usize, known: &LogicalType, memory: &Arc<MemoryBudget>) -> bool {
+    let Column::Arrow { array, field, logical } = column else { return false };
+    if array.len() != rows || array.data_type() != field.data_type() || field.data_type().is_nested() {
+        return false;
+    }
+    let Ok(_metadata) = memory.reserve(field.size().saturating_mul(4)) else { return false };
+    let Ok(physical) = rtdb_columnar::from_field(field) else { return false };
+    if logical.as_ref().is_some_and(|logical| *logical != physical) {
+        return false;
+    }
+    let execution = rtdb_columnar::execution_type(&physical);
+    let observed = match &execution {
+        LogicalType::Maybe(inner) => inner,
+        other => other,
+    };
+    match observed {
+        LogicalType::Null => true,
+        // URI decoding validates the reached spelling before the sort checks its comparator.
+        LogicalType::Scalar(scalar) if *scalar != ScalarType::Uri => types_cover_scalar(known, scalar),
+        _ => false,
+    }
+}
+
+fn types_cover_scalar(known: &LogicalType, scalar: &ScalarType) -> bool {
+    match known {
+        LogicalType::Scalar(known) => known == scalar,
+        LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => types_cover_scalar(inner, scalar),
+        LogicalType::Union(legs) => legs.iter().any(|leg| types_cover_scalar(leg, scalar)),
+        _ => false,
+    }
 }
 
 struct MemoryRun {
@@ -759,16 +803,6 @@ impl BlockKeys {
     }
 }
 
-fn compare_scalar_keys(
-    cache: &mut Option<BlockKeys>, left: usize, right: usize, plan: &SortPlan,
-    read: impl Fn(usize) -> Result<Key>,
-) -> Result<std::cmp::Ordering> {
-    match cache {
-        Some(keys) => keys.compare(left, right, plan, &read),
-        None => plan.compare(&read(left)?.values, &read(right)?.values),
-    }
-}
-
 struct Run {
     reader: SpillReader,
     batch: Option<ColumnBatch>,
@@ -819,7 +853,7 @@ impl Run {
         if self.native {
             self.key = None;
         } else if let Some(batch) = &self.batch {
-            self.key = Some(scalar_key(batch, self.row, plan, columns, false)?.for_comparison());
+            self.key = Some(scalar_key(batch, self.row, plan, columns, false, KeyRead::Comparison)?);
         }
         Ok(())
     }
@@ -838,10 +872,10 @@ impl Run {
                 .compare(left, self.row, right, other.row, &plan.order);
         }
         if self.key.is_none() {
-            self.key = Some(scalar_key(left, self.row, plan, columns, false)?.for_comparison());
+            self.key = Some(scalar_key(left, self.row, plan, columns, false, KeyRead::Comparison)?);
         }
         if other.key.is_none() {
-            other.key = Some(scalar_key(right, other.row, plan, columns, false)?.for_comparison());
+            other.key = Some(scalar_key(right, other.row, plan, columns, false, KeyRead::Comparison)?);
         }
         plan.compare(
             &self.key.as_ref().expect("loaded run key").values,
@@ -850,7 +884,15 @@ impl Run {
     }
 }
 
-fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize], projected: bool) -> Result<Key> {
+enum KeyRead {
+    Observation,
+    Comparison,
+}
+
+fn scalar_key(
+    batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize], projected: bool, read: KeyRead,
+) -> Result<Key> {
+    let comparison = matches!(read, KeyRead::Comparison);
     let reservation = plan
         .execution
         .context
@@ -858,12 +900,38 @@ fn scalar_key(batch: &ColumnBatch, row: usize, plan: &SortPlan, columns: &[usize
         .reserve(256 + key_bound(batch, columns, row)?)?;
     let values = columns
         .iter()
-        .map(|&column| batch.columns[column].expression_value(row, projected, None))
+        .map(|&column| {
+            let column = &batch.columns[column];
+            if comparison && let Some(value) = decimal_comparison_key(column, row) {
+                return Ok(value);
+            }
+            column.expression_value(row, projected, None)
+        })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Key {
+    let key = Key {
         values,
         _reservation: reservation,
-    })
+    };
+    Ok(if comparison { key.for_comparison() } else { key })
+}
+
+fn decimal_comparison_key(column: &Column, row: usize) -> Option<Value> {
+    let (array, field, logical, row) = column.arrow_cell(row)??;
+    if !field.data_type().is_decimal() || field.extension_type_name().is_some() {
+        return None;
+    }
+    let (parameters, bytes) = (ArrowCell { field, array, row }).decimal_coefficient().ok()??;
+    let scale = match logical {
+        None => parameters.scale,
+        Some(logical) => {
+            let logical = match logical { LogicalType::Maybe(inner) => inner, other => other };
+            let LogicalType::Scalar(ScalarType::Decimal { bit_width, scale, .. }) = logical else { return None };
+            if *bit_width != parameters.bit_width { return None; }
+            *scale
+        }
+    };
+    let width = usize::from(parameters.bit_width / 8);
+    Some(Value::F64(rtdb_types::jvm_number::decimal_bytes_to_f64(&bytes[bytes.len() - width..], scale)))
 }
 
 fn write_batch(writer: &mut SpillWriter, batch: ColumnBatch, plan: &SortPlan) -> Result<()> {
@@ -1016,4 +1084,62 @@ fn arrow_wave4_sort_reads_each_cached_key_once() {
     assert_eq!(reads.get(), 2);
     drop(keys);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn declared_arrow_sort_key_types_cover_only_infallible_scalar_reads() {
+    use arrow_array::{Int64Array, NullArray, StringArray};
+    use arrow_schema::Field;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 38, scale: 5, bit_width: 128 });
+    let mixed = integer.join(&decimal);
+    let column = Column::Arrow {
+        array: Arc::new(Int64Array::from(vec![Some(10), None])),
+        field: Arc::new(Field::new("key", arrow_schema::DataType::Int64, true)),
+        logical: Some(integer.maybe()),
+    };
+    assert!(covered_arrow_key(&column, 2, &mixed, &memory));
+    assert!(!covered_arrow_key(&column, 2, &decimal, &memory));
+    assert!(!covered_arrow_key(&column, 3, &mixed, &memory));
+
+    let bottom = Column::Arrow {
+        array: Arc::new(NullArray::new(1)),
+        field: Arc::new(Field::new("key", arrow_schema::DataType::Null, false)),
+        logical: Some(LogicalType::Nothing),
+    };
+    assert!(!covered_arrow_key(&bottom, 1, &mixed, &memory));
+
+    let uri = LogicalType::Scalar(ScalarType::Uri);
+    let invalid = Column::Arrow {
+        array: Arc::new(StringArray::from(vec!["invalid URI"])),
+        field: Arc::new(rtdb_columnar::to_field("key", &uri).unwrap()),
+        logical: None,
+    };
+    assert!(!covered_arrow_key(&invalid, 1, &uri, &memory));
+    assert!(invalid.value(0).is_err());
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn decimal_arrow_sort_keys_use_the_reached_logical_scale_and_signed_zero() {
+    use arrow_array::Decimal128Array;
+
+    let scale = 400;
+    let logical = LogicalType::Scalar(ScalarType::Decimal { precision: 38, scale, bit_width: 128 });
+    let field = Arc::new(rtdb_columnar::to_field("key", &logical).unwrap());
+    let array = Arc::new(Decimal128Array::from(vec![Some(-1), Some(1), None])
+        .with_precision_and_scale(38, 1).unwrap());
+    for logical in [None, Some(logical), Some(LogicalType::Scalar(ScalarType::Decimal {
+        precision: 38, scale: 0, bit_width: 128,
+    }))] {
+        let column = Column::Arrow { array: array.clone(), field: field.clone(), logical };
+        for row in 0..2 {
+            let Value::Decimal(scalar) = column.value(row).unwrap() else { panic!("expected decimal input") };
+            let Some(Value::F64(key)) = decimal_comparison_key(&column, row) else { panic!("expected Arrow comparison key") };
+            assert_eq!(key.to_bits(), rtdb_expr::decimal_to_f64(&scalar).to_bits());
+        }
+        assert!(decimal_comparison_key(&column, 2).is_none());
+    }
 }
