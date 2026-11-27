@@ -9,7 +9,7 @@ use journal_contract::{
 };
 use rtdb_db::{TimedOriginal, WritePipeline};
 use rtdb_node::DecisionClock;
-use rtdb_stream_journal::{KeeperId, TimedOriginalVerifier};
+use rtdb_stream_journal::{KeeperId, TimedCommitment, TimedOriginalVerifier};
 use rtdb_tx::transact::{Cell, DECISION_CLOCK_OFFER, FundingCommand, Op, Row, Transact};
 use rtdb_types::{
     EntityId, Interval, StructFields, TableRef, TimedJournalCutoff, Timestamp, rtdb_v1::MAIN_BRANCH,
@@ -373,11 +373,13 @@ async fn offloaded_funded_record_keeps_its_exact_timed_proof() {
     .unwrap();
     let mut keepers = LocalCluster::start_timed(&[PRINCIPAL]).await.unwrap();
     keepers.enable_offload(PRINCIPAL, offload).await.unwrap();
+    let config = keepers.journal_config(1 << 20, 4096);
+    let trust = keepers.timed_verifier();
     let journal = Arc::new(
         keepers
-            .journal(PRINCIPAL, &keepers.journal_config(1 << 20, 4096))
+            .journal(PRINCIPAL, &config)
             .unwrap()
-            .with_timed_original(keepers.timed_verifier(), Some(2048)),
+            .with_timed_original(trust.clone(), Some(2048)),
     );
     let stream = StreamId(Uuid::new_v4().as_u128());
     journal.create_immutable(stream).await.unwrap();
@@ -415,7 +417,13 @@ async fn offloaded_funded_record_keeps_its_exact_timed_proof() {
         .unwrap();
     assert_eq!(page.records, vec![(original.at, payload)]);
     assert_eq!(batch.prove_timed_original(original).await, Ok(accepted));
+
+    let expected = timed_stream::request(original);
+    let commitment = journal.attest_timed_original(expected).await.unwrap().encode();
     keepers.shutdown().await.unwrap();
+    let commitment = TimedCommitment::decode(&commitment).unwrap();
+    let verified = commitment.verify(config.catalog, expected, &*trust).unwrap();
+    assert_eq!(timed_stream::proof(original, verified), Ok(accepted));
 }
 
 struct WithholdTimedAppend {

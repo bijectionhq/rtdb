@@ -27,7 +27,7 @@ pub fn connect_consensus(url: &str, credentials: &Credentials) -> Option<io::Res
     })())
 }
 pub use stream_logkeeper::stream::{
-    timed::{TimedOriginal, TimedOriginalProof, TimedOriginalVerifier},
+    timed::{TimedCommitment, TimedOriginal, TimedOriginalProof, TimedOriginalVerifier},
     wire::KeeperId,
 };
 
