@@ -77,7 +77,7 @@ impl QueryContext {
         let charge = self.memory.reserve(basis_bound(times)?.checked_add(catalog_bound(&self.catalog)?).ok_or_else(size_error)?)?;
         let times = times.clone();
         let token = None;
-        let mut context = self.execution_child();
+        let mut context = self.execution_child_with_memory(Arc::clone(&self.memory));
         Arc::get_mut(&mut context).ok_or_else(|| invalid("settings-owner", "New context is unexpectedly shared"))?.read_basis = Some(Arc::new(ReadBasis { times: Some(times), snapshot_time, clock_fallback: clock_fallback.into(), token, _reservation: charge }));
         Ok(context)
     }
