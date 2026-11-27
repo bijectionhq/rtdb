@@ -20,7 +20,7 @@
            (org.apache.arrow.vector PeriodDuration)
            (org.apache.arrow.vector.types.pojo ArrowType$Decimal)
            (org.apache.commons.codec.binary Hex)
-           (xtdb.arrow ListValueReader RelationReader RowMask ValueBox ValueReader Vector VectorReader VectorType VectorType$Listy VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
+           (xtdb.arrow ListValueReader RelationReader RowMask Utf8Vector ValueBox ValueReader Vector VectorReader VectorType VectorType$Listy VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
            (xtdb.expression PgFormat)
            (xtdb.operator ProjectionSpec ProjectionSpec$Factory SelectionSpec SelectionSpec$Factory)
            (xtdb.pgwire PgTypes)
@@ -642,6 +642,7 @@
 
    Returns a map containing
     * `:return-type` (VectorType)
+    * optional `:valid-utf8?` when all non-null results are valid UTF-8
     and one of the following
     * for monomorphic return types: `:->call-code` :: emitted-args -> code
     * for polymorphic return types: `:continue-call` :: f, emitted-args -> code
@@ -776,6 +777,9 @@
                          (apply types/merge-types))]
 
     {:return-type return-type
+     :valid-utf8? (every? (fn [{:keys [return-type valid-utf8?]}]
+                           (or (= #xt/type :null return-type) valid-utf8?))
+                         (vals emitted-calls))
      :children (vals emitted-calls)
      :continue (fn continue-call-expr [handle-emitted-expr]
                  (let [build-args-then-call
@@ -1388,16 +1392,19 @@
 
 (defmethod codegen-call [:upper :utf8] [_]
   {:return-type #xt/type :utf8
+   :valid-utf8? true
    :->call-code (fn [[code]]
                   `(str->buf (.toUpperCase (resolve-string ~code))))})
 
 (defmethod codegen-call [:lower :utf8] [_]
   {:return-type #xt/type :utf8
+   :valid-utf8? true
    :->call-code (fn [[code]]
                   `(str->buf (.toLowerCase (resolve-string ~code))))})
 
 (defmethod codegen-call [:reverse :utf8] [_]
   {:return-type #xt/type :utf8
+   :valid-utf8? true
    :->call-code (fn [[code]]
                   `(str->buf (-> (resolve-string ~code) (StringBuilder.) (.reverse) (.toString))))})
 
@@ -2569,7 +2576,7 @@
    assumption wouldn't hold if macroexpansion created new variable exprs, for example.
    macroexpansion is non-deterministic (gensym), so busts the memo cache."
   (-> (fn [expr opts]
-        (let [{:keys [return-type continue] :as emitted-expr} (emit-row-expr expr opts)
+        (let [{:keys [return-type continue valid-utf8?] :as emitted-expr} (emit-row-expr expr opts)
               {:keys [writer-bindings write-value-out!]} (write-value-out-code return-type)]
           {:!projection-fn (delay
                              (-> `(fn [~(-> rel-sym (with-tag RelationReader))
@@ -2586,7 +2593,8 @@
                                  #_(->> (binding [*print-meta* true]))
                                  eval))
 
-           :return-type return-type}))
+           :return-type return-type
+           :valid-utf8? valid-utf8?}))
       (util/lru-memoize) ; <<no-commit>>
       wrap-zone-id-cache-buster))
 
@@ -2680,18 +2688,22 @@
         in-rel RelationReader/DUAL]
     {:return-type return-type
      :write-cell! (fn [{:keys [allocator args]} ^VectorWriter out]
-                    (let [{:keys [^VectorType return-type !projection-fn]}
+                    (let [{:keys [^VectorType return-type !projection-fn valid-utf8?]}
                           (emit-batch (->param-types args) in-rel)
-                          arrow-type (.getArrowType return-type)]
-                      (if (and (instance? Vector out)
-                               (= arrow-type (.getArrowType out))
-                               (VectorWriterKt/hasScalarObjectIdentity arrow-type))
+                          arrow-type (.getArrowType return-type)
+                          utf8-output? (and (= #xt.arrow/type :utf8 arrow-type) (instance? Utf8Vector out))]
+                      (if (or (and utf8-output? valid-utf8?)
+                              (and (instance? Vector out)
+                                   (= arrow-type (.getArrowType out))
+                                   (VectorWriterKt/hasScalarObjectIdentity arrow-type)))
                         (rethrowing-anomalies
                           (@!projection-fn in-rel schema args out))
                         (with-open [value (Vector/open allocator "_scalar" return-type)]
                           (rethrowing-anomalies
                             (@!projection-fn in-rel schema args value))
-                          (.writeObject out (.getObject value 0))))))}))
+                          (if utf8-output?
+                            (VectorWriterKt/writeScalarCell out value 0)
+                            (.writeObject out (.getObject value 0)))))))}))
 
 (defn ->expression-projection-spec ^ProjectionSpec$Factory [col-name expr {:keys [var-types param-types]}]
   (let [{:keys [return-type emit-batch]} (projection-emitter expr var-types param-types)]

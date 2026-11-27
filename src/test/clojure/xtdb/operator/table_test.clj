@@ -1,10 +1,15 @@
 (ns xtdb.operator.table-test
   (:require [clojure.spec.alpha :as s]
             [clojure.test :as t]
+            [xtdb.expression :as expr]
             [xtdb.logical-plan :as lp]
             [xtdb.test-util :as tu]
             [xtdb.time :as time])
-  (:import java.time.Duration))
+  (:import (java.nio.charset StandardCharsets)
+           (java.time Duration)
+           (java.util.function Consumer)
+           (xtdb.api ICursor)
+           (xtdb.arrow Relation RelationReader)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
 
@@ -196,6 +201,39 @@
                         {:args {:record {:numeric-value 12, :label "record"}
                                 :n 7, :label "é", :flag false}
                          :with-types? true}))))
+
+(t/deftest values-text-cells-preserve-java-utf8-replacement
+  (let [^bytes malformed (byte-array (map unchecked-byte [0xed 0xa0 0x80 0x61 0xf0 0x9f]))
+        replaced (String. malformed StandardCharsets/UTF_8)]
+    (with-open [args (Relation. tu/*allocator* ^java.util.Map {"?label" #xt/type :utf8})]
+      (.writeBytes (.vectorFor args "?label") malformed)
+      (.endRow args)
+      (let [{:keys [->cursor vec-types]}
+            (lp/emit-expr (s/conform ::lp/logical-plan
+                                     '[:table {:rows [{:bound ?label,
+                                                       :computed (concat ?label "é"),
+                                                       :encoded (upper ?label)}]}])
+                          {:param-types (expr/->param-types args)})]
+        (t/is (= '{bound #xt/type :utf8, computed #xt/type :utf8, encoded #xt/type :utf8}
+                 vec-types))
+        (with-open [^ICursor cursor (->cursor {:allocator tu/*allocator*, :args args, :schema {}})]
+          (t/is (.tryAdvance cursor
+                             (reify Consumer
+                               (accept [_ out]
+                                 (let [^RelationReader out out]
+                                   (doseq [[col ^String expected] {"bound" replaced,
+                                                                   "computed" (str replaced "é"),
+                                                                   "encoded" (.toUpperCase replaced)}]
+                                     (t/is (= (seq (.getBytes expected StandardCharsets/UTF_8))
+                                              (-> (.vectorFor out col) (.getBytes 0) expr/resolve-bytes seq))))))))))))))
+
+(t/deftest values-known-utf8-writers-append-after-other-rows
+  (t/is (= '{:res [{:text "😀é"} {:text "É😀"} {:text "🎈"}]
+             :types {text #xt/type :utf8}}
+           (tu/query-ra '[:table {:rows [{:text "😀é"}
+                                        {:text (upper ?label)}
+                                        {:text ?rest}]}]
+                        {:args {:label "é😀", :rest "🎈"}, :with-types? true}))))
 
 (t/deftest test-table-stats
   (t/testing "row table stats - should return stats/row-count"
