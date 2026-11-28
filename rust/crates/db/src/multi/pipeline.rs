@@ -997,8 +997,10 @@ impl MultiDatabase {
     pub(super) fn sample_ordering_clock(&self, request: &Transact)
         -> impl std::future::Future<Output = Timestamp> + use<>
     {
-        let floor = request.store_append().and_then(|_| self.writer.as_ref()?.pipeline.last_store_reading())
-            .into_iter().chain(request.store_writer_reading_floor()).max();
+        let supplied = request.store_writer_reading_floor();
+        let inherited = (request.store_append().is_some() || supplied.is_some())
+            .then(|| self.writer.as_ref()?.pipeline.last_store_reading()).flatten();
+        let floor = inherited.into_iter().chain(supplied).max();
         let clock = Arc::clone(&self.clock);
         let skew = self.options.drift_micros;
         async move { rtdb_tx::transact::sample_store_clock(&*clock, floor, skew).await }

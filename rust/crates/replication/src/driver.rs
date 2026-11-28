@@ -2487,8 +2487,10 @@ impl ReplicationDriver {
             }
         }
         let floor = request.as_ref().ok().and_then(|request| {
-            request.transaction.store_append().and_then(|_| serving.last_store_reading())
-                .into_iter().chain(request.transaction.store_writer_reading_floor()).max()
+            let supplied = request.transaction.store_writer_reading_floor();
+            let inherited = (request.transaction.store_append().is_some() || supplied.is_some())
+                .then(|| serving.last_store_reading()).flatten();
+            inherited.into_iter().chain(supplied).max()
         });
         let now = self.cancellation.run_until_cancelled(rtdb_tx::transact::sample_store_clock(
             &*self.clock, floor, SERVING_CLOCK_UNCERTAINTY_MICROS,
