@@ -814,7 +814,8 @@ impl Point {
                                 Guard::Version { branch, .. }
                                 | Guard::CountAtMost { branch, .. } => branch != MAIN_BRANCH,
                                 Guard::Unwritten { .. } | Guard::RetainedStoreBasis { .. }
-                                | Guard::StoreWriter { .. } | Guard::SetStoreWriter { .. } => true,
+                                | Guard::StoreWriter { .. } | Guard::SetStoreWriter { .. } | Guard::ClaimStoreWriter { .. }
+                                | Guard::StoreWriterGeneration { .. } => true,
                                 Guard::Unchanged(_) => false,
                             }
                     })
@@ -1028,7 +1029,8 @@ impl Point {
                     branch != MAIN_BRANCH || !custody && index.has_custody_relation(&range.table)
                 }
                 Guard::Unwritten { .. } | Guard::RetainedStoreBasis { .. }
-                | Guard::StoreWriter { .. } | Guard::SetStoreWriter { .. } => true,
+                | Guard::StoreWriter { .. } | Guard::SetStoreWriter { .. } | Guard::ClaimStoreWriter { .. }
+                | Guard::StoreWriterGeneration { .. } => true,
                 Guard::Unchanged(_) => false,
             })
         {

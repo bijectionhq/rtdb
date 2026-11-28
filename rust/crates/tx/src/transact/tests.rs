@@ -76,26 +76,29 @@ fn a_store_writer_close_orders_against_appends_and_survives_checkpoint_restore()
     let closed = StoreWriterFence { epoch: 2, writer: None };
     let second = StoreWriterFence { epoch: 2, writer: Some([4; 16]) };
     let write = StoreWrite { key: b"k".to_vec(), value: Some(vec![1]), key_stamp: None, value_stamp: None };
-    let append = |key, fence| {
+    let append = |key, fence: Option<(StoreWriterFence, u64)>| {
         let mut request = store_append(key, 0, Vec::new(), vec![write.clone()], Window::default());
-        if let Some(fence) = fence {
-            request.guards.push(Guard::StoreWriter { incarnation: INCARNATION, fence });
+        if let Some((fence, generation)) = fence {
+            request.guards.push(Guard::StoreWriterGeneration { incarnation: INCARNATION, fence, generation, claim: fence.writer.unwrap() });
         }
         request
     };
-    let claim = |fence| Transact::set_store_writer(INCARNATION, fence);
+    let claim = |fence: StoreWriterFence| match fence.writer {
+        Some(writer) => Transact::claim_store_writer(INCARNATION, fence, writer),
+        None => Transact::set_store_writer(INCARNATION, fence),
+    };
     let stale = "rtdb.store/stale-writer";
     assert_eq!(commit(&mut state, 1, &claim(first)).outcome, Outcome::Then);
     assert_eq!(refused(&state, &append(1, None), 2, 20), stale);
-    let applied = commit(&mut state, 2, &append(2, Some(first)));
+    let applied = commit(&mut state, 2, &append(2, Some((first, 1))));
     let closed_at = commit(&mut state, 3, &claim(closed));
     assert_eq!(closed_at.outcome, Outcome::Then);
-    assert_eq!(refused(&state, &append(3, Some(first)), 4, 40), stale);
-    assert_eq!(refused(&state, &append(3, Some(second)), 4, 40), stale);
+    assert_eq!(refused(&state, &append(3, Some((first, 1))), 4, 40), stale);
+    assert_eq!(refused(&state, &append(3, Some((second, 4))), 4, 40), stale);
     let Resolution::Answer(retry) = state.resolve(&claim(closed), 4, Timestamp(40), DEFAULT, &claims()).unwrap()
         else { panic!("expected the current fence to replay"); };
     assert_eq!(retry.basis, closed_at.basis);
-    let Resolution::Answer(retry) = state.resolve(&append(2, Some(first)), 4, Timestamp(40), DEFAULT, &claims()).unwrap()
+    let Resolution::Answer(retry) = state.resolve(&append(2, Some((first, 1))), 4, Timestamp(40), DEFAULT, &claims()).unwrap()
         else { panic!("expected the already committed append to replay"); };
     assert_eq!(retry.basis, applied.basis);
 
@@ -106,14 +109,38 @@ fn a_store_writer_close_orders_against_appends_and_survives_checkpoint_restore()
     assert_eq!(refused(&state, &claim(closed), 5, 50), stale);
     assert_eq!(refused(&state, &claim(first), 5, 50), stale);
     assert_eq!(refused(&state, &claim(StoreWriterFence { writer: Some([5; 16]), ..second }), 5, 50), stale);
-    assert_eq!(commit(&mut state, 5, &append(3, Some(second))).outcome, Outcome::Then);
+    assert_eq!(commit(&mut state, 5, &append(3, Some((second, 4)))).outcome, Outcome::Then);
 
     let historical = TransactState::decode_checkpoint(&state.encode_checkpoint_at(cut.basis).unwrap(), cut).unwrap();
-    assert_eq!(refused(&historical, &append(4, Some(second)), 4, 40), stale);
+    assert_eq!(refused(&historical, &append(4, Some((second, 4))), 4, 40), stale);
     state.restore_in([9; 16]).unwrap();
-    assert_eq!(refused(&state, &append(4, Some(second)), 6, 60), stale);
+    assert_eq!(refused(&state, &append(4, Some((second, 4))), 6, 60), stale);
     assert_eq!(refused(&state, &append(4, None), 6, 60), stale);
-    assert_eq!(commit(&mut state, 6, &Transact::set_store_writer([9; 16], second)).outcome, Outcome::Then);
+    assert_eq!(commit(&mut state, 6, &Transact::claim_store_writer([9; 16], second, [6; 16])).outcome, Outcome::Then);
+}
+
+#[test]
+fn a_new_claim_fences_the_previous_generation_of_the_same_placement() {
+    let mut state = TransactState::new(INCARNATION);
+    let fence = StoreWriterFence { epoch: 1, writer: Some([3; 16]) };
+    let claim = |attempt| Transact::claim_store_writer(INCARNATION, fence, [attempt; 16]);
+    let first = commit(&mut state, 1, &claim(1));
+    let Resolution::Answer(retry) = state.resolve(&claim(1), 2, Timestamp(20), DEFAULT, &claims()).unwrap()
+        else { panic!("expected a replay of this claim attempt"); };
+    assert_eq!(first.basis, retry.basis);
+    let second = commit(&mut state, 2, &claim(2));
+    assert!(second.basis > first.basis);
+    let cut = state.index().head();
+    let state = TransactState::decode_binary_checkpoint(&state.encode_binary_checkpoint().unwrap(), cut).unwrap();
+    assert_eq!(refused(&state, &claim(1), 3, 30), "rtdb.store/stale-writer");
+    let append = |generation, claim| {
+        let mut request = store_append(3, 0, Vec::new(), Vec::new(), Window::default());
+        request.guards.push(Guard::StoreWriterGeneration { incarnation: INCARNATION, fence, generation, claim });
+        request
+    };
+    assert_eq!(refused(&state, &append(first.basis.position(), [1; 16]), 3, 30), "rtdb.store/stale-writer");
+    assert_eq!(refused(&state, &append(second.basis.position(), [1; 16]), 3, 30), "rtdb.store/stale-writer");
+    plan(&state, &append(second.basis.position(), [2; 16]), 3, 30, DEFAULT);
 }
 
 #[test]

@@ -14,6 +14,7 @@ syntax = "proto3";
 //   rtdb.store.v1.Rank   RankRequest   -> RankReply
 //   rtdb.store.v1.StorageSizes StorageSizesRequest -> StorageSizesReply
 //   rtdb.store.v1.FenceWriter FenceWriterRequest -> FenceWriterReply
+//   rtdb.store.v1.ClaimWriter ClaimWriterRequest -> ClaimWriterReply
 //   rtdb.store.v1.PurgeFloor PurgeFloorRequest -> PurgeFloorReply (Multi writer)
 //
 // A version is a commit position within one store incarnation. A restore or a
@@ -181,6 +182,8 @@ message AppendRequest {
 message WriterFence {
   uint64 epoch = 1;
   bytes writer = 2;
+  uint64 generation = 3;
+  bytes claim = 4;
 }
 
 // The timed writer handshake offers and echoes x-rtdb-store-timed-append: 1
@@ -235,8 +238,7 @@ message TimedAppendReceipt {
 message FenceWriterRequest {
   bytes incarnation = 1;
   uint64 epoch = 2;
-  // Absent closes the installation at this epoch. Present claims the epoch
-  // with an opaque 16-byte writer identity.
+  // Obsolete claim field. A populated field is refused.
   optional bytes writer = 3;
 }
 
@@ -244,6 +246,20 @@ message FenceWriterReply {
   bytes incarnation = 1;
   uint64 epoch = 2;
   optional bytes writer = 3;
+}
+
+message ClaimWriterRequest {
+  bytes incarnation = 1;
+  uint64 epoch = 2;
+  bytes assignment = 3;
+  // One opaque 16-byte identity per claim. Retries reuse it.
+  bytes attempt = 4;
+}
+
+message ClaimWriterReply {
+  ClaimWriterRequest claim = 1;
+  // The ordered position of this claim within the incarnation.
+  uint64 generation = 2;
 }
 
 // Returned in x-rtdb-store-access-denial-bin on a denied access probe.

@@ -173,7 +173,7 @@ async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
 
     let reply = client.handshake(handshake()).await.unwrap();
     assert!(!reply.metadata().contains_key(RELEASE));
-    assert_eq!(reply.metadata().get("x-rtdb-store-writer-fence").unwrap(), "1");
+    assert_eq!(reply.metadata().get("x-rtdb-store-writer-fence").unwrap(), "2");
     let bearer = reply.metadata().get("authorization").unwrap().clone();
     assert!(reply.into_inner().message().await.unwrap().is_none());
 
@@ -286,11 +286,12 @@ async fn a_store_access_probe_binds_a_verified_denial_to_the_placed_store() {
 }
 
 #[tokio::test]
-async fn store_fence_closes_the_previous_assignment() {
+async fn store_appends_require_the_latest_claim_for_the_same_placement() {
     use rtdb_flight_sql::rtdb::store::v1 as store;
     use rtdb_node::serving::NativeServingAuthority;
 
     const FENCE: &str = "rtdb.store.v1.FenceWriter";
+    const CLAIM: &str = "rtdb.store.v1.ClaimWriter";
     const APPEND: &str = "rtdb.store.v1.Append";
     let incarnation = [53; 16];
     let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
@@ -312,15 +313,27 @@ async fn store_fence_closes_the_previous_assignment() {
         ..Default::default()
     }.encode_to_vec().into();
     let writer = [3; 16].to_vec();
-    let attached = Some(store::WriterFence { epoch: 1, writer: writer.clone() });
-    client.action(FENCE, order(1, Some(writer))).await.unwrap();
+    let claim = |attempt| store::ClaimWriterRequest {
+        incarnation: incarnation.to_vec(), epoch: 1, assignment: writer.clone(), attempt: vec![attempt; 16],
+    };
+    let first = claim(1);
+    let reply = client.action(CLAIM, first.encode_to_vec().into()).await.unwrap();
+    let reply = store::ClaimWriterReply::decode(reply[0].body.clone()).unwrap();
+    assert_eq!(reply.claim, Some(first));
+    let attached = Some(store::WriterFence { epoch: 1, writer: writer.clone(), generation: reply.generation, claim: vec![1; 16] });
     client.action(APPEND, append(1, attached.clone())).await.unwrap();
+    let reply = client.action(CLAIM, claim(2).encode_to_vec().into()).await.unwrap();
+    let reply = store::ClaimWriterReply::decode(reply[0].body.clone()).unwrap();
+    assert!(reply.generation > attached.as_ref().unwrap().generation);
+    assert_eq!(client.action(APPEND, append(2, attached.clone())).await.unwrap_err().code(), tonic::Code::Aborted);
+    let successor = Some(store::WriterFence { epoch: 1, writer, generation: reply.generation, claim: vec![2; 16] });
+    client.action(APPEND, append(2, successor.clone())).await.unwrap();
     let reply = client.action(FENCE, order(2, None)).await.unwrap();
     assert_eq!(store::FenceWriterReply::decode(reply[0].body.clone()).unwrap(), store::FenceWriterReply {
         incarnation: incarnation.to_vec(), epoch: 2, writer: None,
     });
-    assert_eq!(client.action(APPEND, append(2, attached)).await.unwrap_err().code(), tonic::Code::Aborted);
-    assert_eq!(client.action(APPEND, append(2, None)).await.unwrap_err().code(), tonic::Code::Aborted);
+    assert_eq!(client.action(APPEND, append(3, successor)).await.unwrap_err().code(), tonic::Code::Aborted);
+    assert_eq!(client.action(APPEND, append(3, None)).await.unwrap_err().code(), tonic::Code::Aborted);
     running.stop().await;
 }
 

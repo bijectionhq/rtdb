@@ -59,9 +59,9 @@ pub(crate) const TIMED_APPEND_VERSION: &str = "timed-append-v1";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
 pub(crate) const RANK: &str = "rtdb.store.v1.Rank";
 pub(crate) use purge::PURGE_FLOOR;
-pub(crate) use writer::WRITER_FENCE_HEADER;
+pub(crate) use writer::{CLAIM_WRITER, FENCE_WRITER, WRITER_FENCE_HEADER};
 pub(super) use sizes::STORAGE_SIZES;
-pub(crate) const ACTIONS: [&str; 7] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR, writer::FENCE_WRITER];
+pub(crate) const ACTIONS: [&str; 8] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR, FENCE_WRITER, CLAIM_WRITER];
 
 /// The `RANK_DIGEST` recorded with the vendored copy (vendor/bijection).
 const VENDORED_RANK_DIGEST: &str = include_str!("../../../../vendor/bijection/RANK_DIGEST");
@@ -177,7 +177,8 @@ impl Service {
             RANK => self.store_rank(call, decode(body)?).await,
             STORAGE_SIZES => self.store_storage_sizes(call, decode(body)?).await,
             PURGE_FLOOR => self.store_purge_floor(call, decode(body)?).await,
-            writer::FENCE_WRITER => self.store_fence_writer(call, decode(body)?).await,
+            FENCE_WRITER => self.store_fence_writer(call, decode(body)?).await,
+            CLAIM_WRITER => self.store_claim_writer(call, decode(body)?).await,
             #[cfg(feature = "multi")]
             hold_version::ACTION if hold_version::AVAILABLE => self.store_hold_version(call, decode(body)?).await,
             _ => Err(error::unsupported("rtdb.store.v1")),
@@ -378,9 +379,14 @@ impl StoreAppendInput {
             guards.push(Guard::RetainedStoreBasis { basis: Basis::new(incarnation, required) });
         }
         if let Some(binding) = request.writer_fence {
-            guards.push(Guard::StoreWriter {
-                incarnation,
-                fence: writer::fence(binding.epoch, Some(binding.writer))?,
+            let fence = writer::fence(binding.epoch, Some(binding.writer))?;
+            guards.push(if binding.generation == 0 {
+                if !binding.claim.is_empty() { return Err(error::incorrect("A writer claim requires its ordered generation")); }
+                Guard::StoreWriter { incarnation, fence }
+            } else {
+                let claim = binding.claim.as_slice().try_into()
+                    .map_err(|_| error::incorrect("A store writer claim has 16 bytes"))?;
+                Guard::StoreWriterGeneration { incarnation, fence, generation: binding.generation, claim }
             });
         }
         let transaction = Transact {

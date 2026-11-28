@@ -3,7 +3,6 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::FlightData;
 use bytes::Bytes;
 use prost::Message as _;
-use rtdb_index::branches::store::StoreWriterFence;
 use rtdb_node::{
     CertifiedDecisionClock, Database, DatabaseAccess, SessionIdentity,
     serving::{CatalogRoot, TimedStoreAppend, TimedStoreAuthorizer, TimedStoreCommitment, TimedStoreReceipt},
@@ -12,7 +11,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, TimedJournalCutoff, Timestamp};
 use tokio::sync::oneshot;
 use tonic::{Response, Status, Streaming, metadata::MetadataMap};
 
-use super::{StoreAppendInput, TIMED_APPEND_CAPABILITY, append_reply, error, proto, writer};
+use super::{StoreAppendInput, TIMED_APPEND_CAPABILITY, append_reply, error, proto};
 use crate::{
     service::{Call, Output, Service},
     state::Caller,
@@ -259,13 +258,11 @@ impl Service {
     }
 }
 
-fn append_fence(request: &proto::AppendRequest, incarnation: [u8; 16]) -> Result<Option<StoreWriterFence>, Status> {
+fn append_fence(request: &proto::AppendRequest, incarnation: [u8; 16]) -> Result<Option<proto::WriterFence>, Status> {
     if request.incarnation.as_slice() != incarnation {
         return Err(Status::failed_precondition("The timed Store incarnation changed"));
     }
-    request.writer_fence.as_ref()
-        .map(|binding| writer::fence(binding.epoch, Some(binding.writer.clone())))
-        .transpose()
+    Ok(request.writer_fence.clone())
 }
 
 fn companion_shape(mut request: proto::AppendRequest) -> proto::AppendRequest {
@@ -354,7 +351,7 @@ mod tests {
                 value: Some(vec![0; 32]),
                 ..Default::default()
             }],
-            writer_fence: Some(proto::WriterFence { epoch: 5, writer: vec![3; 16] }),
+            writer_fence: Some(proto::WriterFence { epoch: 5, writer: vec![3; 16], generation: 6, claim: vec![4; 16] }),
             ..Default::default()
         }
     }
@@ -391,6 +388,12 @@ mod tests {
         assert_eq!(companion_shape(confirmed.clone()), original);
         assert_eq!(append_fence(&confirmed, [2; 16]).unwrap(), fence);
         assert!(append_fence(&confirmed, [3; 16]).is_err());
+        confirmed.writer_fence.as_mut().unwrap().generation += 1;
+        assert_ne!(append_fence(&confirmed, [2; 16]).unwrap(), fence);
+        confirmed.writer_fence = fence.clone();
+        confirmed.writer_fence.as_mut().unwrap().claim[0] ^= 1;
+        assert_ne!(append_fence(&confirmed, [2; 16]).unwrap(), fence);
+        confirmed.writer_fence = fence.clone();
         confirmed.since += 1;
         assert_ne!(companion_shape(confirmed.clone()), original);
         confirmed.writer_fence = None;

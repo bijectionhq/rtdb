@@ -27,7 +27,7 @@ pub use oidc::{DeviceAuthorization, OidcConfig};
 pub use password::PasswordHash;
 pub use store_scope::StoreScope;
 pub use visibility_scope::VerifiedLabelScope;
-pub use workload_grant::{OriginalCustodyOperation, OriginalFamilyGrant, OriginalFamilyReadbackGrant, OriginalFamilyReadbackProjection, StoreFence, StoreProvisioning, VerifiedWorkloadGrant, WorkloadGrantConfig, WorkloadOperation};
+pub use workload_grant::{OriginalCustodyOperation, OriginalFamilyGrant, OriginalFamilyReadbackGrant, OriginalFamilyReadbackProjection, PlacementFence, StoreFence, StoreProvisioning, VerifiedWorkloadGrant, WorkloadGrantConfig, WorkloadOperation};
 
 #[derive(Clone)]
 pub struct Secret(Zeroizing<String>);

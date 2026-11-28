@@ -268,6 +268,8 @@ pub enum Guard {
     RetainedStoreBasis { basis: Basis },
     StoreWriter { incarnation: [u8; 16], fence: StoreWriterFence },
     SetStoreWriter { incarnation: [u8; 16], fence: StoreWriterFence },
+    ClaimStoreWriter { incarnation: [u8; 16], fence: StoreWriterFence, attempt: [u8; 16] },
+    StoreWriterGeneration { incarnation: [u8; 16], fence: StoreWriterFence, generation: u64, claim: [u8; 16] },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +570,7 @@ const PRUNED_STORE_CHECKPOINT_VERSION: u8 = 10;
 const FENCED_STORE_CHECKPOINT_VERSION: u8 = 11;
 const TIMED_STORE_RECORD_VERSION: u8 = 12;
 const TIMED_STORE_CHECKPOINT_VERSION: u8 = 12;
+const STORE_WRITER_GENERATION_CHECKPOINT_VERSION: u8 = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TimedStoreEvidence {
@@ -1175,6 +1178,7 @@ impl TransactState {
     }
 
     fn checkpoint_version<'a>(index: &BranchIndex, receipts: impl Iterator<Item = &'a StoredReceipt>) -> u8 {
+        if index.has_store_writer_generations() { return STORE_WRITER_GENERATION_CHECKPOINT_VERSION; }
         let floor_version = if index.has_store_writer_fence() {
             FENCED_STORE_CHECKPOINT_VERSION
         } else if index.store_history_floor() > 0 {
@@ -1419,14 +1423,14 @@ impl TransactState {
         } else {
             request.custody_request_digest.unwrap_or_else(|| Sha256::digest(canonical_request.as_bytes()).into())
         };
-        if let Some((incarnation, fence)) = request.store_writer_change() {
+        if let Some(command) = request.store_writer_change() {
             if authority.is_some() || workload.is_some() || funded_request || hold.is_some()
                 || request.custody_request_digest.is_some()
-                || canonical_request != Transact::set_store_writer(incarnation, fence).canonical_request()?
+                || canonical_request != command.transaction().canonical_request()?
             {
                 return Err(store_append_shape());
             }
-            return store_writer::resolve_change(view, request, incarnation, fence, position, now, fingerprint, canonical_request);
+            return store_writer::resolve_change(view, request, command, position, now, fingerprint, canonical_request);
         }
         let stored = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key));
         if let Some(stored) = stored && appointment.is_none() {
@@ -1619,7 +1623,9 @@ impl TransactState {
         timed_store: Option<TimedStoreEvidence>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         let (guards, writer) = match request.guards.split_last() {
-            Some((Guard::StoreWriter { incarnation, fence }, guards)) => (guards, Some((*incarnation, *fence))),
+            Some((Guard::StoreWriterGeneration { incarnation, fence, generation, claim }, guards)) =>
+                (guards, Some((*incarnation, *fence, *generation, *claim))),
+            Some((Guard::StoreWriter { incarnation, fence }, guards)) => (guards, Some((*incarnation, *fence, 0, [0; 16]))),
             _ => (request.guards.as_slice(), None),
         };
         let (read_guards, retained_basis) = match guards.split_last() {
@@ -2029,6 +2035,13 @@ impl TransactState {
             {
                 return Err(invalid_record());
             }
+            if let BranchEffect::ClaimStoreWriter { incarnation, fence, attempt } = &effect
+                && (receipt_namespace != Some(store_writer::receipt_namespace())
+                    || receipt.key != Transact::claim_store_writer(*incarnation, *fence, *attempt).key
+                    || receipt.outcome != Outcome::Then || workload.is_some() || *attempt == [0; 16])
+            {
+                return Err(invalid_record());
+            }
             if let BranchEffect::NativeDependentCustody(order) = &effect {
                 if receipt_namespace != Some(native_checkpoint_namespace())
                     || receipt.key != dependent_custody_key(order)
@@ -2131,7 +2144,8 @@ impl Guard {
             Self::Version { branch, .. } | Self::CountAtMost { branch, .. } if branch != MAIN_BRANCH =>
                 Err(funding_invalid()),
             Self::Unwritten { .. } | Self::RetainedStoreBasis { .. }
-            | Self::StoreWriter { .. } | Self::SetStoreWriter { .. } => Err(funding_invalid()),
+            | Self::StoreWriter { .. } | Self::SetStoreWriter { .. } | Self::ClaimStoreWriter { .. }
+            | Self::StoreWriterGeneration { .. } => Err(funding_invalid()),
             _ => self.evaluate(history.index(), reading, claims, None),
         }
     }
@@ -2173,7 +2187,8 @@ impl Guard {
             Self::CountAtMost { branch, range, .. } => view(branch)?.count_at_most(range, time),
             Self::Unwritten { range, since } => Ok(index.view(MAIN_BRANCH, At::Latest, Layer::Merged, time)?
                 .store_written_since(range, *since)?.is_none()),
-            Self::RetainedStoreBasis { .. } | Self::StoreWriter { .. } | Self::SetStoreWriter { .. } => Err(store_append_shape()),
+            Self::RetainedStoreBasis { .. } | Self::StoreWriter { .. } | Self::SetStoreWriter { .. }
+            | Self::ClaimStoreWriter { .. } | Self::StoreWriterGeneration { .. } => Err(store_append_shape()),
         }
     }
 }

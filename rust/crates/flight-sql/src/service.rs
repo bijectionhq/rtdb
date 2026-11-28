@@ -48,7 +48,7 @@ pub(crate) struct Inner {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store, StoreRead,
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store, StoreRead, StoreWriter,
     #[cfg(feature = "multi")]
     StoreTimedAppend,
 }
@@ -56,7 +56,7 @@ enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1
 impl CallKind {
     fn requires_store_release(self) -> bool {
         match self {
-            Self::Store | Self::StoreRead => true,
+            Self::Store | Self::StoreRead | Self::StoreWriter => true,
             #[cfg(feature = "multi")]
             Self::StoreTimedAppend => true,
             _ => false,
@@ -360,7 +360,9 @@ impl Service {
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
-                let allowed = if grant.is_store_grant() {
+                let allowed = if grant.is_placement_fence() {
+                    matches!(kind, CallKind::Handshake | CallKind::StoreWriter)
+                } else if grant.is_store_grant() {
                     kind.allows_store_grant()
                 } else if grant.is_original_private_replay() {
                     matches!(kind, CallKind::Handshake | CallKind::V1OriginalPrivateReplay)
@@ -483,7 +485,7 @@ impl Service {
                 caller.principal.authorize_database(attachment.name(), DatabaseAccess::Read).map_err(status)?;
                 Some(attachment)
             } else if let Some(grant) = caller.principal.workload_grant()
-                .filter(|grant| grant.is_original_family_readback() || grant.is_original_private_replay())
+                .filter(|grant| grant.is_original_family_readback() || grant.is_original_private_replay() || grant.is_placement_fence())
             {
                 Some(catalog.database(grant.database()).map_err(status)?)
             } else if catalog.is_placed() {
@@ -506,7 +508,7 @@ impl Service {
             }
             let store_release = if store_handshake {
                 if caller.principal.label_scope().is_some()
-                    || caller.principal.workload_grant().is_some_and(|grant| !grant.is_store_grant())
+                    || caller.principal.workload_grant().is_some_and(|grant| !grant.is_store_grant() && !grant.is_placement_fence())
                     || (self.follower_only() || fresh_replica) && placement.is_none()
                 {
                     return Err(Status::permission_denied("This credential or route does not serve the store contract"));
@@ -647,7 +649,7 @@ impl FlightService for Service {
             && !call.session.fresh_replica && !self.follower_only();
         let fenced_append = call.minted && call.session.caller.verified_credential
             && call.session.caller.principal.label_scope().is_none()
-            && call.session.caller.principal.workload_grant().is_none_or(|grant| grant.is_store_grant())
+            && call.session.caller.principal.workload_grant().is_none_or(|grant| grant.is_store_grant() || grant.is_placement_fence())
             && !call.session.fresh_replica && !self.follower_only();
         #[cfg(feature = "multi")]
         let timed_append = call.session.timed_store_incarnation;
@@ -664,7 +666,7 @@ impl FlightService for Service {
             reply.metadata_mut().insert("x-rtdb-store-retained-basis", tonic::metadata::MetadataValue::from_static("1"));
         }
         if fenced_append {
-            reply.metadata_mut().insert(crate::v1::WRITER_FENCE_HEADER, tonic::metadata::MetadataValue::from_static("1"));
+            reply.metadata_mut().insert(crate::v1::WRITER_FENCE_HEADER, tonic::metadata::MetadataValue::from_static("2"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());
@@ -821,6 +823,7 @@ impl FlightService for Service {
                 crate::v1::original_family_landing::private_replay::ACTION => CallKind::V1OriginalPrivateReplay,
                 crate::v1::TRANSACT => CallKind::V1Appointment,
                 name if crate::v1::is_store_reader_action(name) => CallKind::StoreRead,
+                name if crate::v1::is_store_writer_action(name) => CallKind::StoreWriter,
                 name if crate::v1::is_store_action(name) => CallKind::Store,
                 _ => CallKind::V1Action,
             };

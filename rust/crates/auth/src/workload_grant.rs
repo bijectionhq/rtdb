@@ -260,6 +260,23 @@ struct Claim<'a> {
     original_family_readback: Option<OriginalFamilyReadbackGrant>,
     store_fence: Option<StoreFence>,
     store_provisioning: Option<StoreProvisioning>,
+    placement_fence: Option<PlacementFence>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "role", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PlacementFence {
+    Close { epoch: u64 },
+    Claim { epoch: u64, assignment: [u8; 16] },
+}
+
+impl PlacementFence {
+    fn valid(self) -> bool {
+        match self {
+            Self::Close { epoch } => epoch > 0,
+            Self::Claim { epoch, assignment } => epoch > 0 && assignment != [0; 16],
+        }
+    }
 }
 
 /// Bijection's managed placement fence (grant version 6): `rtdb.store.v1`
@@ -324,6 +341,7 @@ enum Permission {
     OriginalFamilyReadback { scope: Box<OriginalFamilyReadbackGrant>, point: Point },
     FundedAppointment { scope: Box<FundedAppointmentScope>, point: Point },
     Store(Box<StoreGrant>),
+    PlacementFence(PlacementFence),
 }
 
 impl VerifiedWorkloadGrant {
@@ -350,7 +368,18 @@ impl VerifiedWorkloadGrant {
             return Err(invalid_grant());
         }
         let store_grant_fields = ["operations", "authority", "original_custody", "original_family", "original_family_readback"];
-        let permission = if matches!(claim.version, 6 | 7) {
+        let permission = if claim.version == 8 {
+            let fence = claim.placement_fence.filter(|fence| fence.valid()).ok_or_else(invalid_grant)?;
+            if config.assignment().is_none() || config.original_family || config.original_family_readback
+                || !store_grant_fields.iter().chain(["store_fence", "store_provisioning"].iter())
+                    .all(|field| claim_field_absent(raw, field))
+            {
+                return Err(invalid_grant());
+            }
+            Permission::PlacementFence(fence)
+        } else if !claim_field_absent(raw, "placement_fence") {
+            return Err(invalid_grant());
+        } else if matches!(claim.version, 6 | 7) {
             let grant = match (claim.version, claim.store_fence, claim.store_provisioning) {
                 (6, Some(fence), None) if claim_field_absent(raw, "store_provisioning") => StoreGrant::Fence(fence),
                 (7, None, Some(provisioning)) if claim_field_absent(raw, "store_fence") =>
@@ -443,7 +472,22 @@ impl VerifiedWorkloadGrant {
 
     pub(super) fn is_assignment_issued(&self) -> bool {
         self.is_assignment() || self.is_original_custody_control() || self.is_funded_appointment()
-            || self.is_store_grant()
+            || self.is_store_grant() || self.is_placement_fence()
+    }
+
+    pub fn is_placement_fence(&self) -> bool {
+        matches!(self.permission, Permission::PlacementFence(_))
+    }
+
+    pub fn admit_placement_fence(
+        &self, database: &str, incarnation: [u8; 16], requested: PlacementFence, now: Timestamp,
+    ) -> Result<()> {
+        if !matches!(self.permission, Permission::PlacementFence(fence) if fence == requested)
+            || self.database != database || self.incarnation != incarnation
+        {
+            return Err(invalid_grant());
+        }
+        self.revalidate(now)
     }
 
     /// A store grant (a placement fence or a provisioning grant):
@@ -588,7 +632,7 @@ impl VerifiedWorkloadGrant {
 
     pub(super) fn memory_bytes(&self) -> usize {
         self.database.capacity() + match &self.permission {
-            Permission::Create(_) | Permission::OriginalCustody(_) => 0,
+            Permission::Create(_) | Permission::OriginalCustody(_) | Permission::PlacementFence(_) => 0,
             Permission::Store(grant) => grant.scope().memory_bytes(),
             Permission::Assignment { .. } | Permission::OriginalFamily { .. } | Permission::FundedAppointment { .. } => 8192,
             Permission::OriginalFamilyReadback { .. } => 16 * 1024,
@@ -661,6 +705,45 @@ mod tests {
     }
 
     #[test]
+    fn placement_fence_grants_admit_only_the_named_close_or_assignment_claim() {
+        let incarnation = [1; 16];
+        let assignment = [3; 16];
+        let epoch = 2;
+        let identity = WorkloadGrantConfig::new("assignment".into(), "assignment-".into()).unwrap();
+        let issuer = identity.clone().with_assignment(
+            Point::new("public.writer", "authority".into(), Timestamp(0)).unwrap(),
+        );
+        let verify = |raw: &serde_json::Value, config: &WorkloadGrantConfig| VerifiedWorkloadGrant::from_userinfo(
+            raw, "https://assignment.example.invalid/", config, "controller", Timestamp(100), Timestamp(0),
+        );
+        let mut raw = json!({
+            "version": 8, "audience": "assignment", "database": "exact", "incarnation": incarnation,
+            "grant_id": ([2; 16]), "expires_at_micros": 80,
+            "placement_fence": { "role": "claim", "epoch": epoch, "assignment": assignment }
+        });
+        let claim = PlacementFence::Claim { epoch, assignment };
+        let close = PlacementFence::Close { epoch };
+        let grant = verify(&raw, &issuer).unwrap();
+        assert!(grant.is_placement_fence() && grant.is_assignment_issued());
+        assert!(!grant.is_store_grant());
+        assert!(grant.admit_store("exact", incarnation, Timestamp(0)).is_err());
+        assert!(grant.admit_placement_fence("exact", incarnation, claim, Timestamp(0)).is_ok());
+        assert!(grant.admit_placement_fence("exact", incarnation, close, Timestamp(0)).is_err());
+        assert!(grant.admit_placement_fence("other", incarnation, claim, Timestamp(0)).is_err());
+        assert!(grant.admit_placement_fence("exact", [8; 16], claim, Timestamp(0)).is_err());
+        assert!(grant.admit_placement_fence("exact", incarnation, claim, Timestamp(80)).is_err());
+        assert!(grant.admit_placement_fence("exact", incarnation, PlacementFence::Claim { epoch, assignment: [9; 16] }, Timestamp(0)).is_err());
+        assert!(verify(&raw, &identity).is_err());
+
+        raw["placement_fence"] = json!({ "role": "close", "epoch": epoch });
+        let grant = verify(&raw, &issuer).unwrap();
+        assert!(grant.admit_placement_fence("exact", incarnation, close, Timestamp(0)).is_ok());
+        assert!(grant.admit_placement_fence("exact", incarnation, claim, Timestamp(0)).is_err());
+        raw["store_provisioning"] = serde_json::Value::Null;
+        assert!(verify(&raw, &issuer).is_err());
+    }
+
+    #[test]
     fn a_store_grant_admits_only_its_database_incarnation_and_scope_from_the_assignment_issuer() {
         let incarnation = [1; 16];
         let raw = |version: u32, field: &str, grant: serde_json::Value| {
@@ -689,6 +772,7 @@ mod tests {
             verify(&raw(7, "store_provisioning", provisioning.clone()), &assignment).unwrap(),
         ] {
             assert!(grant.is_store_grant() && grant.is_assignment_issued() && !grant.is_assignment());
+            assert!(grant.admit_placement_fence("exact", incarnation, PlacementFence::Close { epoch: 2 }, Timestamp(0)).is_err());
             let admitted = grant.admit_store("exact", incarnation, Timestamp(0)).unwrap();
             let key = [row.as_slice(), b"a"].concat();
             assert!(admitted.admits_write(&key, None));

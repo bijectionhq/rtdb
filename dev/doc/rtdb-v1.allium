@@ -222,12 +222,17 @@ surface StatelessDatabase {
         -- The Basis is part of the request's idempotency identity.
 
     @guarantee StoreWriterFence
-        -- A verified installation-wide writer orders fence changes at the same point as Store Append.
+        -- A verified installation-wide writer or exact managed placement grant orders the authorized fence action at the same point as Store Append.
         -- Each change names the current physical incarnation and a positive epoch.
-        -- The administrator may install the initial writer or close an installation at a higher epoch.
-        -- An opaque writer identity may claim the exact closed epoch.
-        -- An exact retry confirms the current fence, and a superseded or incompatible request refuses.
-        -- After the first fence, every new append requires the exact live writer identity and epoch.
+        -- A higher epoch closes the installation for that placement.
+        -- An opaque assignment may take the initial claim or claim the exact closed epoch.
+        -- The current assignment may submit a fresh claim with a distinct opaque attempt identity.
+        -- Every fresh claim receives its own increasing generation within the installation.
+        -- An exact retry confirms the current result, and a superseded or incompatible request refuses.
+        -- At most one writer generation per placement admits a new append at any order point.
+        -- A new append after fencing requires the exact current placement, generation and claim identity.
+        -- A managed close grant names one database incarnation and close epoch and admits only FenceWriter.
+        -- A managed claim grant names one database incarnation, epoch and assignment and admits only ClaimWriter.
         -- An exact retry may recover a previously ordered append receipt.
         -- Replay and checkpoints preserve the fence at their selected position.
         -- A restore to a new incarnation carries the fence epoch in the closed state.

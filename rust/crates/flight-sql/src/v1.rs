@@ -98,6 +98,10 @@ pub(crate) fn is_store_reader_action(name: &str) -> bool {
     matches!(name, store::READ | store::WATCH | store::RANK)
 }
 
+pub(crate) fn is_store_writer_action(name: &str) -> bool {
+    matches!(name, store::FENCE_WRITER | store::CLAIM_WRITER)
+}
+
 pub(crate) fn is_action(name: &str) -> bool {
     ACTIONS.contains(&name) || store::ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name == original_family_landing::ACTION || name == original_family_readback::ACTION || name == original_family_landing::private_replay::ACTION || name.starts_with("rtdb.admin.v1.")
 }

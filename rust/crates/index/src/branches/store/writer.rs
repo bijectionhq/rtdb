@@ -9,6 +9,20 @@ pub struct StoreWriterFence {
     pub writer: Option<[u8; 16]>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(in crate::branches) struct StoreWriterState {
+    pub epoch: u64,
+    pub writer: Option<[u8; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<[u8; 16]>,
+}
+
+impl StoreWriterState {
+    fn fence(self) -> StoreWriterFence {
+        StoreWriterFence { epoch: self.epoch, writer: self.writer }
+    }
+}
+
 const STALE_WRITER: &str = "rtdb.store/stale-writer";
 
 fn stale_writer() -> Anomaly {
@@ -17,16 +31,33 @@ fn stale_writer() -> Anomaly {
 
 impl BranchIndex {
     fn store_writer_fence(&self) -> Option<StoreWriterFence> {
-        self.store_writer_fences.values().next_back().copied()
+        self.store_writer_fences.values().next_back().map(|state| state.fence())
     }
 
-    pub fn require_store_writer(&self, writer: Option<([u8; 16], StoreWriterFence)>) -> Result<()> {
-        match (self.store_writer_fence(), writer) {
+    pub fn require_store_writer(&self, writer: Option<([u8; 16], StoreWriterFence, u64, [u8; 16])>) -> Result<()> {
+        match (self.store_writer_fences.iter().next_back(), writer) {
             (None, None) => Ok(()),
-            (Some(current), Some((incarnation, requested)))
-                if incarnation == self.head().basis.incarnation() && current.writer.is_some() && current == requested => Ok(()),
+            (Some((&current_generation, current)), Some((incarnation, requested, generation, claim)))
+                if incarnation == self.head().basis.incarnation() && current.writer.is_some()
+                    && current.fence() == requested && generation == current_generation && current.claim == Some(claim) => Ok(()),
             _ => Err(stale_writer()),
         }
+    }
+
+    pub fn check_store_writer_claim(&self, incarnation: [u8; 16], fence: StoreWriterFence) -> Result<()> {
+        if fence.writer.is_none_or(|assignment| assignment == [0; 16]) {
+            return Err(Anomaly::incorrect("rtdb.store/writer-assignment", "A store writer claim names its placement assignment"));
+        }
+        self.check_store_writer_fence(incarnation, fence).map(|_| ())
+    }
+
+    pub(in crate::branches) fn apply_store_writer_claim(
+        &mut self, incarnation: [u8; 16], fence: StoreWriterFence, claim: [u8; 16],
+    ) -> Result<()> {
+        self.check_store_writer_claim(incarnation, fence)?;
+        self.store_writer_fences.insert(self.head().basis.position(),
+            StoreWriterState { epoch: fence.epoch, writer: fence.writer, claim: Some(claim) });
+        Ok(())
     }
 
     pub fn check_store_writer_fence(&self, incarnation: [u8; 16], requested: StoreWriterFence) -> Result<bool> {
@@ -50,7 +81,8 @@ impl BranchIndex {
         if !self.check_store_writer_fence(incarnation, fence)? {
             return Err(Anomaly::fault("rtdb.store/writer-fence-record", "A resolved writer transition must change the fence"));
         }
-        self.store_writer_fences.insert(self.head().basis.position(), fence);
+        self.store_writer_fences.insert(self.head().basis.position(),
+            StoreWriterState { epoch: fence.epoch, writer: fence.writer, claim: None });
         Ok(())
     }
 }

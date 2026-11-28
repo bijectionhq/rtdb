@@ -65,15 +65,20 @@ The resolver checks the inclusive physical floor and the existence of that versi
 A writer detects this capability through `x-rtdb-store-retained-basis: 1` on the authenticated Flight handshake.
 A committed retry answers its original outcome. Reopening a retained basis requires current admission.
 
-`rtdb.store.v1.FenceWriter`:: Orders an installation's writer assignment on the same version line as Append.
-A verified installation-wide write credential can close the installation at a higher positive epoch, or claim the initial or exact closed epoch with an opaque 16-byte writer identity.
-An exact retry confirms the current fence without advancing the store.
-A changed incarnation, an earlier epoch or an incompatible request at the same epoch refuses.
-After installation of a fence, a new Append requires the live writer's exact epoch and identity in `writer_fence`.
+`rtdb.store.v1.FenceWriter`:: Closes the installation at a higher positive placement epoch on the same version line as Append.
+An exact retry confirms the current closed fence without advancing the store.
+
+`rtdb.store.v1.ClaimWriter`:: Orders an initial claim, a claim of the exact closed epoch, or a new claim by the current placement assignment.
+Each fresh claim names an opaque nonzero 16-byte attempt identity and earns its own monotonically increasing generation at the ordered position.
+An exact retry returns the prior generation while it remains current.
+A superseded attempt, changed incarnation, earlier epoch or incompatible assignment refuses.
+Each new Append after fencing requires the live placement epoch, assignment, generation and opaque claim identity in `writer_fence`.
 An exact retry still recovers the previously ordered append's receipt.
-The authenticated writer handshake advertises `x-rtdb-store-writer-fence: 1`.
+The authenticated writer handshake advertises `x-rtdb-store-writer-fence: 2`.
 A checkpoint preserves the fence at its selected cut, and a restored incarnation starts with that epoch closed for a new claim.
 Fence changes produce no byte-key writes or range-watch matches.
+Both control actions accept a verified installation-wide write credential or the exact managed placement fence grant for that action.
+See link:rtdb-managed-workload-grants.adoc#_placement_fence_grants[Placement fence grants].
 
 An authenticated access probe supports checking isolation at an exact placed Store endpoint.
 The caller sends the 16 incarnation bytes in the binary `x-rtdb-store-access-probe-bin` metadata of a new Flight handshake.

@@ -195,6 +195,7 @@ pub enum BranchEffect {
     ScopedHold { command: ScopedHoldCommand, observed_at: Timestamp },
     NativeDependentCustody(NativeDependentCustodyOrder),
     StoreWriterFence { incarnation: [u8; 16], fence: store::StoreWriterFence },
+    ClaimStoreWriter { incarnation: [u8; 16], fence: store::StoreWriterFence, attempt: [u8; 16] },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,7 +253,7 @@ pub struct BranchIndex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     store_history_floor: Option<u64>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
-    store_writer_fences: Map<u64, store::StoreWriterFence>,
+    store_writer_fences: Map<u64, store::StoreWriterState>,
     branches: Map<Branch, Arc<BranchData>>,
     #[serde(with = "entries")]
     catalog: Map<TableRef, Arc<Vec<(Basis, BranchTable)>>>,
@@ -306,6 +307,10 @@ impl BranchIndex {
     pub fn head(&self) -> BranchCut { self.head }
 
     pub fn has_store_writer_fence(&self) -> bool { !self.store_writer_fences.is_empty() }
+
+    pub fn has_store_writer_generations(&self) -> bool {
+        self.store_writer_fences.values().any(|state| state.claim.is_some())
+    }
 
     pub fn oldest_retained_cut(&self) -> BranchCut {
         let floor = self.classic_checkpoint.map_or(0, Basis::position).max(self.store_history_floor());
@@ -408,7 +413,7 @@ impl BranchIndex {
         let rebase = |basis: Basis| Basis::new(incarnation, basis.position());
         if self.head.basis.incarnation() != incarnation {
             self.store_writer_fences = self.store_writer_fences.values().next_back().map_or_else(Map::new, |fence| {
-                Map::unit(self.head.basis.position(), store::StoreWriterFence { writer: None, ..*fence })
+                Map::unit(self.head.basis.position(), store::StoreWriterState { writer: None, claim: None, ..*fence })
             });
         }
         self.store_sizes = Default::default();
@@ -872,6 +877,7 @@ impl BranchIndex {
             BranchEffect::ScopedHold { command, observed_at } => self.apply_scoped_hold(command, observed_at),
             BranchEffect::NativeDependentCustody(order) => self.apply_native_dependent_custody(order)?,
             BranchEffect::StoreWriterFence { incarnation, fence } => self.apply_store_writer_fence(incarnation, fence)?,
+            BranchEffect::ClaimStoreWriter { incarnation, fence, attempt } => self.apply_store_writer_claim(incarnation, fence, attempt)?,
         }
         Ok(())
     }
