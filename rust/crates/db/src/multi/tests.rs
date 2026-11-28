@@ -799,6 +799,43 @@ async fn store_watch_receipt_fences_journal_trim_through_release_and_drain() {
     assert_eq!(writer.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
 }
 
+#[tokio::test]
+async fn store_watch_receipt_survives_trim_of_controls_after_its_cut() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let old = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap().basis;
+    let current = writer.transact(&store_write(2, b"a", Some(b"new"))).await.unwrap().basis;
+
+    let reader = [1; 32];
+    let acquire = StoreVersionHoldRequest::Retain { basis: current, expires_at: Timestamp(1_000), change_history: true };
+    let StoreVersionHoldReply::Held(hold) = writer.store_version_hold(reader, acquire).await.unwrap()
+        else { panic!("expected a watch receipt"); };
+    let control = writer.fresh_history().await.unwrap().through;
+    assert!(control > current.position());
+    let active = writer.enter_held_store_watch(current, reader, hold.key).await.unwrap();
+    writer.checkpoint(Vec::new()).await.unwrap();
+    assert_eq!(writer.fresh_history().await.unwrap().after_floor, current.position());
+    writer.check_local_store_basis(current, Some(&active)).await.unwrap();
+    drop(active);
+    assert_eq!(writer.enter_local_store_watch(old).await.err().unwrap().code, "rtdb/cursor-expired");
+
+    cluster.at(200);
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    successor.tick(&live(2)).await.unwrap();
+    assert_eq!(successor.fresh_history().await.unwrap().after_floor, current.position());
+    assert_eq!(successor.store_version_hold(reader, StoreVersionHoldRequest::Reopen(hold.key)).await.unwrap(),
+        StoreVersionHoldReply::Held(hold));
+    let new = successor.transact(&store_write(3, b"a", Some(b"third"))).await.unwrap().basis;
+    let history = successor.fresh_history().await.unwrap();
+    assert_eq!(history.groups.len(), 1);
+    assert_eq!(history.groups[0].cut.basis, new);
+    let _turn = successor.enter_held_store_watch(current, reader, hold.key).await.unwrap();
+    assert!(successor.checkpoint_retained_suffix(1).await.unwrap().is_none());
+}
+
 async fn text_at(node: &mut MultiDatabase, branch: &str, id: i64) -> Option<Value> {
     let time = (node.clock)();
     let index = node.fresh_index().await.unwrap();

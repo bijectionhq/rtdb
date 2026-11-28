@@ -502,9 +502,20 @@ impl Committed {
         }
     }
 
+    /// Effects are recorded at their committing transaction basis. Control
+    /// records beyond it can be trimmed without removing another change.
+    pub(crate) fn changes_lost_through(&self, through: Lsn) -> Result<u64> {
+        let index = self.transactions.index();
+        let first_retained = Basis::new(
+            index.head().basis.incarnation(), self.coordinates.position(next(through)?)?,
+        );
+        Ok(index.before(first_retained)?.map_or(0, |cut| cut.basis.position()))
+    }
+
     pub(crate) fn retained_changes_after(&self) -> Result<u64> {
-        Ok(self.coordinates.position(Lsn(self.floor.0 - 1))?
+        Ok(self.changes_lost_through(Lsn(self.floor.0 - 1))?
             .max(self.coordinates.origin.map_or(0, |origin| origin.through))
+            .max(self.store_purge_floor)
             .max(self.transactions.index().store_history_floor()))
     }
 

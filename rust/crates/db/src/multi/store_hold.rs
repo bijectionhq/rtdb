@@ -348,8 +348,9 @@ impl MultiDatabase {
     }
 
     pub(super) fn preserves_store_watch_history(&self, through: Lsn) -> Result<bool> {
-        let through = self.state().coordinates.position(through)?;
-        Ok(!self.state().store_holds.retains_changes_before(through, self.lower())
+        let state = self.state();
+        let through = state.changes_lost_through(through)?;
+        Ok(!state.store_holds.retains_changes_before(through, self.lower())
             && !self.store_reads.retains_changes_before(through))
     }
 
