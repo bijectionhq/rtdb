@@ -300,7 +300,7 @@ surface StatelessDatabase {
         -- Standalone ordinary Store reads, writes, recovery and ordered clock slots operate independently of live funding.
 
     @guarantee RetainedFundedStatus
-        -- The issuer handles booking retries by original call identity.
+        -- The original Bijection Kernel handles booking retries by original call identity.
         -- Keyed status reads committed receipts through the current binding and the caller's admitted scope.
         -- When the current receipt retains authorized DecisionClock metadata, Receipt field 9 carries it for the matching owner.
         -- Scoped responses use the projected predecessor and omit the clock numbers.

@@ -490,14 +490,17 @@ Portable restore refuses version 11 transaction checkpoints from that import pat
 
 ### Lineage and funded settlement
 
-This section describes the target design.
+Authenticated RTDB recovery publishes the surviving application lineage and can export proofs of its contents.
 Unknown-tail publication permanently fences the discarded suffix from the surviving lineage.
 An isolated predecessor quorum can still commit previously staged bytes outside that lineage.
 
 Commissioned funded dispatch remains fenced.
-For a future funded dispatch, an issuer enrolls for the exact activation authority, database, binding and receiver certificate.
-The issuer deduplicates bookings and records each append authorization before dispatch, binding the original stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
+The original Kernel still needs to bind each exact timed append to its booking and stage before dispatch, consume lineage proofs after recovery, and update the original task and obligation fates.
+The authorization binds the application catalog, original stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
 The receiver clock supplies the journal clock scale, and the source quorum authenticates the durable timing bound.
+The current Store path orders the Kernel's commit window and reports the application version.
+A plain Store receipt alone leaves a predecessor authorization pending.
+For an included record at the authorized position that matches the append's identity, missing timing evidence also leaves the authorization pending.
 
 The activation authority publishes one segment when it selects the surviving history of a predecessor incarnation and installs the successor binding.
 The publication names the exact application catalog and stream, the signed application head, the inclusive segment end, the successor and the previous lineage publication.
@@ -508,16 +511,16 @@ For a lossless recovery, select the segment end returned by the source quorum se
 For `accept-unknown-tail`, use the verified cut installed from the selected archive.
 An authenticated archive binds the original catalog and its signed head to the cut and preserves access to the proof material independently of the source cell.
 A successor's binding anchors its committed installation so a later recovery cut includes the previously selected history.
-Recovery publishes the segment without calling the issuer and carries the committed receipts in the selected cut to the successor.
+Recovery publishes the segment from the verified application cut and carries its committed receipts to the successor.
 An authenticated control binding requires an authenticated source cut and a committed installation on an authenticated destination journal for every recovery.
 Existing legacy control bindings continue to use ordinary recovery and their legacy archives.
 
 Use `rtdb multi-activation lineage-proof` with direct control-catalog reader credentials and the predecessor incarnation and revision to export the publication and its control inclusion.
-The issuer verifies the publication's inclusion in the control catalog and the application's inclusion against the head root identified by the segment.
-Pin the root of each catalog and verify its signed history to resolve the quorum keys for the head.
+Once the settlement path is connected, the original Kernel verifies the publication's inclusion in the control catalog and the application's inclusion against the head root identified by the segment.
+The Kernel pins both catalog roots and verifies the signed history that identifies the quorum keys for each head.
 Use `rtdb multi-backup lineage-inclusion --archive FILE --catalog-root HEX --position N` to export an application inclusion from a saved portable cut without the source keepers.
 For capture, verify a timed leaf at the authorized position that matches the authorization in full and binds a quorum durability bound strictly before the cutoff.
-For release, verify that the published segment of the authorized stream ends before the position, or that a different leaf occupies the position within that segment.
+For release, verify that the published segment of the authorized stream ends before the position, or that a different record occupies the position within that segment.
 For example, a replacement writer can fill an abandoned position, and an authorized leaf above the selected cut can exist in the old stream while remaining outside the published lineage.
 Until publication, even a verified timed leaf leaves the authorization pending.
 Checkpoint replacement and trim preserve proofs, and retirement preserves a proof archive that can be checked offline.
@@ -526,7 +529,7 @@ RTDB retains committed ordinary receipts by their original retry identity as par
 An authenticated cut carries terminal ordinary DecisionClock receipts and clears reusable offers.
 Legacy appointment receipts, scoped receipts and protected custody require their own portable transfer.
 Use `TxStatus` with the current binding and admitted receipt scope to read a retained receipt.
-The issuer retains the booking and the decision to capture or release even if the authorized transaction has no committed RTDB receipt.
+The original Kernel retains the booking and settles capture or release through its task and obligation fates, including when the authorized transaction has no committed RTDB receipt.
 
 A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
 Drive the same recovery through lost replies and process restart, prove the selected versions and keys stay usable with the verifier offline, and verify that supersession or publication settles only the selected operation's hold.

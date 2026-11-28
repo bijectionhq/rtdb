@@ -484,6 +484,11 @@ contract KernelFundedAdmission {
         -- Binding the slot to a delivery orders the matching obligation and once identity in the Kernel's inbox commit.
         -- RTDB orders and seals the store append for the offered slot, and provides proofs against the published lineage.
 
+    @invariant KernelBindsTimedDispatch
+        -- The Kernel records each append authorization against its original booking and stage before dispatch and before the exclusive decision cutoff.
+        -- The authorization identifies the application catalog, stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
+        -- Exact retries reuse the original booking and authorization, and a changed request for the same stage conflicts.
+
     @invariant StandaloneAdmission
         -- Ordinary reads, writes, recovery and ordered clock slots remain available independently of the Kernel.
         -- A live funded call without a reachable Kernel fails at admission with Unavailable and rtdb/funding-kernel-unavailable.
@@ -500,15 +505,8 @@ contract KernelFundedAdmission {
         -- A predecessor authorization remains pending until the Kernel verifies its inclusion or exclusion in the published lineage.
 }
 
-contract OriginalFundedAdmission {
-    @invariant IssuerOwnsBooking
-        -- Commissioning enrolls an original booking issuer for an exact activation authority, database name, serving binding and receiver certificate.
-        -- The issuer durably orders each booking before returning its receipt or authorizing an accepting stage.
-        -- Before dispatch, the authorization binds the booking and stage to the commissioned stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
-        -- The issuer records an authorization only before its exclusive decision cutoff.
-        -- Exact retries reuse the original booking and authorization, and a changed request for the same stage conflicts.
-
-    @invariant LineageIsTheLedger
+contract PublishedLineageEvidence {
+    @invariant PublishedPrefixes
         -- A database's lineage is the chain of journal segments selected by the activation authority.
         -- Each segment binds its database, predecessor binding, original stream, authenticated head, inclusive end and successor binding to the preceding publication.
         -- Logkeeper authenticates the records committed in each stream and their quorum durability bounds.
@@ -517,13 +515,15 @@ contract OriginalFundedAdmission {
         -- Each successor's installation anchors the inherited prefix, and any later cut includes that installation.
 
     @invariant CaptureRequiresPublishedInclusion
-        -- The issuer captures an authorization exactly once after verifying inclusion of its exact timed leaf within the published segment for that stream.
+        -- The original Kernel captures a predecessor authorization exactly once after verifying inclusion of its exact timed leaf in the published segment.
         -- The leaf binds a quorum durability bound strictly before the authorized journal cutoff.
-        -- Inclusion in an application head alone leaves the authorization pending.
+        -- An application head alone leaves the authorization pending.
+        -- A plain Store append receipt records the application version and leaves a predecessor authorization pending until the Kernel obtains settlement evidence.
+        -- An included record at the authorized position with matching identity and missing timing evidence leaves the authorization pending.
 
     @invariant ReleaseRequiresPublishedExclusion
-        -- The issuer releases an authorization exactly once when the published segment for its stream ends before its position or proves inclusion of a different leaf at that position within the segment.
-        -- A replacement writer's different leaf at the authorized position excludes the authorization once that position survives in a published segment.
+        -- The original Kernel releases a predecessor authorization exactly once when the published segment ends before its position or proves that a different record occupies the authorized position.
+        -- The Kernel records capture or release through the original booking's task and obligation fates.
         -- A verified terminal segment excludes its discarded suffix and all later commits to the predecessor from every successor.
 
     @invariant ProofsOutliveTrim
@@ -531,16 +531,14 @@ contract OriginalFundedAdmission {
         -- A recoverable cut makes its signed head and the proof material for that head available independently of its source keepers.
         -- Retirement archives the material needed to produce inclusion and consistency proofs.
 
-    @invariant VerificationPinsOnlyTheCatalogRoot
-        -- The issuer verifies application and control catalog signatures offline from each catalog's pinned root and signed catalog history.
+    @invariant VerificationPinsCatalogRoots
+        -- The original Kernel verifies application and control catalog signatures from each catalog's pinned root and signed catalog history.
         -- Leaf inclusion binds the exact stream and position to the verified head and the publication binds the selected application head to the database lineage.
         -- Leader movement, keeper replacement and key rotation preserve verification for issued heads.
 
-    @invariant RecoveryIsFundingAgnostic
-        -- The activation authority seals or selects a cut, verifies the successor and publishes the segment without consulting the issuer.
+    @invariant RecoveryPublishesApplicationHistory
+        -- The activation authority seals or selects a cut, verifies the successor and publishes the segment from the application evidence.
         -- The successor inherits the effects and committed receipts at that cut under their original retry identities.
-        -- The issuer owns booking identity and capture or release, and RTDB owns application effects and receipts.
-        -- Commissioned funded dispatch remains fenced.
 }
 
 contract Directory {
@@ -4637,7 +4635,7 @@ surface TerminalStorageMaintenance {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Which original funded issuer will be installed, and how will RTDB enroll and authenticate its authorizations?"
+open question "How does the original Kernel obtain and durably bind the exact timed append authorization for an RTDB Store booking?"
 
 open question "What does an idle RTDB database cost in memory today, and what is the least it can be made to cost?"
     -- resident_idle_target_bytes is a target, not a measurement.
