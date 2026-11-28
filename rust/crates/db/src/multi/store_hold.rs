@@ -14,22 +14,29 @@ const MAX_HOLD_MICROS: i64 = 3_600_000_000;
 /// The original attachment still needs its final delivery check.
 pub struct StoreReadTurn {
     basis: Basis,
-    _owner: Arc<()>,
+    epoch: u64,
+    generation: u64,
+    owner: Arc<()>,
 }
 
 impl StoreReadTurn {
     pub fn basis(&self) -> Basis { self.basis }
+
+    pub fn same_writer(&self, other: &Self) -> bool {
+        self.basis.incarnation() == other.basis.incarnation()
+            && self.epoch == other.epoch && self.generation == other.generation
+    }
 }
 
 #[derive(Default)]
 pub(super) struct StoreReads(Vec<(Basis, Weak<()>)>);
 
 impl StoreReads {
-    fn add(&mut self, basis: Basis) -> StoreReadTurn {
+    fn add(&mut self, basis: Basis, epoch: u64, generation: u64) -> StoreReadTurn {
         self.reap();
         let owner = Arc::new(());
         self.0.push((basis, Arc::downgrade(&owner)));
-        StoreReadTurn { basis, _owner: owner }
+        StoreReadTurn { basis, epoch, generation, owner }
     }
 
     fn reap(&mut self) {
@@ -154,9 +161,9 @@ impl MultiDatabase {
     pub async fn enter_local_store_read(&mut self, at: At) -> Result<Option<StoreReadTurn>> {
         self.refresh().await?;
         self.require_active()?;
-        if self.authority().is_err() {
+        let Ok(writer) = self.authority() else {
             return Ok(None);
-        }
+        };
         let state = self.state();
         let index = self.durable_transactions().index();
         if index.has_custody_groups() || index.has_visibility_history() {
@@ -173,7 +180,27 @@ impl MultiDatabase {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
                 "The requested basis precedes the admitted Store floor"));
         }
-        Ok(Some(self.store_reads.add(basis)))
+        let generation = state.generation;
+        Ok(Some(self.store_reads.add(basis, writer.epoch.0, generation)))
+    }
+
+    pub(super) async fn require_local_store_turn(&mut self, basis: Basis, turn: &StoreReadTurn) -> Result<()> {
+        let writer = self.authority()?;
+        let owner = Arc::downgrade(&turn.owner);
+        if basis != turn.basis || writer.epoch.0 != turn.epoch || self.state().generation != turn.generation
+            || !self.store_reads.0.iter().any(|(at, active)| *at == basis && active.ptr_eq(&owner))
+        {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.store/stale-read-turn",
+                "The Store read belongs to a different writer turn"));
+        }
+        let head = self.state().head;
+        // A successor can fence the original writer before appending a
+        // record. Confirm the original seal in addition to the byte floor.
+        let sealed = self.stream.seal(writer.epoch).await.map_err(|error| self.mutation_failed(error))?;
+        if sealed > head || !self.stream.immutable_history() && sealed != head {
+            return Err(prefix_unsettled());
+        }
+        self.require_authority(writer)
     }
 
     pub(super) async fn store_version_hold(

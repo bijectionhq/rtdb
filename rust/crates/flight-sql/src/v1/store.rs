@@ -136,19 +136,26 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
             let batch = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation).await?;
             {
                 let mut oldest = self.oldest.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
+                #[cfg(feature = "multi")]
+                {
+                    let mut held = self.hold.lock().map_err(|_| Status::internal("Rank retention state is unavailable"))?;
+                    if oldest.is_some() && (held.is_some() != batch.hold.is_some()
+                        || held.as_ref().zip(batch.hold.as_ref()).is_some_and(|(prior, turn)| !prior.same_writer(turn)))
+                    {
+                        return Err(Status::unavailable("The Store writer changed during rank").into());
+                    }
+                    if let Some(turn) = batch.hold
+                        && held.as_ref().is_none_or(|prior| turn.basis() < prior.basis())
+                    {
+                        *held = Some(turn);
+                    }
+                }
                 *oldest = Some(oldest.map_or(batch.basis, |prior| prior.min(batch.basis)));
             }
             #[cfg(feature = "multi")]
             if let Some(delivery) = batch.delivery {
                 let mut admitted = self.delivery.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
                 include_delivery(&mut admitted, delivery)?;
-            }
-            #[cfg(feature = "multi")]
-            if let Some(turn) = batch.hold {
-                let mut held = self.hold.lock().map_err(|_| Status::internal("Rank retention state is unavailable"))?;
-                if held.as_ref().is_none_or(|prior| turn.basis() < prior.basis()) {
-                    *held = Some(turn);
-                }
             }
             let at = store_read::store::Version(batch.basis.position());
             let pages = batch.pages.into_iter().map(|page| store_read::source::RangePage {
@@ -320,12 +327,17 @@ impl Service {
     async fn check_local_store_reply(
         &self, driver: &dyn rtdb_node::serving::ServingDriver, basis: Basis,
         cancellation: &tokio_util::sync::CancellationToken,
+        #[cfg(feature = "multi")] turn: Option<&rtdb_node::serving::StoreReadTurn>,
     ) -> Result<(), Status> {
         #[cfg(feature = "multi")]
         if self.follower().is_some() {
             return Ok(());
         }
-        driver.check_local_store_basis(basis, cancellation).await.map_err(error::anomaly)
+        driver.check_local_store_basis(
+            basis, cancellation,
+            #[cfg(feature = "multi")]
+            turn,
+        ).await.map_err(error::anomaly)
     }
 
     async fn store_read(&self, call: &Call, request: proto::ReadRequest) -> Result<Vec<u8>, Status> {
@@ -359,7 +371,7 @@ impl Service {
         let clock = self.0.node.now();
         let batch = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation).await?;
         #[cfg(feature = "multi")]
-        let _hold = batch.hold;
+        let hold = batch.hold;
         let pages = batch.pages.into_iter().map(|page| proto::RangePage {
             entries: page.entries.into_iter().map(|entry| proto::Entry {
                 key: entry.key, value: entry.value, written: entry.written.position(),
@@ -374,7 +386,11 @@ impl Service {
         }.encode_to_vec();
         #[cfg(feature = "multi")]
         self.check_follower_store_reply(batch.delivery, &call.cancellation).await?;
-        self.check_local_store_reply(driver, batch.basis, &call.cancellation).await?;
+        self.check_local_store_reply(
+            driver, batch.basis, &call.cancellation,
+            #[cfg(feature = "multi")]
+            hold.as_ref(),
+        ).await?;
         self.check_attachment(call, &database)?;
         Ok(reply)
     }
@@ -560,7 +576,7 @@ impl Service {
         let mut after = Basis::new(incarnation, request.after);
         let original = after;
         #[cfg(feature = "multi")]
-        let _hold = if self.follower().is_none() {
+        let hold = if self.follower().is_none() {
             driver.enter_local_store_read(At::Exactly(original), &call.cancellation).await.map_err(error::anomaly)?
         } else {
             None
@@ -610,7 +626,11 @@ impl Service {
         }.encode_to_vec();
         #[cfg(feature = "multi")]
         self.check_follower_store_reply(delivery, &call.cancellation).await?;
-        self.check_local_store_reply(driver, original, &call.cancellation).await?;
+        self.check_local_store_reply(
+            driver, original, &call.cancellation,
+            #[cfg(feature = "multi")]
+            hold.as_ref(),
+        ).await?;
         self.check_attachment(call, &database)?;
         Ok(reply)
     }
@@ -648,8 +668,14 @@ impl Service {
         self.check_follower_store_reply(
             source.delivery.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))?, &call.cancellation,
         ).await?;
+        #[cfg(feature = "multi")]
+        let hold = source.hold.into_inner().map_err(|_| Status::internal("Rank retention state is unavailable"))?;
         if let Some(oldest) = source.oldest.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))? {
-            self.check_local_store_reply(driver, oldest, &call.cancellation).await?;
+            self.check_local_store_reply(
+                driver, oldest, &call.cancellation,
+                #[cfg(feature = "multi")]
+                hold.as_ref(),
+            ).await?;
         }
         self.check_attachment(call, &database)?;
         Ok(reply)

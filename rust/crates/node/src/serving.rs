@@ -439,7 +439,10 @@ pub trait ServingDriver: Send + Sync {
 
     /// Revalidate a materialized Store reply before release. Routes without
     /// an ordered Store floor have no further floor check.
-    async fn check_local_store_basis(&self, _basis: Basis, _cancellation: &CancellationToken) -> Result<()> {
+    async fn check_local_store_basis(
+        &self, _basis: Basis, _cancellation: &CancellationToken,
+        #[cfg(feature = "multi")] _turn: Option<&StoreReadTurn>,
+    ) -> Result<()> {
         Ok(())
     }
 

@@ -750,13 +750,16 @@ impl MultiDatabase {
     }
 
     /// The final byte reply must still admit its oldest consulted basis.
-    pub async fn check_local_store_basis(&mut self, basis: Basis) -> Result<()> {
+    pub async fn check_local_store_basis(&mut self, basis: Basis, turn: Option<&StoreReadTurn>) -> Result<()> {
         self.refresh().await?;
         self.require_active()?;
-        let state = self.state();
         if basis.incarnation() != self.incarnation() {
             return Err(Anomaly::incorrect("rtdb/foreign-basis", "The basis belongs to another database incarnation"));
         }
+        if let Some(turn) = turn {
+            self.require_local_store_turn(basis, turn).await?;
+        }
+        let state = self.state();
         state.require_retained_store_delivery(&self.stream, basis).await?;
         self.check_generation(state.generation).await
     }

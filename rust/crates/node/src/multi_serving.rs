@@ -1008,10 +1008,10 @@ impl ServingDriver for MultiServing {
         }).await
     }
 
-    async fn check_local_store_basis(&self, basis: Basis, cancellation: &CancellationToken) -> Result<()> {
+    async fn check_local_store_basis(&self, basis: Basis, cancellation: &CancellationToken, turn: Option<&StoreReadTurn>) -> Result<()> {
         self.serve(async {
             cancellation.run_until_cancelled(async {
-                self.database.lock().await.check_local_store_basis(basis).await
+                self.database.lock().await.check_local_store_basis(basis, turn).await
             }).await.ok_or_else(interrupted)?
         }).await
     }
@@ -1587,7 +1587,7 @@ mod tests {
         };
         let original = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
-        writer.check_local_store_basis(original.cut.basis, &cancellation).await.unwrap();
+        writer.check_local_store_basis(original.cut.basis, &cancellation, None).await.unwrap();
         let (original, delivery) = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
         assigned.check_store_delivery(&delivery, &cancellation).await.unwrap();
@@ -1606,6 +1606,9 @@ mod tests {
         assert!(writer.supports_store_purge_floor().await);
         let active = writer.enter_local_store_read(At::Exactly(first), &cancellation).await.unwrap().unwrap();
         assert_eq!(active.basis(), first);
+        writer.check_local_store_basis(first, &cancellation, Some(&active)).await.unwrap();
+        assert_eq!(writer.check_local_store_basis(floor, &cancellation, Some(&active)).await.unwrap_err().code,
+            "rtdb.store/stale-read-turn");
         let retained = writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
             .await.unwrap_err();
         assert_eq!(retained.code, "rtdb.store/purge-retention");
@@ -1613,8 +1616,8 @@ mod tests {
         writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
             .await.unwrap();
 
-        assert_eq!(writer.check_local_store_basis(first, &cancellation).await.unwrap_err().code, "rtdb/cursor-expired");
-        writer.check_local_store_basis(floor, &cancellation).await.unwrap();
+        assert_eq!(writer.check_local_store_basis(first, &cancellation, None).await.unwrap_err().code, "rtdb/cursor-expired");
+        writer.check_local_store_basis(floor, &cancellation, None).await.unwrap();
 
         let expired = assigned.check_store_delivery(&delivery, &cancellation).await.unwrap_err();
         assert_eq!(expired.code, "rtdb/cursor-expired");
