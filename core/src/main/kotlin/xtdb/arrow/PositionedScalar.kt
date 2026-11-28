@@ -28,8 +28,9 @@ class PositionedScalar private constructor(private val reader: Vector, private v
             read(reader, index, keepPosition = false)
         }
 
-        private fun read(reader: VectorReader, index: Int, keepPosition: Boolean): Any? {
+        private tailrec fun read(reader: VectorReader, index: Int, keepPosition: Boolean): Any? {
             val source = VectorReader.unwrapRenamed(reader)
+            if (source is IndirectVector) return read(source.inner, source.sourceIndex(index), keepPosition)
             if (source !is MonoVector) return reader.getObject(index, SNAKE_CASE_STRING)
 
             if (source.isNull(index)) return null

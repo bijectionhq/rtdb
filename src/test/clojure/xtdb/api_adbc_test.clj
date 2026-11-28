@@ -15,7 +15,7 @@
            (java.time ZoneId)
            (org.antlr.v4.runtime ParserRuleContext)
            (xtdb.api.error Incorrect)
-           (xtdb.arrow Relation RelationReader VectorReader)
+           (xtdb.arrow PositionedScalar Relation RelationReader VectorReader)
            (xtdb.query PlanCacheKey)
            (xtdb.tx TxOp$PatchDocs TxOp$PutDocs TxWriter)))
 
@@ -136,6 +136,30 @@
          :put-docs (TxOp$PutDocs/openFromRows al "public" "docs" docs vf vt)
          :patch-docs (TxOp$PatchDocs/openFromRows al "public" "docs" docs vf vt))))
    (sql/sql->static-ops sql args)))
+
+(deftest prepared-static-dml-copies-gathered-argument-positions
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (let [al (.getAllocator conn)
+          sql "INSERT INTO docs (_id, title) VALUES (?, ?)"
+          open-gathered-args (fn []
+                               (util/with-close-on-catch [args (vw/open-args al [1 "one"] [2 "skip"] [3 "three"])]
+                                 (.select args (int-array [2 0 2]))))]
+      (util/with-open [expected (with-open [args (open-gathered-args)]
+                                  (open-row-static-ops al sql args time/utc))
+                       actual (with-open [args (open-gathered-args)]
+                                (t/is (instance? PositionedScalar (PositionedScalar/read (.vectorFor args "?_1") 0)))
+                                (sql/sql->tx-ops sql args al time/utc {}))]
+        (t/is (seq actual))
+        (t/is (= (TxWriter/toArrowBytes expected al)
+                 (TxWriter/toArrowBytes actual al))))
+
+      (with-open [stmt (.createStatement conn sql)]
+        (.prepare stmt)
+        (with-open [args (open-gathered-args)]
+          (.bind stmt args))
+        (.executeUpdate stmt)))
+    (t/is (= [{:xt/id 1, :title "one"} {:xt/id 3, :title "three"}]
+             (xt/q conn "SELECT _id, title FROM docs ORDER BY _id")))))
 
 (deftest prepared-static-dml-source-bytes
   (with-open [conn (xt/open-adbc-conn *node*)]

@@ -13,7 +13,9 @@ import xtdb.arrow.agg.VectorSummer
 import xtdb.util.Hasher
 import java.nio.ByteBuffer
 
-class IndirectVector(private val inner: VectorReader, private val sel: VectorIndirection) : VectorReader, LongLongVectorReader {
+class IndirectVector(internal val inner: VectorReader, private val sel: VectorIndirection) : VectorReader, LongLongVectorReader {
+    internal fun sourceIndex(idx: Int) = sel[idx]
+
     override val name: String get() = inner.name
     override val valueCount: Int get() = sel.valueCount()
     override val nullable: Boolean get() = inner.nullable
@@ -34,7 +36,7 @@ class IndirectVector(private val inner: VectorReader, private val sel: VectorInd
     override fun getAsDouble(idx: Int) = inner.getAsDouble(sel[idx])
     override fun getBytes(idx: Int): ByteBuffer = inner.getBytes(sel[idx])
     override fun getPointer(idx: Int, reuse: ArrowBufPointer) = inner.getPointer(sel[idx], reuse)
-    override fun getObject(idx: Int, keyFn: IKeyFn<*>) = inner.getObject(sel[idx], keyFn)
+    override fun getObject(idx: Int, keyFn: IKeyFn<*>) = inner.getObject(sourceIndex(idx), keyFn)
 
     override fun getLongLongHigh(idx: Int) = (inner as LongLongVectorReader).getLongLongHigh(sel[idx])
     override fun getLongLongLow(idx: Int) = (inner as LongLongVectorReader).getLongLongLow(sel[idx])
