@@ -1008,6 +1008,14 @@ impl ServingDriver for MultiServing {
         }).await
     }
 
+    async fn check_local_store_basis(&self, basis: Basis, cancellation: &CancellationToken) -> Result<()> {
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.check_local_store_basis(basis).await
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
     async fn store_sizes(&self, epoch: Option<u64>, now: Timestamp, cancellation: &CancellationToken) -> Result<StorageSizes> {
         self.serve(async {
             cancellation.run_until_cancelled(async {
@@ -1571,6 +1579,7 @@ mod tests {
         };
         let original = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
+        writer.check_local_store_basis(original.cut.basis, &cancellation).await.unwrap();
         let (original, delivery) = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
         assigned.check_store_delivery(&delivery, &cancellation).await.unwrap();
@@ -1589,6 +1598,9 @@ mod tests {
         assert!(writer.supports_store_purge_floor().await);
         writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
             .await.unwrap();
+
+        assert_eq!(writer.check_local_store_basis(first, &cancellation).await.unwrap_err().code, "rtdb/cursor-expired");
+        writer.check_local_store_basis(floor, &cancellation).await.unwrap();
 
         let expired = assigned.check_store_delivery(&delivery, &cancellation).await.unwrap_err();
         assert_eq!(expired.code, "rtdb/cursor-expired");

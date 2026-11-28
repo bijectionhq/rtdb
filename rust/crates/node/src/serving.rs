@@ -437,6 +437,12 @@ pub trait ServingDriver: Send + Sync {
         Ok(pages)
     }
 
+    /// Revalidate a materialized Store reply before release. Routes without
+    /// an ordered Store floor have no further floor check.
+    async fn check_local_store_basis(&self, _basis: Basis, _cancellation: &CancellationToken) -> Result<()> {
+        Ok(())
+    }
+
     async fn store_sizes(&self, _epoch: Option<u64>, _now: Timestamp, _cancellation: &CancellationToken) -> Result<StorageSizes> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
     }

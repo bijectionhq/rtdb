@@ -108,6 +108,7 @@ struct StoreRanges<'a> {
     incarnation: [u8; 16],
     now: rtdb_types::Timestamp,
     cancellation: &'a tokio_util::sync::CancellationToken,
+    oldest: std::sync::Mutex<Option<Basis>>,
     #[cfg(feature = "multi")]
     delivery: std::sync::Mutex<Option<rtdb_node::FollowerStoreDelivery>>,
 }
@@ -129,6 +130,10 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
                 StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false }
             });
             let batch = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation).await?;
+            {
+                let mut oldest = self.oldest.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
+                *oldest = Some(oldest.map_or(batch.basis, |prior| prior.min(batch.basis)));
+            }
             #[cfg(feature = "multi")]
             if let Some(delivery) = batch.delivery {
                 let mut admitted = self.delivery.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
@@ -296,6 +301,17 @@ impl Service {
         Ok(())
     }
 
+    async fn check_local_store_reply(
+        &self, driver: &dyn rtdb_node::serving::ServingDriver, basis: Basis,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), Status> {
+        #[cfg(feature = "multi")]
+        if self.follower().is_some() {
+            return Ok(());
+        }
+        driver.check_local_store_basis(basis, cancellation).await.map_err(error::anomaly)
+    }
+
     async fn store_read(&self, call: &Call, request: proto::ReadRequest) -> Result<Vec<u8>, Status> {
         if request.ranges.is_empty() {
             return Err(error::incorrect("A read names at least one range"));
@@ -340,6 +356,7 @@ impl Service {
         }.encode_to_vec();
         #[cfg(feature = "multi")]
         self.check_follower_store_reply(batch.delivery, &call.cancellation).await?;
+        self.check_local_store_reply(driver, batch.basis, &call.cancellation).await?;
         self.check_attachment(call, &database)?;
         Ok(reply)
     }
@@ -523,6 +540,7 @@ impl Service {
         let wait = Duration::from_millis(request.wait_millis).min(MAX_WAIT);
         let deadline = tokio::time::Instant::now() + wait;
         let mut after = Basis::new(incarnation, request.after);
+        let original = after;
         #[cfg(feature = "multi")]
         let mut delivery = None;
         let touched = loop {
@@ -568,6 +586,7 @@ impl Service {
         }.encode_to_vec();
         #[cfg(feature = "multi")]
         self.check_follower_store_reply(delivery, &call.cancellation).await?;
+        self.check_local_store_reply(driver, original, &call.cancellation).await?;
         self.check_attachment(call, &database)?;
         Ok(reply)
     }
@@ -581,6 +600,7 @@ impl Service {
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let source = StoreRanges {
             service: self, driver, scope, incarnation, now: self.0.node.now(), cancellation: &call.cancellation,
+            oldest: std::sync::Mutex::new(None),
             #[cfg(feature = "multi")]
             delivery: std::sync::Mutex::new(None),
         };
@@ -602,6 +622,9 @@ impl Service {
         self.check_follower_store_reply(
             source.delivery.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))?, &call.cancellation,
         ).await?;
+        if let Some(oldest) = source.oldest.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))? {
+            self.check_local_store_reply(driver, oldest, &call.cancellation).await?;
+        }
         self.check_attachment(call, &database)?;
         Ok(reply)
     }

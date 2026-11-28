@@ -747,6 +747,18 @@ impl MultiDatabase {
         self.follower_state(owner)?.require_retained_store_delivery(&self.stream, basis).await
     }
 
+    /// The final byte reply must still admit its oldest consulted basis.
+    pub async fn check_local_store_basis(&mut self, basis: Basis) -> Result<()> {
+        self.refresh().await?;
+        self.require_active()?;
+        let state = self.state();
+        if basis.incarnation() != self.incarnation() {
+            return Err(Anomaly::incorrect("rtdb/foreign-basis", "The basis belongs to another database incarnation"));
+        }
+        state.require_retained_store_delivery(&self.stream, basis).await?;
+        self.check_generation(state.generation).await
+    }
+
     fn follower_state(&self, owner: &Arc<()>) -> Result<&Committed> {
         if !self.assigned_follower.ptr_eq(&Arc::downgrade(owner)) || self.writer.is_some() {
             return Err(follower_unavailable());

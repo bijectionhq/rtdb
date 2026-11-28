@@ -255,6 +255,8 @@ surface StatelessDatabase {
         -- An admitted publication retains its request reservation through the ordered decision even if the Flight call ends.
         -- A successful reply names the same incarnation and the requested minimum once the durable floor covers it.
         -- The writer reclaims superseded history within that floor under its retention and checkpoint rules.
+        -- A materialized Read or Rank reply rechecks its oldest consulted byte version against the ordered floor before release.
+        -- A Watch reply checks its original cursor even when the scan visited later effect pages.
 
     @guarantee StoreVersionHold
         -- The hosted Multi writer orders exact physical Version admission and release alongside Store floor publication.
