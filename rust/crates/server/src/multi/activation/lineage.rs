@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Binding, LINEAGE_PROTOCOL, State, activation_stream_id};
+use super::{Binding, LINEAGE_PROTOCOL, activation_stream_id};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +108,26 @@ pub enum Published {
     Open(LineageFloor),
 }
 
+/// The fields of an activation record that publish lineage. The control
+/// inclusion authenticates the whole record, so a verifier ignores the
+/// fields it does not settle against, including those of later releases.
+#[derive(Deserialize)]
+struct LineageRecord {
+    version: u8,
+    binding: Binding,
+    #[serde(default)]
+    publication: Option<LineagePublication>,
+    #[serde(default)]
+    floor: Option<LineageFloor>,
+}
+
+#[derive(Deserialize)]
+struct LineagePublication {
+    predecessor: Binding,
+    #[serde(default)]
+    segment: Option<LineageSegment>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationProof {
@@ -137,7 +157,7 @@ impl PublicationProof {
         control_root: CatalogRoot,
         source: Option<StreamId>,
     ) -> Result<Published> {
-        let state = self.state(authority, database, control_root)?;
+        let state = self.record(authority, database, control_root)?;
         if state.version != LINEAGE_PROTOCOL {
             return Err(invalid("The control record is not a lineage activation record"));
         }
@@ -166,7 +186,7 @@ impl PublicationProof {
         Ok(Published::Closed(segment))
     }
 
-    fn state(&self, authority: Uuid, database: &str, control_root: CatalogRoot) -> Result<State> {
+    fn record(&self, authority: Uuid, database: &str, control_root: CatalogRoot) -> Result<LineageRecord> {
         let stream = activation_stream_id(authority, database)?;
         let leaf = self
             .control_inclusion

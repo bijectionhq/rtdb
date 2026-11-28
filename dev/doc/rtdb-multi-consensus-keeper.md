@@ -526,6 +526,7 @@ Pass `--through` a journal position you can restore, such as the source LSN of a
 It prints the floor's control publication proof, which verifies like a lineage proof.
 A floor only grows, and publishing an equal or lower prefix returns the current floor.
 Publish floors only once every activation authority reader runs a release that reads them.
+The settlement verifier ignores activation fields it does not settle against, so it accepts records written by later releases.
 
 RTDB pins each catalog's root in its journal configuration's `catalog_root`, and refuses authenticated history without one.
 A database whose control catalog is authenticated settles against its lineage, so its application catalog must support authenticated streams.

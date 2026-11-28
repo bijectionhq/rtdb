@@ -100,7 +100,23 @@ fn leaf(at: u64) -> Leaf {
     }
 }
 
+fn activation_record(binding: Binding) -> serde_json::Value {
+    serde_json::json!({
+        "version": LINEAGE_PROTOCOL,
+        "lineage_base_version": 2,
+        "binding": binding,
+        "grants_closed": false,
+        "grants_end": null,
+        "retired": [],
+        "publication": null,
+    })
+}
+
 fn publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
+    publication_with(source, |_| ())
+}
+
+fn publication_with(source: &Archive, amend: impl FnOnce(&mut serde_json::Value)) -> (PublicationProof, CatalogRoot) {
     let control_stream = activation_stream_id(AUTHORITY, DATABASE).unwrap();
     let source_head = source.signed_head.head;
     let segment = LineageSegment {
@@ -115,15 +131,14 @@ fn publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
         end: Lsn(source_head.size),
         previous: None,
     };
-    let mut state = serde_json::to_value(State::initial(SUCCESSOR.incarnation)).unwrap();
-    state["version"] = LINEAGE_PROTOCOL.into();
-    state["binding"] = serde_json::to_value(SUCCESSOR).unwrap();
+    let mut state = activation_record(SUCCESSOR);
     state["publication"] = serde_json::json!({
         "operation": Uuid::from_u128(8),
         "predecessor": PREDECESSOR,
         "manifest_digest": Vec::from([1u8; 32]),
         "segment": segment,
     });
+    amend(&mut state);
     let control_record = serde_json::to_vec(&state).unwrap();
     let control = archive(
         CONTROL,
@@ -340,6 +355,17 @@ fn lineage_rejects_substituted_publication_and_application_head() {
     );
 }
 
+#[test]
+fn lineage_proof_verifies_a_record_carrying_fields_of_a_later_release() {
+    let source = archive(SOURCE, STREAM, [leaf(1)]);
+    let (publication, control_root) = publication_with(&source, |state| {
+        state["later"] = serde_json::json!({ "field": true });
+        state["publication"]["later"] = serde_json::json!(1);
+    });
+    let segment = publication.verify(AUTHORITY, DATABASE, control_root).unwrap();
+    assert_eq!(segment.successor, SUCCESSOR);
+}
+
 fn floor_publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
     let control_stream = activation_stream_id(AUTHORITY, DATABASE).unwrap();
     let floor = LineageFloor {
@@ -347,9 +373,7 @@ fn floor_publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
         source_root: source.history.genesis.root(),
         source_head: source.signed_head.head,
     };
-    let mut state = serde_json::to_value(State::initial(PREDECESSOR.incarnation)).unwrap();
-    state["version"] = LINEAGE_PROTOCOL.into();
-    state["lineage_base_version"] = 2.into();
+    let mut state = activation_record(PREDECESSOR);
     state["floor"] = serde_json::to_value(floor).unwrap();
     let control_record = serde_json::to_vec(&state).unwrap();
     let control = archive(
