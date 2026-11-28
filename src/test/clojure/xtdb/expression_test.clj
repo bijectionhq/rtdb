@@ -489,6 +489,33 @@
       '(cond p (concat a "!") 4) false
       '(octet_length (cond p (concat a "!"))) false)))
 
+(t/deftest coalesce-projects-the-first-non-null-result
+  (with-open [rel (tu/open-rel {:a ["" nil nil nil], :b ["unused" "second" nil nil], :c [nil nil "😀" nil]})]
+    (t/is (= {:res ["" "second" "[😀]" nil], :res-type #xt/type [:? :utf8]}
+             (run-projection rel '(coalesce a b (concat "[" c "]"))))))
+  (let [form '(coalesce (cast a #xt/type :varbinary)
+                        (concat (cast b #xt/type :varbinary) (cast "ff" #xt/type :varbinary)))]
+    (with-open [rel (tu/open-rel {:a ["00" nil nil], :b ["f" "ab" nil]})]
+      (let [{:keys [res res-type]} (run-projection rel form)]
+        (t/is (= #xt/type [:? :varbinary] res-type))
+        (t/is (= [[0] [-85 -1] nil] (mapv #(some-> % expr/resolve-bytes vec) res)))))
+    (with-open [rel (tu/open-rel {:a [nil "0g"], :b ["f" "0g"]})]
+      (t/is (thrown-with-msg? DecoderException #"Odd number of characters"
+                             (run-projection rel form))))))
+
+(t/deftest coalesce-projection-writer-requires-a-plain-byte-result
+  (let [opts {:var-types {'a #xt/type [:? :utf8], 'b #xt/type [:? :utf8]}, :projection? true}
+        direct? (fn [form]
+                  (-> (expr/form->expr form opts)
+                      (#'expr/emit-row-expr opts)
+                      :continue-projection
+                      some?))]
+    (t/are [form expected] (= expected (direct? form))
+      '(coalesce a b (concat b "!")) true
+      '(coalesce 1 (concat b "!")) false
+      '(coalesce a b (concat b "!") 4) false
+      '(octet_length (coalesce a (concat b "!"))) false)))
+
 (t/deftest byte-span-projections-preserve-canonical-text-and-keyword-bytes
   (with-open [^Vector text (tu/open-vec "text" #xt/type :utf8 [])
               ^Vector kw (tu/open-vec "kw" #xt/type :keyword [])]

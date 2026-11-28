@@ -2465,6 +2465,10 @@ surface QueryAccess {
         -- Only the selected result expression is evaluated, and an absent ELSE produces null when no condition matches.
         -- Mixed result layouts and CASE values consumed by another expression use scalar evaluation.
 
+    @guarantee JvmCoalesceProjections
+        -- A JVM COALESCE projection with a plain UTF-8 or Binary result can write the selected fallback directly to the result cell.
+        -- Each reached operand is evaluated once, in order, through the first non-null value.
+
     @guarantee JvmValuesAndRecordExpressions
         -- JVM VALUES retains the order of rows and evaluates each reached cell in its existing expression order.
         -- Compatible scalar parameters and children of bound records are copied at their Arrow positions.

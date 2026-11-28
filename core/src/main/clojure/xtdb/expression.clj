@@ -638,39 +638,41 @@
                                   continue-let)}
           (wrap-boxed-poly-return opts)))))
 
-(defmethod codegen-expr :if-some [{:keys [local expr then else]} opts]
+(defmethod codegen-expr :if-some [{:keys [local expr then else ::projection-root? ::byte-projection-branch?]} opts]
   (let [{continue-expr :continue, ^VectorType expr-return-type :return-type, :as emitted-expr}
         (codegen-expr expr opts)
 
         expr-rets (set (.getLegs expr-return-type))
+        project-branches? (or projection-root? byte-projection-branch?)
+        emit-branch (fn [branch branch-opts]
+                      (codegen-expr (cond-> branch project-branches? (assoc ::byte-projection-branch? true))
+                                    branch-opts))
 
         emitted-thens (->> (for [local-type (disj expr-rets #xt/type :null)]
                              (MapEntry/create local-type
-                                              (codegen-expr then (assoc-in opts [:local-types local] local-type))))
+                                              (emit-branch then (assoc-in opts [:local-types local] local-type))))
                            (into {}))
         then-ret-type (apply types/merge-types (into [] (map :return-type) (vals emitted-thens)))
-
-        children (cons emitted-expr (vals emitted-thens))]
-
-    (-> (if-not (contains? expr-rets #xt/type :null)
-          {:return-type then-ret-type
+        emitted-else (when (contains? expr-rets #xt/type :null)
+                       (emit-branch else opts))
+        return-type (if emitted-else
+                      (types/merge-types (:return-type emitted-else) then-ret-type)
+                      then-ret-type)
+        children (cond-> (cons emitted-expr (vals emitted-thens))
+                   emitted-else (conj emitted-else))]
+    (letfn [(continue-if-some [f out]
+              (continue-expr (fn [local-type code]
+                               (if (= local-type #xt/type :null)
+                                 (continue-result emitted-else f out)
+                                 `(let [~local ~code]
+                                    ~(continue-result (get emitted-thens local-type) f out))))))]
+      (-> {:return-type return-type
            :children children
-           :continue (fn [f]
-                       (continue-expr (fn [local-type code]
-                                        `(let [~local ~code]
-                                           ~((:continue (get emitted-thens local-type)) f)))))}
-
-          (let [{e-ret-type :return-type, e-cont :continue, :as emitted-else} (codegen-expr else opts)
-                return-type (types/merge-types e-ret-type then-ret-type)]
-            {:return-type return-type
-             :children (cons emitted-else children)
-             :continue (fn [f]
-                         (continue-expr (fn [local-type code]
-                                          (if (= local-type #xt/type :null)
-                                            (e-cont f)
-                                            `(let [~local ~code]
-                                               ~((:continue (get emitted-thens local-type)) f))))))}))
-        (wrap-boxed-poly-return opts))))
+           :continue #(continue-if-some % nil)
+           :continue-projection (when (and (plain-byte-result? return-type)
+                                           (some :continue-projection children))
+                                  continue-if-some)}
+          (wrap-boxed-poly-return opts)))))
 
 (defmulti codegen-call
   "Expects a map containing the expression and:
