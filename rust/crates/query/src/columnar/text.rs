@@ -1,12 +1,16 @@
 use std::{fmt::Write, mem::size_of, sync::Arc};
 
-use arrow_array::{Array, StringArray, builder::StringBuilder};
+use arrow_array::{
+    Array, NullArray, StringArray,
+    builder::{ListBuilder, StringBuilder},
+};
+use arrow_schema::DataType;
 use rtdb_columnar::MemoryReservation;
 use rtdb_expr::kernels::{
     identifier_needs_quotes, literal_replace_length, text_overlay_edges, text_substring, text_trim,
 };
 use rtdb_plan::{Expr, Schema};
-use rtdb_types::{AnomalyKind, LogicalType, Result, ScalarType, Value};
+use rtdb_types::{AnomalyKind, ListKind, LogicalType, Result, ScalarType, Value};
 
 use super::{
     Column, ColumnBatch,
@@ -148,10 +152,17 @@ pub(super) fn column(
     batch: &ColumnBatch,
     execution: &Execution,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    if plain_scalar(output) != Some(&ScalarType::Utf8) || batch.len == 0 {
+    if batch.len == 0 {
         return Ok(None);
     }
     let result = match expr {
+        Expr::Call { name, args, .. }
+            if name.eq_ignore_ascii_case("parse_ident")
+                || name.eq_ignore_ascii_case("parse-ident") =>
+        {
+            parse_ident(args, output, schema, batch, execution)
+        }
+        _ if plain_scalar(output) != Some(&ScalarType::Utf8) => return Ok(None),
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("str") => {
             concatenate(args, Some, schema, batch, execution)
         }
@@ -168,6 +179,115 @@ pub(super) fn column(
     match result {
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
         result => result,
+    }
+}
+
+fn parse_ident(
+    args: &[Expr],
+    output: &LogicalType,
+    schema: &Schema,
+    batch: &ColumnBatch,
+    execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let [source] = args else {
+        return Ok(None);
+    };
+    let output = match output {
+        LogicalType::Maybe(inner) => inner.as_ref(),
+        output => output,
+    };
+    if !matches!(output, LogicalType::List { kind: ListKind::List, element }
+        if **element == LogicalType::Scalar(ScalarType::Utf8))
+    {
+        return Ok(None);
+    }
+    let Some(source) = TextInput::bind_text(source, schema, batch, execution) else {
+        return Ok(None);
+    };
+
+    let context = &execution.context;
+    let mut present = 0;
+    let mut items = 0usize;
+    let mut payload = 0usize;
+    for row in 0..batch.len {
+        context.check_cancelled_at(row)?;
+        let Some(cell) = source.text(row) else {
+            return Ok(None);
+        };
+        let Some(cell) = cell else { continue };
+        if !cell.is_ascii() {
+            return Ok(None);
+        }
+        for (index, part) in cell.split('.').enumerate() {
+            context.check_cancelled_at(index)?;
+            if part.is_empty() || part.starts_with('"') {
+                return Ok(None);
+            }
+            items = items.checked_add(1).ok_or_else(size_error)?;
+            payload = payload.checked_add(part.len()).ok_or_else(size_error)?;
+        }
+        if i32::try_from(items).is_err() || i32::try_from(payload).is_err() {
+            return Ok(None);
+        }
+        present += 1;
+    }
+
+    if present == 0 {
+        let charge = context.memory.reserve(1024)?;
+        return finish(observed_scalar_column(NullArray::new(batch.len))?, charge).map(Some);
+    }
+    let bound = batch
+        .len
+        .checked_add(items)
+        .and_then(|offsets| offsets.checked_add(2))
+        .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
+        .and_then(|bytes| bytes.checked_add(payload))
+        .and_then(|bytes| bytes.checked_add(batch.len.div_ceil(8) + 1024))
+        .ok_or_else(size_error)?;
+    let charge = context.memory.reserve(bound)?;
+    let logical = if present == batch.len {
+        output.clone()
+    } else {
+        output.clone().maybe()
+    };
+    let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+    let DataType::List(item) = field.data_type() else {
+        unreachable!("PARSE_IDENT produces a list of text");
+    };
+    let strings = StringBuilder::with_capacity(items, payload);
+    let mut builder = ListBuilder::with_capacity(strings, batch.len).with_field(Arc::clone(item));
+    for row in 0..batch.len {
+        context.check_cancelled_at(row)?;
+        match source.text(row) {
+            Some(Some(cell)) => {
+                for (index, part) in cell.split('.').enumerate() {
+                    context.check_cancelled_at(index)?;
+                    append_ascii_lowercase(builder.values(), part);
+                }
+                builder.append(true);
+            }
+            Some(None) => builder.append(false),
+            None => return Ok(None),
+        }
+    }
+    let column = Column::Arrow {
+        array: Arc::new(builder.finish()),
+        field,
+        logical: Some(logical),
+    };
+    finish(column, charge).map(Some)
+}
+
+fn append_ascii_lowercase(builder: &mut StringBuilder, part: &str) {
+    if part.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        for byte in part.bytes() {
+            builder
+                .write_char(char::from(byte.to_ascii_lowercase()))
+                .expect("Writing into a StringBuilder only appends bytes");
+        }
+        builder.append_value("");
+    } else {
+        builder.append_value(part);
     }
 }
 
@@ -465,7 +585,7 @@ fn project_with_context<'a>(
         .and_then(|bytes| bytes.checked_add(payload))
         .and_then(|bytes| bytes.checked_add(rows.div_ceil(8) + 1024))
         .ok_or_else(size_error)?;
-    let mut charge = context.memory.reserve(bound)?;
+    let charge = context.memory.reserve(bound)?;
     let mut builder = StringBuilder::with_capacity(rows, payload);
     for row in 0..rows {
         context.check_cancelled_at(row)?;
@@ -479,7 +599,13 @@ fn project_with_context<'a>(
             None => return Ok(None),
         }
     }
-    let column = observed_scalar_column(builder.finish())?;
+    finish(observed_scalar_column(builder.finish())?, charge).map(Some)
+}
+
+fn finish(
+    column: Column,
+    mut charge: Arc<MemoryReservation>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
     let bytes = owned_projection_bytes(&column)?;
     let reservation = Arc::get_mut(&mut charge).expect("The text writer owns its reservation");
     if bytes <= reservation.bytes() {
@@ -487,5 +613,5 @@ fn project_with_context<'a>(
     } else {
         reservation.grow_to(bytes)?;
     }
-    Ok(Some((column, charge)))
+    Ok((column, charge))
 }

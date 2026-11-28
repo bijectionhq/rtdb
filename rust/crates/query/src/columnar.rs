@@ -6155,6 +6155,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_ident_writes_ordered_arrow_parts_and_observed_nulls() {
+        use arrow_array::ListArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let batch = |cells: &[Option<&str>]| {
+            ColumnBatch::settled(vec![Column::Arrow {
+                array: Arc::new(StringArray::from_iter(cells.iter().copied())),
+                field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+                logical: Some(input.data_type.clone()),
+            }], cells.len(), memory.reserve(4096).unwrap()).unwrap()
+        };
+        let args = vec![input.expression()];
+        let expression = Expr::Call {
+            name: "parse_ident".into(),
+            return_type: rtdb_plan::function_type_with_args("parse_ident", &args).unwrap(),
+            args,
+        };
+        let mut cursor = record_projection_cursor(
+            batch(&[Some("Foo.BAR_2"), None, Some("select"), Some("a\"b.Mixed")]),
+            schema.clone(), vec![expression.clone()], &memory,
+        );
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let Column::Arrow { array, field, .. } = &page.columns[0] else { panic!("Expected a packed list"); };
+        let DataType::List(child) = field.data_type() else { panic!("Expected a text list field"); };
+        assert!(field.is_nullable());
+        assert_eq!(child.data_type(), &DataType::Utf8);
+        assert!(!child.is_nullable());
+        let lists = array.as_any().downcast_ref::<ListArray>().unwrap();
+        let parts = lists.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(lists.value_offsets(), &[0, 2, 2, 3, 5]);
+        assert!(lists.is_null(1));
+        assert_eq!(parts.iter().collect::<Vec<_>>(), [
+            Some("foo"), Some("bar_2"), Some("select"), Some("a\"b"), Some("mixed"),
+        ]);
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        assert!(page.column_reservation(0).bytes() >= owned_projection_bytes(&page.columns[0]).unwrap());
+        drop((page, cursor));
+        assert_eq!(memory.used_bytes(), 0);
+
+        let mut cursor = record_projection_cursor(batch(&[None]), schema, vec![expression], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(&page.columns[0], Column::Arrow { array, .. } if array.data_type() == &DataType::Null));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn parse_ident_keeps_quoted_unicode_and_first_reached_parse_errors() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let batch = |cells: &[Option<&str>]| {
+            ColumnBatch::settled(vec![Column::Arrow {
+                array: Arc::new(StringArray::from_iter(cells.iter().copied())),
+                field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+                logical: Some(input.data_type.clone()),
+            }], cells.len(), memory.reserve(4096).unwrap()).unwrap()
+        };
+        let args = vec![input.expression()];
+        let expression = Expr::Call {
+            name: "parse_ident".into(),
+            return_type: rtdb_plan::function_type_with_args("parse_ident", &args).unwrap(),
+            args,
+        };
+        let mut cursor = record_projection_cursor(
+            batch(&[None, Some("\"MiX\".\"a\"\"b\".ABC"), Some("ΟΣ.名")]),
+            schema.clone(), vec![expression.clone()], &memory,
+        );
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let list = |parts: &[&str]| Value::list(parts.iter().map(|part| Value::Utf8((*part).into())).collect());
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Null);
+        assert_eq!(page.columns[0].value(1).unwrap(), list(&["MiX", "a\"b", "abc"]));
+        assert_eq!(page.columns[0].value(2).unwrap(), list(&["ος", "名"]));
+
+        let cases = [
+            (["a..b", "\"unterminated"], "xtdb.expression/zero-length-identifier"),
+            (["\"unterminated", "a..b"], "xtdb.expression/unterminated-quoted-identifier"),
+        ];
+        for ([first, second], code) in cases {
+            let mut cursor = record_projection_cursor(
+                batch(&[None, Some("ok.part"), Some(first), Some(second)]),
+                schema.clone(), vec![expression.clone()], &memory,
+            );
+            assert_eq!(cursor.next_batch().await.err().unwrap().code, code);
+        }
+    }
+
+    #[tokio::test]
     async fn text_substring_reads_small_signed_controls_and_preserves_character_bounds() {
         use arrow_array::{Int8Array, Int16Array};
 
