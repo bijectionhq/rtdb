@@ -775,6 +775,7 @@ value CommitOpts {
     --                   A reusable SQL retry key has separate stored receipt identities for separate hour buckets.
     --                   Lookup covers the current and previous buckets and checks the exclusive expiry.
     --                   A typed metadata association names one ordinary record or an exact record in the submitting owner's Root.
+    --                   A Binary Root association uses the complete tagged handle for the linked put and subsequent erasure.
     --                   Its payload is retained only when the transaction commits a put for that record without erasing it.
     --                   An ordered record erase erases its associated metadata in the same commit.
     --                   The installed catalog determines retention even when a query selects an earlier system time.

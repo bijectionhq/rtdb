@@ -4282,7 +4282,10 @@ impl<'a> OpenTransaction<'a> {
             let linked = match &unit {
                 Some(MetadataErasureUnit::Table { table, id }) => Some((table.clone(), id.iid(), None)),
                 Some(MetadataErasureUnit::Owned { relation, id }) => self.options.user.as_deref()
-                    .filter(|owner| !owner.is_empty()).map(|owner| (relation.table(owner), id.iid(), Some(id.handle_bytes()))),
+                    .filter(|owner| !owner.is_empty()).map(|owner| {
+                        let (iid, handle) = id.iid_and_handle();
+                        (relation.table(owner), iid, Some(handle))
+                    }),
                 None => None,
             };
             let mut retained = StructFields::new();
@@ -5442,6 +5445,70 @@ mod tests {
     struct NoRoleChecks;
     impl TransactionAuthorization for NoRoleChecks {
         fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { panic!("unexpected role check") }
+    }
+
+    #[test]
+    fn replayed_owned_binary_metadata_keeps_the_exact_receipt_link_and_window() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            footprint_grants: Default::default(), decision_clock: None,
+            write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None,
+            world_constraints: None, database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let relation = rtdb_types::OwnedRelation::new("records")?;
+        let table = relation.table("owner");
+        let bytes = vec![0, 0xfe, 0xff];
+        let id = rtdb_types::EntityId::Binary(bytes.clone());
+        let metadata = Value::Struct(StructFields::from([("rtdb_erasure_unit_v1".into(), Value::Struct(StructFields::from([
+            ("owned_relation".into(), Value::Utf8(relation.name().into())),
+            ("id".into(), Value::Binary(bytes)),
+        ])))]));
+        let source = SourceTransaction::new(vec![], SubmitOptions {
+            user: Some("owner".into()), user_metadata: Some(UserMetadata::new(metadata.clone(), &memory)?),
+            ..Default::default()
+        }, &memory)?;
+        let encoded = source.encode()?;
+        let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice())?.unwrap();
+        let replayed = SourceTransaction::decode(&message, &memory)?;
+        assert_eq!(source.body_digest()?, replayed.body_digest()?);
+        let user_metadata = replayed.options.user_metadata.as_ref().unwrap();
+        let Some(crate::values::MetadataErasureUnit::Owned { id: crate::values::MetadataOwnedId::Binary(borrowed), .. }) = user_metadata.erasure_unit()? else {
+            panic!("Expected a borrowed Binary metadata association");
+        };
+        let Some(Value::Binary(payload)) = user_metadata.value().field("rtdb_erasure_unit_v1").and_then(|unit| unit.field("id")) else {
+            panic!("Expected the retained Binary metadata cell");
+        };
+        assert_eq!(borrowed.as_ptr(), payload.as_ptr());
+
+        let snapshot = rtdb_index::PartitionState::empty(Default::default())?.snapshot();
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(99) };
+        let observed = Timestamp(100);
+        for matching in [true, false] {
+            let mut tx = OpenTransaction::new(snapshot.clone(), key, &replayed.options, &context)?;
+            let handle = if matching { id.handle_bytes() } else { rtdb_types::EntityId::Binary(vec![0]).handle_bytes() };
+            tx.buffer.append(table.clone(), StoredEvent {
+                position: None, origin: None, commit_position: 0, entity_key: Some(handle.into()), iid: id.iid(),
+                system_from: key.system_time, valid_time: Interval::ALL, recency: None,
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])),
+            })?;
+            tx.write_result(&TransactionResult::Committed { tx_key: key }, Some(user_metadata), Some(Timestamp(98)), observed)?;
+            let writes = tx.buffer.stage()?;
+            let receipt = writes.tables().get(&receipts_table());
+            assert_eq!(receipt.is_some(), matching);
+            if let Some(receipt) = receipt {
+                let event = receipt.batch().unwrap().view().read_event(0)?;
+                assert_eq!(event.valid_time, interval(observed, Timestamp(observed.0 + RECEIPT_WINDOW_MICROS))?);
+                let StoredOperation::Put(row) = event.operation else { panic!("Expected a retained receipt"); };
+                assert_eq!(row.get("user_metadata"), Some(&metadata));
+                assert_eq!(row.get(retention::METADATA_ERASURE_UNIT),
+                    Some(&Value::Utf8(retention::metadata_erasure_key(&table, id.iid(), Some(&id.handle_bytes())))));
+            }
+        }
+        Ok(())
     }
 
     struct CapturingWriter {

@@ -1283,13 +1283,35 @@ impl EntityIds {
     pub fn ids(&self) -> &[EntityId] { &self.ids }
 }
 
-pub(crate) enum MetadataErasureUnit {
+pub(crate) enum MetadataErasureUnit<'a> {
     Table { table: TableRef, id: EntityId },
-    Owned { relation: rtdb_types::OwnedRelation, id: EntityId },
+    Owned { relation: rtdb_types::OwnedRelation, id: MetadataOwnedId<'a> },
 }
 
-impl MetadataErasureUnit {
-    fn parse(value: &Value) -> Result<Option<Self>> {
+pub(crate) enum MetadataOwnedId<'a> {
+    Binary(&'a [u8]),
+    Scalar(EntityId),
+}
+
+impl MetadataOwnedId<'_> {
+    pub(crate) fn iid_and_handle(&self) -> (rtdb_types::Iid, Vec<u8>) {
+        match self {
+            Self::Binary(bytes) => {
+                let id = rtdb_columnar::EntityIdRef::Binary(bytes);
+                let mut integer = [0; 8];
+                let (tag, payload) = id.handle_parts(&mut integer);
+                let mut handle = Vec::with_capacity(payload.len() + 1);
+                handle.push(tag);
+                handle.extend_from_slice(payload);
+                (id.iid(), handle)
+            }
+            Self::Scalar(id) => (id.iid(), id.handle_bytes()),
+        }
+    }
+}
+
+impl<'a> MetadataErasureUnit<'a> {
+    fn parse(value: &'a Value) -> Result<Option<Self>> {
         let Value::Struct(metadata) = value else { return Ok(None); };
         let Some(target) = metadata.get("rtdb_erasure_unit_v1") else { return Ok(None); };
         let invalid = || Anomaly::incorrect("rtdb.tx/metadata-erasure-unit",
@@ -1298,21 +1320,21 @@ impl MetadataErasureUnit {
         if fields.len() != 2 { return Err(invalid()); }
         let id = fields.get("id").ok_or_else(invalid)?;
         let target = (fields.get("table"), fields.get("owned_relation"));
-        let id = if matches!(target, (None, Some(Value::Utf8(_)))) {
-            id.owned_entity_id()?
-        } else {
-            id.entity_id()?
-        };
+        if let (None, Some(Value::Utf8(relation))) = target {
+            let id = match id {
+                Value::Binary(bytes) => MetadataOwnedId::Binary(bytes),
+                id => MetadataOwnedId::Scalar(id.entity_id()?),
+            };
+            let relation = rtdb_types::OwnedRelation::new(relation)?;
+            if !relation.is_root_data() { return Err(invalid()); }
+            return Ok(Some(Self::Owned { relation, id }));
+        }
+        let id = id.entity_id()?;
         let unit = match target {
             (Some(Value::Utf8(table)), None) => {
                 let table = TableRef::parse(table)?;
                 if crate::source::is_reserved_write_schema(&table.schema) { return Err(invalid()); }
                 Self::Table { table, id }
-            }
-            (None, Some(Value::Utf8(relation))) => {
-                let relation = rtdb_types::OwnedRelation::new(relation)?;
-                if !relation.is_root_data() { return Err(invalid()); }
-                Self::Owned { relation, id }
             }
             _ => return Err(invalid()),
         };
@@ -1332,7 +1354,7 @@ impl UserMetadata {
     }
     pub fn value(&self) -> &Value { &self.value }
 
-    pub(crate) fn erasure_unit(&self) -> Result<Option<MetadataErasureUnit>> { MetadataErasureUnit::parse(self.value()) }
+    pub(crate) fn erasure_unit(&self) -> Result<Option<MetadataErasureUnit<'_>>> { MetadataErasureUnit::parse(self.value()) }
 }
 
 #[derive(Clone, Debug)]
