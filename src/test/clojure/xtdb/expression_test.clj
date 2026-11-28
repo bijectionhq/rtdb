@@ -451,6 +451,44 @@
       (t/is (= #xt/type :varbinary res-type))
       (t/is (= [0 -128 4 9 0 -128 8 5] (vec (expr/resolve-bytes (first res))))))))
 
+(t/deftest searched-case-projects-only-the-selected-text-branch
+  (with-open [rel (tu/open-rel {:p [true false nil false true],
+                               :q [true true false nil true],
+                               :a ["é" "aaaaa" "unused" nil nil]})]
+    (t/is (= {:res [">é<" "界界a" nil nil nil], :res-type #xt/type [:? :utf8]}
+             (run-projection rel '(cond p (concat ">" a "<") q (replace a "aa" "界")))))
+    (t/is (= {:res [">é<" 4 4 4 nil], :res-type #xt/type #{:utf8 :i64 :null}}
+             (run-projection rel '(cond p (concat ">" a "<") 4))))))
+
+(t/deftest simple-case-preserves-binary-layout-and-reached-decoder-errors
+  (let [form '(case n
+                1 (concat (cast a #xt/type :varbinary) (cast "ff" #xt/type :varbinary))
+                2 (cast a #xt/type :varbinary))]
+    (with-open [rel (tu/open-rel {:n [1 2 3 nil 1], :a ["00" "ab" "f" "0g" nil]})]
+      (let [{:keys [res res-type]} (run-projection rel form)]
+        (t/is (= #xt/type [:? :varbinary] res-type))
+        (t/is (= [[0 -1] [-85] nil nil nil] (mapv #(some-> % expr/resolve-bytes vec) res))))
+      (t/is (= {:res [2 1 nil nil nil], :res-type #xt/type [:? :i32]}
+               (run-projection rel (list 'octet_length form)))))
+    (with-open [rel (tu/open-rel {:n [3 2 1], :a ["0g" "f" "0g"]})]
+      (t/is (thrown-with-msg? DecoderException #"Odd number of characters"
+                             (run-projection rel form))))))
+
+(t/deftest case-projection-writer-requires-a-plain-byte-result
+  (let [opts {:var-types {'p #xt/type :bool, 'a #xt/type :utf8}, :projection? true}
+        direct? (fn [form]
+                  (-> (expr/form->expr form opts)
+                      (#'expr/emit-row-expr opts)
+                      :continue-projection
+                      some?))]
+    (t/are [form expected] (= expected (direct? form))
+      '(cond p (concat a "!")) true
+      '(case p true (concat a "!")) true
+      '(cond p (replace a "aa" "界")) true
+      '(case p true (cast a #xt/type :varbinary)) true
+      '(cond p (concat a "!") 4) false
+      '(octet_length (cond p (concat a "!"))) false)))
+
 (t/deftest byte-span-projections-preserve-canonical-text-and-keyword-bytes
   (with-open [^Vector text (tu/open-vec "text" #xt/type :utf8 [])
               ^Vector kw (tu/open-vec "kw" #xt/type :keyword [])]

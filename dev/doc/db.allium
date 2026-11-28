@@ -2456,6 +2456,13 @@ surface QueryAccess {
         -- A JVM binary-to-text cast can write lowercase hex with the existing backslash-x prefix and binary extent.
         -- Direct writes preserve the result layout, null slots, and the order of reached operand errors.
 
+    @guarantee JvmCaseProjections
+        -- A JVM CASE projection with a plain UTF-8 or Binary result can write the selected branch directly to the result cell.
+        -- Simple CASE evaluates its operand once per row.
+        -- Searched CASE evaluates conditions in order until one is true.
+        -- Only the selected result expression is evaluated, and an absent ELSE produces null when no condition matches.
+        -- Mixed result layouts and CASE values consumed by another expression use scalar evaluation.
+
     @guarantee JvmValuesAndRecordExpressions
         -- JVM VALUES retains the order of rows and evaluates each reached cell in its existing expression order.
         -- Compatible scalar parameters and children of bound records are copied at their Arrow positions.

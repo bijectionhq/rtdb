@@ -582,38 +582,60 @@
   (codegen-expr {:op :variable, :variable param, :rel args-sym, :idx 0}
                 {:var-types {param (get param-types param)}}))
 
-(defmethod codegen-expr :if [{:keys [pred then else]} opts]
-  (let [{p-cont :continue, :as emitted-p} (codegen-expr {:op :call, :f :boolean, :args [pred]} opts)
-        {t-ret :return-type, t-cont :continue, :as emitted-t} (codegen-expr then opts)
-        {e-ret :return-type, e-cont :continue, :as emitted-e} (codegen-expr else opts)
+(defn- plain-byte-result? [^VectorType return-type]
+  (and (not (instance? VectorType$Poly return-type))
+       (#{#xt.arrow/type :utf8 #xt.arrow/type :varbinary} (.getArrowType return-type))
+       (= return-type (.getUnencoded return-type))))
+
+(defn- continue-result [{:keys [continue continue-projection]} f out]
+  (if (and out continue-projection)
+    (continue-projection f out)
+    (continue f)))
+
+(defmethod codegen-expr :if [{:keys [pred then else ::projection-root? ::byte-projection-branch?]} opts]
+  (let [project-branches? (or projection-root? byte-projection-branch?)
+        emit-branch (fn [branch]
+                      (codegen-expr (cond-> branch project-branches? (assoc ::byte-projection-branch? true)) opts))
+        {p-cont :continue, :as emitted-p} (codegen-expr {:op :call, :f :boolean, :args [pred]} opts)
+        {t-ret :return-type, :as emitted-t} (emit-branch then)
+        {e-ret :return-type, :as emitted-e} (emit-branch else)
         return-type (types/merge-types t-ret e-ret)]
-    (-> {:return-type return-type
-         :children [emitted-p emitted-t emitted-e]
-         :continue (fn [f]
-                     `(if ~(p-cont (fn [_ code] code))
-                        ~(t-cont f)
-                        ~(e-cont f)))}
-        (wrap-boxed-poly-return opts))))
+    (letfn [(continue-if [f out]
+              `(if ~(p-cont (fn [_ code] code))
+                 ~(continue-result emitted-t f out)
+                 ~(continue-result emitted-e f out)))]
+      (-> {:return-type return-type
+           :children [emitted-p emitted-t emitted-e]
+           :continue #(continue-if % nil)
+           :continue-projection (when (and (plain-byte-result? return-type)
+                                           (some :continue-projection [emitted-t emitted-e]))
+                                  continue-if)}
+          (wrap-boxed-poly-return opts)))))
 
 (defmethod codegen-expr :local [{:keys [local]} {:keys [local-types]}]
   (let [return-type (get local-types local)]
     {:return-type return-type
      :continue (fn [f] (f return-type local))}))
 
-(defmethod codegen-expr :let [{:keys [local expr body]} opts]
+(defmethod codegen-expr :let [{:keys [local expr body ::projection-root? ::byte-projection-branch?]} opts]
   (let [{^VectorType local-return-type :return-type, continue-expr :continue, :as emitted-expr} (codegen-expr expr opts)
+        body (cond-> body (or projection-root? byte-projection-branch?) (assoc ::byte-projection-branch? true))
         emitted-bodies (->> (for [local-type (.getLegs local-return-type)]
                               (MapEntry/create local-type
                                                (codegen-expr body (assoc-in opts [:local-types local] local-type))))
                             (into {}))
         return-type (apply types/merge-types (into [] (map :return-type) (vals emitted-bodies)))]
-    (-> {:return-type return-type
-         :children (cons emitted-expr (vals emitted-bodies))
-         :continue (fn [f]
-                     (continue-expr (fn [local-type code]
-                                      `(let [~local ~code]
-                                         ~((:continue (get emitted-bodies local-type)) f)))))}
-        (wrap-boxed-poly-return opts))))
+    (letfn [(continue-let [f out]
+              (continue-expr (fn [local-type code]
+                               `(let [~local ~code]
+                                  ~(continue-result (get emitted-bodies local-type) f out)))))]
+      (-> {:return-type return-type
+           :children (cons emitted-expr (vals emitted-bodies))
+           :continue #(continue-let % nil)
+           :continue-projection (when (and (plain-byte-result? return-type)
+                                           (some :continue-projection (vals emitted-bodies)))
+                                  continue-let)}
+          (wrap-boxed-poly-return opts)))))
 
 (defmethod codegen-expr :if-some [{:keys [local expr then else]} opts]
   (let [{continue-expr :continue, ^VectorType expr-return-type :return-type, :as emitted-expr}
@@ -658,7 +680,7 @@
     * `:return-type` (VectorType)
     * optional `:valid-utf8?` when all non-null results are valid UTF-8
     * optional `:->write-code` :: plain-output, emitted-args -> code
-      for a root call writing one cell to a plain projection result.
+      for a call writing one cell directly to a plain projection result.
       The writer is a VariableWidthVector for UTF-8 or Binary, a KeywordVector for Keyword, or a ListVector for List.
     and one of the following
     * for monomorphic return types: `:->call-code` :: emitted-args -> code
@@ -768,7 +790,7 @@
              (contains? (nth ea 1) :literal))
         (coerce 1 0)))))
 
-(defn- codegen-call* [{:keys [f emitted-args ::projection-root?] :as expr}]
+(defn- codegen-call* [{:keys [f emitted-args ::projection-root? ::byte-projection-branch?] :as expr}]
   (let [shortcut-null? (shortcut-null-args? f)
 
         all-arg-types (reduce (fn [acc {:keys [^VectorType return-type]}]
@@ -820,7 +842,8 @@
                            (vals emitted-calls))
        :children (vals emitted-calls)
        :continue #(continue-call-expr % nil)
-       :continue-projection (when (and projection-root?
+       :continue-projection (when (and (or projection-root?
+                                          (and byte-projection-branch? (plain-byte-result? return-type)))
                                        (not (instance? VectorType$Poly return-type))
                                        (some :->write-code (vals emitted-calls)))
                               continue-call-expr)})))
@@ -1634,7 +1657,7 @@
                  (build-args-then-call [])))})
 
 ;; concat is not a simple mono-call, as it permits a variable number of arguments so we can avoid intermediate alloc
-(defn- codegen-concat [{:keys [emitted-args ::projection-root?] :as expr}]
+(defn- codegen-concat [{:keys [emitted-args ::projection-root? ::byte-projection-branch?] :as expr}]
   (when (< (count emitted-args) 2)
     (throw (err/incorrect :xtdb.expression/arity-error "Arity error, concat requires at least two arguments"
                           {:expr (dissoc expr :emitted-args)})))
@@ -1666,7 +1689,8 @@
                 (build-args-then-call [])))]
       {:return-type return-type
        :continue #(continue-concat % nil)
-       :continue-projection (when (and projection-root? resolve-part) continue-concat)})))
+       :continue-projection (when (and (or projection-root? byte-projection-branch?) resolve-part)
+                              continue-concat)})))
 
 (defmethod codegen-call [:substring :utf8 :int] [_]
   {:return-type #xt/type :utf8
@@ -1733,12 +1757,12 @@
   (codegen-overlay #xt/type :utf8 `resolve-utf8-buf `StringUtil/sqlUtf8Overlay `StringUtil/sqlUtf8OverlayParts))
 
 (defmethod codegen-call [:replace :utf8 :utf8 :utf8]
-  [{[_ {target :literal} {replacement :literal}] :args, :keys [::projection-root?]}]
+  [{[_ {target :literal} {replacement :literal}] :args, :keys [::projection-root? ::byte-projection-branch?]}]
   (let [call {:return-type #xt/type :utf8
               :->call-code (fn [[s target replacement]]
                              `(-> (.replace (resolve-string ~s) (resolve-string ~target) (resolve-string ~replacement))
                                   (resolve-utf8-buf)))}]
-    (if (and projection-root? (string? target) (seq target) (string? replacement))
+    (if (and (or projection-root? byte-projection-branch?) (string? target) (seq target) (string? replacement))
       (let [target-bytes (gensym 'target_bytes)
             replacement-bytes (gensym 'replacement_bytes)]
         (-> call
