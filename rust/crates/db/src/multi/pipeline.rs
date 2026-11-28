@@ -653,12 +653,12 @@ async fn burst(
         };
         for ((work, original_timed), position) in waiters.into_iter().zip(positions) {
             if original_timed {
-                let terminal = database_guard.decide_terminal(authority.lease, position, upper);
-                let result = terminal.and_then(|(write, redecide)| {
+                let result = async {
+                    let (write, redecide) = database_guard.decide_terminal(authority.lease, position, upper)?;
                     let queued = take_redecisions(&mut staged, &redecide)?;
                     stage_batch(&mut database_guard, &mut staged, queued).await;
                     Ok(write)
-                });
+                }.await;
                 match result {
                     Ok(write) => staged.push_front(Staged {
                         work,
