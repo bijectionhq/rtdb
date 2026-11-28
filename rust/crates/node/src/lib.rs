@@ -35,7 +35,7 @@ pub mod serving;
 #[cfg(feature = "multi")]
 mod multi_serving;
 #[cfg(feature = "multi")]
-pub use multi_serving::{MaintenanceSchedule, ManagedCheckpointProvider, ManagedCheckpointRead, ManagedCheckpointSource, MultiFollower, MultiFollowerProgress, MultiServing, MultiWriteAdmission, MultiWriteRoute};
+pub use multi_serving::{FollowerStoreDelivery, MaintenanceSchedule, ManagedCheckpointProvider, ManagedCheckpointRead, ManagedCheckpointSource, MultiFollower, MultiFollowerProgress, MultiServing, MultiWriteAdmission, MultiWriteRoute};
 pub use rtdb_tx::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceWorldWinner, HostedControlWrite, WorldConstraintArchive};
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{DurableRange, FundedMutationClock, MAX_DURABLE_RANGE_BYTES, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};

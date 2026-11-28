@@ -80,6 +80,27 @@ pub(crate) fn check_rank_digest() -> rtdb_types::Result<()> {
     Ok(())
 }
 
+struct StoreBatch {
+    basis: Basis,
+    pages: Vec<StorePage>,
+    #[cfg(feature = "multi")]
+    delivery: Option<rtdb_node::FollowerStoreDelivery>,
+}
+
+#[cfg(feature = "multi")]
+fn include_delivery(
+    admitted: &mut Option<rtdb_node::FollowerStoreDelivery>,
+    read: rtdb_node::FollowerStoreDelivery,
+) -> Result<(), Status> {
+    match admitted {
+        Some(admitted) => admitted.include(read).map_err(error::follower),
+        None => {
+            *admitted = Some(read);
+            Ok(())
+        },
+    }
+}
+
 struct StoreRanges<'a> {
     service: &'a Service,
     driver: &'a dyn rtdb_node::serving::ServingDriver,
@@ -87,6 +108,8 @@ struct StoreRanges<'a> {
     incarnation: [u8; 16],
     now: rtdb_types::Timestamp,
     cancellation: &'a tokio_util::sync::CancellationToken,
+    #[cfg(feature = "multi")]
+    delivery: std::sync::Mutex<Option<rtdb_node::FollowerStoreDelivery>>,
 }
 
 impl store_read::source::RangeSource for StoreRanges<'_> {
@@ -105,9 +128,14 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
                 let after = read.after.clone().filter(|after| range.contains(after));
                 StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false }
             });
-            let (basis, pages) = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation).await?;
-            let at = store_read::store::Version(basis.position());
-            let pages = pages.into_iter().map(|page| store_read::source::RangePage {
+            let batch = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation).await?;
+            #[cfg(feature = "multi")]
+            if let Some(delivery) = batch.delivery {
+                let mut admitted = self.delivery.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
+                include_delivery(&mut admitted, delivery)?;
+            }
+            let at = store_read::store::Version(batch.basis.position());
+            let pages = batch.pages.into_iter().map(|page| store_read::source::RangePage {
                 entries: page.entries.into_iter().map(|entry| store_read::store::Entry {
                     key: entry.key,
                     value: entry.value,
@@ -229,24 +257,43 @@ impl Service {
         &self, driver: &dyn rtdb_node::serving::ServingDriver,
         reads: &mut (dyn ExactSizeIterator<Item = StoreRead> + Send), at: At, incarnation: [u8; 16], now: Timestamp,
         cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<(Basis, Vec<StorePage>), Status> {
+    ) -> Result<StoreBatch, Status> {
         let expected_pages = reads.len();
         #[cfg(feature = "multi")]
-        let pages = if let Some(follower) = self.follower() {
+        let (pages, delivery) = if let Some(follower) = self.follower() {
             let mut page_at = at;
             let mut pages = Vec::with_capacity(expected_pages);
+            let mut delivery = None;
             for read in reads {
-                let page = follower.reader.read_store(read, page_at, now, cancellation).await.map_err(error::follower)?;
+                let (page, received) = follower.reader.read_store(read, page_at, now, cancellation).await.map_err(error::follower)?;
+                include_delivery(&mut delivery, received)?;
                 page_at = At::Exactly(page.cut.basis);
                 pages.push(page);
             }
-            pages
+            (pages, delivery)
         } else {
-            driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?
+            (driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?, None)
         };
         #[cfg(not(feature = "multi"))]
         let pages = driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?;
-        Ok((read_batch_basis(at, incarnation, expected_pages, &pages)?, pages))
+        let basis = read_batch_basis(at, incarnation, expected_pages, &pages)?;
+        Ok(StoreBatch {
+            basis, pages,
+            #[cfg(feature = "multi")]
+            delivery,
+        })
+    }
+
+    #[cfg(feature = "multi")]
+    async fn check_follower_store_reply(
+        &self, delivery: Option<rtdb_node::FollowerStoreDelivery>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), Status> {
+        if let Some(delivery) = delivery {
+            let follower = self.follower().ok_or_else(|| Status::unavailable("The assigned Store follower is unavailable"))?;
+            follower.reader.check_store_delivery(&delivery, cancellation).await.map_err(error::follower)?;
+        }
+        Ok(())
     }
 
     async fn store_read(&self, call: &Call, request: proto::ReadRequest) -> Result<Vec<u8>, Status> {
@@ -278,20 +325,23 @@ impl Service {
             StoreRead { range, after, limit, projection, filter: filter.clone(), reverse: request.reverse }
         });
         let clock = self.0.node.now();
-        let (basis, pages) = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation).await?;
-        let pages = pages.into_iter().map(|page| proto::RangePage {
+        let batch = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation).await?;
+        let pages = batch.pages.into_iter().map(|page| proto::RangePage {
             entries: page.entries.into_iter().map(|entry| proto::Entry {
                 key: entry.key, value: entry.value, written: entry.written.position(),
             }).collect(),
             resume: page.resume,
         }).collect();
-        self.check_attachment(call, &database)?;
-        Ok(proto::ReadReply {
+        let reply = proto::ReadReply {
             incarnation: incarnation.to_vec(),
-            at: basis.position(),
+            at: batch.basis.position(),
             pages,
             clock_micros: Some(clock.0),
-        }.encode_to_vec())
+        }.encode_to_vec();
+        #[cfg(feature = "multi")]
+        self.check_follower_store_reply(batch.delivery, &call.cancellation).await?;
+        self.check_attachment(call, &database)?;
+        Ok(reply)
     }
 
     async fn store_append(&self, call: &Call, request: proto::AppendRequest) -> Result<Vec<u8>, Status> {
@@ -522,7 +572,11 @@ impl Service {
         let program = store_read::rank::RankRequest::decode(&request.program).map_err(|refused| error::incorrect(&refused.to_string()))?;
         let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
-        let source = StoreRanges { service: self, driver, scope, incarnation, now: self.0.node.now(), cancellation: &call.cancellation };
+        let source = StoreRanges {
+            service: self, driver, scope, incarnation, now: self.0.node.now(), cancellation: &call.cancellation,
+            #[cfg(feature = "multi")]
+            delivery: std::sync::Mutex::new(None),
+        };
         let reply = store_read::rank::rank(&source, program).await.map_err(|refused| {
             let refused = match refused.downcast::<Status>() {
                 Ok(status) => return status,
@@ -535,9 +589,14 @@ impl Service {
                 error::incorrect(&message)
             }
         })?;
-        self.check_attachment(call, &database)?;
         let reply = reply.encode().map_err(|failed| Status::internal(failed.to_string()))?;
-        Ok(proto::RankReply { incarnation: incarnation.to_vec(), reply }.encode_to_vec())
+        let reply = proto::RankReply { incarnation: incarnation.to_vec(), reply }.encode_to_vec();
+        #[cfg(feature = "multi")]
+        self.check_follower_store_reply(
+            source.delivery.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))?, &call.cancellation,
+        ).await?;
+        self.check_attachment(call, &database)?;
+        Ok(reply)
     }
 }
 

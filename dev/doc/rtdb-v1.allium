@@ -200,9 +200,10 @@ surface StatelessDatabase {
         -- The gateway acknowledges a fresh handshake when the writer serves the fresh reader route.
         -- Read, Watch and Rank are the Store actions admitted on a reader route after agreement.
         -- An assigned follower selects byte-store read and rank pages from its locally applied prefix.
-        -- A Store Read confirms the version against the ordered floor through a current journal observation before returning the locally materialized page.
+        -- An assigned follower confirms each materialized Store Read or Rank range page against the ordered floor through a current journal observation.
+        -- Before returning the encoded Read or Rank reply, it confirms that the oldest consulted version remains above or at the floor.
         -- If the follower cannot authenticate that suffix within its admission bound, it must catch up before it can confirm the floor.
-        -- It rechecks the assigned replica and the observed key generation before returning a byte-store page or watch result.
+        -- It rechecks the same replica assignment and observed key generation before returning a Read, Rank or Watch reply.
         -- Read, Watch and Rank return UNAUTHENTICATED on an admitted route when the Store bearer is unknown or expired, so the caller can start a new handshake.
         -- Each store action on a listener with a linked release requires the session established by that agreement.
 

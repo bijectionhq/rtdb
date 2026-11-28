@@ -79,6 +79,25 @@ pub struct MultiFollower {
     owner: Arc<()>,
 }
 
+#[derive(Debug)]
+pub struct FollowerStoreDelivery {
+    basis: Basis,
+    generation: u64,
+    owner: Weak<()>,
+}
+
+impl FollowerStoreDelivery {
+    pub fn include(&mut self, other: Self) -> Result<()> {
+        if !self.owner.ptr_eq(&other.owner) || self.generation != other.generation
+            || self.basis.incarnation() != other.basis.incarnation()
+        {
+            return Err(interrupted());
+        }
+        self.basis = self.basis.min(other.basis);
+        Ok(())
+    }
+}
+
 pub struct MultiFollowerProgress {
     pub applied_position: u64,
     pub retained_from: Basis,
@@ -97,7 +116,7 @@ impl MultiFollower {
 
     pub async fn read_store(
         &self, read: StoreRead, at: At, now: Timestamp, cancellation: &CancellationToken,
-    ) -> Result<StorePage> {
+    ) -> Result<(StorePage, FollowerStoreDelivery)> {
         self.serving.serve(async {
             cancellation.run_until_cancelled(async {
                 let database = self.serving.database.lock().await;
@@ -109,7 +128,27 @@ impl MultiFollower {
                 let page = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)?;
                 database.check_follower_store_basis(&self.owner, page.cut.basis).await?;
                 database.check_generation(generation).await?;
-                Ok(page)
+                let delivery = FollowerStoreDelivery { basis: page.cut.basis, generation, owner: Arc::downgrade(&self.owner) };
+                Ok((page, delivery))
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
+    pub async fn check_store_delivery(&self, delivery: &FollowerStoreDelivery, cancellation: &CancellationToken) -> Result<()> {
+        self.serving.serve(async {
+            cancellation.run_until_cancelled(async {
+                if !delivery.owner.ptr_eq(&Arc::downgrade(&self.owner)) {
+                    return Err(interrupted());
+                }
+                let database = self.serving.database.lock().await;
+                let (index, generation) = database.follower_view(&self.owner)?;
+                require_plain_follower(&index)?;
+                if generation != delivery.generation {
+                    return Err(interrupted());
+                }
+                index.cut(At::Exactly(delivery.basis))?;
+                database.check_follower_store_basis(&self.owner, delivery.basis).await?;
+                database.check_generation(generation).await
             }).await.ok_or_else(interrupted)?
         }).await
     }
@@ -1529,8 +1568,9 @@ mod tests {
         };
         let original = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
-        let original = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
+        let (original, delivery) = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
+        assigned.check_store_delivery(&delivery, &cancellation).await.unwrap();
 
         assert!(!follower.supports_store_purge_floor().await);
         let refusal = follower.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
@@ -1539,6 +1579,9 @@ mod tests {
         assert!(writer.supports_store_purge_floor().await);
         writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
             .await.unwrap();
+
+        let expired = assigned.check_store_delivery(&delivery, &cancellation).await.unwrap_err();
+        assert_eq!(expired.code, "rtdb/cursor-expired");
 
         let second_attempt = [4; 16];
         let second_claim = writer.transact(Transact::claim_store_writer(incarnation, fence, second_attempt), &cancellation)
