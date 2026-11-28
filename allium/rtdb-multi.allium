@@ -2247,6 +2247,7 @@ rule ConsumeIntake {
 -- A selected empty set, empty map, or canonical timestamp range keeps its concrete output type and retained document charge through Arrow delivery.
 -- Compatible nested fields write compact values from the winning Arrow positions.
 -- A selected floating-point list retains the validity of each element and the bits of each present value in its concrete output type.
+-- A selected plain Text or Binary list reports its observed child type and preserves element order, validity and the bytes of each present element.
 -- The point preserves the distinctions between an absent child, a present null, and a present value.
 -- The reply uses the selected document's retained-value size for admission and validates the reached decimal coefficients before encoding.
 -- Held search reads text from the selected shadow field after interpreting its field-presence marker.

@@ -7132,6 +7132,76 @@ mod world_point_tests {
     }
 
     #[test]
+    fn world_point_plain_byte_lists_match_checked_layout_ipc_and_reply_admission() {
+        use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+
+        let child_data = |first: &'static [u8]| {
+            let mut entries = vec![b"before".as_slice(), first, b"", b"first"];
+            entries.extend(std::iter::repeat_n(b"hidden-null".as_slice(), 63));
+            entries.extend([b"last".as_slice(), b"hidden-null", b"hidden-null", b"hidden-parent", b"after"]);
+            let offsets = OffsetBuffer::<i32>::from_lengths(entries.iter().map(|entry| entry.len()));
+            let validity = NullBuffer::from((0..entries.len()).map(|row| !matches!(row, 4..=66 | 68..=69)).collect::<Vec<_>>());
+            (offsets, Buffer::from(entries.concat()), Some(validity))
+        };
+        let (offsets, data, validity) = child_data("é".as_bytes());
+        let text = Arc::new(StringArray::new(offsets, data, validity)) as ArrayRef;
+        let (offsets, data, validity) = child_data(b"\xff");
+        let binary = Arc::new(BinaryArray::new(offsets, data, validity)) as ArrayRef;
+        let columns = [("texts", ScalarType::Utf8, text), ("bytes", ScalarType::Binary, binary)].map(|(name, scalar, child)| {
+            let list = LogicalType::list(LogicalType::Scalar(scalar).maybe()).maybe();
+            let field = to_field(name, &list).unwrap();
+            let DataType::List(item) = field.data_type() else { unreachable!() };
+            let offsets = OffsetBuffer::new(vec![0, 1, 3, 68, 70, 70, 71, 72].into());
+            let validity = NullBuffer::from(vec![true, true, true, true, true, false, true]);
+            let array = ListArray::new(Arc::clone(item), offsets, child, Some(validity));
+            (field, Arc::new(array) as ArrayRef)
+        });
+        let (fields, arrays) = columns.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        let source = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+        let ipc = |batch: &RecordBatch| {
+            write_arrow_stream(batch.schema_ref(), std::slice::from_ref(batch), IpcWriteOptions::default()).unwrap()
+        };
+        for row in 1..=5 {
+            let batch = source.slice(row, 1);
+            let decoded = crate::WorldPointRow::cells(&batch).map(|cell| {
+                (cell.field.name().clone(), rtdb_columnar::read_value(cell.field, cell.array, cell.row).unwrap())
+            }).collect::<StructFields<_>>();
+            let bytes = Value::document_retained_bytes(&decoded).unwrap();
+            assert_eq!(crate::WorldPointRow::document_bytes(&batch).unwrap(), bytes);
+            let bound = 4096 + 8 * bytes;
+            let memory = MemoryBudget::new(bound);
+            let (plans, charge) = prepare_world_point(&batch, &memory).unwrap();
+            assert_eq!(charge.bytes(), bound);
+            let (fields, arrays) = plans.into_iter().zip(batch.schema_ref().fields()).map(|(plan, field)| {
+                plan.write(field.name()).unwrap()
+            }).unzip::<_, _, Vec<_>, Vec<_>>();
+            let actual = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+            let (fields, arrays) = decoded.iter().map(|(name, value)| {
+                let logical = value.logical_type();
+                (to_field(name, &logical).unwrap(), rtdb_columnar::build_array_refs(&logical, &[value]).unwrap())
+            }).unzip::<_, _, Vec<_>, Vec<_>>();
+            let checked = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+            assert_eq!(actual.schema_ref(), checked.schema_ref());
+            assert_eq!(actual.get_array_memory_size(), checked.get_array_memory_size());
+            assert_eq!(ipc(&actual), ipc(&checked));
+            if row == 2 {
+                let text = actual.column(0).as_list::<i32>().values().as_string::<i32>();
+                let binary = actual.column(1).as_list::<i32>().values().as_binary::<i32>();
+                assert_eq!(text.value_data(), b"firstlast");
+                assert_eq!(binary.value_data(), b"firstlast");
+            }
+            drop((actual, charge));
+            assert_eq!(memory.used_bytes(), 0);
+
+            let tight = MemoryBudget::new(bound - 1);
+            let expected = status(tight.reserve(bound).unwrap_err());
+            let refused = prepare_world_point(&batch, &tight).err().unwrap();
+            assert_eq!((refused.code(), refused.message()), (expected.code(), expected.message()));
+            assert_eq!(tight.used_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn world_point_canonicalizes_other_timestamp_ranges_and_reaches_null_endpoint_errors_before_admission() {
         use arrow_array::{FixedSizeListArray, TimestampMicrosecondArray};
 
@@ -7176,11 +7246,12 @@ mod world_point_tests {
     #[test]
     fn world_point_reads_later_fields_before_reporting_a_reply_budget_refusal() {
         let uri = Arc::new(to_field("uri", &LogicalType::Scalar(ScalarType::Uri)).unwrap());
-        let first = Arc::new(StringArray::from(vec!["first"]));
+        let prefix = LogicalType::list(LogicalType::Scalar(ScalarType::Utf8));
+        let first = rtdb_columnar::build_array(&prefix, &[Value::list(vec![Value::Utf8("first".into())])]).unwrap();
         let second = Arc::new(StructArray::new(vec![uri].into(), vec![Arc::new(StringArray::from(vec!["not a URI"]))], None));
         let field = Field::new("payload", second.data_type().clone(), false);
         let expected = rtdb_columnar::read_value(&field, second.as_ref(), 0).unwrap_err();
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("prefix", DataType::Utf8, false), field])), vec![first, second]).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("prefix", &prefix).unwrap(), field])), vec![first, second]).unwrap();
         let memory = MemoryBudget::new(1);
         let error = prepare_world_point(&batch, &memory).err().unwrap();
         assert_eq!(error.message(), status(expected).message());

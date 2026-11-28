@@ -1,8 +1,8 @@
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, NullArray, RecordBatch, StringArray,
-    builder::{Float32Builder, Float64Builder}, cast::AsArray, types::{Float32Type, Float64Type}};
-use arrow_buffer::{OffsetBuffer, ScalarBuffer, bit_util};
+use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, GenericByteArray, ListArray, NullArray, RecordBatch, StringArray,
+    builder::{Float32Builder, Float64Builder}, cast::AsArray, types::{BinaryType, ByteArrayType, Float32Type, Float64Type, Utf8Type}};
+use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer, bit_util};
 use arrow_schema::{DataType, Field};
 use futures::future::BoxFuture;
 use rtdb_columnar::{ArrowCell, MemoryReservation};
@@ -157,6 +157,7 @@ enum PointStorage<'a> {
     Slice(ArrowCell<'a>),
     Compact { cell: ArrowCell<'a>, validate_uri: bool },
     FloatList { values: &'a dyn Array, rows: Range<usize> },
+    ByteList { values: &'a dyn Array, rows: Range<usize>, payload_bytes: usize },
     Struct(Vec<PointCell<'a>>),
     Decoded(Value),
     Read(ArrowCell<'a>),
@@ -272,9 +273,14 @@ impl<'a> PointCell<'a> {
                     return Ok(None);
                 }
                 let element = match element.as_ref() { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+                let plain_list = *kind == ListKind::List && selected.field.metadata().is_empty();
                 let (header, width) = match (element, item.data_type()) {
                     (LogicalType::Scalar(ScalarType::F32), DataType::Float32) => (size_of::<Float32Array>(), 4),
                     (LogicalType::Scalar(ScalarType::F64), DataType::Float64) => (size_of::<Float64Array>(), 8),
+                    (LogicalType::Scalar(ScalarType::Utf8), DataType::Utf8) if plain_list =>
+                        return Ok(Self::try_byte_list::<Utf8Type>(values, rows, element)),
+                    (LogicalType::Scalar(ScalarType::Binary), DataType::Binary) if plain_list =>
+                        return Ok(Self::try_byte_list::<BinaryType>(values, rows, element)),
                     _ => return Ok(None),
                 };
                 let nulls = values.nulls().map_or(0, |nulls| nulls.slice(rows.start, rows.len()).null_count());
@@ -294,6 +300,35 @@ impl<'a> PointCell<'a> {
             _ => return Ok(None),
         };
         Ok(Some(Self { logical, bytes, storage }))
+    }
+
+    fn try_byte_list<T: ByteArrayType<Offset = i32>>(
+        values: &'a dyn Array, rows: Range<usize>, element: &LogicalType,
+    ) -> Option<Self> {
+        let values = values.as_bytes_opt::<T>()?;
+        let nulls = values.nulls().map(|nulls| nulls.slice(rows.start, rows.len()));
+        let null_count = nulls.as_ref().map_or(0, NullBuffer::null_count);
+        if null_count == rows.len() { return None; }
+        let offsets = &values.value_offsets()[rows.start..=rows.end];
+        let (element, payload_bytes, validity_bytes) = match nulls.filter(|_| null_count != 0) {
+            None => (element.clone(), (offsets[rows.len()] - offsets[0]) as usize, 0),
+            Some(nulls) => (
+                element.clone().maybe(),
+                nulls.valid_slices().map(|(start, end)| (offsets[end] - offsets[start]) as usize).sum(),
+                bit_util::ceil(rows.len(), 64) * size_of::<u64>(),
+            ),
+        };
+        // Point admission charges the canonical scalar-list field and the capacities of Arrow's byte interleave.
+        let bytes = size_of::<GenericByteArray<T>>()
+            .checked_add(Field::new("value", T::DATA_TYPE, null_count != 0).size())?
+            .checked_add(size_of_val(offsets))?
+            .checked_add(payload_bytes)?
+            .checked_add(validity_bytes)?;
+        Some(Self {
+            logical: LogicalType::list(element),
+            bytes,
+            storage: PointStorage::ByteList { values, rows, payload_bytes },
+        })
     }
 
     pub(crate) fn write(self, name: &str) -> Result<(Field, ArrayRef)> {
@@ -334,6 +369,11 @@ impl<'a> PointCell<'a> {
                 }
             }
             PointStorage::FloatList { values, rows } => compact_float_list(field, values, rows)?,
+            PointStorage::ByteList { values, rows, payload_bytes } => match values.data_type() {
+                DataType::Utf8 => compact_byte_list(field, values.as_string::<i32>(), rows, payload_bytes)?,
+                DataType::Binary => compact_byte_list(field, values.as_binary::<i32>(), rows, payload_bytes)?,
+                _ => unreachable!("Prepared point byte list"),
+            },
             PointStorage::Struct(children) => {
                 let DataType::Struct(fields) = field.data_type() else { unreachable!("Prepared point struct") };
                 let arrays = children.into_iter().zip(fields.iter()).map(|(child, field)| child.write_as(field))
@@ -413,8 +453,53 @@ fn compact_float_list(field: &Field, values: &dyn Array, rows: Range<usize>) -> 
     })
 }
 
+fn compact_byte_list<T: ByteArrayType<Offset = i32>>(
+    field: &Field, values: &GenericByteArray<T>, rows: Range<usize>, payload_bytes: usize,
+) -> Result<ArrayRef> {
+    let DataType::List(item) = field.data_type() else { unreachable!("Prepared point byte list") };
+    let length = rows.len();
+    let nulls = item.is_nullable().then(|| {
+        NullBuffer::from(BooleanBuffer::collect_bool(length, |index| values.is_valid(rows.start + index)))
+    });
+    let mut offsets = Vec::with_capacity(length + 1);
+    let mut payload = Vec::with_capacity(payload_bytes);
+    offsets.push(0);
+    for (index, row) in rows.enumerate() {
+        if nulls.as_ref().is_none_or(|nulls| nulls.is_valid(index)) {
+            payload.extend_from_slice(values.value(row).as_ref());
+        }
+        offsets.push(i32::try_from(payload.len()).expect("Selected values fit the source i32 offsets"));
+    }
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let child: ArrayRef = Arc::new(GenericByteArray::<T>::try_new(offsets, payload.into(), nulls).map_err(point_arrow)?);
+    // The encoder grant includes the parent offset capacity retained by the packed list writer.
+    let mut offsets = vec![0];
+    offsets.push(i32::try_from(length).expect("An Arrow list has i32 offsets"));
+    rtdb_columnar::build_list_array(Arc::clone(item), offsets.into(), &child, None)
+}
+
 fn point_arrow(error: arrow_schema::ArrowError) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn held_point_plain_byte_lists_prepare_borrowed_child_spans() {
+    let text = Arc::new(StringArray::from(vec!["skipped", "taken"])) as ArrayRef;
+    let binary = Arc::new(BinaryArray::from_iter_values([b"skipped".as_slice(), b"taken"])) as ArrayRef;
+    for (scalar, child) in [(ScalarType::Utf8, text), (ScalarType::Binary, binary)] {
+        let field = rtdb_columnar::to_field("items", &LogicalType::list(LogicalType::Scalar(scalar))).unwrap();
+        let DataType::List(item) = field.data_type() else { unreachable!() };
+        let offsets = OffsetBuffer::new(vec![0, 1, 2].into());
+        let array = ListArray::new(Arc::clone(item), offsets, Arc::clone(&child), None);
+        let plan = PointCell::prepare(ArrowCell { field: &field, array: &array, row: 1 }).unwrap();
+        let PointStorage::ByteList { values, rows, payload_bytes } = plan.storage else {
+            panic!("Expected a borrowed byte-list plan");
+        };
+        assert!(std::ptr::addr_eq(values, child.as_ref()));
+        assert_eq!(rows, 1..2);
+        assert_eq!(payload_bytes, 5);
+    }
 }
 
 #[cfg(test)]
