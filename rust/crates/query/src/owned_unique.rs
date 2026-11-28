@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, fmt::Write, sync::Arc};
 
+use arrow_array::{Array, ArrayRef, ListArray};
+use arrow_schema::{DataType, Field};
 use rtdb_columnar::OwnedBatch;
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp,
@@ -63,6 +65,24 @@ pub async fn read_owned_unique_policy(
     owner: &str,
     relation: &OwnedRelation,
 ) -> Result<OwnedUniquePolicy> {
+    read_unique_policy(context, owner, relation, false).await.map(|(policy, _)| policy)
+}
+
+#[doc(hidden)]
+pub async fn read_owned_unique_policy_for_update(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+) -> Result<(OwnedUniquePolicy, Option<ArrayRef>)> {
+    read_unique_policy(context, owner, relation, true).await
+}
+
+async fn read_unique_policy(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    retain_paths: bool,
+) -> Result<(OwnedUniquePolicy, Option<ArrayRef>)> {
     let id = EntityId::String(OWNED_UNIQUE_POLICY_ID.into());
     let cursor = open_owned_unique_point(
         context.clone(),
@@ -107,10 +127,28 @@ pub async fn read_owned_unique_policy(
         }
         installed.insert(name, column.clone());
     }
-    Ok(OwnedUniquePolicy {
-        paths: installed,
-        through_events,
-    })
+    let positioned = if retain_paths { canonical_paths(batch.batch()) } else { None };
+    Ok((OwnedUniquePolicy { paths: installed, through_events }, positioned))
+}
+
+fn canonical_paths(batch: &arrow_array::RecordBatch) -> Option<ArrayRef> {
+    use arrow_array::cast::AsArray;
+
+    let (slot, field) = batch.schema_ref().column_with_name("paths")?;
+    let array = batch.column(slot);
+    let list = array.as_any().downcast_ref::<ListArray>()?;
+    let DataType::List(item) = field.data_type() else { return None; };
+    let expected = Field::new("$data$", DataType::Struct(vec![
+        Field::new("path", DataType::Utf8, false),
+        Field::new("column", DataType::Utf8, false),
+    ].into()), false);
+    if !field.metadata().is_empty() || item.as_ref() != &expected || list.is_null(0) {
+        return None;
+    }
+    let entries = list.value(0);
+    let entries = entries.as_struct();
+    (entries.null_count() == 0 && entries.columns().iter().all(|column| column.null_count() == 0))
+        .then(|| array.slice(0, 1))
 }
 
 pub struct OwnedUniqueHit {
@@ -195,4 +233,38 @@ fn uncovered() -> Anomaly {
         "rtdb.owned/unique-uncovered",
         "The owned unique path cannot prove its complete occupancy",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{RecordBatch, cast::AsArray};
+
+    #[test]
+    fn a_unique_frontier_can_reuse_only_the_admitted_paths() -> Result<()> {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let first = OwnedRelation::new("a")?;
+        let second = OwnedRelation::new("b")?;
+        let policy = OwnedUniquePolicy {
+            paths: BTreeMap::from([(second, "other".into()), (first, "keeper".into())]),
+            through_events: 4,
+        };
+        let original = Value::Struct(policy.document());
+        let before = rtdb_columnar::build_array(&original.logical_type(), &[original])?;
+        let before = rtdb_columnar::retain_array(before, &memory.reserve(1 << 16)?)?;
+        let batch = RecordBatch::from(before.as_struct().clone());
+        let expected = policy.document().remove("paths").unwrap();
+        let positioned = canonical_paths(&batch).expect("exact plain path list");
+        let field = rtdb_columnar::to_field("paths", &expected.logical_type())?;
+        assert_eq!(rtdb_columnar::read_value(&field, positioned.as_ref(), 0)?, expected);
+
+        let wrong = Value::Struct(StructFields::from([
+            ("column".into(), Value::Utf8("keeper".into())),
+            ("path".into(), Value::Utf8("a".into())),
+        ]));
+        let wrong = Value::Struct(StructFields::from([("paths".into(), Value::list(vec![wrong]))]));
+        let wrong = rtdb_columnar::build_array(&wrong.logical_type(), &[wrong])?;
+        assert!(canonical_paths(&RecordBatch::from(wrong.as_struct().clone())).is_none());
+        Ok(())
+    }
 }

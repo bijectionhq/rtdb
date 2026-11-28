@@ -1,9 +1,11 @@
 //! Durable RTDB resolver driver for SS8 footprint grants, work-keyed OCC
 //! debits, strict work-key age rotation, lease-loss transfer, and all-writer
 //! (Flight + SQL) fencing.
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
-use rtdb_columnar::read_value;
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, cast::AsArray};
+use arrow_schema::{DataType, Field};
+use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_types::{
     Anomaly, AnomalyCategory, AnomalyKind, EntityId, Result, StructFields, TableRef, Timestamp, Value,
 };
@@ -13,7 +15,7 @@ use super::footprint_grant::{
     self, GrantHolder, GrantProposalVerdict, TransferVerdict,
     WaiterEntry, WriterKind,
 };
-use super::{OpenTransaction, interval};
+use super::{OpenTransaction, interval, positioned_control::{ControlCell, control_record}};
 use crate::OwnedFootprintGrantOp;
 
 /// The resolver's durable footprint grant settings, configured from the node configuration.
@@ -88,6 +90,7 @@ pub(crate) struct DurableGrantRow {
     pub progress_step: u64,
     pub footprint: BTreeSet<String>,
     pub active: bool,
+    positioned_footprint: Option<ArrayRef>,
 }
 
 impl DurableGrantRow {
@@ -120,6 +123,26 @@ impl DurableGrantRow {
             || self.footprint.iter().any(|t| other.contains(t))
     }
 
+    fn positioned_document(&self, memory: &Arc<MemoryBudget>) -> Result<Option<ArrayRef>> {
+        let Some(footprint) = self.positioned_footprint.as_ref() else { return Ok(None); };
+        if !matches_footprint(footprint, &self.footprint) {
+            return Ok(None);
+        }
+        control_record(memory, &[
+            ("_id", ControlCell::Value(Value::Utf8(self.work_key.clone()))),
+            ("work_age", ControlCell::Value(Value::I64(self.work_age as i64))),
+            ("holder_attempt", ControlCell::Value(Value::I64(self.holder_attempt as i64))),
+            ("reopened_cut", ControlCell::Value(Value::I64(self.reopened_cut))),
+            ("progress_step", ControlCell::Value(Value::I64(self.progress_step as i64))),
+            ("footprint", ControlCell::Funded(footprint)),
+            ("status", ControlCell::Value(Value::Utf8(self.status().into()))),
+        ]).map(Some)
+    }
+
+    fn status(&self) -> &'static str {
+        if self.active { STATUS_ACTIVE } else { STATUS_WAITING }
+    }
+
     fn to_document(&self) -> StructFields<Value> {
         let footprint_list = self
             .footprint
@@ -136,14 +159,75 @@ impl DurableGrantRow {
             ("footprint".into(), Value::list(footprint_list)),
             (
                 "status".into(),
-                Value::Utf8(if self.active { STATUS_ACTIVE } else { STATUS_WAITING }.into()),
+                Value::Utf8(self.status().into()),
             ),
         ])
     }
 }
 
+enum StoredFootprint {
+    Decoded(Value),
+    Arrow(ArrayRef),
+}
+
+impl StoredFootprint {
+    fn normalize(self) -> (BTreeSet<String>, Option<ArrayRef>) {
+        match self {
+            Self::Arrow(arrow) => {
+                let items = arrow.as_list::<i32>().value(0);
+                let names = items.as_string::<i32>().iter().flatten().map(str::to_owned).collect();
+                (names, Some(arrow))
+            }
+            Self::Decoded(Value::List(items)) => {
+                let names = (0..items.len()).filter_map(|index| items.view().utf8(index))
+                    .map(str::to_owned).collect();
+                (names, None)
+            }
+            Self::Decoded(_) => (BTreeSet::new(), None),
+        }
+    }
+}
+
+fn canonical_footprint(batch: &RecordBatch, row: usize) -> Option<ArrayRef> {
+    let (slot, field) = batch.schema_ref().column_with_name("footprint")?;
+    let array = batch.column(slot);
+    let list = array.as_any().downcast_ref::<ListArray>()?;
+    let DataType::List(item) = field.data_type() else { return None; };
+    if !field.metadata().is_empty() || item.as_ref() != &Field::new("$data$", DataType::Utf8, false)
+        || list.is_null(row)
+    {
+        return None;
+    }
+    let items = list.value(row);
+    let strings = items.as_string::<i32>();
+    if strings.is_empty() || strings.null_count() != 0
+        || (1..strings.len()).any(|index| strings.value(index - 1) >= strings.value(index))
+    {
+        return None;
+    }
+    Some(array.slice(row, 1))
+}
+
+fn copy_footprint(batch: &RecordBatch, row: usize, memory: &Arc<MemoryBudget>) -> Option<ArrayRef> {
+    let source = canonical_footprint(batch, row)?;
+    let field = batch.schema_ref().column_with_name("footprint")?.1;
+    let bound = rtdb_columnar::estimate_event_copy_cell_bytes(field, source.as_ref(), 0).ok()?
+        .checked_mul(4)?.checked_add(4096)?;
+    let mut charge = memory.try_reserve(bound)?;
+    let copied = rtdb_columnar::copy_event_cells(&[source.as_ref()], &[Some((0, 0))]).ok()?;
+    Arc::get_mut(&mut charge)?.shrink_to(copied.get_array_memory_size()).ok()?;
+    rtdb_columnar::retain_array(copied, &charge).ok()
+}
+
+fn matches_footprint(array: &ArrayRef, footprint: &BTreeSet<String>) -> bool {
+    let items = array.as_list::<i32>().value(0);
+    let strings = items.as_string::<i32>();
+    !strings.is_empty() && strings.len() == footprint.len()
+        && strings.iter().zip(footprint).all(|(name, expected)| name == Some(expected.as_str()))
+}
+
 impl OpenTransaction<'_> {
-    pub(super) async fn load_ss8_grants(&self) -> Result<Vec<DurableGrantRow>> {
+    async fn load_ss8_grants(&self, retain_for: Option<&str>) -> Result<Vec<DurableGrantRow>> {
         let table = ss8_footprint_grants_table();
         if !self.snapshot()?.contains_table(&table) {
             return Ok(Vec::new());
@@ -155,43 +239,44 @@ impl OpenTransaction<'_> {
             )
             .await?;
         let mut rows = Vec::new();
+        let mut retain_for = retain_for;
         while let Some(batch) = query.next_batch().await? {
             let batch = batch.batch();
             for row in 0..batch.num_rows() {
                 let cell = |index: usize| {
                     read_value(batch.schema().field(index), batch.column(index).as_ref(), row)
                 };
+                let work_key_cell = cell(0)?;
+                let keep_footprint = matches!(&work_key_cell, Value::Utf8(key) if retain_for == Some(key.as_str()));
+                if keep_footprint {
+                    retain_for = None;
+                }
+                let footprint_cell = || {
+                    let positioned = if keep_footprint { copy_footprint(batch, row, &self.context.memory) } else { None };
+                    match positioned {
+                        Some(arrow) => Ok(StoredFootprint::Arrow(arrow)),
+                        None => cell(5).map(StoredFootprint::Decoded),
+                    }
+                };
+                let (work_age, holder_attempt, reopened_cut, progress_step, stored_footprint, status) = (
+                    cell(1)?, cell(2)?, cell(3)?, cell(4)?, footprint_cell()?, cell(6)?,
+                );
                 let (
                     Value::Utf8(work_key),
                     Value::I64(work_age),
                     Value::I64(holder_attempt),
                     Value::I64(reopened_cut),
                     Value::I64(progress_step),
-                    footprint_val,
+                    stored_footprint,
                     Value::Utf8(status),
-                ) = (
-                    cell(0)?,
-                    cell(1)?,
-                    cell(2)?,
-                    cell(3)?,
-                    cell(4)?,
-                    cell(5)?,
-                    cell(6)?,
-                )
+                ) = (work_key_cell, work_age, holder_attempt, reopened_cut, progress_step, stored_footprint, status)
                 else {
                     return Err(Anomaly::fault(
                         "rtdb.tx/ss8-grant-row",
                         "Durable SS8 footprint grant row has an invalid schema",
                     ));
                 };
-                let mut footprint = BTreeSet::new();
-                if let Value::List(items) = footprint_val {
-                    for index in 0..items.len() {
-                        if let Some(name) = items.view().utf8(index) {
-                            footprint.insert(name.to_owned());
-                        }
-                    }
-                }
+                let (footprint, positioned_footprint) = stored_footprint.normalize();
                 rows.push(DurableGrantRow {
                     work_key,
                     work_age: work_age as u64,
@@ -200,6 +285,7 @@ impl OpenTransaction<'_> {
                     progress_step: progress_step as u64,
                     footprint,
                     active: status == STATUS_ACTIVE,
+                    positioned_footprint,
                 });
             }
         }
@@ -234,11 +320,15 @@ impl OpenTransaction<'_> {
     }
 
     fn write_ss8_grant_row(&mut self, row: &DurableGrantRow) -> Result<()> {
-        self.buffer.put(
-            ss8_footprint_grants_table(),
-            row.to_document(),
-            interval(Timestamp(0), Timestamp::MAX)?,
-        )
+        let table = ss8_footprint_grants_table();
+        let valid = interval(Timestamp(0), Timestamp::MAX)?;
+        if row.positioned_document(&self.context.memory).ok().flatten().is_some_and(|document| {
+            let iid = EntityId::string_iid(&row.work_key);
+            self.try_stage_control_put(&table, iid, valid, document)
+        }) {
+            return Ok(());
+        }
+        self.buffer.put(table, row.to_document(), valid)
     }
 
     fn delete_ss8_grant_row(&mut self, work_key: &str) -> Result<()> {
@@ -268,7 +358,7 @@ impl OpenTransaction<'_> {
         if written_tables.is_empty() {
             return Ok(());
         }
-        let grants = self.load_ss8_grants().await?;
+        let grants = self.load_ss8_grants(None).await?;
         for grant in &grants {
             if !grant.active {
                 continue;
@@ -335,7 +425,7 @@ impl OpenTransaction<'_> {
                 holder_attempt,
                 ..
             } => {
-                let grants = self.load_ss8_grants().await?;
+                let grants = self.load_ss8_grants(None).await?;
                 let Some(grant) = grants.iter().find(|g| g.work_key == *work_key) else {
                     return Err(Anomaly::new(
                         AnomalyCategory::Conflict,
@@ -368,7 +458,7 @@ impl OpenTransaction<'_> {
                 attempt,
                 footprint,
             } => {
-                let mut grants = self.load_ss8_grants().await?;
+                let mut grants = self.load_ss8_grants(Some(work_key)).await?;
                 let requested: BTreeSet<String> = footprint.iter().cloned().collect();
                 let existing = grants.iter().position(|g| g.work_key == *work_key);
                 let mut entry = match existing {
@@ -394,6 +484,7 @@ impl OpenTransaction<'_> {
                         progress_step: 0,
                         footprint: requested,
                         active: false,
+                        positioned_footprint: None,
                     },
                 };
                 let blocked_by_active = grants
@@ -421,7 +512,7 @@ impl OpenTransaction<'_> {
                 progress_step,
                 additional_footprint,
             } => {
-                let grants = self.load_ss8_grants().await?;
+                let grants = self.load_ss8_grants(Some(work_key)).await?;
                 let Some(mut grant) = grants.into_iter().find(|g| g.work_key == *work_key) else {
                     return Err(Anomaly::new(
                         AnomalyCategory::Conflict,
@@ -485,7 +576,7 @@ impl OpenTransaction<'_> {
         work_key: &str,
         expected_attempt: Option<u64>,
     ) -> Result<()> {
-        let mut grants = self.load_ss8_grants().await?;
+        let mut grants = self.load_ss8_grants(None).await?;
         let Some(index) = grants.iter().position(|g| g.work_key == work_key) else {
             return Ok(());
         };
@@ -536,6 +627,42 @@ impl OpenTransaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_grant_reuses_only_the_same_normalized_footprint() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut grant = DurableGrantRow {
+            work_key: "work".into(), work_age: 1, holder_attempt: 2, reopened_cut: 3, progress_step: 0,
+            footprint: ["public.a".into(), "public.b".into()].into(), active: false, positioned_footprint: None,
+        };
+        let prior = Value::Struct(grant.to_document());
+        let arrow = rtdb_columnar::build_array(&prior.logical_type(), &[prior])?;
+        let arrow = rtdb_columnar::retain_array(arrow, &memory.reserve(1 << 15)?)?;
+        let batch = RecordBatch::from(arrow.as_struct().clone());
+        assert!(copy_footprint(&batch, 0, &MemoryBudget::new(1)).is_none());
+        grant.positioned_footprint = copy_footprint(&batch, 0, &memory);
+        assert!(grant.positioned_footprint.is_some());
+        grant.active = true;
+        grant.holder_attempt = 4;
+        grant.progress_step = 3;
+        let positioned = grant.positioned_document(&memory)?.expect("same canonical footprint");
+        super::super::positioned_control::assert_control_bytes(
+            &memory, &ss8_footprint_grants_table(), grant.to_document(), positioned, None,
+        )?;
+
+        grant.footprint.insert("public.c".into());
+        assert!(grant.positioned_document(&memory)?.is_none());
+        for names in [["public.b", "public.a"], ["public.a", "public.a"]] {
+            let list = Value::list(names.map(|name| Value::Utf8(name.into())).into());
+            let ty = list.logical_type();
+            let field = rtdb_columnar::to_field("footprint", &ty)?;
+            let array = rtdb_columnar::build_array(&ty, &[list])?;
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![array])
+                .map_err(rtdb_columnar::arrow_error)?;
+            assert!(canonical_footprint(&batch, 0).is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_grant_debits_only_the_conflicts_the_resolver_raises_for_changed_data() {

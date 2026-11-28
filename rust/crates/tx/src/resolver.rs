@@ -56,6 +56,7 @@ mod owned_capacity;
 use crate::hosted_control::HOSTED_CAPACITY_DECLARATIONS;
 use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
+mod positioned_control;
 use owned_unique::OwnedUniqueChanges;
 mod world_constraints;
 pub use world_constraints::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceWorldWinner, PreparedFamilyDerivative, WorldConstraintArchive};

@@ -6,7 +6,11 @@ use rtdb_query::{
 
 use rtdb_types::{EntityId, OwnedRelation};
 
-use super::{replay_constraints::{ConstraintMember, ConstraintMembers}, *};
+use super::{
+    positioned_control::{ControlCell, control_record},
+    replay_constraints::{ConstraintMember, ConstraintMembers},
+    *,
+};
 use crate::hosted_control::ReplayConstraintKind;
 
 pub(super) use rtdb_query::{
@@ -21,6 +25,7 @@ pub(super) struct OwnedUniqueChanges {
 
 struct TouchedPath {
     policy: OwnedUniquePolicy,
+    positioned_paths: Option<ArrayRef>,
     writes: i64,
     affected: BTreeMap<EntityId, Vec<Interval>>,
 }
@@ -112,6 +117,7 @@ impl OpenTransaction<'_> {
             relation.clone(),
             Some(TouchedPath {
                 policy,
+                positioned_paths: None,
                 writes: 0,
                 affected: BTreeMap::new(),
             }),
@@ -128,7 +134,7 @@ impl OpenTransaction<'_> {
     ) -> Result<()> {
         if !self.unique_changes.paths.contains_key(relation) {
             let snapshot = self.snapshot()?;
-            let policy = self.unique_policy(snapshot, owner, relation).await?;
+            let (policy, positioned_paths) = self.unique_policy_with_paths(snapshot, owner, relation, true).await?;
             self.unique_changes.reservations.push(
                 self.context
                     .memory
@@ -136,6 +142,7 @@ impl OpenTransaction<'_> {
             );
             let path = (!policy.paths.is_empty()).then_some(TouchedPath {
                 policy,
+                positioned_paths,
                 writes: 0,
                 affected: BTreeMap::new(),
             });
@@ -184,6 +191,7 @@ impl OpenTransaction<'_> {
         for (relation, path) in changes.paths {
             let Some(TouchedPath {
                 mut policy,
+                positioned_paths,
                 affected,
                 writes,
             }) = path
@@ -230,11 +238,14 @@ impl OpenTransaction<'_> {
                 )?;
             }
             policy.through_events = through_events;
-            self.buffer.put(
-                relation.unique_table(&owner),
-                policy.document(),
-                Interval::ALL,
-            )?;
+            let table = relation.unique_table(&owner);
+            let id = EntityId::String(OWNED_UNIQUE_POLICY_ID.into());
+            if !positioned_paths.as_ref().is_some_and(|paths| {
+                unique_frontier_document(&self.context.memory, &id, paths, through_events)
+                    .is_ok_and(|document| self.try_stage_control_put(&table, id.iid(), Interval::ALL, document))
+            }) {
+                self.buffer.put(table, policy.document(), Interval::ALL)?;
+            }
         }
         Ok(())
     }
@@ -364,8 +375,18 @@ impl OpenTransaction<'_> {
         owner: &str,
         relation: &OwnedRelation,
     ) -> Result<OwnedUniquePolicy> {
+        self.unique_policy_with_paths(snapshot, owner, relation, false).await.map(|(policy, _)| policy)
+    }
+
+    async fn unique_policy_with_paths(
+        &self,
+        snapshot: Snapshot,
+        owner: &str,
+        relation: &OwnedRelation,
+        retain_paths: bool,
+    ) -> Result<(OwnedUniquePolicy, Option<ArrayRef>)> {
         if !snapshot.contains_table(&relation.unique_table(owner)) {
-            return Ok(OwnedUniquePolicy::default());
+            return Ok((OwnedUniquePolicy::default(), None));
         }
         let context = self
             .context
@@ -376,7 +397,11 @@ impl OpenTransaction<'_> {
                 self.trace_parent,
             )?
             .with_accelerators(Arc::from([]));
-        rtdb_query::read_owned_unique_policy(context, owner, relation).await
+        if retain_paths {
+            rtdb_query::read_owned_unique_policy_for_update(context, owner, relation).await
+        } else {
+            rtdb_query::read_owned_unique_policy(context, owner, relation).await.map(|policy| (policy, None))
+        }
     }
 
     pub(super) async fn read_occupancy_cell(&self, cursor: Option<QueryCursor>, id: &EntityId, column: &str, uncovered: fn() -> Anomaly) -> Result<Option<Value>> {
@@ -404,6 +429,16 @@ impl OpenTransaction<'_> {
     pub(super) fn read_occupancy_value_at(&self, rows: &RecordBatch, row: usize, column: &str, uncovered: fn() -> Anomaly) -> Result<Value> {
         occupancy_value_at(&self.context.memory, rows, row, column, uncovered)
     }
+}
+
+fn unique_frontier_document(
+    memory: &Arc<MemoryBudget>, id: &EntityId, paths: &ArrayRef, through_events: i64,
+) -> Result<ArrayRef> {
+    control_record(memory, &[
+        ("_id", ControlCell::Value(id.as_value())),
+        ("paths", ControlCell::Funded(paths)),
+        ("through_events", ControlCell::Value(Value::I64(through_events))),
+    ])
 }
 
 pub(super) fn unique_segment_interval(
@@ -524,4 +559,32 @@ pub(super) fn unique_key_bytes(value: Option<&[u8]>) -> Result<&[u8]> {
 
 pub(super) fn invalid_key() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/unique-key", "The unique path requires a nonempty Binary key of at most 4096 bytes")
+}
+
+#[cfg(test)]
+mod positioned_policy_tests {
+    use super::*;
+
+    #[test]
+    fn a_unique_frontier_encodes_with_its_occupancy_put() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut policy = OwnedUniquePolicy::default();
+        policy.paths.insert(OwnedRelation::new("names")?, "name_key".into());
+        policy.through_events = 6;
+        let prior = Value::Struct(policy.document());
+        let array = rtdb_columnar::build_array(&prior.logical_type(), &[prior])?;
+        let array = rtdb_columnar::retain_array(array, &memory.reserve(1 << 15)?)?;
+        let paths = array.as_struct().column_by_name("paths").unwrap();
+        let id = EntityId::String(OWNED_UNIQUE_POLICY_ID.into());
+        policy.through_events = 7;
+        let positioned = unique_frontier_document(&memory, &id, paths, policy.through_events)?;
+        let occupancy = StructFields::from([
+            ("_id".into(), Value::Utf8("k01".into())),
+            ("holder".into(), Value::Binary(vec![5])),
+        ]);
+        super::super::positioned_control::assert_control_bytes(
+            &memory, &OwnedRelation::new("facts")?.unique_table("owner"), policy.document(), positioned,
+            Some(occupancy),
+        )
+    }
 }
