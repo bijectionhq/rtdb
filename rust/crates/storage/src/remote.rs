@@ -741,20 +741,39 @@ impl RemoteObjects {
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        let length = self.head(key).await?.size;
-        if range.start > range.end || range.end > length {
-            return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
+        if range.start >= range.end {
+            let length = self.head(key).await?.size;
+            if range.start > range.end || range.end > length {
+                return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
+            }
+            return Ok(Bytes::new());
         }
-        if range.is_empty() { return Ok(Bytes::new()); }
-        self.with_read(key, self.read_range(key, range)).await
+        match self.with_read(key, self.read_range(key, range.clone())).await {
+            Err(Error::MissingObject(missing)) => Err(Error::MissingObject(missing)),
+            Err(error) => match self.head(key).await {
+                Err(Error::MissingObject(missing)) => Err(Error::MissingObject(missing)),
+                Ok(object) if range.end > object.size => {
+                    Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: object.size })
+                }
+                _ if matches!(error, Error::InvalidRange { .. }) => {
+                    Err(Error::Remote { key: key.to_string(), message: "provider returned a different byte range".into() })
+                }
+                _ => Err(error),
+            },
+            bytes => bytes,
+        }
     }
 
     async fn read_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        let bytes = self.client.get_range(&self.path(key)?, range.clone()).await.map_err(|error| provider_error(key, error))?;
-        if bytes.len() as u64 != range.end - range.start {
-            return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
+        let response = self.read(key, GetOptions::new().with_range(Some(range.clone()))).await?;
+        if response.range != range || response.meta.size < range.end {
+            return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
         }
-        Ok(bytes)
+        let length = usize::try_from(range.end - range.start)
+            .map_err(|_| Error::Task("The provider range exceeds addressable memory".into()))?;
+        collect_exact_body(response, key, length, || Error::Remote {
+            key: key.to_string(), message: "provider returned an incomplete byte range".into(),
+        }).await
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes, authority: Option<&IoRegion>) -> Result<ProviderPublication> {

@@ -802,6 +802,27 @@ async fn successful_reserved_range_retains_the_charge_after_the_region_drains() 
 }
 
 #[tokio::test]
+async fn a_range_read_is_one_provider_request_and_still_reports_missing_and_out_of_range_reads() {
+    let provider = ControlledStore::new(Hooks::default());
+    provider.inner.put(&Path::from("data.arrow"), Bytes::from_static(b"0123456789").into()).await.unwrap();
+    let store = RemoteStore::new(Arc::clone(&provider) as Arc<dyn ProviderStore>, None);
+    let key = ObjectKey::new("data.arrow").unwrap();
+    let calls = || provider.observed.calls.load(Ordering::SeqCst);
+
+    assert_eq!(store.get_range(&key, 2..6).await.unwrap().as_ref(), b"2345");
+    assert_eq!(calls(), 1);
+    assert_eq!(store.get_range(&key, 0..10).await.unwrap().as_ref(), b"0123456789");
+    assert_eq!(calls(), 2);
+
+    assert!(matches!(store.get_range(&key, 8..11).await, Err(Error::InvalidRange { start: 8, end: 11, length: 10, .. })));
+    assert!(matches!(store.get_range(&key, 10..12).await, Err(Error::InvalidRange { length: 10, .. })));
+    assert!(matches!(store.get_range(&key, 11..11).await, Err(Error::InvalidRange { length: 10, .. })));
+    assert!(store.get_range(&key, 10..10).await.unwrap().is_empty());
+    let missing = ObjectKey::new("missing.arrow").unwrap();
+    assert!(matches!(store.get_range(&missing, 0..4).await, Err(Error::MissingObject(_))));
+}
+
+#[tokio::test]
 async fn publication_reports_staging_cleanup_failure_after_destination_is_visible() {
     let provider = ControlledStore::new(Hooks { fail_delete: true, ..Default::default() });
     let store = RemoteStore::new(provider.clone(), Some(ObjectKey::new("db").unwrap()));
