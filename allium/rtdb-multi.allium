@@ -491,6 +491,7 @@ contract KernelFundedAdmission {
 
     @invariant TimedStoreEnrollment
         -- The operator enables the exchange on a private TLS Multi writer and installs the hosted control owner and source-bound receiver certificate.
+        -- The writer binds one explicit loopback, RFC 1918 IPv4 or IPv6 unique-local address.
         -- Timed Store negotiation requires a non-fresh authenticated writer session for an activated commissioned database.
         -- The exchange checks a fresh receiver sample and the submitted cutoffs against the installed certificate before entering the writer turn.
         -- The Kernel verifies the offered commitment against its installed application catalog before returning the exact authorization.

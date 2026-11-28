@@ -485,7 +485,8 @@ The Kernel resolves exact retries through its original call identities after set
 The stock RTDB deployment check for a standalone listener is a legacy `OfferDecisionClock` Flight action.
 It returns the typed missing-Kernel refusal before using the request body.
 A listener serving RTDB v1 also omits the legacy funded feature names from `Capabilities`.
-For a dedicated commissioned Multi writer, enable `flightSql.kernelTimedStore` on its private loopback TLS listener.
+For a dedicated commissioned Multi writer, enable `flightSql.kernelTimedStore` on its private TLS listener.
+Set `flightSql.host` to an explicit loopback, RFC 1918 IPv4 or IPv6 unique-local address.
 Set `flightSql.ownedNativeActions`, install the hosted control owner and relations, and provide the source-bound `fundedReceiverClock` and authenticated timed journal.
 The installed node command loads `certificate.pem` and `key.pem` from the absolute `flightSql.kernelTimedStoreTlsDirectory`. Keep both files private.
 On the Kernel, use `timed_store_application_catalog` in the hosted Store binding to install the direct TLS `writer_url`, the catalog UUID in `catalog`, and its genesis digest in `root_sha256`.

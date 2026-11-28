@@ -1,4 +1,6 @@
 use std::{future::Future, io::{self, IoSlice}, net::SocketAddr, pin::Pin, sync::{Arc, Mutex}, task::{Context, Poll}};
+#[cfg(feature = "multi")]
+use std::net::IpAddr;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use futures::{StreamExt, task::AtomicWaker};
 use rtdb_auth::Authenticator;
@@ -31,6 +33,14 @@ pub(crate) enum Binding {
     Follower(crate::follower::FollowerRoute),
 }
 
+#[cfg(feature = "multi")]
+fn timed_store_address(address: IpAddr) -> bool {
+    match address.to_canonical() {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    }
+}
+
 impl ServerDriver {
     /// Binds the insecure Flight endpoint without spawning a task.
     /// The owner runs this driver and cancels its handle, then joins `run`, before closing the node.
@@ -51,6 +61,19 @@ impl ServerDriver {
     pub async fn bind_loopback_tls(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, tls: rustls::ServerConfig) -> Result<(ServerHandle, Self)> {
         if !config.address.ip().is_loopback() {
             return Err(Anomaly::incorrect("rtdb.flight-sql/development-tls", "Development Flight TLS requires a loopback address"));
+        }
+        config.validate(None)?;
+        Self::bind_private_tls(config, node, authenticator, tls, Binding::Ordinary).await
+    }
+
+    /// Bind the commissioned timed Store writer to one private TLS interface.
+    #[cfg(feature = "multi")]
+    pub async fn bind_timed_store_tls(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, tls: rustls::ServerConfig) -> Result<(ServerHandle, Self)> {
+        if config.timed_store_clock.is_none() || !timed_store_address(config.address.ip()) {
+            return Err(Anomaly::incorrect(
+                "rtdb.flight-sql/timed-store-listener",
+                "Timed Store requires a commissioned clock and an explicit loopback, RFC 1918 or IPv6 unique-local address",
+            ));
         }
         config.validate(None)?;
         Self::bind_private_tls(config, node, authenticator, tls, Binding::Ordinary).await
@@ -341,6 +364,17 @@ mod tests {
     use rtdb_storage::{HeldView, ReadLease, sealing::PlaintextView};
     use rtdb_types::MemoryBudget;
     use tokio::io::AsyncWriteExt;
+
+    #[cfg(feature = "multi")]
+    #[test]
+    fn timed_store_binds_only_explicit_private_addresses() {
+        for address in ["127.0.0.1", "::1", "10.0.0.1", "172.16.0.1", "172.31.255.254", "192.168.0.1", "fd00::1", "::ffff:10.0.0.1"] {
+            assert!(timed_store_address(address.parse().unwrap()), "{address}");
+        }
+        for address in ["0.0.0.0", "::", "172.15.0.1", "172.32.0.1", "100.64.0.1", "169.254.0.1", "224.0.0.1", "fe80::1", "2001:db8::1", "::ffff:192.0.2.1"] {
+            assert!(!timed_store_address(address.parse().unwrap()), "{address}");
+        }
+    }
 
     #[tokio::test]
     async fn queued_flight_bytes_require_the_original_grant_at_the_socket() {

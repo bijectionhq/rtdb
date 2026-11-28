@@ -428,6 +428,8 @@ impl ServerDriver {
                 ..Default::default() };
             let (handle, driver) = match (&installed_tls, &development_tls) {
                 (Some(tls), _) => rtdb_flight_sql::ServerDriver::bind_standalone(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
+                #[cfg(feature = "multi")]
+                (None, Some(tls)) if settings.kernel_timed_store => rtdb_flight_sql::ServerDriver::bind_timed_store_tls(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
                 (None, Some(tls)) => rtdb_flight_sql::ServerDriver::bind_loopback_tls(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
                 (None, None) => rtdb_flight_sql::ServerDriver::bind(ordinary, node.clone(), auth.clone()).await?,
             };
