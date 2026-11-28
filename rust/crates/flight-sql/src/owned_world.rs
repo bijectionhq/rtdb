@@ -2,7 +2,7 @@ use std::{ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, NullArray, RecordBatch, StringArray,
     builder::{Float32Builder, Float64Builder}, cast::AsArray, types::{Float32Type, Float64Type}};
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer, bit_util};
 use arrow_schema::{DataType, Field};
 use futures::future::BoxFuture;
 use rtdb_columnar::{ArrowCell, MemoryReservation};
@@ -268,9 +268,7 @@ impl<'a> PointCell<'a> {
             }
             LogicalType::List { kind: kind @ (ListKind::List | ListKind::FixedSizeList(_)), element } => {
                 let Some((item, values, rows)) = selected.sequence_range() else { return Ok(None); };
-                if rows.is_empty() || !item.metadata().is_empty()
-                    || values.nulls().is_some_and(|nulls| nulls.slice(rows.start, rows.len()).null_count() != 0)
-                {
+                if rows.is_empty() || !item.metadata().is_empty() {
                     return Ok(None);
                 }
                 let element = match element.as_ref() { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
@@ -279,9 +277,18 @@ impl<'a> PointCell<'a> {
                     (LogicalType::Scalar(ScalarType::F64), DataType::Float64) => (size_of::<Float64Array>(), 8),
                     _ => return Ok(None),
                 };
-                let bytes = rows.len().checked_mul(width).and_then(|bytes| header.checked_add(bytes))
+                let nulls = values.nulls().map_or(0, |nulls| nulls.slice(rows.start, rows.len()).null_count());
+                // Point admission charges the validity capacity allocated by copy_float_components.
+                let validity_bytes = if nulls == 0 { 0 } else {
+                    bit_util::round_upto_multiple_of_64(bit_util::ceil(rows.len(), 8))
+                };
+                let bytes = rows.len().checked_mul(width)
+                    .and_then(|bytes| header.checked_add(bytes)?.checked_add(validity_bytes))
                     .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-                let logical = LogicalType::List { kind: kind.clone(), element: Box::new(element.clone()) };
+                let observed = if nulls == 0 { element.clone() }
+                    else if nulls == rows.len() { LogicalType::Null }
+                    else { element.clone().maybe() };
+                let logical = LogicalType::List { kind: kind.clone(), element: Box::new(observed) };
                 (logical, bytes, PointStorage::FloatList { values, rows })
             }
             _ => return Ok(None),
@@ -365,14 +372,25 @@ fn compact_float_list(field: &Field, values: &dyn Array, rows: Range<usize>) -> 
     };
     let length = rows.len();
     let array: ArrayRef = match item.data_type() {
+        DataType::Null => Arc::new(NullArray::new(length)),
         DataType::Float32 => {
             let mut output = Float32Builder::with_capacity(length);
-            output.append_slice(&values.as_primitive::<Float32Type>().values()[rows]);
+            let values = values.as_primitive::<Float32Type>();
+            if item.is_nullable() {
+                output.extend(values.slice(rows.start, length).iter());
+            } else {
+                output.append_slice(&values.values()[rows]);
+            }
             Arc::new(output.finish())
         }
         DataType::Float64 => {
             let mut output = Float64Builder::with_capacity(length);
-            output.append_slice(&values.as_primitive::<Float64Type>().values()[rows]);
+            let values = values.as_primitive::<Float64Type>();
+            if item.is_nullable() {
+                output.extend(values.slice(rows.start, length).iter());
+            } else {
+                output.append_slice(&values.values()[rows]);
+            }
             Arc::new(output.finish())
         }
         _ => unreachable!("Prepared point float components"),
@@ -380,7 +398,16 @@ fn compact_float_list(field: &Field, values: &dyn Array, rows: Range<usize>) -> 
     Ok(match width {
         Some(width) => Arc::new(FixedSizeListArray::try_new(Arc::clone(item), width, array, None).map_err(point_arrow)?),
         None => {
-            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, i32::try_from(length).expect("An Arrow list has i32 offsets")]));
+            let end = i32::try_from(length).expect("An Arrow list has i32 offsets");
+            let offsets = if item.is_nullable() {
+                // Reply admission includes the offset capacity retained by the detached list writer.
+                let mut offsets = vec![0];
+                offsets.push(end);
+                offsets
+            } else {
+                vec![0, end]
+            };
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
             Arc::new(ListArray::try_new(Arc::clone(item), offsets, array, None).map_err(point_arrow)?)
         }
     })
@@ -388,6 +415,70 @@ fn compact_float_list(field: &Field, values: &dyn Array, rows: Range<usize>) -> 
 
 fn point_arrow(error: arrow_schema::ArrowError) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn held_point_nullable_float_lists_keep_projected_validity_bits_and_the_original_charge() {
+    use arrow_buffer::NullBuffer;
+    use arrow_ipc::writer::IpcWriteOptions;
+    use arrow_schema::Schema;
+
+    let range_bits = 513;
+    let f32_type = LogicalType::list(LogicalType::Scalar(ScalarType::F32).maybe());
+    let f32_field = rtdb_columnar::to_field("items", &f32_type).unwrap();
+    let DataType::List(item) = f32_field.data_type() else { unreachable!() };
+    let mut floats = vec![123.0_f32; 1 + range_bits];
+    floats[1] = f32::from_bits(0x7fc0_0042);
+    floats[2] = -0.0;
+    let mut validity = vec![false; floats.len()];
+    validity[..3].fill(true);
+    let values = Float32Array::new(floats.into(), Some(NullBuffer::from(validity)));
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 1 + range_bits as i32]));
+    let f32_list = ListArray::try_new(Arc::clone(item), offsets, Arc::new(values), None).unwrap().slice(1, 1);
+    let f32_present = ListArray::try_new(Arc::clone(item), OffsetBuffer::new(ScalarBuffer::from(vec![0, 1])),
+        Arc::new(Float32Array::from(vec![-0.0])), None).unwrap();
+
+    let f64_type = LogicalType::List {
+        kind: ListKind::FixedSizeList(2),
+        element: Box::new(LogicalType::Scalar(ScalarType::F64).maybe()),
+    };
+    let f64_field = rtdb_columnar::to_field("fixed", &f64_type).unwrap();
+    let DataType::FixedSizeList(item, width) = f64_field.data_type() else { unreachable!() };
+    let values = Float64Array::new(vec![1.0, 2.0, 30.0, 40.0, -0.0, 60.0].into(),
+        Some(NullBuffer::from(vec![true, true, false, false, true, false])));
+    let f64_list = FixedSizeListArray::try_new(Arc::clone(item), *width, Arc::new(values), None).unwrap();
+    let input = [
+        (f32_field.clone(), Arc::new(f32_list) as ArrayRef),
+        (f32_field, Arc::new(f32_present) as ArrayRef),
+        (f64_field.clone(), Arc::new(f64_list.slice(1, 1)) as ArrayRef),
+        (f64_field, Arc::new(f64_list.slice(2, 1)) as ArrayRef),
+    ];
+    for (field, array) in input {
+        let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+        let decoded = rtdb_columnar::read_value(&field, array.as_ref(), 0).unwrap();
+        let observed = decoded.logical_type();
+        let plan = PointCell::prepare(cell).unwrap();
+        assert!(matches!(&plan.storage, PointStorage::FloatList { .. }));
+        assert_eq!(plan.heap_bytes(), decoded.retained_bytes().unwrap() - size_of::<Value>());
+        let (output_field, output) = plan.write(field.name()).unwrap();
+        assert_eq!(output_field, rtdb_columnar::to_field(field.name(), &observed).unwrap());
+        let expected = rtdb_columnar::build_array(&observed, &[decoded]).unwrap();
+        let schema = Arc::new(Schema::new(vec![output_field]));
+        let ipc = |array| {
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+            rtdb_format::ipc::write_arrow_stream(&schema, &[batch], IpcWriteOptions::default()).unwrap()
+        };
+        if let LogicalType::List { element, .. } = &observed
+            && **element == LogicalType::Scalar(ScalarType::F32)
+        {
+            let list = output.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(list.offsets().inner().inner().capacity(), 2 * size_of::<i32>());
+        } else {
+            assert_eq!(output.get_array_memory_size(), expected.get_array_memory_size());
+        }
+        assert_eq!(ipc(output), ipc(expected));
+    }
 }
 
 
