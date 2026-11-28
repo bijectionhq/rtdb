@@ -4278,17 +4278,25 @@ impl<'a> OpenTransaction<'a> {
                 Some(MetadataErasureUnit::Table { table, id }) => Some((table.clone(), id.iid(), None)),
                 Some(MetadataErasureUnit::Owned { relation, id }) => self.options.user.as_deref()
                     .filter(|owner| !owner.is_empty()).map(|owner| {
-                        let (iid, handle) = id.iid_and_handle();
-                        (relation.table(owner), iid, Some(handle))
+                        let id = id.as_ref();
+                        (relation.table(owner), id.iid(), Some(id))
                     }),
                 None => None,
             };
             let mut retained = StructFields::new();
             let keep = match linked {
-                Some((table, iid, entity)) if result.committed() && self.buffer.puts_metadata_unit(&table, iid, entity.as_deref())? => {
-                    let erased_with = retention::metadata_erasure_key(&table, iid, entity.as_deref());
-                    retained.insert(retention::METADATA_ERASURE_UNIT.into(), Value::Utf8(erased_with));
-                    true
+                Some((table, iid, entity)) if result.committed() => {
+                    let mut integer = [0; 8];
+                    let handle = match &entity {
+                        Some(id) => Some(id.handle_parts(&mut integer)),
+                        None => None,
+                    };
+                    let linked = self.buffer.puts_metadata_unit(&table, iid, handle)?;
+                    if linked {
+                        let erased_with = retention::metadata_erasure_key_parts(&table, iid, handle);
+                        retained.insert(retention::METADATA_ERASURE_UNIT.into(), Value::Utf8(erased_with));
+                    }
+                    linked
                 }
                 _ => unit.is_none(),
             };
@@ -5528,7 +5536,7 @@ mod tests {
     }
 
     #[test]
-    fn replayed_owned_binary_metadata_keeps_the_exact_receipt_link_and_window() -> Result<()> {
+    fn replayed_owned_metadata_keeps_the_exact_typed_receipt_link_and_window() -> Result<()> {
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
             footprint_grants: Default::default(), decision_clock: None,
@@ -5541,51 +5549,90 @@ mod tests {
         };
         let relation = rtdb_types::OwnedRelation::new("records")?;
         let table = relation.table("owner");
-        let bytes = vec![0, 0xfe, 0xff];
-        let id = rtdb_types::EntityId::Binary(bytes.clone());
-        let metadata = Value::Struct(StructFields::from([("rtdb_erasure_unit_v1".into(), Value::Struct(StructFields::from([
-            ("owned_relation".into(), Value::Utf8(relation.name().into())),
-            ("id".into(), Value::Binary(bytes)),
-        ])))]));
-        let source = SourceTransaction::new(vec![], SubmitOptions {
-            user: Some("owner".into()), user_metadata: Some(UserMetadata::new(metadata.clone(), &memory)?),
-            ..Default::default()
-        }, &memory)?;
-        let encoded = source.encode()?;
-        let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice())?.unwrap();
-        let replayed = SourceTransaction::decode(&message, &memory)?;
-        assert_eq!(source.body_digest()?, replayed.body_digest()?);
-        let user_metadata = replayed.options.user_metadata.as_ref().unwrap();
-        let Some(crate::values::MetadataErasureUnit::Owned { id: crate::values::MetadataOwnedId::Binary(borrowed), .. }) = user_metadata.erasure_unit()? else {
-            panic!("Expected a borrowed Binary metadata association");
-        };
-        let Some(Value::Binary(payload)) = user_metadata.value().field("rtdb_erasure_unit_v1").and_then(|unit| unit.field("id")) else {
-            panic!("Expected the retained Binary metadata cell");
-        };
-        assert_eq!(borrowed.as_ptr(), payload.as_ptr());
-
         let snapshot = rtdb_index::PartitionState::empty(Default::default())?.snapshot();
         let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(99) };
         let observed = Timestamp(100);
-        for matching in [true, false] {
-            let mut tx = OpenTransaction::new(snapshot.clone(), key, &replayed.options, &context)?;
-            let handle = if matching { id.handle_bytes() } else { rtdb_types::EntityId::Binary(vec![0]).handle_bytes() };
-            tx.buffer.append(table.clone(), StoredEvent {
-                position: None, origin: None, commit_position: 0, entity_key: Some(handle.into()), iid: id.iid(),
-                system_from: key.system_time, valid_time: Interval::ALL, recency: None,
-                operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])),
-            })?;
-            tx.write_result(&TransactionResult::Committed { tx_key: key }, Some(user_metadata), Some(Timestamp(98)), observed)?;
-            let writes = tx.buffer.stage()?;
-            let receipt = writes.tables().get(&receipts_table());
-            assert_eq!(receipt.is_some(), matching);
-            if let Some(receipt) = receipt {
-                let event = receipt.batch().unwrap().view().read_event(0)?;
-                assert_eq!(event.valid_time, interval(observed, Timestamp(observed.0 + RECEIPT_WINDOW_MICROS))?);
-                let StoredOperation::Put(row) = event.operation else { panic!("Expected a retained receipt"); };
-                assert_eq!(row.get("user_metadata"), Some(&metadata));
-                assert_eq!(row.get(retention::METADATA_ERASURE_UNIT),
-                    Some(&Value::Utf8(retention::metadata_erasure_key(&table, id.iid(), Some(&id.handle_bytes())))));
+        for id in [
+            rtdb_types::EntityId::Binary(vec![0, 0xfe, 0xff]),
+            rtdb_types::EntityId::Binary(vec![]),
+            rtdb_types::EntityId::String("places/東京".into()),
+            rtdb_types::EntityId::Keyword(rtdb_types::Keyword::from_name("places/東京")),
+            rtdb_types::EntityId::Integer(-31),
+            rtdb_types::EntityId::Uuid([7; 16]),
+        ] {
+            let metadata = Value::Struct(StructFields::from([("rtdb_erasure_unit_v1".into(), Value::Struct(StructFields::from([
+                ("owned_relation".into(), Value::Utf8(relation.name().into())),
+                ("id".into(), id.as_value()),
+            ])))]));
+            let source = SourceTransaction::new(vec![], SubmitOptions {
+                user: Some("owner".into()), user_metadata: Some(UserMetadata::new(metadata.clone(), &memory)?),
+                ..Default::default()
+            }, &memory)?;
+            let encoded = source.encode()?;
+            let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice())?.unwrap();
+            let replayed = SourceTransaction::decode(&message, &memory)?;
+            assert_eq!(source.body_digest()?, replayed.body_digest()?);
+            let user_metadata = replayed.options.user_metadata.as_ref().unwrap();
+            let Some(crate::values::MetadataErasureUnit::Owned { id: association, .. }) = user_metadata.erasure_unit()? else {
+                panic!("Expected a typed metadata association");
+            };
+            let id_cell = user_metadata.value().field("rtdb_erasure_unit_v1").and_then(|unit| unit.field("id")).unwrap();
+            let borrowed = match id_cell {
+                Value::Binary(payload) => Some(payload.as_slice()),
+                Value::Utf8(payload) => Some(payload.as_bytes()),
+                Value::Keyword(payload) => Some(payload.as_str().as_bytes()),
+                _ => None,
+            };
+            if let Some(borrowed) = borrowed {
+                let mut integer = [0; 8];
+                let association = association.as_ref();
+                assert_eq!(association.handle_parts(&mut integer).1.as_ptr(), borrowed.as_ptr());
+            }
+
+            let canonical = id.handle_bytes();
+            let mut wrong_tag = canonical.clone();
+            wrong_tag[0] = if canonical[0] == 4 { 0 } else { 4 };
+            let mut wrong_payload = canonical.clone();
+            wrong_payload.push(0);
+            for (handle, erased, arrow) in [
+                (&canonical, false, false), (&canonical, false, true),
+                (&wrong_tag, false, true), (&wrong_payload, false, false),
+                (&canonical, true, false),
+            ] {
+                let mut tx = OpenTransaction::new(snapshot.clone(), key, &replayed.options, &context)?;
+                let document = StructFields::from([("_id".into(), id.as_value())]);
+                if arrow {
+                    let document = Value::Struct(document);
+                    let array = rtdb_columnar::build_array(&document.logical_type(), std::slice::from_ref(&document))?;
+                    let header = EventHeader {
+                        position: None, commit_position: 0, iid: id.iid(),
+                        system_from: key.system_time, valid_time: Interval::ALL, op: EventOp::Put,
+                    };
+                    tx.buffer.append_owned_put(&table, array, header, handle, None)?;
+                } else {
+                    tx.buffer.append(table.clone(), StoredEvent {
+                        position: None, origin: None, commit_position: 0, entity_key: Some(Arc::from(handle.as_slice())), iid: id.iid(),
+                        system_from: key.system_time, valid_time: Interval::ALL, recency: None, operation: StoredOperation::Put(document),
+                    })?;
+                }
+                if erased {
+                    tx.buffer.append(table.clone(), StoredEvent {
+                        position: None, origin: None, commit_position: 0, entity_key: Some(Arc::from(handle.as_slice())), iid: id.iid(),
+                        system_from: key.system_time, valid_time: Interval::ALL, recency: None, operation: StoredOperation::Erase,
+                    })?;
+                }
+                tx.write_result(&TransactionResult::Committed { tx_key: key }, Some(user_metadata), Some(Timestamp(98)), observed)?;
+                let writes = tx.buffer.stage()?;
+                let receipt = writes.tables().get(&receipts_table());
+                assert_eq!(receipt.is_some(), handle == &canonical && !erased);
+                if let Some(receipt) = receipt {
+                    let event = receipt.batch().unwrap().view().read_event(0)?;
+                    assert_eq!(event.valid_time, interval(observed, Timestamp(observed.0 + RECEIPT_WINDOW_MICROS))?);
+                    let StoredOperation::Put(row) = event.operation else { panic!("Expected a retained receipt"); };
+                    assert_eq!(row.get("user_metadata"), Some(&metadata));
+                    assert_eq!(row.get(retention::METADATA_ERASURE_UNIT),
+                        Some(&Value::Utf8(retention::metadata_erasure_key(&table, id.iid(), Some(&canonical)))));
+                }
             }
         }
         Ok(())

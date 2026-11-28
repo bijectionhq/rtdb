@@ -106,13 +106,40 @@ fn clock_error(message: &str) -> Anomaly { Anomaly::fault("rtdb.tx/retention-clo
 pub(super) const METADATA_ERASURE_UNIT: &str = "metadata_erasure_unit";
 
 pub(super) fn metadata_erasure_key(table: &TableRef, iid: Iid, key: Option<&[u8]>) -> String {
+    metadata_erasure_digest(table, [key.unwrap_or(&iid.0), &[]])
+}
+
+pub(super) fn metadata_erasure_key_parts(table: &TableRef, iid: Iid, key: Option<(u8, &[u8])>) -> String {
+    match key {
+        Some((tag, payload)) => metadata_erasure_digest(table, [&[tag], payload]),
+        None => metadata_erasure_key(table, iid, None),
+    }
+}
+
+fn metadata_erasure_digest(table: &TableRef, key: [&[u8]; 2]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"rtdb/transaction-metadata-erasure/v1");
-    for field in [table.schema.as_bytes(), table.table.as_bytes(), key.unwrap_or(&iid.0)] {
+    for field in [table.schema.as_bytes(), table.table.as_bytes()] {
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field);
     }
+    digest.update((key[0].len() as u64 + key[1].len() as u64).to_be_bytes());
+    for part in key { digest.update(part); }
     format!("{:x}", digest.finalize())
+}
+
+#[test]
+fn metadata_erasure_keys_preserve_v1_framing() {
+    let table = TableRef::new("app", "records");
+    let iid = Iid([0x2a; 16]);
+    assert_eq!(
+        metadata_erasure_key_parts(&table, iid, None),
+        "5a49faa7d23cfb781f0d6d1c49b9199a1dda17dde03f1a783defd539d6da450d",
+    );
+    assert_eq!(
+        metadata_erasure_key_parts(&table, iid, Some((4, &[0, 0xfe, 0xff]))),
+        "0b9b2c38ba74b586491e2b0c38c6aeec03d66cd397744f115c0668b1e59b1689",
+    );
 }
 
 impl OpenTransaction<'_> {

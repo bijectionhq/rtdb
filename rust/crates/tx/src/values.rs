@@ -5,7 +5,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::Bytes;
-use rtdb_columnar::{ArrowCell, ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
+use rtdb_columnar::{ArrowCell, ColumnReader, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, ListKind, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 pub(crate) mod arguments;
@@ -1289,23 +1289,15 @@ pub(crate) enum MetadataErasureUnit<'a> {
 }
 
 pub(crate) enum MetadataOwnedId<'a> {
-    Binary(&'a [u8]),
+    Borrowed(EntityIdRef<'a>),
     Scalar(EntityId),
 }
 
 impl MetadataOwnedId<'_> {
-    pub(crate) fn iid_and_handle(&self) -> (rtdb_types::Iid, Vec<u8>) {
+    pub(crate) fn as_ref(&self) -> EntityIdRef<'_> {
         match self {
-            Self::Binary(bytes) => {
-                let id = rtdb_columnar::EntityIdRef::Binary(bytes);
-                let mut integer = [0; 8];
-                let (tag, payload) = id.handle_parts(&mut integer);
-                let mut handle = Vec::with_capacity(payload.len() + 1);
-                handle.push(tag);
-                handle.extend_from_slice(payload);
-                (id.iid(), handle)
-            }
-            Self::Scalar(id) => (id.iid(), id.handle_bytes()),
+            Self::Borrowed(id) => *id,
+            Self::Scalar(id) => EntityIdRef::from(id),
         }
     }
 }
@@ -1322,7 +1314,9 @@ impl<'a> MetadataErasureUnit<'a> {
         let target = (fields.get("table"), fields.get("owned_relation"));
         if let (None, Some(Value::Utf8(relation))) = target {
             let id = match id {
-                Value::Binary(bytes) => MetadataOwnedId::Binary(bytes),
+                Value::Binary(bytes) => MetadataOwnedId::Borrowed(EntityIdRef::Binary(bytes)),
+                Value::Utf8(text) => MetadataOwnedId::Borrowed(EntityIdRef::String(text)),
+                Value::Keyword(keyword) => MetadataOwnedId::Borrowed(EntityIdRef::Keyword(keyword.as_str())),
                 id => MetadataOwnedId::Scalar(id.entity_id()?),
             };
             let relation = rtdb_types::OwnedRelation::new(relation)?;

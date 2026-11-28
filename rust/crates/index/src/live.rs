@@ -1553,11 +1553,16 @@ impl TransactionBuffer {
     pub fn erase_iid(&mut self, table: &TableRef, iid: Iid) -> Result<()> {
         self.append_to(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid, system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None }).map(drop)
     }
-    pub fn puts_metadata_unit(&self, table: &TableRef, iid: Iid, key: Option<&[u8]>) -> Result<bool> {
+    pub fn puts_metadata_unit(&self, table: &TableRef, iid: Iid, key: Option<(u8, &[u8])>) -> Result<bool> {
         let Some(pending) = self.tables.get(table) else { return Ok(false); };
+        let matches_key = |stored: Option<&[u8]>| match (key, stored) {
+            (None, None) => true,
+            (Some((tag, payload)), Some(stored)) => stored.split_first() == Some((&tag, payload)),
+            _ => false,
+        };
         let mut put = false;
         for event in &pending.events {
-            if event.iid != iid || event.entity_key.as_deref() != key { continue; }
+            if event.iid != iid || !matches_key(event.entity_key.as_deref()) { continue; }
             match &event.operation {
                 StoredOperation::Erase => return Ok(false),
                 StoredOperation::Put(_) => put = true,
@@ -1567,7 +1572,7 @@ impl TransactionBuffer {
         for PendingBatch { batch, .. } in &pending.batches {
             for row in 0..batch.len() {
                 let header = batch.header(row)?;
-                if header.iid != iid || batch.view().entity_key(row)? != key { continue; }
+                if header.iid != iid || !matches_key(batch.view().entity_key(row)?) { continue; }
                 match header.op {
                     EventOp::Erase => return Ok(false),
                     EventOp::Put => put = true,
