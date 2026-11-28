@@ -115,6 +115,7 @@ The public `EXPLAIN ANALYZE` report uses its existing schema.
   The cursor aligns compatible selected layouts and emits sparse fixed-size list selections using Arrow buffers.
   The same selection works on maps from the live index.
   The buffer pool can retain decoded pages and parsed footers independently of the file's encoded payload.
+  A primary point read retains the whole page it decodes where the pool admits it, so a later point read or row load of that page reads no storage.
 * The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.
 * Temporal file selection includes live candidates before dropping persisted files.
 * Page selection uses temporal summaries, recency ceilings, and IID ranges, with a bypass option for comparison tests.
