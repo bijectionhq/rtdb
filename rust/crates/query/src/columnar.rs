@@ -5253,6 +5253,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_list_subscripts_keep_child_positions_and_check_only_reached_sql_indices() {
+        let memory = MemoryBudget::new(1 << 22);
+        for (scalar, winner) in [
+            (ScalarType::Utf8, Value::Utf8("é\0".into())),
+            (ScalarType::Binary, Value::Binary(vec![0, 255])),
+        ] {
+            let mut input = field(0, scalar.clone());
+            input.data_type = LogicalType::list(LogicalType::Scalar(scalar.clone()).maybe()).maybe();
+            let index = field(1, ScalarType::I64);
+            let schema = Schema::new(vec![input.clone(), index.clone()]).unwrap();
+            let source = [
+                Value::list(vec![Value::Null, winner.clone()]), Value::Null,
+                Value::list(vec![]), Value::list(vec![winner.clone()]),
+                Value::list(vec![winner.clone()]), Value::list(vec![winner.clone()]),
+            ];
+            let array = rtdb_columnar::copy_array(&input.data_type, &source).unwrap();
+            let child = array.as_any().downcast_ref::<ListArray>().unwrap().values().clone();
+            let batch = |indices: Vec<Option<i64>>| {
+                let columns = [
+                    (Arc::clone(&array), &input),
+                    (Arc::new(Int64Array::from(indices)) as ArrayRef, &index),
+                ].map(|(array, field)| Column::Arrow {
+                    array, field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                    logical: Some(field.data_type.clone()),
+                });
+                ColumnBatch::settled(columns.into(), source.len(), memory.reserve(4096).unwrap()).unwrap()
+            };
+            let subscript = |index| Expr::Subscript {
+                expr: Box::new(input.expression()), index: Box::new(index),
+                data_type: LogicalType::Scalar(scalar.clone()).maybe(),
+            };
+            let sql_index = |expr| Expr::binary(BinaryOp::Subtract, expr, Expr::Literal(Value::I64(1)));
+            let expression = subscript(sql_index(index.expression()));
+            let input_batch = batch(vec![Some(2), Some(i64::MIN), Some(1), Some(0), None, Some(-1)]);
+            let backing = Arc::downgrade(input_batch.column_reservation(0));
+            let mut cursor = record_projection_cursor(input_batch, schema.clone(), vec![expression.clone()], &memory);
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            let column = &page.columns[0];
+            for (row, value) in [winner.clone(), Value::Null, Value::Null, Value::Null, Value::Null, Value::Null].into_iter().enumerate() {
+                assert_eq!(column.value(row).unwrap(), value);
+            }
+            let cell = column.funded_arrow_cell(0, page.column_reservation(0)).unwrap().unwrap();
+            assert!(Arc::ptr_eq(cell.array, &child));
+            assert_eq!(cell.row, 1);
+            assert!(backing.upgrade().is_some());
+            drop(page);
+            assert!(backing.upgrade().is_none());
+
+            let mut cursor = record_projection_cursor(
+                batch(vec![Some(2), None, Some(i64::MIN), None, None, None]),
+                schema.clone(), vec![expression], &memory,
+            );
+            cursor.scalar_fallbacks = Some(0);
+            assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/overflow-error");
+            assert_eq!(cursor.scalar_fallbacks, Some(1));
+
+            let parameter_ty = LogicalType::Scalar(ScalarType::I16);
+            let expression = subscript(Expr::Parameter { index: 0, data_type: parameter_ty.clone() });
+            let binding = arrow_array::RecordBatch::try_new(
+                Arc::new(arrow_schema::Schema::new(vec![rtdb_columnar::to_field("arg", &parameter_ty).unwrap()])),
+                vec![Arc::new(arrow_array::Int16Array::from(vec![0, 1]))],
+            ).unwrap();
+            let backing = memory.reserve(binding.get_array_memory_size()).unwrap();
+            let binding = rtdb_columnar::OwnedBatch::with_reservation(binding, backing).unwrap();
+            let mut cursor = record_projection_cursor(batch(vec![None; source.len()]), schema, vec![expression], &memory);
+            cursor.execution.parameters = Arc::new(crate::parameters::BoundParameters::from_arrow(binding, 1, vec![parameter_ty], &memory).unwrap());
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            assert_eq!(page.columns[0].value(0).unwrap(), winner);
+            let cell = page.columns[0].funded_arrow_cell(0, page.column_reservation(0)).unwrap().unwrap();
+            assert!(Arc::ptr_eq(cell.array, &child));
+            assert_eq!(cell.row, 1);
+        }
+    }
+
+    fn assert_observed_list_result(column: &Column, expected: &[Value], memory: &Arc<MemoryBudget>) {
+        let (checked, _charge) = pack_evaluated_column(expected, memory).unwrap();
+        for (row, value) in expected.iter().enumerate() {
+            assert_eq!(&column.value(row).unwrap(), value);
+            let (_, actual_field, actual_type, _) = column.arrow_cell(row).unwrap().unwrap();
+            let (_, checked_field, checked_type, _) = checked.arrow_cell(row).unwrap().unwrap();
+            assert_eq!((actual_field, actual_type), (checked_field, checked_type));
+        }
+    }
+
+    #[tokio::test]
+    async fn trim_array_copies_text_and_binary_prefixes_with_their_observed_child_layouts() {
+        let memory = MemoryBudget::new(1 << 22);
+        for (scalar, kept, removed) in [
+            (ScalarType::Utf8, Value::Utf8("é\0".into()), Value::Utf8("removed".into())),
+            (ScalarType::Binary, Value::Binary(vec![0, 255]), Value::Binary(vec![123])),
+        ] {
+            let mut input = field(0, scalar.clone());
+            input.data_type = LogicalType::list(LogicalType::Scalar(scalar).maybe()).maybe();
+            let schema = Schema::new(vec![input.clone()]).unwrap();
+            let list = Value::list;
+            let source = [
+                Value::Null, list(vec![removed.clone()]), list(vec![Value::Null, removed.clone()]),
+                list(vec![kept.clone(), Value::Null, removed.clone()]),
+                list(vec![kept.clone(), removed.clone()]), list(vec![kept.clone(), removed]),
+            ];
+            let expected = [
+                Value::Null, list(vec![]), list(vec![Value::Null]),
+                list(vec![kept.clone(), Value::Null]), list(vec![kept.clone()]), list(vec![kept]),
+            ];
+            let batch = |values: &[Value]| ColumnBatch::settled(vec![Column::Arrow {
+                array: rtdb_columnar::copy_array(&input.data_type, values).unwrap(),
+                field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+                logical: Some(input.data_type.clone()),
+            }], values.len(), memory.reserve(4096).unwrap()).unwrap();
+            let expr = |count| {
+                let args = vec![input.expression(), Expr::Literal(count)];
+                let name = "trim_array";
+                Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args }
+            };
+            let mut cursor = record_projection_cursor(batch(&source), schema.clone(), vec![expr(Value::I32(1))], &memory);
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            assert_observed_list_result(&page.columns[0], &expected, &memory);
+            for (count, code) in [
+                (2, "xtdb.expression/array-element-error"),
+                (-1, "xtdb/invalid-argument-types"),
+                (i64::MIN, "xtdb.expression/array-element-error"),
+            ] {
+                let mut cursor = record_projection_cursor(batch(&source[..2]), schema.clone(), vec![expr(Value::I64(count))], &memory);
+                cursor.scalar_fallbacks = Some(0);
+                assert_eq!(cursor.next_batch().await.err().unwrap().code, code);
+                assert_eq!(cursor.scalar_fallbacks, Some(1));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_and_empty_delimiters_write_split_lists_with_the_checked_layouts() {
+        let memory = MemoryBudget::new(1 << 22);
+        let input = field(0, ScalarType::Utf8);
+        let delimiter = field(1, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone(), delimiter.clone()]).unwrap();
+        let list = |tokens: &[&str]| Value::list(tokens.iter().map(|text| Value::Utf8((*text).into())).collect());
+        let batch = |texts: &[Option<&str>], delimiters: &[Option<&str>]| {
+            let columns = [(texts, &input), (delimiters, &delimiter)].map(|(values, field)| Column::Arrow {
+                array: Arc::new(StringArray::from_iter(values.iter().copied())),
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                logical: Some(field.data_type.clone()),
+            });
+            ColumnBatch::settled(columns.into(), texts.len(), memory.reserve(4096).unwrap()).unwrap()
+        };
+        let expr = |delimiter| {
+            let args = vec![input.expression(), delimiter];
+            let name = "string_to_array";
+            Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args }
+        };
+        let texts = [Some("é🪢é\0🪢"), Some("😀\0"), None, Some(""), Some("🪢")];
+        let mut cursor = record_projection_cursor(
+            batch(&texts, &[Some("🪢"), Some(""), None, None, Some("🪢")]),
+            schema.clone(), vec![expr(delimiter.expression()), expr(Expr::Literal(Value::Utf8(String::new())))], &memory,
+        );
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        assert_observed_list_result(&page.columns[0], &[
+            list(&["é", "é\0", ""]), list(&["😀\0"]), Value::Null, list(&[]), list(&["", ""]),
+        ], &memory);
+        assert_observed_list_result(&page.columns[1], &[
+            list(&["é🪢é\0🪢"]), list(&["😀\0"]), Value::Null, list(&[]), list(&["🪢"]),
+        ], &memory);
+
+        let expression = expr(Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) });
+        let mut cursor = record_projection_cursor(batch(&[Some("a|b|")], &[None]), schema.clone(), vec![expression], &memory);
+        cursor.execution.parameters = Arc::new(crate::parameters::BoundParameters::infer(vec![Value::Utf8("|".into())], &memory).unwrap());
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        assert_observed_list_result(&page.columns[0], &[list(&["a", "b", ""])], &memory);
+
+        let mut cursor = record_projection_cursor(batch(&[Some("😀a")], &[None]), schema, vec![expr(delimiter.expression())], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(1));
+        assert_observed_list_result(&page.columns[0], &[list(&["?", "?", "a"])], &memory);
+    }
+
+    #[tokio::test]
     async fn list_subscripts_keep_funded_text_and_binary_child_positions() {
         let memory = MemoryBudget::new(1 << 22);
         for (scalar, winner) in [
@@ -7319,7 +7506,7 @@ impl BatchCursor for BatchExpressions {
                 owners[index] = Some(owner);
                 continue;
             }
-            if let Some((column, owner)) = lists::split_text(expression, &self.schema, &batch, &self.execution)? {
+            if let Some((column, owner)) = lists::list_call(expression, &self.schema, &batch, &self.execution)? {
                 columns.push(column);
                 owners[index] = Some(owner);
                 continue;
@@ -8467,8 +8654,12 @@ pub(crate) mod projection {
         }
 
         let Expr::Subscript { expr, index, .. } = expression else { return Ok(None); };
-        let Some(index) = literal_index(index) else { return Ok(None); };
-        let index = usize::try_from(index).ok();
+        let literal = literal_index(index);
+        let runtime = if literal.is_none() {
+            let Some(index) = super::lists::RuntimeIndex::bind(index, schema, batch, execution) else { return Ok(None); };
+            Some(index)
+        } else { None };
+        let literal = literal.and_then(|index| usize::try_from(index).ok());
         let (result_type, scalar) = match super::plain_scalar(output) {
             Some(ScalarType::Utf8) => (DataType::Utf8, ScalarType::Utf8),
             Some(ScalarType::Binary) => (DataType::Binary, ScalarType::Binary),
@@ -8499,11 +8690,11 @@ pub(crate) mod projection {
         let mut sources = vec![None];
         let mut source_positions = HashMap::new();
         let mut picks = Vec::with_capacity(batch.len);
-        for row in 0..batch.len {
-            context.check_cancelled_at(row)?;
+        for batch_row in 0..batch.len {
+            context.check_cancelled_at(batch_row)?;
             let cell = match &input {
                 Input::Column(column, owner) => {
-                    let Some(cell) = column.funded_arrow_cell(row, owner) else { return Ok(None); };
+                    let Some(cell) = column.funded_arrow_cell(batch_row, owner) else { return Ok(None); };
                     cell
                 }
                 Input::Parameter(cell) => Some(*cell),
@@ -8519,7 +8710,7 @@ pub(crate) mod projection {
             }
             let child = match field.data_type() {
                 DataType::List(child) => array.as_any().downcast_ref::<ListArray>().map(|list| (child, list.values())),
-                DataType::FixedSizeList(child, _) => array.as_any().downcast_ref::<FixedSizeListArray>().map(|list| (child, list.values())),
+                DataType::FixedSizeList(child, _) if runtime.is_none() => array.as_any().downcast_ref::<FixedSizeListArray>().map(|list| (child, list.values())),
                 _ => None,
             };
             let Some((child, child_array)) = child else { return Ok(None); };
@@ -8528,6 +8719,13 @@ pub(crate) mod projection {
                 picks.push((0, 0));
                 continue;
             }
+            let index = match &runtime {
+                Some(index) => {
+                    let Some(index) = index.zero_based(batch_row) else { return Ok(None); };
+                    index
+                }
+                None => literal,
+            };
             let Some((_, _, range)) = (ArrowCell { field, array: array.as_ref(), row }).sequence_range() else { return Ok(None); };
             let Some(child_row) = index.filter(|&index| index < range.len()).map(|index| range.start + index) else {
                 picks.push((0, 0));

@@ -214,10 +214,15 @@
 -- A packed list page carries its backing reservation into the query batch, whose slices retain the charge for the buffers they keep alive.
 -- A packed child page with an admitted execution layout carries the logical type of its physical field.
 -- A native list subscript with a constant index can preserve a plain text or binary child position and its backing charge from an input column or a funded bound argument.
+-- A native variable-list subscript can also preserve that position with an exact signed index from an input column or bound argument.
 -- The selected child keeps its own scalar field admission alongside the source buffer charge.
--- The selected position uses the SQL index adjustment and yields null for a null parent, null child, or out-of-range index.
--- Native STRING_TO_ARRAY with a literal nonempty delimiter can write tokens from plain text into funded Arrow lists.
+-- The selected position uses the SQL index adjustment and yields null for a null parent, null child, null index, or out-of-range index.
+-- A null list parent short-circuits index evaluation, and a reached SQL index adjustment can report signed overflow.
+-- Native TRIM_ARRAY with a nonnegative literal count can copy retained plain text and binary child prefixes directly into funded Arrow lists.
+-- The trimmed output preserves null parents, bottom-typed empty lists, and the type and nullability observed in each retained prefix.
+-- Native STRING_TO_ARRAY with an exact text delimiter can write tokens from plain text into funded Arrow lists.
 -- The result preserves null inputs, empty lists, and empty tokens within nonempty inputs in their observed layouts.
+-- An empty delimiter keeps nonempty text as one token, and a null delimiter splits it into UTF-16 units.
 -- JVM STRING_TO_ARRAY with well-formed UTF-8 operands can write token spans into a plain Arrow UTF-8 list using its projection allocator.
 -- It retains leading, consecutive, and trailing empty tokens in nonempty input, and preserves empty lists and null input.
 -- A null delimiter uses the scalar UTF-16 code unit split, and malformed byte operands use the scalar UTF-8 decoding rules.
