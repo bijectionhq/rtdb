@@ -339,3 +339,79 @@ fn lineage_rejects_substituted_publication_and_application_head() {
             .is_err()
     );
 }
+
+fn floor_publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
+    let control_stream = activation_stream_id(AUTHORITY, DATABASE).unwrap();
+    let floor = LineageFloor {
+        binding: PREDECESSOR,
+        source_root: source.history.genesis.root(),
+        source_head: source.signed_head.head,
+    };
+    let mut state = serde_json::to_value(State::initial(PREDECESSOR.incarnation)).unwrap();
+    state["version"] = LINEAGE_PROTOCOL.into();
+    state["lineage_base_version"] = 2.into();
+    state["floor"] = serde_json::to_value(floor).unwrap();
+    let control_record = serde_json::to_vec(&state).unwrap();
+    let control = archive(
+        CONTROL,
+        control_stream,
+        [Leaf {
+            stream: control_stream,
+            at: Lsn(1),
+            writer_epoch: Epoch(1),
+            payload_sha256: Sha256::digest(&control_record).into(),
+            quorum_durable_upper_micros: 70,
+            timing: None,
+        }],
+    );
+    (
+        PublicationProof {
+            control_record,
+            control_inclusion: control.inclusion(Lsn(1)).unwrap(),
+        },
+        control.history.genesis.root(),
+    )
+}
+
+#[test]
+fn lineage_floor_captures_a_serving_incarnations_included_append() {
+    let source = archive(SOURCE, STREAM, [leaf(1)]);
+    let inclusion = source.inclusion(Lsn(1)).unwrap();
+    let (floor, control_root) = floor_publication(&source);
+    let verify = |authorization, inclusion| {
+        verify_settlement(
+            AUTHORITY, DATABASE, control_root, source.history.genesis.root(), authorization, Some(&floor), inclusion,
+        )
+        .unwrap()
+    };
+    assert_eq!(verify(authorization(1), None), Settlement::Pending);
+    assert_eq!(verify(authorization(1), Some(&inclusion)), Settlement::Capture);
+    assert_eq!(verify(authorization(2), None), Settlement::Pending, "an open floor still grows");
+    assert!(floor.verify(AUTHORITY, DATABASE, control_root).is_err());
+}
+
+#[test]
+fn lineage_floor_releases_a_position_it_filled_with_another_append() {
+    let replacement = Leaf { writer_epoch: Epoch(2), timing: None, ..leaf(1) };
+    let source = archive(SOURCE, STREAM, [replacement]);
+    let inclusion = source.inclusion(Lsn(1)).unwrap();
+    let (floor, control_root) = floor_publication(&source);
+    let application_root = source.history.genesis.root();
+    assert_eq!(
+        verify_settlement(
+            AUTHORITY, DATABASE, control_root, application_root, authorization(1), Some(&floor), Some(&inclusion),
+        )
+        .unwrap(),
+        Settlement::Release
+    );
+    let cut = SettlementCut { predecessor: PREDECESSOR, successor: SUCCESSOR, end: Lsn(1) };
+    assert_eq!(
+        verify_settlement_at(
+            AUTHORITY, DATABASE, control_root, application_root, authorization(1), Some(&floor), Some(&inclusion),
+            Some(cut),
+        )
+        .unwrap_err()
+        .code,
+        "rtdb/lineage-proof"
+    );
+}

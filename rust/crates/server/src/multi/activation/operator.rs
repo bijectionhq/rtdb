@@ -21,9 +21,11 @@ mod settlement;
 pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation lineage-proof DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
                  --expected-incarnation UUID --expected-revision N
+       rtdb multi-activation lineage-floor DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
+                 --expected-incarnation UUID --expected-revision N --through N --journal-url URL --journal-reader-tls-dir DIR
        rtdb multi-activation verify-settlement DATABASE --authority-id UUID --application-root HEX --control-root HEX
-                 --expected-incarnation UUID --expected-revision N --successor-incarnation UUID --successor-revision N
-                 --selected-end N --evidence FILE
+                 --expected-incarnation UUID --expected-revision N
+                 [--successor-incarnation UUID --successor-revision N --selected-end N] --evidence FILE
        rtdb multi-activation bootstrap DATABASE AUTHORITY --incarnation UUID
        rtdb multi-activation upgrade-grants DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
        rtdb multi-activation freeze DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
@@ -265,6 +267,16 @@ enum Command {
         tls: PathBuf,
         predecessor: Binding,
     },
+    LineageFloor {
+        database: String,
+        identity: Uuid,
+        url: String,
+        tls: PathBuf,
+        expected: Binding,
+        through: journal_contract::Lsn,
+        journal_url: String,
+        journal_tls: PathBuf,
+    },
     VerifySettlement(settlement::Verification),
     Direct {
         authority: Authority,
@@ -399,6 +411,19 @@ impl Options {
                 return Err(arguments_error());
             }
             return Ok(Self(Command::LineageProof { database, identity, url, tls, predecessor }));
+        }
+        if operation == "lineage-floor" {
+            let expected = binding(&mut fields)?;
+            let through = journal_contract::Lsn(take(&mut fields, "--through")?.parse().map_err(|_| arguments_error())?);
+            let identity = id(take(&mut fields, "--authority-id")?)?;
+            let url = take(&mut fields, "--authority-url")?;
+            let tls = take(&mut fields, "--authority-tls-dir")?.into();
+            let journal_url = take(&mut fields, "--journal-url")?;
+            let journal_tls = take(&mut fields, "--journal-reader-tls-dir")?.into();
+            if immutable_streams || !fields.is_empty() {
+                return Err(arguments_error());
+            }
+            return Ok(Self(Command::LineageFloor { database, identity, url, tls, expected, through, journal_url, journal_tls }));
         }
 
         let action = match operation.as_str() {
@@ -544,6 +569,17 @@ impl Options {
                     &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusReader,
                 ).await?;
                 let proof = authority.lineage_publication_proof(&database, predecessor).await?;
+                serde_json::to_value(proof).map_err(|_| super::corrupt())
+            }
+            Command::LineageFloor { database, identity, url, tls, expected, through, journal_url, journal_tls } => {
+                let authority = ActivationAuthority::connect(
+                    &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusOperator,
+                ).await?;
+                let connection = crate::cli::development_stream_journal(&journal_url, &journal_tls)?;
+                let path = connection.url.strip_prefix(CONSENSUS_SCHEME).ok_or_else(arguments_error)?;
+                let config = crate::multi::JournalConfig::read(std::path::Path::new(path)).map_err(crate::multi::io_error)?;
+                let journal = rtdb_stream_journal::ConsensusJournal::new(&connection.credentials, &config).map_err(crate::multi::io_error)?;
+                let proof = authority.publish_lineage_floor(&database, expected, &journal, through).await?;
                 serde_json::to_value(proof).map_err(|_| super::corrupt())
             }
             Command::VerifySettlement(verification) => verification.run(),

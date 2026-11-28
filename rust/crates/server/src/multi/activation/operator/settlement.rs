@@ -21,7 +21,8 @@ pub(super) struct Verification {
     authority: Uuid,
     application_root: CatalogRoot,
     control_root: CatalogRoot,
-    cut: SettlementCut,
+    /// The closed cut the issuer expects, or none to accept an open floor.
+    cut: Option<SettlementCut>,
     evidence: PathBuf,
 }
 
@@ -39,19 +40,28 @@ impl Verification {
         let application_root = CatalogRoot(hex_digest(take(&mut fields, "--application-root")?)?);
         let control_root = CatalogRoot(hex_digest(take(&mut fields, "--control-root")?)?);
         let predecessor = binding(&mut fields)?;
-        let successor = Binding {
-            incarnation: id(take(&mut fields, "--successor-incarnation")?)?,
-            revision: take(&mut fields, "--successor-revision")?.parse().map_err(|_| arguments_error())?,
+        let cut = match (
+            fields.remove("--successor-incarnation"),
+            fields.remove("--successor-revision"),
+            fields.remove("--selected-end"),
+        ) {
+            (Some(incarnation), Some(revision), Some(end)) => Some(SettlementCut {
+                predecessor,
+                successor: Binding {
+                    incarnation: id(incarnation)?,
+                    revision: revision.parse().map_err(|_| arguments_error())?,
+                },
+                end: Lsn(end.parse().map_err(|_| arguments_error())?),
+            }),
+            (None, None, None) => None,
+            _ => return Err(arguments_error()),
         };
-        let end = Lsn(take(&mut fields, "--selected-end")?.parse().map_err(|_| arguments_error())?);
         let evidence = take(&mut fields, "--evidence")?.into();
         if !fields.is_empty() {
             return Err(arguments_error());
         }
         Ok(Self {
-            database, authority, application_root, control_root,
-            cut: SettlementCut { predecessor, successor, end },
-            evidence,
+            database, authority, application_root, control_root, cut, evidence,
         })
     }
 
@@ -74,7 +84,7 @@ impl Verification {
             .map_err(|_| invalid_evidence())?;
         let settlement = verify_settlement_at(
             self.authority, &self.database, self.control_root, self.application_root,
-            authorization, publication.as_ref(), inclusion.as_ref(), Some(self.cut),
+            authorization, publication.as_ref(), inclusion.as_ref(), self.cut,
         )?;
         Ok(json!({ "format": 1, "settlement": settlement }))
     }
@@ -108,11 +118,11 @@ mod tests {
             authority: Uuid::from_u128(2),
             application_root: CatalogRoot([3; 32]),
             control_root: CatalogRoot([4; 32]),
-            cut: SettlementCut {
+            cut: Some(SettlementCut {
                 predecessor: Binding { incarnation: predecessor, revision: 1 },
                 successor: Binding { incarnation: Uuid::from_u128(3), revision: 2 },
                 end: Lsn(1),
-            },
+            }),
             evidence: evidence.path().to_owned(),
         };
         let authorization = serde_json::to_string(&authorization).unwrap();

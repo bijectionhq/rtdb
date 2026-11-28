@@ -521,11 +521,13 @@ contract PublishedLineageEvidence {
         -- Each segment binds its database, predecessor binding, original stream, authenticated head, inclusive end and successor binding to the preceding publication.
         -- Logkeeper authenticates the records committed in each stream and their quorum durability bounds.
         -- The independent control catalog authenticates the activation publication that selects which records survive.
-        -- Writer takeovers close prior epochs in the stream, and the authority publishes the surviving prefix when the incarnation ends.
+        -- While an incarnation serves, the authority can publish its authenticated prefix as the incarnation's open floor.
+        -- Every later cut of that incarnation keeps its floor.
+        -- When the incarnation ends, the authority publishes the closed segment through its fence or cut.
         -- Each successor's installation anchors the inherited prefix, and any later cut includes that installation.
 
     @invariant CaptureRequiresPublishedInclusion
-        -- The original Kernel captures a predecessor authorization exactly once after verifying inclusion of its exact timed leaf in the published segment.
+        -- The original Kernel captures an authorization exactly once after verifying inclusion of its exact timed leaf in a published floor or closed segment.
         -- The leaf binds a quorum durability bound strictly before the authorized journal cutoff.
         -- An application head alone leaves the authorization pending.
         -- A replacement writer waits at Store ordering until its own reading reaches the recovered prefix's last Store reading.
@@ -535,7 +537,8 @@ contract PublishedLineageEvidence {
         -- An included record at the authorized position with matching identity and missing timing evidence leaves the authorization pending.
 
     @invariant ReleaseRequiresPublishedExclusion
-        -- The original Kernel releases a predecessor authorization exactly once when the published segment ends before its position or proves that a different record occupies the authorized position.
+        -- The original Kernel releases an authorization exactly once when a closed segment ends before its position or a published floor or segment proves that a different record occupies the authorized position.
+        -- An open floor that ends before the authorized position leaves the authorization pending.
         -- The Kernel records capture or release through the original booking's task and obligation fates.
         -- A verified terminal segment excludes its discarded suffix and all later commits to the predecessor from every successor.
 

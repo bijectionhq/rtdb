@@ -75,6 +75,39 @@ impl LineageSegment {
     }
 }
 
+/// The serving incarnation's published prefix. Every later cut of this
+/// incarnation keeps it, so an append inside it is part of the lineage.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LineageFloor {
+    pub binding: Binding,
+    pub source_root: CatalogRoot,
+    pub source_head: Head,
+}
+
+impl LineageFloor {
+    pub(super) fn valid(&self) -> bool {
+        !self.binding.incarnation.is_nil()
+            && self.binding.revision > 0
+            && self.source_root.0 != [0; 32]
+            && self.source_head.valid()
+            && self.source_head.size > 0
+            && self.source_head.stream == StreamId(self.binding.incarnation.as_u128())
+    }
+
+    pub fn end(&self) -> Lsn {
+        Lsn(self.source_head.size)
+    }
+}
+
+/// Where the published lineage of one source stream ends: closed at a fence
+/// or cut that names the successor, or open at the serving incarnation's floor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Published {
+    Closed(LineageSegment),
+    Open(LineageFloor),
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationProof {
@@ -89,6 +122,51 @@ impl PublicationProof {
         database: &str,
         control_root: CatalogRoot,
     ) -> Result<LineageSegment> {
+        match self.published(authority, database, control_root, None)? {
+            Published::Closed(segment) => Ok(segment),
+            Published::Open(_) => Err(invalid("The activation record publishes an open lineage floor")),
+        }
+    }
+
+    /// The lineage this control record publishes for the `source` stream: its
+    /// open floor, or else its closed segment.
+    pub fn published(
+        &self,
+        authority: Uuid,
+        database: &str,
+        control_root: CatalogRoot,
+        source: Option<StreamId>,
+    ) -> Result<Published> {
+        let state = self.state(authority, database, control_root)?;
+        if state.version != LINEAGE_PROTOCOL {
+            return Err(invalid("The control record is not a lineage activation record"));
+        }
+        if let Some(floor) = state.floor.filter(|floor| Some(floor.source_head.stream) == source) {
+            if !floor.valid() || floor.binding != state.binding {
+                return Err(invalid("The activation record does not publish this lineage floor"));
+            }
+            return Ok(Published::Open(floor));
+        }
+        let publication = state
+            .publication
+            .ok_or_else(|| invalid("The control record has no activation publication"))?;
+        let segment = publication
+            .segment
+            .ok_or_else(|| invalid("The activation publication has no lineage segment"))?;
+        if !segment.valid()
+            || segment.authority != authority
+            || segment.database != database
+            || segment.predecessor != publication.predecessor
+            || segment.successor != state.binding
+        {
+            return Err(invalid(
+                "The activation publication does not select this lineage segment",
+            ));
+        }
+        Ok(Published::Closed(segment))
+    }
+
+    fn state(&self, authority: Uuid, database: &str, control_root: CatalogRoot) -> Result<State> {
         let stream = activation_stream_id(authority, database)?;
         let leaf = self
             .control_inclusion
@@ -100,26 +178,8 @@ impl PublicationProof {
                 "The control leaf does not bind this activation publication",
             ));
         }
-        let state: State = serde_json::from_slice(&self.control_record)
-            .map_err(|_| invalid("The control record is not a supported activation record"))?;
-        let publication = state
-            .publication
-            .ok_or_else(|| invalid("The control record has no activation publication"))?;
-        let segment = publication
-            .segment
-            .ok_or_else(|| invalid("The activation publication has no lineage segment"))?;
-        if state.version != LINEAGE_PROTOCOL
-            || !segment.valid()
-            || segment.authority != authority
-            || segment.database != database
-            || segment.predecessor != publication.predecessor
-            || segment.successor != state.binding
-        {
-            return Err(invalid(
-                "The activation publication does not select this lineage segment",
-            ));
-        }
-        Ok(segment)
+        serde_json::from_slice(&self.control_record)
+            .map_err(|_| invalid("The control record is not a supported activation record"))
     }
 }
 
@@ -222,34 +282,45 @@ pub(super) fn verify_settlement_at(
     let Some(publication) = publication else {
         return Ok(Settlement::Pending);
     };
-    let segment = publication.verify(authority, database, control_root)?;
-    if selected.is_some_and(|cut| !cut.matches(&segment)) {
-        return Err(invalid("The publication differs from the selected predecessor, successor, or end"));
-    }
-    if segment.source_root == control_root
-        || segment.source_catalog == publication.control_inclusion.signed_head.head.catalog
-    {
+    let control_catalog = publication.control_inclusion.signed_head.head.catalog;
+    let (source_root, source_head, end, closed) =
+        match publication.published(authority, database, control_root, Some(authorization.stream))? {
+            Published::Closed(segment) => {
+                if selected.is_some_and(|cut| !cut.matches(&segment)) {
+                    return Err(invalid("The publication differs from the selected predecessor, successor, or end"));
+                }
+                (segment.source_root, segment.source_head, segment.end, true)
+            }
+            Published::Open(floor) => {
+                if selected.is_some() {
+                    return Err(invalid("The publication is an open floor, not the selected cut"));
+                }
+                (floor.source_root, floor.source_head, floor.end(), false)
+            }
+        };
+    if source_root == control_root || source_head.catalog == control_catalog {
         return Err(invalid(
             "Lineage requires independent control and application catalogs",
         ));
     }
-    if segment.source_stream != authorization.stream
-        || segment.source_catalog != authorization.catalog
-        || segment.source_root != application_root
+    if source_head.stream != authorization.stream
+        || source_head.catalog != authorization.catalog
+        || source_root != application_root
     {
         return Err(invalid("The lineage segment covers another journal"));
     }
-    if segment.end < authorization.at {
-        return Ok(Settlement::Release);
+    if end < authorization.at {
+        // Only a closed segment's end is final; an open floor still grows.
+        return Ok(if closed { Settlement::Release } else { Settlement::Pending });
     }
     let Some(inclusion) = inclusion else {
         return Ok(Settlement::Pending);
     };
     let head = inclusion.signed_head.head;
-    if head.catalog != segment.source_catalog
-        || head.stream != segment.source_stream
-        || head.root != segment.source_head.root
-        || head.size != segment.end.0
+    if head.catalog != source_head.catalog
+        || head.stream != source_head.stream
+        || head.root != source_head.root
+        || head.size != end.0
     {
         return Err(invalid(
             "The application proof does not open the published head",

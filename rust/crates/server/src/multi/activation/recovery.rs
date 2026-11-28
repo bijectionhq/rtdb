@@ -7,7 +7,7 @@ use super::{
 use journal_contract::{Epoch, Journal, JournalError, Lsn, SealReceipt, StreamId, WriterSessionId};
 use rtdb_db::{AuthenticatedCut, InstallationAnchor};
 use rtdb_stream_journal::ConsensusJournal;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -139,6 +139,12 @@ fn custody_protocol(
 impl State {
     fn installation_anchor(&self) -> Option<InstallationAnchor> {
         self.publication.as_ref()?.recovery.as_ref()?.installation_anchor
+    }
+
+    /// Whether a cut through `end` keeps every append the serving
+    /// incarnation already published as its lineage floor.
+    pub(super) fn keeps_lineage_floor(&self, end: Lsn) -> bool {
+        self.floor.as_ref().is_none_or(|floor| floor.end() <= end)
     }
 
     pub(super) fn valid_recovery(&self) -> bool {
@@ -423,7 +429,7 @@ impl ActivationAuthority {
             }
         }
         Err(Anomaly::new(
-            rtdb_types::AnomalyCategory::Conflict,
+            AnomalyCategory::Conflict,
             "rtdb/activation-custody-pending",
             "The recovery authority has not settled this candidate",
         ))
@@ -441,7 +447,7 @@ impl ActivationAuthority {
             Err(error) => return Err(error),
         }
         Err(Anomaly::new(
-            rtdb_types::AnomalyCategory::Conflict,
+            AnomalyCategory::Conflict,
             "rtdb/activation-object-custody",
             "The retained activation decision must settle this exact candidate",
         ))
@@ -689,6 +695,9 @@ impl ActivationAuthority {
         {
             return Err(conflict());
         }
+        if !frozen.keeps_lineage_floor(Lsn(installation.source_cut.lsn)) {
+            return Err(below_lineage_floor());
+        }
         let ranked_closure = frozen.require_ranked_closure()?;
         let successor = self.candidate(name, pending.intent)?;
         let successor_binding = Binding {
@@ -759,6 +768,14 @@ impl ActivationAuthority {
     }
 }
 
+fn below_lineage_floor() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Conflict,
+        "rtdb/lineage-floor",
+        "The recovery cut ends before the lineage floor already published for this incarnation. Restore a backup through the floor.",
+    )
+}
+
 async fn seal_predecessor(source: &dyn Journal, operation: Operation) -> Result<SealReceipt> {
     let stream = StreamId(operation.predecessor.incarnation.as_u128());
     source
@@ -822,6 +839,88 @@ mod tests {
         time::Duration,
     };
     use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lineage_floor_settles_a_serving_incarnation_and_binds_later_cuts() {
+        use std::{collections::BTreeSet, net::Ipv4Addr};
+        use rtdb_crypt::FileKms;
+        use rtdb_db::{ActivationScope, MultiDatabase, MultiOptions, Role};
+        use rtdb_node::{Clock, SystemClock};
+        use rtdb_storage::MemoryStore;
+        use rtdb_tx::transact::Transact;
+        use super::super::lineage::{Authorization, Published, Settlement, verify_settlement};
+
+        const NAME: &str = "floor";
+        const PRINCIPAL: &str = "urn:logkeeper:client:lineage-floor";
+        let control = LocalCluster::start_authenticated(&[PRINCIPAL]).await.unwrap();
+        let source = LocalCluster::start_authenticated(&[PRINCIPAL]).await.unwrap();
+        let open = |cluster: &LocalCluster| {
+            Arc::new(cluster.journal(PRINCIPAL, &cluster.journal_config(64 << 20, 4 << 20)).unwrap())
+        };
+        let control_journal = open(&control);
+        let source_journal = open(&source);
+        for journal in [&control_journal, &source_journal] {
+            journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+        }
+        let control_root = control.catalog_root().unwrap();
+        let source_root = source.catalog_root().unwrap();
+        let identity = Uuid::new_v4();
+        let mut authority = ActivationAuthority::new(control_journal.clone(), identity).unwrap();
+        Arc::get_mut(&mut authority).unwrap().authenticated_journal = Some(control_journal.clone());
+
+        let directory = tempfile::tempdir().unwrap();
+        let vault = directory.path().join("source");
+        FileKms::create_directory(&vault).unwrap();
+        let keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
+        let node = Ipv4Addr::LOCALHOST.into();
+        let binding = authority.bootstrap(NAME, Uuid::new_v4()).await.unwrap();
+        let mut database = MultiDatabase::new(
+            MultiOptions { database: binding.incarnation, node, lease_micros: 60_000_000, drift_micros: 0 },
+            source_journal.clone(), Arc::new(MemoryStore::default()), keys, Arc::new(|| SystemClock.now()),
+        ).unwrap().with_immutable_journal().with_authenticated_journal(source_journal.clone(), true)
+            .with_activation_scope(ActivationScope::new(identity, NAME).unwrap()).unwrap();
+        database.create().await.unwrap();
+        assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        database.transact(&Transact {
+            custody_request_digest: None, request_memory: None, key: vec![7; 16], require: vec![],
+            window: Default::default(), guards: vec![], requires: vec![], otherwise: vec![], ops: vec![],
+        }).await.unwrap();
+
+        let through = source_journal.head(StreamId(binding.incarnation.as_u128())).await.unwrap();
+        let proof = authority.publish_lineage_floor(NAME, binding, &source_journal, through).await.unwrap();
+        let stream = StreamId(binding.incarnation.as_u128());
+        let Published::Open(floor) = proof.published(identity, NAME, control_root, Some(stream)).unwrap()
+            else { panic!("expected an open lineage floor") };
+        assert_eq!(floor.binding, binding);
+        assert_eq!(floor.end(), through);
+        assert_eq!(authority.publish_lineage_floor(NAME, binding, &source_journal, Lsn(through.0 - 1)).await.unwrap()
+            .published(identity, NAME, control_root, Some(stream)).unwrap(), Published::Open(floor.clone()));
+
+        let at = floor.end();
+        let inclusion = source_journal.inclusion(stream, at, Some(at.0)).await.unwrap();
+        let committed = inclusion.verify(source_root).unwrap();
+        let authorization = Authorization {
+            catalog: floor.source_head.catalog,
+            stream,
+            writer_epoch: committed.writer_epoch,
+            at,
+            payload_sha256: [9; 32],
+            timing: rtdb_stream_journal::authenticated::Timing {
+                exclusive_cutoff_micros: i64::MAX,
+                receiver_certificate_sha256: [8; 32],
+            },
+        };
+        let settle = |authorization, inclusion| verify_settlement(
+            identity, NAME, control_root, source_root, authorization, Some(&proof), inclusion,
+        ).unwrap();
+        assert_eq!(settle(authorization, Some(&inclusion)), Settlement::Release);
+        assert_eq!(settle(Authorization { at: Lsn(at.0 + 1), ..authorization }, None), Settlement::Pending);
+
+        let (_, state) = authority.read(authority.stream_id(NAME).unwrap()).await.unwrap();
+        let state = state.unwrap();
+        assert!(state.keeps_lineage_floor(at));
+        assert!(!state.keeps_lineage_floor(Lsn(at.0 - 1)));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lineage_database_names_an_unauthenticated_application_catalog() {

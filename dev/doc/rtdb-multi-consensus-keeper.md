@@ -498,7 +498,7 @@ Portable restore refuses version 11 transaction checkpoints from that import pat
 ### Lineage and funded settlement
 
 Authenticated RTDB recovery publishes the surviving application lineage and can export proofs of its contents.
-Unknown-tail publication permanently fences the discarded suffix from the surviving lineage.
+Unknown-tail publication excludes the discarded suffix from the surviving lineage for good.
 An isolated predecessor quorum can still commit previously staged bytes outside that lineage.
 
 The Kernel binds each commissioned timed append to its original booking and stage before dispatch.
@@ -517,6 +517,15 @@ The activation authority publishes one segment when it selects the surviving his
 The publication names the exact application catalog and stream, the signed application head, the inclusive segment end, the successor and the previous lineage publication.
 The same decision orders the segment and the successor binding in the independent control journal.
 A writer takeover can fence an earlier epoch within the application stream while that incarnation's lineage publication is still pending.
+
+While an incarnation serves, the authority can publish its authenticated prefix as the incarnation's open lineage floor.
+Every later cut of that incarnation keeps the floor, so a recovery whose cut ends before it is refused with `rtdb/lineage-floor` until a backup through the floor is restored.
+An append inside a published floor is part of the lineage, so its authorization settles without waiting for the incarnation to end.
+Use `rtdb multi-activation lineage-floor` with direct control-catalog operator credentials, the current incarnation and revision, and application journal reader credentials.
+Pass `--through` a journal position you can restore, such as the source LSN of a retained portable backup, because no cut may end before the floor.
+It prints the floor's control publication proof, which verifies like a lineage proof.
+A floor only grows, and publishing an equal or lower prefix returns the current floor.
+Publish floors only once every activation authority reader runs a release that reads them.
 
 RTDB pins each catalog's root in its journal configuration's `catalog_root`, and refuses authenticated history without one.
 A database whose control catalog is authenticated settles against its lineage, so its application catalog must support authenticated streams.
@@ -556,6 +565,8 @@ rtdb multi-activation verify-settlement "$DATABASE" \
   --evidence "$EVIDENCE_JSON"
 ```
 
+To settle against an open floor, omit the successor and selected end and use the proof printed by `lineage-floor` as the publication.
+
 Take both bindings and the exact selected journal LSN from the independently accepted recovery.
 The selected end is a journal position separate from the application Store version.
 Supply the catalog roots as 64 hexadecimal digits from trusted configuration.
@@ -571,7 +582,8 @@ The command checks that any publication names the expected predecessor, successo
 The command reports evidence for the Kernel's decision without changing any booking or fate.
 
 For capture, verify a timed leaf at the authorized position that matches the authorization in full and binds a quorum durability bound strictly before the cutoff.
-For release, verify that the published segment of the authorized stream ends before the position, or that a different record occupies the position within that segment.
+For release, verify that the closed segment of the authorized stream ends before the position, or that a different record occupies the position within a published segment or floor.
+An open floor that ends before the position leaves the authorization pending, because the floor still grows.
 For example, a replacement writer can fill an abandoned position, and an authorized leaf above the selected cut can exist in the old stream while remaining outside the published lineage.
 Until publication, even a verified timed leaf leaves the authorization pending.
 Checkpoint replacement and trim preserve proofs, and retirement preserves a proof archive that can be checked offline.

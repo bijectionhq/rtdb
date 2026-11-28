@@ -97,6 +97,51 @@ impl ActivationAuthority {
         Ok(lineage::PublicationProof { control_record: record, control_inclusion: inclusion })
     }
 
+    /// Publishes the serving incarnation's authenticated prefix through
+    /// `through` as its lineage floor and returns the control proof an issuer
+    /// settles against. Every later cut keeps the floor, so `through` is a
+    /// prefix the operator can restore, such as a retained backup's cut.
+    pub(crate) async fn publish_lineage_floor(
+        &self,
+        name: &str,
+        expected: Binding,
+        application: &rtdb_stream_journal::ConsensusJournal,
+        through: Lsn,
+    ) -> Result<lineage::PublicationProof> {
+        self.access.require_operator()?;
+        let control = self.authenticated_journal.as_ref().ok_or_else(unavailable)?;
+        let stream = self.stream_id(name)?;
+        let (head, history) = application
+            .authenticated_head(StreamId(expected.incarnation.as_u128()), Some(through.0))
+            .await
+            .map_err(journal_error)?;
+        let floor = lineage::LineageFloor { binding: expected, source_root: history.genesis.root(), source_head: head.head };
+        if !floor.valid() {
+            return Err(conflict());
+        }
+        self.change(stream, |state| {
+            let state = state.ok_or_else(unavailable)?;
+            state.require(expected)?;
+            if !state.uses_lineage() || state.recovery.is_some() {
+                return Err(conflict());
+            }
+            if state.floor.as_ref().is_some_and(|prior| prior.end() >= floor.end()) {
+                return Ok(None);
+            }
+            let mut next = state.clone();
+            next.floor = Some(floor.clone());
+            Ok(Some(next))
+        })
+        .await?;
+        let (position, observed) = self.read_record(stream).await?;
+        let (state, record) = observed.ok_or_else(unavailable)?;
+        if state.floor.as_ref().is_none_or(|published| published.binding != expected || published.end() < floor.end()) {
+            return Err(unavailable());
+        }
+        let inclusion = control.inclusion(stream, position, Some(position.0)).await.map_err(journal_error)?;
+        Ok(lineage::PublicationProof { control_record: record.to_vec(), control_inclusion: inclusion })
+    }
+
     async fn read_publication(&self, stream: StreamId) -> Result<Option<(Publication, Option<ArchivedControlRecord>)>> {
         let position = Lsn(1);
         if !self.access.is_local() {

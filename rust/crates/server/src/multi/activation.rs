@@ -176,6 +176,8 @@ struct State {
     recovery: Option<recovery::Pending>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     superseded_recoveries: BTreeSet<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor: Option<lineage::LineageFloor>,
 }
 
 impl State {
@@ -194,6 +196,7 @@ impl State {
             publication: None,
             recovery: None,
             superseded_recoveries: BTreeSet::new(),
+            floor: None,
         }
     }
 
@@ -555,6 +558,7 @@ impl ActivationAuthority {
         next.publication = Some(publication.clone());
         next.recovery = None;
         next.superseded_recoveries.clear();
+        next.floor = None;
         if let Some(ranked) = &mut next.ranked {
             ranked.provider = None;
             ranked.closure = None;
@@ -661,6 +665,8 @@ impl ActivationAuthority {
                 || state.publication.as_ref().and_then(|publication| publication.segment.as_ref())
                     .is_some_and(|segment| state.version != LINEAGE_PROTOCOL || !segment.valid()
                         || segment.authority != self.identity || self.stream_id(&segment.database).ok() != Some(stream))
+                || state.floor.as_ref().is_some_and(|floor| state.version != LINEAGE_PROTOCOL || !floor.valid()
+                    || floor.binding != state.binding)
                 || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
