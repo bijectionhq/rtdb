@@ -5455,6 +5455,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtdb-lineage"
+version = "0.1.0"
+dependencies = [
+ "journal-contract",
+ "ring",
+ "rtdb-journal-logkeeper",
+ "rtdb-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "uuid",
+]
+
+[[package]]
 name = "rtdb-logkeeper"
 version = "0.1.0"
 dependencies = [
@@ -5924,6 +5938,7 @@ dependencies = [
  "rtdb-java-date",
  "rtdb-journal-logkeeper",
  "rtdb-kafka",
+ "rtdb-lineage",
  "rtdb-maintenance",
  "rtdb-metrics",
  "rtdb-node",

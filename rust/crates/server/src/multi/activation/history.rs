@@ -72,7 +72,7 @@ impl ActivationAuthority {
         Ok(found)
     }
 
-    pub(crate) async fn lineage_publication_proof(&self, name: &str, predecessor: Binding) -> Result<lineage::PublicationProof> {
+    pub(crate) async fn lineage_publication_proof(&self, name: &str, predecessor: Binding) -> Result<rtdb_lineage::PublicationProof> {
         let journal = self.authenticated_journal.as_ref().ok_or_else(unavailable)?;
         let stream = self.stream_id(name)?;
         let (position, observed) = self.read_record(stream).await?;
@@ -94,7 +94,7 @@ impl ActivationAuthority {
         if leaf.at != position || leaf.stream != stream || leaf.payload_sha256 != <[u8; 32]>::from(Sha256::digest(&record)) {
             return Err(corrupt());
         }
-        Ok(lineage::PublicationProof { control_record: record, control_inclusion: inclusion })
+        Ok(rtdb_lineage::PublicationProof { control_record: record, control_inclusion: inclusion })
     }
 
     /// Publishes the serving incarnation's authenticated prefix through
@@ -107,7 +107,7 @@ impl ActivationAuthority {
         expected: Binding,
         application: &rtdb_stream_journal::ConsensusJournal,
         through: Lsn,
-    ) -> Result<lineage::PublicationProof> {
+    ) -> Result<rtdb_lineage::PublicationProof> {
         self.access.require_operator()?;
         let control = self.authenticated_journal.as_ref().ok_or_else(unavailable)?;
         let stream = self.stream_id(name)?;
@@ -115,7 +115,7 @@ impl ActivationAuthority {
             .authenticated_head(StreamId(expected.incarnation.as_u128()), Some(through.0))
             .await
             .map_err(journal_error)?;
-        let floor = lineage::LineageFloor { binding: expected, source_root: history.genesis.root(), source_head: head.head };
+        let floor = rtdb_lineage::LineageFloor { binding: expected, source_root: history.genesis.root(), source_head: head.head };
         if !floor.valid() {
             return Err(conflict());
         }
@@ -139,7 +139,7 @@ impl ActivationAuthority {
             return Err(unavailable());
         }
         let inclusion = control.inclusion(stream, position, Some(position.0)).await.map_err(journal_error)?;
-        Ok(lineage::PublicationProof { control_record: record.to_vec(), control_inclusion: inclusion })
+        Ok(rtdb_lineage::PublicationProof { control_record: record.to_vec(), control_inclusion: inclusion })
     }
 
     async fn read_publication(&self, stream: StreamId) -> Result<Option<(Publication, Option<ArchivedControlRecord>)>> {

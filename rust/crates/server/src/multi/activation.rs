@@ -12,6 +12,8 @@ use journal_contract::{
     reference::{FileJournal, Limits},
 };
 use rtdb_db::{ServingAuthority, ServingPermit, StreamAuthentication};
+pub use rtdb_lineage::Binding;
+use rtdb_lineage::{LINEAGE_PROTOCOL, activation_stream_id};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +22,6 @@ use uuid::Uuid;
 
 mod clock;
 mod history;
-pub mod lineage;
 pub(super) mod journal_custody;
 pub(crate) mod operator;
 #[cfg(test)]
@@ -39,7 +40,6 @@ const RECOVERY_KEY_CUSTODY_PROTOCOL: u8 = 5;
 const RECOVERY_JOURNAL_CUSTODY_PROTOCOL: u8 = 6;
 const RECOVERY_HOSTED_CUSTODY_PROTOCOL: u8 = 7;
 const RANKED_RECOVERY_PROTOCOL: u8 = 8;
-pub(super) const LINEAGE_PROTOCOL: u8 = 12;
 #[cfg(any(unix, feature = "backup-object-holds"))]
 const BROKER_FRAME_BYTES: usize = 16 * 1024;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
@@ -79,13 +79,6 @@ impl Access {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Binding {
-    pub incarnation: Uuid,
-    pub revision: u64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActivationStatus {
     pub binding: Binding,
@@ -118,7 +111,7 @@ struct Publication {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<recovery::Completed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    segment: Option<lineage::LineageSegment>,
+    segment: Option<rtdb_lineage::LineageSegment>,
 }
 
 /// Produced by the destination installer after its reconstruction is committed.
@@ -177,7 +170,7 @@ struct State {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     superseded_recoveries: BTreeSet<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    floor: Option<lineage::LineageFloor>,
+    floor: Option<rtdb_lineage::LineageFloor>,
 }
 
 impl State {
@@ -840,16 +833,6 @@ fn not_active() -> Anomaly {
         "rtdb/activation-fenced",
         "The database incarnation may not serve",
     )
-}
-
-fn activation_stream_id(authority: Uuid, name: &str) -> Result<StreamId> {
-    super::validate_deployment_name(name)?;
-    let mut hash = Sha256::new();
-    hash.update(b"rtdb.activation.v1");
-    hash.update(authority.as_bytes());
-    hash.update(name.as_bytes());
-    let digest: [u8; 32] = hash.finalize().into();
-    Ok(StreamId(u128::from_be_bytes(digest[..16].try_into().unwrap())))
 }
 
 fn successor_incarnation(

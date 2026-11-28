@@ -7,7 +7,33 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Binding, LINEAGE_PROTOCOL, activation_stream_id};
+/// The activation protocol whose records publish lineage.
+pub const LINEAGE_PROTOCOL: u8 = 12;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    pub incarnation: Uuid,
+    pub revision: u64,
+}
+
+pub fn validate_deployment_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
+        return Err(Anomaly::incorrect("rtdb.multi/configuration", "Invalid deployment name"));
+    }
+    Ok(())
+}
+
+/// The control stream that orders one database's activation records.
+pub fn activation_stream_id(authority: Uuid, name: &str) -> Result<StreamId> {
+    validate_deployment_name(name)?;
+    let mut hash = Sha256::new();
+    hash.update(b"rtdb.activation.v1");
+    hash.update(authority.as_bytes());
+    hash.update(name.as_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    Ok(StreamId(u128::from_be_bytes(digest[..16].try_into().unwrap())))
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -25,7 +51,7 @@ pub struct LineageSegment {
 }
 
 impl LineageSegment {
-    pub(super) fn valid(&self) -> bool {
+    pub fn valid(&self) -> bool {
         !self.authority.is_nil()
             && !self.predecessor.incarnation.is_nil()
             && !self.successor.incarnation.is_nil()
@@ -86,7 +112,7 @@ pub struct LineageFloor {
 }
 
 impl LineageFloor {
-    pub(super) fn valid(&self) -> bool {
+    pub fn valid(&self) -> bool {
         !self.binding.incarnation.is_nil()
             && self.binding.revision > 0
             && self.source_root.0 != [0; 32]
@@ -241,7 +267,7 @@ pub enum Settlement {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct SettlementCut {
+pub struct SettlementCut {
     pub predecessor: Binding,
     pub successor: Binding,
     pub end: Lsn,
@@ -270,7 +296,7 @@ pub fn verify_settlement(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn verify_settlement_at(
+pub fn verify_settlement_at(
     authority: Uuid,
     database: &str,
     control_root: CatalogRoot,

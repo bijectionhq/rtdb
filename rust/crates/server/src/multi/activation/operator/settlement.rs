@@ -8,10 +8,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{arguments_error, binding, hex_digest, id, take};
-use crate::multi::activation::{
-    Binding,
-    lineage::{Authorization, PublicationProof, SettlementCut, verify_settlement_at},
-};
+use rtdb_lineage::{Authorization, Binding, PublicationProof, SettlementCut, verify_settlement_at};
 
 const MAX_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
 

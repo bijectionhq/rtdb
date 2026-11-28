@@ -704,7 +704,7 @@ impl ActivationAuthority {
             incarnation: successor,
             revision: operation.predecessor.revision.checked_add(1).ok_or_else(conflict)?,
         };
-        let segment = installation.source_head.map(|source| super::lineage::LineageSegment {
+        let segment = installation.source_head.map(|source| rtdb_lineage::LineageSegment {
             authority: self.identity,
             database: name.to_owned(),
             predecessor: operation.predecessor,
@@ -848,7 +848,7 @@ mod tests {
         use rtdb_node::{Clock, SystemClock};
         use rtdb_storage::MemoryStore;
         use rtdb_tx::transact::Transact;
-        use super::super::lineage::{Authorization, Published, Settlement, verify_settlement};
+        use rtdb_lineage::{Authorization, Published, Settlement, verify_settlement};
 
         const NAME: &str = "floor";
         const PRINCIPAL: &str = "urn:logkeeper:client:lineage-floor";

@@ -55,6 +55,7 @@ rtdb-tls = { path = "crates/tls" }
 rtdb-affinity = { path = "crates/affinity" }
 rtdb-directory = { path = "crates/directory" }
 rtdb-logkeeper = { path = "crates/logkeeper" }
+rtdb-lineage = { path = "crates/lineage" }
 journal-contract = { git = "https://github.com/bijectionhq/logkeeper.git", rev = "bf1baac54c58912d85a570df68d4adbf51b626f4" }
 stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "bf1baac54c58912d85a570df68d4adbf51b626f4", features = ["stream"] }
 ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "bf1baac54c58912d85a570df68d4adbf51b626f4", features = ["ordered-daemon"] }

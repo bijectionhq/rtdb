@@ -439,3 +439,10 @@ fn lineage_floor_releases_a_position_it_filled_with_another_append() {
         "rtdb/lineage-proof"
     );
 }
+
+#[test]
+fn authorization_reads_a_full_width_stream_id() {
+    let authorization = Authorization { stream: StreamId(1 << 100), ..authorization(1) };
+    let json = serde_json::to_vec(&authorization).unwrap();
+    assert_eq!(serde_json::from_slice::<Authorization>(&json).unwrap(), authorization);
+}

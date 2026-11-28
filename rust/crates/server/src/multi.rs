@@ -16,6 +16,7 @@ use journal_contract::{
 use rtdb_auth::{AuthConfig, Authenticator};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Generation, Kms};
+use rtdb_lineage::validate_deployment_name;
 use rtdb_db::{
     ActivationScope, DeploymentRetirement, JournalBatchAppender, MultiDatabase, MultiOptions, NewStream, Role,
     discover_nodes,
@@ -1781,13 +1782,6 @@ fn check_incarnation(driver: &MultiServing, id: Uuid) -> Result<()> {
         return Err(invalid(
             "The local database incarnation differs from its ordered registration",
         ));
-    }
-    Ok(())
-}
-
-fn validate_deployment_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
-        return Err(invalid("Invalid deployment name"));
     }
     Ok(())
 }
