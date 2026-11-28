@@ -1142,6 +1142,9 @@ config {
 --   It makes the L0 pairs durable before installing the per-table block names.
 --   It makes every per-table block durable before installing the root name.
 --   A retry accepts an existing dependency only when its contents match.
+--   JVM in-memory storage exposes a trie data or metadata file after its Arrow footer is complete and the storage allocator admits the encoded file's bytes.
+--   A failed or abandoned write leaves any previous file at that key readable.
+--   A borrowed record batch keeps its backing through replacement or deletion of the file until the reader releases it.
 --   The block, its L0 tries and its boundary are held from here until the adopt.
 --   What is NOT installed here is the table catalog's metadata fold and the trie catalog's state, and the live index is not rolled — so a term dying between the two operations leaves the block RE-PRODUCIBLE, a second attempt at an index the catalog already holds being refused.
 --   Table entries the produce DOES allocate, minting one for a table new in this block: the per-table file paths of step 3 and the block file of step 4 both record them, so they cannot wait for the adopt.

@@ -22,6 +22,10 @@ import java.nio.channels.Channels.newChannel
 import java.nio.file.Path
 import java.util.*
 
+private class ArrowFileOutput : ByteArrayOutputStream() {
+    fun asByteBuffer(): ByteBuffer = ByteBuffer.wrap(buf, 0, count)
+}
+
 internal class MemoryStorage(
     allocator: BufferAllocator,
     override val epoch: StorageEpoch
@@ -31,30 +35,29 @@ internal class MemoryStorage(
 
     private val memoryStore: NavigableMap<Path, ArrowBuf> = TreeMap()
 
-    companion object {
-        private fun objectMissingException(path: Path) = IllegalStateException("Object $path doesn't exist.")
-
-        private fun <K, V> Map<K, V>.lockAndGet(key: K): V? = synchronized(this) { get(key) }
+    private fun openObject(key: Path): ArrowBuf = synchronized(memoryStore) {
+        val buf = memoryStore[key] ?: throw IllegalStateException("Object $key doesn't exist.")
+        buf.referenceManager.retain()
+        buf
     }
 
     override fun getByteArray(key: Path): ByteArray =
-        (memoryStore.lockAndGet(key) ?: throw objectMissingException(key)).toByteArray()
+        openObject(key).use { it.toByteArray() }
 
     override suspend fun getFooter(key: Path): ArrowFooter =
-        (memoryStore.lockAndGet(key) ?: throw objectMissingException(key)).readArrowFooter()
+        openObject(key).use { it.readArrowFooter() }
 
-    override suspend fun getRecordBatch(key: Path, idx: Int): ArrowRecordBatch {
+    override suspend fun getRecordBatch(key: Path, idx: Int): ArrowRecordBatch =
         try {
-            val arrowBuf = memoryStore.lockAndGet(key) ?: throw objectMissingException(key)
+            openObject(key).use { arrowBuf ->
+                val arrowBlock = arrowBuf.readArrowFooter().recordBatches.getOrNull(idx)
+                    ?: throw IndexOutOfBoundsException("Record batch index out of bounds of arrow file")
 
-            val arrowBlock = arrowBuf.readArrowFooter().recordBatches.getOrNull(idx)
-                ?: throw IndexOutOfBoundsException("Record batch index out of bounds of arrow file")
-
-            return arrowBuf.toArrowRecordBatchView(arrowBlock)
+                arrowBuf.toArrowRecordBatchView(arrowBlock)
+            }
         } catch (e: Exception) {
             throw IllegalStateException("Failed opening record batch '$key'", e)
         }
-    }
 
     override suspend fun putObject(key: Path, buffer: ByteBuffer) {
         synchronized(memoryStore) {
@@ -90,8 +93,8 @@ internal class MemoryStorage(
         }
 
     override fun openArrowWriter(key: Path, rel: Relation): ArrowWriter {
-        val baos = ByteArrayOutputStream()
-        return newChannel(baos).closeOnCatch { writeChannel ->
+        val output = ArrowFileOutput()
+        return newChannel(output).closeOnCatch { writeChannel ->
             rel.startUnload(writeChannel).closeOnCatch { unloader ->
                 object : ArrowWriter {
                     override fun writePage() {
@@ -99,11 +102,10 @@ internal class MemoryStorage(
                     }
 
                     override suspend fun end(): FileSize {
-                        unloader.end()
+                        val fileSize = unloader.end()
                         writeChannel.close()
-                        val bytes = baos.toByteArray()
-                        putObject(key, ByteBuffer.wrap(bytes))
-                        return bytes.size.toLong()
+                        putObject(key, output.asByteBuffer())
+                        return fileSize
                     }
 
                     override fun close() {
