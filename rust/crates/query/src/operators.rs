@@ -836,7 +836,8 @@ fn materialize_bound_rows(rows: &[Vec<Expr>], width: usize, execution: &Executio
         let (source, row) = execution.parameters.arrow_input(*index)?;
         let array = source.batch().column(*index);
         let field = source.batch().schema_ref().field(*index);
-        if field.data_type() != array.data_type() || !field.metadata().is_empty() || !array.is_valid(row)
+        if field.data_type() != array.data_type() || !field.metadata().is_empty()
+            || (array.is_null(row) && !field.is_nullable())
             || !matches!(array.data_type(), DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
                 | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary)
             || &rtdb_columnar::from_field(field).ok()? != execution.parameters.types().get(*index)?
@@ -871,8 +872,13 @@ fn materialize_bound_rows(rows: &[Vec<Expr>], width: usize, execution: &Executio
     for position in 0..width {
         let picks = || rows.iter().map(|row| cell(&row[position]).expect("Admitted Arrow parameter"));
         let mut payload = 0usize;
+        let mut nulls = 0;
         for (index, (array, row)) in picks().enumerate() {
             execution.context.check_cancelled_at(index)?;
+            if array.is_null(row) {
+                nulls += 1;
+                continue;
+            }
             let bytes = match array.data_type() {
                 DataType::Utf8 => array.as_string::<i32>().value(row).len(),
                 DataType::Binary => array.as_binary::<i32>().value(row).len(),
@@ -884,7 +890,9 @@ fn materialize_bound_rows(rows: &[Vec<Expr>], width: usize, execution: &Executio
         let bytes = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(payload))
             .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size)?;
         let reservation = memory.reserve(bytes)?;
-        let array = {
+        let array = if nulls == rows.len() {
+            arrow_array::new_null_array(&DataType::Null, rows.len())
+        } else {
             let mut arrays = Vec::with_capacity(rows.len());
             let mut positions = Vec::with_capacity(rows.len());
             for (index, (array, row)) in picks().enumerate() {
@@ -895,7 +903,7 @@ fn materialize_bound_rows(rows: &[Vec<Expr>], width: usize, execution: &Executio
             rtdb_columnar::copy_selected_cells(&arrays, &positions)?
         };
         execution.context.check_cancelled()?;
-        let field = Arc::new(Field::new("value", array.data_type().clone(), false));
+        let field = Arc::new(Field::new("value", array.data_type().clone(), nulls != 0));
         let logical = Some(rtdb_columnar::from_field(&field)?);
         output.append_column(Column::Arrow { array, field, logical }, reservation, memory)?;
     }
@@ -1904,8 +1912,9 @@ mod template_tests {
     }
 
     #[tokio::test]
-    async fn uniform_multi_row_values_gather_bound_cells_with_order_and_duplicates() {
+    async fn uniform_multi_row_values_gather_bound_cells_with_order_duplicates_and_nulls() {
         use arrow_array::{BinaryArray, RecordBatch, StringArray};
+        use arrow_buffer::NullBuffer;
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use crate::{columnar::Column, parameters::BoundParameters};
         use rtdb_expr::ParameterLookup;
@@ -1919,12 +1928,13 @@ mod template_tests {
             ArrowField::new("n", DataType::Utf8, true),
         ]);
         let types = argument_fields.fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
+        let hidden = StringArray::from(vec!["ignored", "hidden"]);
         let arguments = RecordBatch::try_new(Arc::new(argument_fields), vec![
             Arc::new(StringArray::from(vec!["unused", "é"])),
             Arc::new(BinaryArray::from_vec(vec![b"x", b"\0\xff"])),
             Arc::new(StringArray::from(vec!["ignored", ""])),
             Arc::new(BinaryArray::from_vec(vec![b"y", b""])),
-            Arc::new(StringArray::from(vec![Some("ignored"), None])),
+            Arc::new(StringArray::new(hidden.offsets().clone(), hidden.values().clone(), Some(NullBuffer::from(vec![true, false])))),
         ]).unwrap();
         let bound = rtdb_columnar::OwnedBatch::new(arguments, &memory).unwrap();
         let execution = Execution {
@@ -1937,14 +1947,28 @@ mod template_tests {
         let param = |index: usize| Expr::Parameter { index, data_type: types[index].clone() };
         let rows = vec![vec![param(2), param(1)], vec![param(0), param(3)], vec![param(2), param(1)]];
         let batch = materialize_columns(&rows, 2, &execution).await.unwrap().unwrap();
-        assert!((0..4).all(|slot| execution.parameters.known_value(slot).is_none()));
-        let nulls = materialize_columns(&[vec![param(0)], vec![param(4)]], 1, &execution).await.unwrap().unwrap();
-        let Column::Arrow { field, .. } = &nulls.columns[0] else { panic!("Expected packed text"); };
-        assert_eq!(field.data_type(), &DataType::Utf8);
-        assert!(field.is_nullable());
-        assert_eq!(nulls.columns[0].value(1).unwrap(), Value::Null);
-        assert_eq!(execution.parameters.known_value(0), Some(&Value::Utf8("é".into())));
+        let nullable_rows = [vec![param(4), param(4)], vec![param(0), param(4)], vec![param(4), param(4)]];
+        let nullable_batch = materialize_columns(&nullable_rows, 2, &execution).await.unwrap().unwrap();
+        assert!((0..types.len()).all(|slot| execution.parameters.known_value(slot).is_none()));
+        let different_layouts = [vec![param(4)], vec![param(1)]];
+        assert!(materialize_bound_rows(&different_layouts, 1, &execution).unwrap().is_none());
+        let fallback = materialize_columns(&different_layouts, 1, &execution).await.unwrap().unwrap();
+        assert_eq!(fallback.columns[0].value(0).unwrap(), Value::Null);
+        assert_eq!(fallback.columns[0].value(1).unwrap(), Value::Binary(vec![0, 255]));
         drop(execution);
+
+        let Column::Arrow { array, field, logical } = &nullable_batch.columns[0] else { panic!("Expected nullable text"); };
+        let ty = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", &ty).unwrap());
+        assert_eq!(logical.as_ref(), Some(&ty));
+        let text = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(text.iter().collect::<Vec<_>>(), vec![None, Some("é"), None]);
+        assert_eq!(text.value_data(), "é".as_bytes());
+        let Column::Arrow { array, field, logical } = &nullable_batch.columns[1] else { panic!("Expected Arrow Null"); };
+        assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", &LogicalType::Null).unwrap());
+        assert_eq!(logical.as_ref(), Some(&LogicalType::Null));
+        assert_eq!(array.len(), 3);
+
         assert_eq!(batch.columns[0].value(0).unwrap(), Value::Utf8("".into()));
         assert_eq!(batch.columns[0].value(1).unwrap(), Value::Utf8("é".into()));
         assert_eq!(batch.columns[0].value(2).unwrap(), Value::Utf8("".into()));
