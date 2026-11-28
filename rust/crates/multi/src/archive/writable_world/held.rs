@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{cmp::Ordering, future::Future, iter::Peekable, pin::Pin, time::Duration, vec::IntoIter};
 
 use rtdb_flight_sql::FrozenWorldWinner;
 use rtdb_types::{OwnedIdentityScan, ROOT_ROW_CARRIERS, RootRowCarrier, SharedColumnCarrierPrefix};
@@ -1905,25 +1905,26 @@ impl HeldCheckpointWorld {
                 self.archive_identity_candidates(relation, valid, after, FETCH, None, None).await?.into_parts()
             };
 
-            let (candidates, through) = identity_candidates(&parent, &local.keys, FETCH);
-            for key in candidates {
-                let id = key.clone();
+            let (local, _local_charges) = local.into_parts();
+            let mut candidates = EffectiveIdentityWindow::new(parent, local, FETCH);
+            let mut next_cursor = None;
+            while let Some((key, order)) = candidates.peek() {
                 let shadow = if let Some(cut) = cut {
-                    let read = cut.shadow(&id, valid).await?;
-                    decode_point(read.row.into_iter().collect(), &id, &self.memory, None)?
+                    let read = cut.shadow(key, valid).await?;
+                    decode_point(read.row.into_iter().collect(), key, &self.memory, None)?
                         .map(|fact| fact.into_shadow(self.open.record.id).map(|shadow| shadow.is_some()))
                         .transpose()?
                 } else {
-                    self.open.read_local(relation, &id, valid, &self.memory, false).await?.0
+                    self.open.read_local(relation, key, valid, &self.memory, false).await?.0
                         .map(|fact| fact.is_some())
                 };
                 let visible = match shadow {
                     Some(visible) => visible,
                     None => {
-                        if local.keys.binary_search(key).is_ok() || parent.binary_search(key).is_err() {
+                        if order != Ordering::Less {
                             return Err(OwnedWorld::unavailable());
                         }
-                        self.open.snapshot.check_point_purge_floor(relation, &id, self.open.retained.basis.system_time).await?;
+                        self.open.snapshot.check_point_purge_floor(relation, key, self.open.retained.basis.system_time).await?;
                         true
                     }
                 };
@@ -1934,17 +1935,27 @@ impl HeldCheckpointWorld {
                     }
                     bytes = bytes.checked_add(key.retained_bytes()).filter(|size| *size <= (8 << 20)).ok_or_else(OwnedWorld::unavailable)?;
                     reservations.push(self.memory.reserve(key.retained_bytes())?);
-                    keys.push(key.clone());
+                }
+                let (key, through) = candidates.take(order);
+                if through {
+                    let charge = self.memory.reserve(key.retained_bytes())?;
+                    if visible {
+                        next_cursor = Some((key.clone(), charge));
+                        keys.push(key);
+                    } else {
+                        next_cursor = Some((key, charge));
+                    }
+                    break;
+                }
+                if visible {
+                    keys.push(key);
                 }
             }
-            if more || through.is_none() {
+            if more || next_cursor.is_none() {
                 complete = true;
                 break;
             }
-            if let Some(through) = through {
-                let charge = self.memory.reserve(through.retained_bytes())?;
-                cursor = Some((through.clone(), charge));
-            }
+            cursor = next_cursor;
         }
         if !complete { return Err(OwnedWorld::unavailable()); }
         self.check_relation(relation)?;
@@ -2574,6 +2585,44 @@ impl<'a> InheritedRelation<'a> {
             }
         }
         Ok(timeline)
+    }
+}
+
+struct EffectiveIdentityWindow {
+    parent: Peekable<IntoIter<EntityId>>,
+    local: Peekable<IntoIter<EntityId>>,
+    parent_full: bool,
+    local_full: bool,
+}
+
+impl EffectiveIdentityWindow {
+    fn new(parent: Vec<EntityId>, local: Vec<EntityId>, fetch: usize) -> Self {
+        Self {
+            parent_full: parent.len() == fetch,
+            local_full: local.len() == fetch,
+            parent: parent.into_iter().peekable(),
+            local: local.into_iter().peekable(),
+        }
+    }
+
+    fn peek(&mut self) -> Option<(&EntityId, Ordering)> {
+        match (self.parent.peek(), self.local.peek()) {
+            (Some(parent), Some(local)) => {
+                let order = parent.cmp(local);
+                Some((if order.is_gt() { local } else { parent }, order))
+            }
+            (Some(parent), None) => Some((parent, Ordering::Less)),
+            (None, Some(local)) => Some((local, Ordering::Greater)),
+            (None, None) => None,
+        }
+    }
+
+    fn take(&mut self, order: Ordering) -> (EntityId, bool) {
+        let parent = (order != Ordering::Greater).then(|| self.parent.next().expect("Peeked parent identity"));
+        let local = (order != Ordering::Less).then(|| self.local.next().expect("Peeked local identity"));
+        let through = (parent.is_some() && self.parent_full && self.parent.len() == 0)
+            || (local.is_some() && self.local_full && self.local.len() == 0);
+        (parent.or(local).expect("Peeked identity"), through)
     }
 }
 
@@ -3497,6 +3546,47 @@ mod ancestor_boundaries_tests {
         let (candidates, through) = identity_candidates(&parent, &overlay, 2);
         assert_eq!(through, Some(&EntityId::String("c".to_owned())));
         assert_eq!(candidates.cloned().collect::<Vec<_>>(), ["a", "b", "c"].map(|value| EntityId::String(value.to_owned())));
+    }
+
+    #[test]
+    fn effective_identity_window_moves_typed_payloads_through_the_first_full_source() {
+        fn check(parent: Vec<EntityId>, local: Vec<EntityId>, fetch: usize) {
+            let (candidates, through) = identity_candidates(&parent, &local, fetch);
+            let expected = candidates.map(|key| {
+                let order = match (parent.binary_search(key), local.binary_search(key)) {
+                    (Ok(_), Ok(_)) => Ordering::Equal,
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => unreachable!(),
+                };
+                (key.clone(), order, through == Some(key))
+            }).collect::<Vec<_>>();
+            let bytes = |key: &EntityId| match key {
+                EntityId::String(key) => key.as_ptr(),
+                EntityId::Binary(key) => key.as_ptr(),
+                _ => unreachable!(),
+            };
+            let mut window = EffectiveIdentityWindow::new(parent, local, fetch);
+            let mut actual = Vec::new();
+            while let Some((key, order)) = window.peek() {
+                let pointer = bytes(key);
+                let (key, through) = window.take(order);
+                assert_eq!(bytes(&key), pointer);
+                actual.push((key, order, through));
+                if through { break; }
+            }
+            assert_eq!(actual, expected);
+        }
+
+        let text = |keys: &[&str]| keys.iter().map(|key| EntityId::String((*key).to_owned())).collect();
+        check(text(&["a", "é", "é\0"]), text(&["b", "é", "z"]), 3);
+        check(text(&["b", "é", "z"]), text(&["a", "é", "é\0"]), 3);
+        check(text(&["a", "é"]), text(&["b", "é"]), 2);
+        check(text(&[]), text(&["a", "é"]), 3);
+
+        let binary = |keys: &[&[u8]]| keys.iter().map(|key| EntityId::Binary(key.to_vec())).collect();
+        check(binary(&[&[0], &[0, 255], &[255]]), binary(&[&[0, 255], &[0, 255, 0]]), 3);
+        check(binary(&[]), binary(&[]), 3);
     }
 
     #[test]
