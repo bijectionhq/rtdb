@@ -95,6 +95,7 @@
 -- An embedded session opened with a native principal uses that identity for authorization and transaction attribution.
 -- Embedded ADBC metadata builds its catalog, schema, table, and column arrays with the declared ADBC field order and list validity.
 -- JVM ADBC GetObjects copies names from ordered catalog query pages into the requested levels of the nested result.
+-- At CATALOGS depth, JVM GetObjects captures filtered UTF-8 catalog names in SQL LIKE query order before returning the reader, and allocates the Arrow result batch when the caller loads it.
 -- A depth boundary leaves the next list null, and an expanded catalog with no matching schemas has an empty list.
 -- At full depth the column pattern selects columns before ordinal positions are assigned within each returned table.
 -- JVM Flight SQL GetDbSchemas and GetTables copy names from the ordered catalog query pages into the response.

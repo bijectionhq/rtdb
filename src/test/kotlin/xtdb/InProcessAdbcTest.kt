@@ -3,6 +3,7 @@ package xtdb
 import org.apache.arrow.adbc.core.AdbcConnection.GetObjectsDepth
 import org.apache.arrow.adbc.core.AdbcInfoCode
 import org.apache.arrow.adbc.core.AdbcStatement
+import org.apache.arrow.adbc.core.StandardSchemas
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.UInt4Vector
@@ -12,6 +13,7 @@ import org.apache.arrow.vector.complex.ListVector
 import org.apache.arrow.vector.types.pojo.ArrowType
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
@@ -1262,16 +1264,21 @@ class InProcessAdbcTest {
 
     @Test
     fun `getObjects catalogPattern filters catalogs via SQL LIKE`() {
-        xtdb.connect().use { it.attachDb("new_db", Database.Config()) }
-
         xtdb.connect().use { conn ->
-            conn.getObjects(GetObjectsDepth.CATALOGS, "new%", null, null, null, null).use { rdr ->
+            for (name in listOf("new_z", "new_é", "new_a")) conn.attachDb(name, Database.Config())
+
+            conn.getObjects(GetObjectsDepth.CATALOGS, "new%", "no_schema", "no_table", arrayOf("VIEW"), "no_column").use { rdr ->
+                conn.attachDb("new_b", Database.Config())
+                assertEquals(StandardSchemas.GET_OBJECTS_SCHEMA, rdr.vectorSchemaRoot.schema)
                 assertTrue(rdr.loadNextBatch())
                 val root = rdr.vectorSchemaRoot
-                val catalogs = (0 until root.rowCount)
-                    .map { root.getVector("catalog_name").getObject(it).toString() }.toSet()
-                assertEquals(setOf("new_db"), catalogs, "LIKE 'new%' matches new_db, not xtdb")
+                assertEquals(listOf("new_a", "new_z", "new_é"),
+                    (0 until root.rowCount).map { root.getVector("catalog_name").getObject(it).toString() })
+                assertTrue((0 until root.rowCount).all { root.getVector("catalog_db_schemas").isNull(it) })
+                assertFalse(rdr.loadNextBatch())
             }
+
+            conn.getObjects(GetObjectsDepth.CATALOGS, "new%", null, null, null, null).close()
         }
     }
 
@@ -1296,6 +1303,7 @@ class InProcessAdbcTest {
             conn.getObjects(GetObjectsDepth.CATALOGS, "no\nsuch", null, null, null, null).use { rdr ->
                 assertTrue(rdr.loadNextBatch())
                 assertEquals(0, rdr.vectorSchemaRoot.rowCount)
+                assertFalse(rdr.loadNextBatch())
             }
         }
     }

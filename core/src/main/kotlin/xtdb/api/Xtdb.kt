@@ -60,6 +60,7 @@ import xtdb.util.closeAll
 import xtdb.util.closeAllOnCatch
 import xtdb.util.closeOnCatch
 import xtdb.util.requiringResolve
+import xtdb.util.toByteArray
 import xtdb.util.useAll
 import xtdb.util.XtdbVersion
 import java.net.URL
@@ -1557,6 +1558,9 @@ interface Xtdb : DataSource, AdbcDatabase, AutoCloseable {
             tableTypes: Array<out String>?,
             columnNamePattern: String?
         ): ArrowReader {
+            if (depth == GetObjectsDepth.CATALOGS && catalogPattern != null)
+                return filteredCatalogReader(catalogPattern)
+
             // ADBC's catalogPattern is a SQL LIKE pattern; the shared lister evaluates it via the EE.
             val catalogs = catalogNames(catalogPattern, exact = false)
 
@@ -1575,6 +1579,26 @@ interface Xtdb : DataSource, AdbcDatabase, AutoCloseable {
                         )
                     }
 
+                    rel.endRow()
+                }
+            }
+        }
+
+        private fun filteredCatalogReader(pattern: String): ArrowReader {
+            val names = buildList {
+                forEachCatalogNamePage(pattern) { page ->
+                    val datnames = page["datname"]
+                    for (idx in 0 until page.rowCount) add(datnames.getBytes(idx).toByteArray())
+                }
+            }
+
+            return relationBatchReader(StandardSchemas.GET_OBJECTS_SCHEMA) { rel ->
+                val catalogNames = rel["catalog_name"]
+                val dbSchemas = rel["catalog_db_schemas"]
+
+                for (name in names) {
+                    catalogNames.writeBytes(name)
+                    dbSchemas.writeNull()
                     rel.endRow()
                 }
             }
@@ -1669,21 +1693,22 @@ interface Xtdb : DataSource, AdbcDatabase, AutoCloseable {
             else -> catalogNamesLike(filter)
         }
 
+        private fun catalogNamesLike(pattern: String): List<String> = buildList {
+            forEachCatalogNamePage(pattern) { page ->
+                for (idx in 0 until page.rowCount) add(page["datname"].getObject(idx).toString())
+            }
+        }
+
         // A LIKE pattern needs the expression engine, so this one goes through pg_catalog.pg_database — bound
         // (safe for any pattern) and unchecked (metadata isn't gated by the connection's tx access-mode).
-        private fun catalogNamesLike(pattern: String): List<String> =
+        private fun forEachCatalogNamePage(pattern: String, onPage: (RelationReader) -> Unit) {
             createStatement("SELECT datname FROM pg_catalog.pg_database WHERE datname LIKE ? ORDER BY datname")
                 .use { stmt ->
                     stmt.prepare()
                     Relation.openFromRows(allocator, listOf(mapOf("?_0" to pattern))).use { stmt.bind(it) }
-                    buildList {
-                        stmt.openUncheckedQuery().use { cursor ->
-                            cursor.forEachRemaining { rel ->
-                                for (i in 0 until rel.rowCount) add(rel["datname"].getObject(i).toString())
-                            }
-                        }
-                    }
+                    stmt.openUncheckedQuery().use { cursor -> cursor.forEachRemaining { onPage(it) } }
                 }
+        }
 
         internal fun forEachObjectPage(
             catalog: DatabaseName,
