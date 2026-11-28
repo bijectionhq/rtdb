@@ -523,6 +523,8 @@ impl Service {
         let wait = Duration::from_millis(request.wait_millis).min(MAX_WAIT);
         let deadline = tokio::time::Instant::now() + wait;
         let mut after = Basis::new(incarnation, request.after);
+        #[cfg(feature = "multi")]
+        let mut delivery = None;
         let touched = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let request = Changes {
@@ -537,7 +539,9 @@ impl Service {
             };
             #[cfg(feature = "multi")]
             let page = if let Some(follower) = self.follower() {
-                follower.reader.store_changes(request, &call.cancellation).await.map_err(error::follower)?
+                let (page, received) = follower.reader.store_changes(request, &call.cancellation).await.map_err(error::follower)?;
+                include_delivery(&mut delivery, received)?;
+                page
             } else {
                 driver.changes(request, &call.cancellation).await.map_err(error::anomaly)?
             };
@@ -557,12 +561,15 @@ impl Service {
                 break None;
             }
         };
-        self.check_attachment(call, &database)?;
-        Ok(proto::WatchReply {
+        let reply = proto::WatchReply {
             incarnation: incarnation.to_vec(),
             touched,
             through: after.position(),
-        }.encode_to_vec())
+        }.encode_to_vec();
+        #[cfg(feature = "multi")]
+        self.check_follower_store_reply(delivery, &call.cancellation).await?;
+        self.check_attachment(call, &database)?;
+        Ok(reply)
     }
 
     async fn store_rank(&self, call: &Call, request: proto::RankRequest) -> Result<Vec<u8>, Status> {

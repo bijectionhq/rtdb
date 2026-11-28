@@ -201,7 +201,8 @@ surface StatelessDatabase {
         -- Read, Watch and Rank are the Store actions admitted on a reader route after agreement.
         -- An assigned follower selects byte-store read and rank pages from its locally applied prefix.
         -- An assigned follower confirms each materialized Store Read or Rank range page against the ordered floor through a current journal observation.
-        -- Before returning the encoded Read or Rank reply, it confirms that the oldest consulted version remains above or at the floor.
+        -- Before returning the encoded Read, Rank or Watch reply, it confirms that the oldest consulted version remains above or at the floor.
+        -- A follower Watch retains its original resume basis across every page consulted for the reply.
         -- If the follower cannot authenticate that suffix within its admission bound, it must catch up before it can confirm the floor.
         -- It rechecks the same replica assignment and observed key generation before returning a Read, Rank or Watch reply.
         -- Read, Watch and Rank return UNAUTHENTICATED on an admitted route when the Store bearer is unknown or expired, so the caller can start a new handshake.

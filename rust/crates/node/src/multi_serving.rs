@@ -143,17 +143,19 @@ impl MultiFollower {
                 let database = self.serving.database.lock().await;
                 let (index, generation) = database.follower_view(&self.owner)?;
                 require_plain_follower(&index)?;
-                if generation != delivery.generation {
+                if generation != delivery.generation
+                    || index.head().basis.incarnation() != delivery.basis.incarnation()
+                {
                     return Err(interrupted());
                 }
-                index.cut(At::Exactly(delivery.basis))?;
                 database.check_follower_store_basis(&self.owner, delivery.basis).await?;
                 database.check_generation(generation).await
             }).await.ok_or_else(interrupted)?
         }).await
     }
 
-    pub async fn store_changes(&self, request: Changes, cancellation: &CancellationToken) -> Result<ChangePage> {
+    pub async fn store_changes(&self, request: Changes, cancellation: &CancellationToken) -> Result<(ChangePage, FollowerStoreDelivery)> {
+        let after = request.after.ok_or_else(|| Anomaly::incorrect("rtdb/follower-source", "A byte-store watch requires its resume basis"))?;
         if request.branch != rtdb_types::rtdb_v1::MAIN_BRANCH
             || request.tables.len() != 1
             || !request.tables.contains(&rtdb_index::branches::store::store_table())
@@ -167,8 +169,9 @@ impl MultiFollower {
         }
         let page = self.serving.changes(request, cancellation).await?;
         let generation = page.key_generation.ok_or_else(interrupted)?;
-        self.check_retained_delivery(generation, cancellation).await?;
-        Ok(page)
+        let delivery = FollowerStoreDelivery { basis: after, generation, owner: Arc::downgrade(&self.owner) };
+        self.check_store_delivery(&delivery, cancellation).await?;
+        Ok((page, delivery))
     }
 
     pub async fn query_ranked_ivf(&self, source: QuerySource, target: &crate::serving::ranked_ivf::Target,
@@ -1571,6 +1574,13 @@ mod tests {
         let (original, delivery) = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
         assigned.check_store_delivery(&delivery, &cancellation).await.unwrap();
+        let (changes, watch_delivery) = assigned.store_changes(Changes {
+            branch: MAIN_BRANCH.into(),
+            tables: [rtdb_index::branches::store::store_table()].into(),
+            after: Some(first), until: None, order: ChangeOrder::Ascending,
+            images: ChangeImages::Keys, limit: 16, wait: Duration::ZERO,
+        }, &cancellation).await.unwrap();
+        assert!(changes.through >= floor);
 
         assert!(!follower.supports_store_purge_floor().await);
         let refusal = follower.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
@@ -1581,6 +1591,8 @@ mod tests {
             .await.unwrap();
 
         let expired = assigned.check_store_delivery(&delivery, &cancellation).await.unwrap_err();
+        assert_eq!(expired.code, "rtdb/cursor-expired");
+        let expired = assigned.check_store_delivery(&watch_delivery, &cancellation).await.unwrap_err();
         assert_eq!(expired.code, "rtdb/cursor-expired");
 
         let second_attempt = [4; 16];

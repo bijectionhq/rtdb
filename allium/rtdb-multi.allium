@@ -1259,7 +1259,8 @@ contract EpochScopedStorage {
         -- The collector deletes database objects from earlier epochs outside the closure of the retained records, checkpoints and pins.
         -- After a certified trim through a checkpoint covering the authorized store floor, the Multi writer may also delete the exact manifests of superseded checkpoints outside that closure.
         -- A replica that raced the trim loads the replacement base and applies its retained suffix.
-        -- A follower returning a materialized ordered-byte page or ranked result confirms its earliest consulted basis against floor advances at a current authenticated journal prefix.
+        -- A follower returning a Store Read, Rank or Watch reply confirms its earliest consulted basis against floor advances at a current authenticated journal prefix.
+        -- On a Store Watch that basis is the caller's original resume position.
         -- A ranked result retains the original assignment and observed key generation through this final confirmation.
         -- A gap from the follower's applied prefix to the authenticated prefix requires catch-up before admission.
         -- Publication inherits earlier-epoch references from the current committed closure and introduces new objects from the current epoch.
