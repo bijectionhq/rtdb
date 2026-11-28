@@ -254,6 +254,8 @@ message ClaimWriterRequest {
   bytes assignment = 3;
   // One opaque 16-byte identity per claim. Retries reuse it.
   bytes attempt = 4;
+  // The successor waits for its raw Store clock to pass this inherited reading.
+  optional int64 reading_floor_micros = 5;
 }
 
 message ClaimWriterReply {

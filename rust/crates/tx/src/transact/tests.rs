@@ -144,6 +144,19 @@ fn a_new_claim_fences_the_previous_generation_of_the_same_placement() {
 }
 
 #[test]
+fn a_successor_claim_records_its_sample_after_the_inherited_reading() {
+    let mut state = TransactState::new(INCARNATION);
+    let fence = StoreWriterFence { epoch: 1, writer: Some([3; 16]) };
+    let mut claim = Transact::claim_store_writer(INCARNATION, fence, [4; 16]);
+    claim.window.not_before = Some(Timestamp(101));
+    assert_eq!(refused(&state, &claim, 1, 100), "rtdb.tx/system-time");
+    let accepted = plan(&state, &claim, 1, 101, DEFAULT);
+    let receipt = apply(&mut state, 1, accepted.record()).unwrap();
+    assert_eq!(receipt.store_reading, Some(Timestamp(101)));
+    assert_eq!(state.index().last_store_reading(), Some(Timestamp(101)));
+}
+
+#[test]
 fn a_store_append_judges_the_sample_independently_of_system_time() {
     use rtdb_index::branches::store::{Projection, StoreRead};
     let mut state = TransactState::new(INCARNATION);

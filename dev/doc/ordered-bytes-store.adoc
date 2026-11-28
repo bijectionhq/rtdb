@@ -144,7 +144,7 @@ It always reports how far it inspected, so a caller resumes from there.
   Append windows, timed admission and stamped placeholders all use that reading.
   The store judges the window and stamp through the vendored Bijection `fact_store::persistence::judge::admit`.
 * The ordering point waits while its raw sample is below the last ordered store reading.
-  A replacement writer starts with the last reading in its recovered prefix and follows the same rule.
+  A replacement writer starts with the greater of the last reading in its recovered prefix and the reading floor its opener supplies. A successor claim waits for a raw sample beyond the supplied floor and records that sample before allowing Store appends.
   A wait beyond the configured clock skew bound raises an operator clock fault.
   The vendored judge's regression result is an ordering-point fault.
 * XTDB SQL `system_time` strictly increases through store appends as through other transactions (`max(now, latest + 1 µs)`).

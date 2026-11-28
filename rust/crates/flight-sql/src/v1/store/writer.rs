@@ -53,8 +53,13 @@ impl Service {
             .map_err(|_| error::incorrect("A store writer claim attempt has 16 bytes"))?;
         let fence = StoreWriterFence { epoch: request.epoch, writer: Some(assignment) };
         let permission = PlacementFence::Claim { epoch: request.epoch, assignment };
-        let generation = self.order_store_writer(call, expected, permission,
-            Transact::claim_store_writer(expected, fence, attempt)).await?;
+        let mut command = Transact::claim_store_writer(expected, fence, attempt);
+        if let Some(floor) = request.reading_floor_micros {
+            let first = floor.checked_add(1).filter(|_| floor >= 0)
+                .ok_or_else(|| error::incorrect("The Store reading floor must allow a later clock sample"))?;
+            command.window.not_before = Some(rtdb_types::Timestamp(first));
+        }
+        let generation = self.order_store_writer(call, expected, permission, command).await?;
         Ok(proto::ClaimWriterReply { claim: Some(request), generation }.encode_to_vec())
     }
 

@@ -13,6 +13,12 @@ impl Transact {
         WriterCommand { incarnation, fence, attempt: Some(attempt) }.transaction()
     }
 
+    /// A successor claim's earliest admissible raw sample. The serving
+    /// orderer samples against this and the last reading it already holds.
+    pub fn store_writer_reading_floor(&self) -> Option<Timestamp> {
+        self.store_writer_change().and_then(|command| command.attempt.and(self.window.not_before))
+    }
+
     pub(super) fn store_writer_change(&self) -> Option<WriterCommand> {
         match self.guards.as_slice() {
             [Guard::SetStoreWriter { incarnation, fence }] =>
@@ -66,9 +72,16 @@ pub(super) fn resolve_change(
     let WriterCommand { incarnation, fence, attempt } = command;
     let head = view.index.head();
     let namespace = Some(receipt_namespace());
+    let reading_floor = request.store_writer_reading_floor();
+    if let Some(floor) = reading_floor
+        && now < view.index.last_store_reading().map_or(floor, |last| last.max(floor))
+    {
+        return Err(store_time_order());
+    }
+    let reading = reading_floor.map(|_| now);
     let receipt = |cut: BranchCut| Receipt {
         key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome: Outcome::Then,
-        replayed: false, erasure: None, decision_clock: None, store_reading: None,
+        replayed: false, erasure: None, decision_clock: None, store_reading: reading,
     };
     let prior = view.receipts.get(&namespace).and_then(|receipts| receipts.get(&request.key));
     let effect = if let Some(attempt) = attempt {
@@ -76,6 +89,9 @@ pub(super) fn resolve_change(
             return Err(Anomaly::incorrect("rtdb.store/writer-attempt", "A store writer claim needs a nonzero attempt identity"));
         }
         if let Some(prior) = prior {
+            if reading_floor.is_some_and(|floor| prior.receipt.store_reading.is_none_or(|sample| sample < floor)) {
+                return Err(store_time_order());
+            }
             view.index.require_store_writer(Some((incarnation, fence, prior.receipt.basis.position(), attempt)))?;
             return Ok((Resolution::Answer(replay(&prior.receipt)), None));
         }
@@ -94,6 +110,9 @@ pub(super) fn resolve_change(
     let cut = BranchCut { basis: Basis::new(incarnation, position), system_time: now.max(head.system_time.next()?) };
     let mut after = view.index.clone();
     after.advance(cut)?;
+    if let Some(reading) = reading {
+        after.record_store_reading(reading)?;
+    }
     after.apply(effect.clone())?;
     let record = TransactionRecord::Tx(ResolvedTransact {
         fingerprint, receipt: receipt(cut), effects: vec![effect], before: None, receipt_namespace: namespace,

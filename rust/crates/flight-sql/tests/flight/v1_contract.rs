@@ -357,6 +357,7 @@ async fn store_appends_require_the_latest_claim_for_the_same_placement() {
     let writer = [3; 16].to_vec();
     let claim = |attempt| store::ClaimWriterRequest {
         incarnation: incarnation.to_vec(), epoch: 1, assignment: writer.clone(), attempt: vec![attempt; 16],
+        reading_floor_micros: None,
     };
     let first = claim(1);
     let reply = client.action(CLAIM, first.encode_to_vec().into()).await.unwrap();

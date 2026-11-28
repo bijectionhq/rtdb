@@ -456,6 +456,7 @@ async fn claim_writer(
         epoch: 1,
         assignment: Uuid::new_v4().as_bytes().to_vec(),
         attempt: Uuid::new_v4().as_bytes().to_vec(),
+        reading_floor_micros: None,
     };
     let request = writer_request(
         Action {
