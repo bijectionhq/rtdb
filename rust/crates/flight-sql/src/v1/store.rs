@@ -609,6 +609,7 @@ impl Service {
                 if self.follower_only() || call.session.fresh_replica {
                     return Err(error::unsupported("rtdb.store.v1.Watch with exact retention"));
                 }
+                call.require_retained_watch_transport()?;
                 let account = hold_version::reader_account(call)?;
                 let reader = hold_version::reader_identity(incarnation, account);
                 let key = hold_version::hold_key(incarnation, retention)?;

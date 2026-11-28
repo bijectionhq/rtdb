@@ -9,7 +9,7 @@ use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExe
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
-use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER, LINKED_STORE_RELEASE, REQUEST_STORE_DRAIN_HEADER, STORE_DRAIN_PROOF_HEADER, STORE_RELEASE_HEADER};
+use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER, ISOLATED_WATCH_FORWARD, LINKED_STORE_RELEASE, REQUEST_STORE_DRAIN_HEADER, RETAINED_STORE_WATCH_HEADER, STORE_DRAIN_PROOF_HEADER, STORE_RELEASE_HEADER};
 use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -23,8 +23,8 @@ use crate::{admin, capability::CellSecret, cipher::Cipher, classic_flight, contr
 
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
-const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v6";
-const DRAIN_CONTEXT: &str = "rtdb.multi/flight-store-drain/v2";
+const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v7";
+const DRAIN_CONTEXT: &str = "rtdb.multi/flight-store-drain/v3";
 const DRAIN_HEADER: &str = "x-rtdb-store-drain-ticket";
 const CLOSE_SESSION_FRAME: &[u8] = b"\x00\x00\x00\x00\x0e\x0a\x0cCloseSession";
 const FRESH_HEADER: &str = "x-rtdb-fresh-read";
@@ -71,6 +71,7 @@ struct FreshReplica {
 struct SessionRoute {
     target: Target,
     session: Uuid,
+    drain_enrolled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +86,7 @@ struct Router {
     secret: Arc<CellSecret>,
     routes: Cipher,
     transport: Client<HttpConnector, RequestBody>,
+    isolated_watch_transport: Client<HttpConnector, RequestBody>,
     calls: Arc<Semaphore>,
     deployments: Arc<DeploymentConnections>,
     options: GatewayOptions,
@@ -156,10 +158,13 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
     let mut client = Client::builder(TokioExecutor::new());
     client.http2_only(true).retry_canceled_requests(false).pool_timer(TokioTimer::new())
         .pool_max_idle_per_host(1).pool_idle_timeout(Duration::from_secs(30));
-    let transport = client.build(connector);
+    let transport = client.build(connector.clone());
+    // The writer's cutoff closes its HTTP/2 socket. Keep that socket out
+    // of the pool so it cannot fence unrelated requests.
+    let isolated_watch_transport = client.pool_max_idle_per_host(0).build(connector);
     let retained_key = options.classic_retained_flight_key.as_deref().map(classic_flight::read_retained_key).transpose()?;
     let router = Arc::new(Router { directory, control: control::ControlKey(Some(Arc::clone(secret))),
-        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport,
+        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, isolated_watch_transport,
         calls: Arc::new(Semaphore::new(limit)),
         deployments: Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment)),
         timeout: options.startup_timeout, options, retained_key, inspected_actions: MemoryBudget::new(8 * MAXIMUM_ACTION_FRAME_BYTES) });
@@ -429,6 +434,12 @@ impl Router {
             Some(_) => return Err(Status::invalid_argument("Request a drain ticket at the Flight handshake")),
             None => false,
         };
+        let isolated_watch = match single_header(request.headers(), RETAINED_STORE_WATCH_HEADER)? {
+            Some("1") if !draining && request.uri().path() == DO_ACTION
+                && route.as_ref().is_some_and(|route| route.drain_enrolled) => true,
+            Some(_) => return Err(Status::permission_denied("A retained Store watch requires its enrolled gateway session")),
+            None => false,
+        };
         let fresh = match single_header(request.headers(), FRESH_HEADER)? {
             Some("1") if route.is_none() && request.uri().path() == HANDSHAKE => true,
             Some(_) => return Err(Status::permission_denied("A fresh Flight route is fixed at its handshake")),
@@ -486,7 +497,9 @@ impl Router {
         if issue_drain {
             headers.insert(REQUEST_STORE_DRAIN_HEADER, HeaderValue::from_static("1"));
         }
-        headers.insert(GATEWAY_ANSWER_DEADLINE_HEADER, HeaderValue::from_static("forward"));
+        headers.remove(RETAINED_STORE_WATCH_HEADER);
+        let delivery_route = if isolated_watch { ISOLATED_WATCH_FORWARD } else { "forward" };
+        headers.insert(GATEWAY_ANSWER_DEADLINE_HEADER, HeaderValue::from_static(delivery_route));
         headers.insert(DATABASE_HEADER, header_value(&target.name)?);
         if let Some(session) = session {
             headers.insert(header::COOKIE, header_value(&format!("{COOKIE}={session}"))?);
@@ -519,11 +532,17 @@ impl Router {
             }
         };
         let request = Request::from_parts(parts, body);
-        let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL attachment disconnected"))?;
+        let transport = if isolated_watch { &self.isolated_watch_transport } else { &self.transport };
+        let mut response = transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL attachment disconnected"))?;
         let deadline = single_header(response.headers(), GATEWAY_ANSWER_DEADLINE_HEADER)?
             .map(|header| header.parse::<u64>().ok().and_then(DeliveryDeadline::from_wire_nanos)
                 .ok_or_else(|| Status::unavailable("The Flight holder's answer deadline expired"))).transpose()?;
         response.headers_mut().remove(GATEWAY_ANSWER_DEADLINE_HEADER);
+        if isolated_watch && deadline.is_none()
+            && response.headers().get("grpc-status").is_none_or(|status| status == "0")
+        {
+            return Err(Status::unavailable("The retained Store watch has no writer delivery deadline"));
+        }
         if let Some(deadline) = deadline {
             egress.restrict(deadline).map_err(|_| Status::unavailable("The Flight answer cannot reach this socket before expiry"))?;
         }
@@ -590,12 +609,11 @@ impl Router {
         let session = cookie.strip_prefix("arrow_flight_session_id=").and_then(|id| Uuid::parse_str(id).ok())
             .ok_or_else(|| Status::internal("Invalid private Flight SQL session"))?;
         target.acknowledge_fresh(headers);
-        let session = SessionRoute { target, session };
+        let drain_enrolled = issue_drain && headers.contains_key(header::AUTHORIZATION)
+            && single_header(headers, STORE_RELEASE_HEADER)? == Some(LINKED_STORE_RELEASE) && drain_proof.is_some();
+        let session = SessionRoute { target, session, drain_enrolled };
         let route = self.encode(ROUTE_CONTEXT, &session)?;
-        if issue_drain && headers.contains_key(header::AUTHORIZATION)
-            && single_header(headers, STORE_RELEASE_HEADER)? == Some(LINKED_STORE_RELEASE)
-            && let Some(proof) = drain_proof
-        {
+        if let Some(proof) = drain_proof.filter(|_| drain_enrolled) {
             let proof = proof.to_str().ok().filter(|proof| proof.len() == 43)
                 .ok_or_else(|| Status::internal("Invalid private Flight Store drain proof"))?;
             let mut ticket = header_value(&self.encode(DRAIN_CONTEXT, &DrainRoute { session, proof: proof.into() })?)?;

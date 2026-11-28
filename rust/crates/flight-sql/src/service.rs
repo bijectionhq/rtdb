@@ -139,6 +139,8 @@ pub(crate) struct Call {
     store_reply: std::sync::Mutex<Option<crate::v1::store::StoreReplyGuard>>,
     egress: Option<Arc<crate::server::FlightEgress>>,
     routed_delivery: bool,
+    #[cfg(feature = "multi")]
+    isolated_watch: bool,
     pub(crate) classic_flight_excluded: bool,
     pub(crate) classic_retained: Option<crate::ClassicRetainedAdmission>,
 }
@@ -241,6 +243,14 @@ impl Call {
             headers.insert(crate::GATEWAY_ANSWER_DEADLINE_HEADER, wire.to_string().parse().map_err(arrow)?);
         }
         Ok((headers, cutoff))
+    }
+
+    #[cfg(feature = "multi")]
+    pub(crate) fn require_retained_watch_transport(&self) -> Result<(), Status> {
+        if self.isolated_watch && self.session.store_drain_enrolled && self.egress.is_some() {
+            return Ok(());
+        }
+        Err(Status::failed_precondition("A retained Store watch requires its enrolled, isolated gateway transport"))
     }
 
     #[cfg(feature = "multi")]
@@ -595,9 +605,16 @@ impl Service {
                 Some(StoreRelease::negotiate(request.metadata(), caller.verified_credential)?)
             } else { None };
             if timed_store.is_some() { StoreRelease::require(store_release)?; }
+            let store_drain_enrolled = store_release.is_some() && caller.verified_credential && forwarded_peer.is_some()
+                && {
+                    let values = request.metadata().get_all(REQUEST_STORE_DRAIN_HEADER);
+                    let mut values = values.iter();
+                    values.next().is_some_and(|value| value == "1") && values.next().is_none()
+                };
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
             let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
-                placement.as_ref(), fresh_replica, store_release, timed_store, self.memory().reserve(capacity).map_err(status)?));
+                placement.as_ref(), fresh_replica, store_release, timed_store, store_drain_enrolled,
+                self.memory().reserve(capacity).map_err(status)?));
             sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
                 self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
@@ -628,12 +645,16 @@ impl Service {
         let active_call = attachment.as_deref().filter(|_| !retained_proof)
             .and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
         let store_read = store_read.then(|| session.enter_store_read()).transpose()?;
+        let delivery_route = request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER);
+        let isolated_watch = delivery_route.is_some_and(|header| header == crate::ISOLATED_WATCH_FORWARD);
         let call = Call { service: self.clone(), kind, session, minted, database, cancellation: self.0.cancellation.child_token(),
             admission, _lease: Some(lease), _active_call: active_call, store_read, _reservation: reservation,
             #[cfg(feature = "multi")]
             store_reply: std::sync::Mutex::new(None),
             egress: transport.map(|transport| transport.egress.clone()),
-            routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward"),
+            routed_delivery: isolated_watch || delivery_route.is_some_and(|header| header == "forward"),
+            #[cfg(feature = "multi")]
+            isolated_watch,
             classic_flight_excluded, classic_retained: None };
         if !store_close && self.0.node.catalog().is_managed()
             && let Ok(attached) = self.0.node.catalog().database(&call.database)
@@ -731,19 +752,12 @@ impl FlightService for Service {
             self.check_family_readback_handshake(&call).await.map_err(|status| call.error(status))?;
         }
         let release = if call.minted { call.session.store_release } else { None };
-        let drain_proof = if release.is_some() && call.session.caller.verified_credential {
-            let offered = request.metadata().get_all(REQUEST_STORE_DRAIN_HEADER);
-            let mut offered = offered.iter();
-            match offered.next() {
-                Some(value) if value == "1" && offered.next().is_none() => {
-                    let session = Uuid::parse_str(&call.session.id).map_err(arrow)?;
-                    let mut proof: tonic::metadata::MetadataValue<_> =
-                        self.0.auth.issue_store_drain(session, &call.database).parse().map_err(arrow)?;
-                    proof.set_sensitive(true);
-                    Some(proof)
-                }
-                _ => None,
-            }
+        let drain_proof = if call.minted && call.session.store_drain_enrolled {
+            let session = Uuid::parse_str(&call.session.id).map_err(arrow)?;
+            let mut proof: tonic::metadata::MetadataValue<_> =
+                self.0.auth.issue_store_drain(session, &call.database).parse().map_err(arrow)?;
+            proof.set_sensitive(true);
+            Some(proof)
         } else { None };
         let retained_basis_append = call.minted && call.session.caller.verified_credential
             && call.session.caller.principal.label_scope().is_none()
@@ -779,7 +793,7 @@ impl FlightService for Service {
         }
         #[cfg(feature = "multi")]
         if version_hold {
-            reply.metadata_mut().insert(crate::v1::store::HOLD_VERSION_HEADER, tonic::metadata::MetadataValue::from_static("4"));
+            reply.metadata_mut().insert(crate::v1::store::HOLD_VERSION_HEADER, tonic::metadata::MetadataValue::from_static("5"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());

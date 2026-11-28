@@ -401,7 +401,9 @@ message PurgeFloorReply {
 }
 
 // rtdb.store.v1.HoldVersion orders exact byte retention on the current Multi writer.
-// A fresh Store handshake advertises x-rtdb-store-hold-version: 4 for holds, retained watches and drain settlement.
+// A fresh Store handshake advertises x-rtdb-store-hold-version: 5 for holds and drain settlement.
+// A retained Watch additionally requires the gateway's enrolled Store drain session and
+// a request with x-rtdb-retained-watch: 1 to isolate the watch's provider socket.
 // Reopen and release require database read access for the same authenticated account
 // and issuer in this incarnation. The receipt carries no data authority.
 message HoldVersionRequest {

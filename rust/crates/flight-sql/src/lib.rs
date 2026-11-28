@@ -34,6 +34,10 @@ pub use owned_world::{FrozenWorldWinner, OwnedWorldHost, OwnedWorldRead, Prepare
 
 /// Private Flight gateway request marker and response cutoff.
 pub const GATEWAY_ANSWER_DEADLINE_HEADER: &str = "x-rtdb-answer-deadline";
+/// Request an isolated gateway-to-writer transport for a retained Store Watch.
+pub const RETAINED_STORE_WATCH_HEADER: &str = "x-rtdb-retained-watch";
+/// The gateway's private confirmation that this request has an isolated socket.
+pub const ISOLATED_WATCH_FORWARD: &str = "isolated-watch";
 
 mod v1;
 mod trace_scope;
