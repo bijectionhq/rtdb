@@ -190,7 +190,7 @@ For same-host verification, the broker account owns the stopped destination's da
 ### Ranked catalogue admission
 
 Configure `ranked_providers` in the broker configuration as a map from operator-selected names to S3 settings. Each allocation requires an explicit region. Keep the original bucket, endpoint and prefix registered while its recovery outcomes are needed. Credentials may rotate without changing the allocation identity.
-Ranked commissioning requires a build with `backup-object-holds` and a versioned S3 allocation.
+Ranked commissioning requires a versioned S3 allocation and the `all-backends` release variant or a build with `backup-object-holds`.
 
 Commission a provider against the active binding before enabling the ranked writer for that incarnation.
 

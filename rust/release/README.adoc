@@ -5,6 +5,7 @@ No image, binary, native library or JVM binding has been built or qualified.
 `matrix.json` lists the intended Linux platforms and feature selections; each requires its own execution evidence before it is advertised as supported.
 Local packaging includes the native server, offline configuration migrator, shared and static embedded libraries, C header and build metadata.
 The all-backends selection enables Kafka, Kafka Connect, S3, Azure, GCS and PostgreSQL CDC in the server, migrator and embedded library.
+It also includes the hosted Multi recovery commands for acquisitions in versioned S3 allocations.
 It also includes the server's CloudWatch module and the migrator's matching capability check.
 The pinned JVM selections are `standalone`, `aws`, `azure`, and `google-cloud`, each built by its matching `:docker:<variant>:shadowJar` task.
 Standalone includes local storage and PostgreSQL CDC; each cloud selection also includes Kafka, Kafka Connect, and its own storage provider.

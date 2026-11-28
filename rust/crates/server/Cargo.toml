@@ -23,7 +23,7 @@ azure = ["rtdb-node/azure", "dep:rtdb-azure"]
 gcs = ["rtdb-node/gcs"]
 pg-source = ["rtdb-node/pg-source", "rtdb-metrics/pg-source", "dep:rtdb-pg-source"]
 cloudwatch = ["dep:aws-config", "dep:aws-sdk-cloudwatch"]
-all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source", "cloudwatch", "multi"]
+all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source", "cloudwatch", "backup-object-holds"]
 
 [dependencies]
 dhat = { version = "=0.3.3", optional = true }
