@@ -1239,6 +1239,7 @@ contract EpochScopedStorage {
         -- A published sequence slot retains the exact catalogue and remains discoverable without its operation ID.
         -- Closure is irreversible and exposes the final immutable inventory through sequence pages.
         -- A closure receipt requires the digest of every committed sequence slot in order to match the closed provider ledger.
+        -- A catalogue outcome page returns entries from the scan that recomputes and checks that digest.
         -- A staged ranked object has a provider upload recorded against the scope before payload submission.
         -- The original provider confirms that any recorded upload has drained before the custodian returns a closure receipt.
         -- The closure receipt also binds the complete inventory of staged versions, with each version's exact build cut and key generation.

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -112,7 +112,7 @@ impl RankedAdmission {
             .await?
     }
 
-    /// Reads the next page of the provider's immutable admission prefix.
+    /// Verifies the closed catalogue inventory before returning its next page.
     pub async fn outcomes(
         &self,
         scope: ClosedRankedAdmission,
@@ -123,7 +123,7 @@ impl RankedAdmission {
 
     pub async fn outcome_page(
         &self,
-        scope: ClosedRankedAdmission,
+        receipt: ClosedRankedAdmission,
         after: u64,
         limit: usize,
     ) -> Result<RankedAdmissionPage> {
@@ -135,17 +135,18 @@ impl RankedAdmission {
             .run_async(async move {
                 Ok(async {
                     let (ledger, _) = owner.root().await?;
-                    if !ledger.closed || ledger.staging.is_some() || scope != owner.receipt(&ledger) || after > ledger.count {
+                    if !ledger.closed
+                        || ledger.staging.is_some()
+                        || receipt != owner.receipt(&ledger)
+                        || after > receipt.admitted
+                    {
                         return Err(invalid());
                     }
-                    let end = after.saturating_add(limit as u64).min(ledger.count);
-                    let mut catalogues = Vec::with_capacity((end - after) as usize);
-                    for sequence in after..end {
-                        catalogues.push(owner.entry(sequence + 1).await?);
-                    }
+                    let end = after.saturating_add(limit as u64).min(receipt.admitted);
+                    let catalogues = owner.scan_catalogues(receipt, after..end).await?;
                     Ok(RankedAdmissionPage {
                         catalogues,
-                        next_after: (end < ledger.count).then_some(end),
+                        next_after: (end < receipt.admitted).then_some(end),
                     })
                 }
                 .await)
@@ -249,28 +250,38 @@ impl RankedAdmission {
                 self.drain_staging(upload).await?;
                 continue;
             }
-            self.verify_inventory(&ledger).await?;
-            self.verify_staging(ledger.completed_staging).await?;
-            return Ok(self.receipt(&ledger));
+            let receipt = self.receipt(&ledger);
+            self.scan_catalogues(receipt, 0..0).await?;
+            self.verify_staging(receipt.staging).await?;
+            return Ok(receipt);
         }
         Err(contention())
     }
 
-    async fn verify_inventory(&self, ledger: &Ledger) -> Result<()> {
-        let mut catalogues = stream::iter(1..=ledger.count)
-            .map(|sequence| self.entry(sequence))
+    async fn scan_catalogues(
+        &self,
+        receipt: ClosedRankedAdmission,
+        selection: Range<u64>,
+    ) -> Result<Vec<RankedCatalog>> {
+        let mut entries = stream::iter(0..receipt.admitted)
+            .map(|offset| async move { Ok::<_, Anomaly>((offset, self.entry(offset + 1).await?)) })
             .buffered(INVENTORY_READ_CONCURRENCY);
         let mut digest = [0; 32];
-        while let Some(catalogue) = catalogues.next().await {
-            digest = inventory_step(digest, catalogue?)?;
+        let mut catalogues = Vec::with_capacity((selection.end - selection.start) as usize);
+        while let Some(entry) = entries.next().await {
+            let (offset, catalogue) = entry?;
+            digest = inventory_step(digest, catalogue)?;
+            if selection.contains(&offset) {
+                catalogues.push(catalogue);
+            }
         }
-        if digest != ledger.inventory_sha256 {
+        if digest != receipt.inventory_sha256 {
             return Err(Anomaly::fault(
                 "rtdb.storage/ranked-admission-inventory",
                 "The original ranked catalogue inventory does not match the closed ledger",
             ));
         }
-        Ok(())
+        Ok(catalogues)
     }
 
     fn receipt(&self, ledger: &Ledger) -> ClosedRankedAdmission {
@@ -529,6 +540,38 @@ mod tests {
         wrong.commission().await.unwrap();
         wrong.close().await.unwrap();
         assert!(wrong.outcomes(closed, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ranked_outcome_page_refuses_a_catalogue_replaced_after_closure() {
+        let provider = Arc::new(InMemory::new());
+        let scope = scope();
+        let writer = open(provider.clone(), scope);
+        writer.commission().await.unwrap();
+        let first = catalogue(scope, 1);
+        let last = catalogue(scope, 2);
+        writer.publish(first).await.unwrap();
+        writer.publish(last).await.unwrap();
+        let receipt = writer.close().await.unwrap();
+
+        let custodian = open(provider, scope);
+        assert_eq!(
+            custodian.outcome_page(receipt, 1, 1).await.unwrap().catalogues,
+            [last]
+        );
+        let mut replacement = first;
+        replacement.manifest.digest = [8; 32];
+        let bytes = Bytes::from(Record::RankedCatalog(replacement).encode().unwrap());
+        assert!(writer.put(&writer.entry_path(1), bytes, PutMode::Overwrite).await.unwrap());
+
+        let mismatch = "rtdb.storage/ranked-admission-inventory";
+        for after in [0, 1] {
+            assert_eq!(
+                custodian.outcome_page(receipt, after, 1).await.unwrap_err().code,
+                mismatch
+            );
+        }
+        assert_eq!(custodian.close().await.unwrap_err().code, mismatch);
     }
 
     #[tokio::test]
