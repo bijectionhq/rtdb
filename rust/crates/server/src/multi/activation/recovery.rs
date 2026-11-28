@@ -122,14 +122,73 @@ impl From<Installation> for InstallationRecord {
 const UNPAIRED_AUTHENTICATION: &str = "an installation names its source cut without its anchor, or the reverse";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PendingRecord", into = "PendingRecord")]
 pub(super) struct Pending {
+    intent: Intent,
+    installation: Option<Installation>,
+    seal: SourceSeal,
+}
+
+/// Where a lossless recovery sealed its predecessor's source journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceSeal {
+    Unsealed,
+    End(Lsn),
+    /// A lineage seal, at the authenticated cut whose head ends the segment.
+    Cut(AuthenticatedCut),
+}
+
+impl SourceSeal {
+    fn end(self) -> Option<Lsn> {
+        match self {
+            Self::Unsealed => None,
+            Self::End(end) => Some(end),
+            Self::Cut(cut) => Some(cut.end()),
+        }
+    }
+
+    fn cut(self) -> Option<AuthenticatedCut> {
+        match self {
+            Self::Cut(cut) => Some(cut),
+            Self::Unsealed | Self::End(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRecord {
     intent: Intent,
     installation: Option<Installation>,
     #[serde(rename = "final_source_lsn")]
     sealed_segment_end: Option<Lsn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sealed_head: Option<AuthenticatedCut>,
+}
+
+impl TryFrom<PendingRecord> for Pending {
+    type Error = &'static str;
+
+    fn try_from(record: PendingRecord) -> std::result::Result<Self, Self::Error> {
+        let seal = match (record.sealed_segment_end, record.sealed_head) {
+            (None, None) => SourceSeal::Unsealed,
+            (Some(end), None) => SourceSeal::End(end),
+            (Some(end), Some(cut)) if cut.end() == end => SourceSeal::Cut(cut),
+            _ => return Err("a pending recovery's sealed head does not end at its sealed end"),
+        };
+        Ok(Self { intent: record.intent, installation: record.installation, seal })
+    }
+}
+
+impl From<Pending> for PendingRecord {
+    fn from(pending: Pending) -> Self {
+        Self {
+            intent: pending.intent,
+            installation: pending.installation,
+            sealed_segment_end: pending.seal.end(),
+            sealed_head: pending.seal.cut(),
+        }
+    }
 }
 
 /// A published recovery. Its source cut is the publication's lineage
@@ -316,11 +375,14 @@ impl State {
                     .intent
                     .destination_cell
                     .is_none_or(|cell| !cell.is_nil())
-                && (pending.sealed_segment_end.is_none() || self.grants_closed)
-                && pending.sealed_head.is_some() == (self.uses_lineage() && pending.sealed_segment_end.is_some())
-                && pending.sealed_head.is_none_or(|source| pending.sealed_segment_end.is_some_and(|end| {
-                    source.matches(*self.binding.incarnation.as_bytes(), end)
-                }))
+                && (pending.seal == SourceSeal::Unsealed || self.grants_closed)
+                && match pending.seal {
+                    SourceSeal::Unsealed => true,
+                    SourceSeal::End(_) => !self.uses_lineage(),
+                    SourceSeal::Cut(cut) => {
+                        self.uses_lineage() && cut.matches(*self.binding.incarnation.as_bytes(), cut.end())
+                    }
+                }
                 && pending.installation.is_none_or(|installation| {
                     installation.source_cut.lsn != 0
                         && installation.valid_authentication(self.uses_lineage(), self.binding, self.installation_anchor())
@@ -328,9 +390,9 @@ impl State {
                             .is_some_and(|protocol| self.recovery_protocol() >= protocol)
                         && match pending.intent.loss_policy {
                             LossPolicy::Lossless => {
-                                pending.sealed_segment_end == Some(Lsn(installation.source_cut.lsn))
+                                pending.seal.end() == Some(Lsn(installation.source_cut.lsn))
                             }
-                            LossPolicy::AcceptUnknownTail => pending.sealed_segment_end.is_none(),
+                            LossPolicy::AcceptUnknownTail => pending.seal == SourceSeal::Unsealed,
                         }
                 })
         });
@@ -473,15 +535,14 @@ impl ActivationAuthority {
                     return Err(conflict());
                 }
                 let mut next = state.clone();
-                let mut sealed_segment_end = None;
-                let mut sealed_head = None;
+                let mut seal = SourceSeal::Unsealed;
                 if let Some(pending) = state.recovery {
                     if pending.intent == intent {
                         return Ok(None);
                     }
                     if supersedes != Some(pending.intent.operation.operation_id)
                         || operation.operation_id == pending.intent.operation.operation_id
-                        || (pending.sealed_segment_end.is_some()
+                        || (pending.seal != SourceSeal::Unsealed
                             && intent.loss_policy != LossPolicy::Lossless)
                     {
                         return Err(conflict());
@@ -489,8 +550,7 @@ impl ActivationAuthority {
                     next.superseded_recoveries
                         .insert(pending.intent.operation.operation_id);
                     if intent.loss_policy == LossPolicy::Lossless {
-                        sealed_segment_end = pending.sealed_segment_end;
-                        sealed_head = pending.sealed_head;
+                        seal = pending.seal;
                     }
                 } else if supersedes.is_some() {
                     return Err(conflict());
@@ -499,8 +559,7 @@ impl ActivationAuthority {
                 next.recovery = Some(Pending {
                     intent,
                     installation: None,
-                    sealed_segment_end,
-                    sealed_head,
+                    seal,
                 });
                 Ok(Some(next))
             })
@@ -616,7 +675,7 @@ impl ActivationAuthority {
             candidate: self.candidate(name, pending.intent)?,
             grants_closed: state.grants_closed,
             installation: pending.installation,
-            sealed_segment_end: pending.sealed_segment_end,
+            sealed_segment_end: pending.seal.end(),
             ranked_closure: state.ranked.and_then(|ranked| ranked.closure),
         })
     }
@@ -699,11 +758,11 @@ impl ActivationAuthority {
             let mut pending = state.pending(operation)?;
             if lineage != state.uses_lineage()
                 || !installation.valid_authentication(lineage, operation.predecessor, state.installation_anchor())
-                || pending.sealed_head.is_some_and(|sealed| {
+                || pending.seal.cut().is_some_and(|sealed| {
                     installation.authentication.is_none_or(|authentication| !same_source_tree(sealed, authentication.source))
                 })
                 || pending.intent.loss_policy == LossPolicy::Lossless
-                    && (installation.authentication.is_some() != pending.sealed_head.is_some())
+                    && (installation.authentication.is_some() != pending.seal.cut().is_some())
             {
                 return Err(conflict());
             }
@@ -711,7 +770,7 @@ impl ActivationAuthority {
                 return same_installation(prior, installation);
             }
             if intent.loss_policy == LossPolicy::Lossless
-                && pending.sealed_segment_end != Some(Lsn(installation.source_cut.lsn))
+                && pending.seal.end() != Some(Lsn(installation.source_cut.lsn))
             {
                 return Err(Anomaly::incorrect(
                     "rtdb/activation-final-source-cut",
@@ -749,7 +808,7 @@ impl ActivationAuthority {
         {
             return Err(conflict());
         }
-        if pending.sealed_segment_end.is_some() {
+        if pending.seal != SourceSeal::Unsealed {
             return self.recovery_status_at(name, &state, operation);
         }
         let lineage = self.supports_lineage(stream).await?;
@@ -770,16 +829,16 @@ impl ActivationAuthority {
         // writer fence orders all still in-flight writer requests before this cut.
         let seal = seal_predecessor(source, operation).await?;
         let sealed_segment_end = seal.sealed_head_lsn;
-        let sealed_head = match authenticated {
+        let sealed = match authenticated {
             Some(journal) => {
                 let (head, history) = journal.authenticated_head(seal.fence.stream, Some(sealed_segment_end.0)).await.map_err(journal_error)?;
                 let catalog_root = history.genesis.root();
                 head.verify(catalog_root, &history).map_err(|_| conflict())?;
                 let cut = AuthenticatedCut { head: head.head, catalog_root };
                 if !cut.matches(*operation.predecessor.incarnation.as_bytes(), sealed_segment_end) { return Err(conflict()); }
-                Some(cut)
+                SourceSeal::Cut(cut)
             }
-            None => None,
+            None => SourceSeal::End(sealed_segment_end),
         };
         let state = self
             .change(stream, |state| {
@@ -802,11 +861,10 @@ impl ActivationAuthority {
                 {
                     return Err(conflict());
                 }
-                if let Some(prior) = pending.sealed_segment_end {
+                if let Some(prior) = pending.seal.end() {
                     return if prior == sealed_segment_end { Ok(None) } else { Err(conflict()) };
                 }
-                pending.sealed_segment_end = Some(sealed_segment_end);
-                pending.sealed_head = sealed_head;
+                pending.seal = sealed;
                 let mut next = state.clone();
                 next.recovery = Some(pending);
                 Ok(Some(next))
@@ -870,7 +928,7 @@ impl ActivationAuthority {
                 ranked_closure,
                 loss_policy: pending.intent.loss_policy,
                 source_cut: installation.source_cut,
-                sealed_segment_end: pending.sealed_segment_end,
+                sealed_segment_end: pending.seal.end(),
                 key_hold: installation.key_hold,
                 journal_hold: installation.journal_hold,
                 objects_sha256: installation.objects_sha256,
@@ -1037,6 +1095,36 @@ mod tests {
         let mut unpaired = recorded;
         unpaired["recovery"].as_object_mut().unwrap().remove("installation_anchor");
         assert!(serde_json::from_value::<Publication>(unpaired).is_err());
+    }
+
+    #[test]
+    fn pending_recovery_seals_at_its_heads_end() {
+        let installation = recorded_installation();
+        let intent = Intent {
+            operation: Operation { predecessor: Binding { incarnation: Uuid::from_u128(2), revision: 1 }, operation_id: Uuid::from_u128(3) },
+            destination_cell: None,
+            loss_policy: LossPolicy::Lossless,
+        };
+        let recorded = serde_json::json!({
+            "intent": intent,
+            "installation": null,
+            "final_source_lsn": 3,
+            "sealed_head": installation["source_head"],
+        });
+        let pending: Pending = serde_json::from_value(recorded.clone()).unwrap();
+        assert_eq!(pending.seal.end(), Some(Lsn(3)));
+        assert!(pending.seal.cut().is_some());
+        assert_eq!(serde_json::to_value(pending).unwrap(), recorded);
+
+        let mut unsealed = recorded.clone();
+        unsealed["final_source_lsn"] = serde_json::Value::Null;
+        unsealed.as_object_mut().unwrap().remove("sealed_head");
+        assert_eq!(serde_json::from_value::<Pending>(unsealed).unwrap().seal, SourceSeal::Unsealed);
+        for end in [serde_json::Value::Null, serde_json::json!(4)] {
+            let mut misplaced = recorded.clone();
+            misplaced["final_source_lsn"] = end;
+            assert!(serde_json::from_value::<Pending>(misplaced).is_err());
+        }
     }
 
     #[test]
