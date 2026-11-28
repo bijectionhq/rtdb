@@ -37,6 +37,11 @@ fn stale_writer() -> Anomaly {
 }
 
 impl BranchIndex {
+    /// The ordered position of the current byte-store writer claim or fence.
+    pub fn store_writer_fence_position(&self) -> Option<u64> {
+        self.store_writer_fences.keys().next_back().copied()
+    }
+
     fn store_writer_fence(&self) -> Option<StoreWriterFence> {
         self.store_writer_fences.values().next_back().map(|state| state.fence())
     }

@@ -1019,7 +1019,7 @@ impl ServingDriver for MultiServing {
     async fn enter_local_store_read(&self, at: At, cancellation: &CancellationToken) -> Result<Option<StoreReadTurn>> {
         self.serve(async {
             cancellation.run_until_cancelled(async {
-                self.database.lock().await.enter_local_store_read(at).await
+                self.database.lock().await.enter_local_store_read(at).await.map(Some)
             }).await.ok_or_else(interrupted)?
         }).await
     }
@@ -1587,7 +1587,9 @@ mod tests {
         };
         let original = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
-        writer.check_local_store_basis(original.cut.basis, &cancellation, None).await.unwrap();
+        assert_eq!(writer.check_local_store_basis(original.cut.basis, &cancellation, None).await.unwrap_err().code,
+            "rtdb.store/stale-read-turn");
+        assert!(follower.enter_local_store_read(At::Exactly(first), &cancellation).await.is_err());
         let (original, delivery) = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
         assigned.check_store_delivery(&delivery, &cancellation).await.unwrap();
@@ -1616,8 +1618,12 @@ mod tests {
         writer.publish_store_purge_floor(floor, floor.position(), 0, guards(), first_writer, reserve(), &cancellation)
             .await.unwrap();
 
-        assert_eq!(writer.check_local_store_basis(first, &cancellation, None).await.unwrap_err().code, "rtdb/cursor-expired");
-        writer.check_local_store_basis(floor, &cancellation, None).await.unwrap();
+        match writer.enter_local_store_read(At::Exactly(first), &cancellation).await {
+            Err(error) => assert_eq!(error.code, "rtdb/cursor-expired"),
+            Ok(_) => panic!("the purged basis cannot start another writer read"),
+        }
+        let old_writer_turn = writer.enter_local_store_read(At::Exactly(floor), &cancellation).await.unwrap().unwrap();
+        writer.check_local_store_basis(floor, &cancellation, Some(&old_writer_turn)).await.unwrap();
 
         let expired = assigned.check_store_delivery(&delivery, &cancellation).await.unwrap_err();
         assert_eq!(expired.code, "rtdb/cursor-expired");
@@ -1628,6 +1634,13 @@ mod tests {
         let second_claim = writer.transact(Transact::claim_store_writer(incarnation, fence, second_attempt), &cancellation)
             .await.unwrap().basis;
         let current_writer = StoreWriterClaim { fence, generation: second_claim.position(), claim: second_attempt };
+        assert_eq!(writer.check_local_store_basis(floor, &cancellation, Some(&old_writer_turn)).await.unwrap_err().code,
+            "rtdb.store/stale-read-turn");
+        let current_turn = writer.enter_local_store_read(At::Exactly(floor), &cancellation).await.unwrap().unwrap();
+        assert!(!old_writer_turn.same_writer(&current_turn));
+        writer.check_local_store_basis(floor, &cancellation, Some(&current_turn)).await.unwrap();
+        drop(old_writer_turn);
+        drop(current_turn);
         for stale in [first_writer, StoreWriterClaim { claim: first_attempt, ..current_writer }] {
             let refusal = writer.publish_store_purge_floor(floor, floor.position(), 0, guards(), stale, reserve(), &cancellation)
                 .await.unwrap_err();

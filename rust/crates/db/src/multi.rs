@@ -756,9 +756,8 @@ impl MultiDatabase {
         if basis.incarnation() != self.incarnation() {
             return Err(Anomaly::incorrect("rtdb/foreign-basis", "The basis belongs to another database incarnation"));
         }
-        if let Some(turn) = turn {
-            self.require_local_store_turn(basis, turn).await?;
-        }
+        let turn = turn.ok_or_else(store_hold::stale_read_turn)?;
+        self.require_local_store_turn(basis, turn).await?;
         let state = self.state();
         state.require_retained_store_delivery(&self.stream, basis).await?;
         self.check_generation(state.generation).await
