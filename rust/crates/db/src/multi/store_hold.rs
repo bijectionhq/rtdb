@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::{Arc, Weak}};
 
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
@@ -9,6 +9,42 @@ use super::{MultiDatabase, Uuid, no_writer, store_floor::prefix_unsettled};
 const MAX_DATABASE_HOLDS: usize = 256;
 const MAX_READER_HOLDS: usize = 32;
 const MAX_HOLD_MICROS: i64 = 3_600_000_000;
+
+/// A local writer read keeps its basis through materialization and encoding.
+/// The original attachment still needs its final delivery check.
+pub struct StoreReadTurn {
+    basis: Basis,
+    _owner: Arc<()>,
+}
+
+impl StoreReadTurn {
+    pub fn basis(&self) -> Basis { self.basis }
+}
+
+#[derive(Default)]
+pub(super) struct StoreReads(Vec<(Basis, Weak<()>)>);
+
+impl StoreReads {
+    fn add(&mut self, basis: Basis) -> StoreReadTurn {
+        self.reap();
+        let owner = Arc::new(());
+        self.0.push((basis, Arc::downgrade(&owner)));
+        StoreReadTurn { basis, _owner: owner }
+    }
+
+    fn reap(&mut self) {
+        self.0.retain(|(_, owner)| owner.strong_count() > 0);
+    }
+
+    pub(super) fn check_floor(&mut self, keep_from: u64) -> Result<()> {
+        self.reap();
+        if self.0.iter().any(|(basis, _)| basis.position() < keep_from) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/purge-retention",
+                "An active Store read still retains history"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreVersionHoldKey {
@@ -115,6 +151,31 @@ impl StoreHolds {
 }
 
 impl MultiDatabase {
+    pub async fn enter_local_store_read(&mut self, at: At) -> Result<Option<StoreReadTurn>> {
+        self.refresh().await?;
+        self.require_active()?;
+        if self.authority().is_err() {
+            return Ok(None);
+        }
+        let state = self.state();
+        let index = self.durable_transactions().index();
+        if index.has_custody_groups() || index.has_visibility_history() {
+            return Err(Anomaly::unsupported("rtdb.store/unsupported",
+                "The ordered-bytes store serves only an unlabelled database"));
+        }
+        let floor = state.store_purge_floor.max(index.store_history_floor());
+        if matches!(at, At::Exactly(basis) if basis.incarnation() == self.incarnation() && basis.position() < floor) {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
+                "The requested basis precedes the admitted Store floor"));
+        }
+        let basis = index.cut(at)?.basis;
+        if basis.position() < floor {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
+                "The requested basis precedes the admitted Store floor"));
+        }
+        Ok(Some(self.store_reads.add(basis)))
+    }
+
     pub(super) async fn store_version_hold(
         &mut self, reader: [u8; 32], request: StoreVersionHoldRequest,
     ) -> Result<StoreVersionHoldReply> {

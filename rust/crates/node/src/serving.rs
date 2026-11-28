@@ -202,7 +202,7 @@ pub struct FundingSubmission {
 #[cfg(feature = "multi")]
 pub use rtdb_db::AppliedWatch;
 #[cfg(feature = "multi")]
-pub use rtdb_db::{StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest};
+pub use rtdb_db::{StoreReadTurn, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest};
 
 /// Without `multi` no attachment applies a journal, so there is no position to watch.
 #[cfg(not(feature = "multi"))]
@@ -441,6 +441,11 @@ pub trait ServingDriver: Send + Sync {
     /// an ordered Store floor have no further floor check.
     async fn check_local_store_basis(&self, _basis: Basis, _cancellation: &CancellationToken) -> Result<()> {
         Ok(())
+    }
+
+    #[cfg(feature = "multi")]
+    async fn enter_local_store_read(&self, _at: At, _cancellation: &CancellationToken) -> Result<Option<StoreReadTurn>> {
+        Ok(None)
     }
 
     async fn store_sizes(&self, _epoch: Option<u64>, _now: Timestamp, _cancellation: &CancellationToken) -> Result<StorageSizes> {

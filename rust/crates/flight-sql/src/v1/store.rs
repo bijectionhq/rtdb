@@ -85,6 +85,8 @@ struct StoreBatch {
     pages: Vec<StorePage>,
     #[cfg(feature = "multi")]
     delivery: Option<rtdb_node::FollowerStoreDelivery>,
+    #[cfg(feature = "multi")]
+    hold: Option<rtdb_node::serving::StoreReadTurn>,
 }
 
 #[cfg(feature = "multi")]
@@ -111,6 +113,8 @@ struct StoreRanges<'a> {
     oldest: std::sync::Mutex<Option<Basis>>,
     #[cfg(feature = "multi")]
     delivery: std::sync::Mutex<Option<rtdb_node::FollowerStoreDelivery>>,
+    #[cfg(feature = "multi")]
+    hold: std::sync::Mutex<Option<rtdb_node::serving::StoreReadTurn>>,
 }
 
 impl store_read::source::RangeSource for StoreRanges<'_> {
@@ -138,6 +142,13 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
             if let Some(delivery) = batch.delivery {
                 let mut admitted = self.delivery.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
                 include_delivery(&mut admitted, delivery)?;
+            }
+            #[cfg(feature = "multi")]
+            if let Some(turn) = batch.hold {
+                let mut held = self.hold.lock().map_err(|_| Status::internal("Rank retention state is unavailable"))?;
+                if held.as_ref().is_none_or(|prior| turn.basis() < prior.basis()) {
+                    *held = Some(turn);
+                }
             }
             let at = store_read::store::Version(batch.basis.position());
             let pages = batch.pages.into_iter().map(|page| store_read::source::RangePage {
@@ -265,7 +276,7 @@ impl Service {
     ) -> Result<StoreBatch, Status> {
         let expected_pages = reads.len();
         #[cfg(feature = "multi")]
-        let (pages, delivery) = if let Some(follower) = self.follower() {
+        let (pages, delivery, hold) = if let Some(follower) = self.follower() {
             let mut page_at = at;
             let mut pages = Vec::with_capacity(expected_pages);
             let mut delivery = None;
@@ -275,9 +286,12 @@ impl Service {
                 page_at = At::Exactly(page.cut.basis);
                 pages.push(page);
             }
-            (pages, delivery)
+            (pages, delivery, None)
         } else {
-            (driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?, None)
+            let hold = driver.enter_local_store_read(at, cancellation).await.map_err(error::anomaly)?;
+            let at = hold.as_ref().map_or(at, |hold| At::Exactly(hold.basis()));
+            let pages = driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?;
+            (pages, None, hold)
         };
         #[cfg(not(feature = "multi"))]
         let pages = driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?;
@@ -286,6 +300,8 @@ impl Service {
             basis, pages,
             #[cfg(feature = "multi")]
             delivery,
+            #[cfg(feature = "multi")]
+            hold,
         })
     }
 
@@ -342,6 +358,8 @@ impl Service {
         });
         let clock = self.0.node.now();
         let batch = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation).await?;
+        #[cfg(feature = "multi")]
+        let _hold = batch.hold;
         let pages = batch.pages.into_iter().map(|page| proto::RangePage {
             entries: page.entries.into_iter().map(|entry| proto::Entry {
                 key: entry.key, value: entry.value, written: entry.written.position(),
@@ -542,6 +560,12 @@ impl Service {
         let mut after = Basis::new(incarnation, request.after);
         let original = after;
         #[cfg(feature = "multi")]
+        let _hold = if self.follower().is_none() {
+            driver.enter_local_store_read(At::Exactly(original), &call.cancellation).await.map_err(error::anomaly)?
+        } else {
+            None
+        };
+        #[cfg(feature = "multi")]
         let mut delivery = None;
         let touched = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -603,6 +627,8 @@ impl Service {
             oldest: std::sync::Mutex::new(None),
             #[cfg(feature = "multi")]
             delivery: std::sync::Mutex::new(None),
+            #[cfg(feature = "multi")]
+            hold: std::sync::Mutex::new(None),
         };
         let reply = store_read::rank::rank(&source, program).await.map_err(|refused| {
             let refused = match refused.downcast::<Status>() {

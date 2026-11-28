@@ -257,6 +257,7 @@ surface StatelessDatabase {
         -- The writer reclaims superseded history within that floor under its retention and checkpoint rules.
         -- A materialized Read or Rank reply rechecks its oldest consulted byte version against the ordered floor before release.
         -- A Watch reply checks its original cursor even when the scan visited later effect pages.
+        -- A live local writer retains a read turn through reply encoding. Its ordered purge refuses to pass any such turn's oldest basis.
 
     @guarantee StoreVersionHold
         -- The hosted Multi writer orders exact physical Version admission and release alongside Store floor publication.

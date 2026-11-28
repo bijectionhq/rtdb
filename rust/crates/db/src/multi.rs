@@ -60,7 +60,7 @@ use pipeline::{Append, AttemptError, Planned, receipt_for};
 use rotation::ArmedRotation;
 pub use rotation::RotationReceipt;
 pub use retirement::DeploymentRetirement;
-pub use store_hold::{StoreVersionHold, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest};
+pub use store_hold::{StoreReadTurn, StoreVersionHold, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest};
 pub use timed_store::{TimedStoreAppend, TimedStoreAuthorizer, TimedStoreCommitment, TimedStoreReceipt};
 
 /// Wakes a waiter when its residence applies a new journal position, or when the journal holds an entry the residence has not applied, such as one another writer appended.
@@ -157,6 +157,7 @@ pub struct MultiDatabase {
     last_allocated: Epoch,
     competing_seal: Option<Lease>,
     assigned_follower: Weak<()>,
+    store_reads: store_hold::StoreReads,
     deferred_checkpoints: bool,
     binary_checkpoints: bool,
     hold_writes_after_recovery: bool,
@@ -200,6 +201,7 @@ impl MultiDatabase {
             last_allocated: Epoch(0),
             competing_seal: None,
             assigned_follower: Weak::new(),
+            store_reads: store_hold::StoreReads::default(),
             deferred_checkpoints: false,
             binary_checkpoints: false,
             hold_writes_after_recovery: false,

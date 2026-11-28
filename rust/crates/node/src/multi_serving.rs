@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeOrder, ChangePage, Changes, FamilyReviewSelection, QuerySource, QueryView, ROW_VISIBILITY,
-    ServingDriver, ServingScope, StoreVersionHoldReply, StoreVersionHoldRequest, TimedStoreAppend, TimedStoreReceipt,
+    ServingDriver, ServingScope, StoreReadTurn, StoreVersionHoldReply, StoreVersionHoldRequest, TimedStoreAppend, TimedStoreReceipt,
     WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
@@ -1016,6 +1016,14 @@ impl ServingDriver for MultiServing {
         }).await
     }
 
+    async fn enter_local_store_read(&self, at: At, cancellation: &CancellationToken) -> Result<Option<StoreReadTurn>> {
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.enter_local_store_read(at).await
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
     async fn store_sizes(&self, epoch: Option<u64>, now: Timestamp, cancellation: &CancellationToken) -> Result<StorageSizes> {
         self.serve(async {
             cancellation.run_until_cancelled(async {
@@ -1596,6 +1604,12 @@ mod tests {
             .await.unwrap_err();
         assert_eq!(refusal.code, "rtdb/no-writer");
         assert!(writer.supports_store_purge_floor().await);
+        let active = writer.enter_local_store_read(At::Exactly(first), &cancellation).await.unwrap().unwrap();
+        assert_eq!(active.basis(), first);
+        let retained = writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
+            .await.unwrap_err();
+        assert_eq!(retained.code, "rtdb.store/purge-retention");
+        drop(active);
         writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
             .await.unwrap();
 
