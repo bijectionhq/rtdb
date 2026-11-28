@@ -19,7 +19,7 @@
            (java.util.stream IntStream IntStream$Builder)
            (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector.types DateUnit TimeUnit)
-           (org.apache.arrow.vector.types.pojo ArrowType$Date ArrowType$Decimal ArrowType$Duration ArrowType$FixedSizeBinary ArrowType$Timestamp)
+           (org.apache.arrow.vector.types.pojo ArrowType$Date ArrowType$Decimal ArrowType$Duration ArrowType$FixedSizeBinary ArrowType$Time ArrowType$Timestamp)
            (xtdb.api ICursor)
            (xtdb.arrow ArrowTypes IntVector MonoVector RelationReader RowMask RowMask$Builder RowValueReader Vector VectorReader VectorType VectorWriter)
            (xtdb.arrow.agg AggregateSpec AggregateSpec$Factory Average Count GroupMapper GroupMapper$Mapper GroupMapper$Null RowCount StdDevPop StdDevSamp Sum VarWidthMinMax VariancePop VarianceSamp)
@@ -444,6 +444,20 @@
       (and (contains? #{nil "UTC" "Z"} (.getTimezone arrow-type))
            (<= (long min-local-epoch-second) (.getLong values (int idx)) (long max-local-epoch-second)))))
 
+(defn- copy-percentile-time? [^ArrowType$Time arrow-type, ^VectorReader values, ^long idx]
+  (let [unit (.getUnit arrow-type)
+        width (.getBitWidth arrow-type)]
+    (cond
+      (and (= 32 width) (contains? #{TimeUnit/SECOND TimeUnit/MILLISECOND} unit))
+      (let [ticks (.getInt values (int idx))]
+        (and (<= 0 ticks) (< ticks (if (= TimeUnit/SECOND unit) 86400 86400000))))
+
+      (and (= 64 width) (contains? #{TimeUnit/MICROSECOND TimeUnit/NANOSECOND} unit))
+      (let [ticks (.getLong values (int idx))]
+        (and (<= 0 ticks) (< ticks (if (= TimeUnit/MICROSECOND unit) 86400000000 86400000000000))))
+
+      :else false)))
+
 (defn- copy-percentile-value! [^VectorWriter out-vec, ^VectorReader values, ^long idx]
   (let [arrow-type (.getArrowType values)
         same-type? (= (.getArrowType out-vec) arrow-type)]
@@ -474,6 +488,8 @@
                     (= DateUnit/DAY (.getUnit ^ArrowType$Date arrow-type)))
                (and (instance? ArrowType$Timestamp arrow-type)
                     (copy-percentile-timestamp? arrow-type values idx))
+               (and (instance? ArrowType$Time arrow-type)
+                    (copy-percentile-time? arrow-type values idx))
                (and (or (= ArrowTypes/UTF8_TYPE arrow-type) (= KeywordType/INSTANCE arrow-type))
                     (.isValidUtf8 (UnsafeByteOperations/unsafeWrap (.getBytes values (int idx)))))))
       (.copyRow (.rowCopier values out-vec) (int idx))

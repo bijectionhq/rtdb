@@ -214,6 +214,49 @@
                                         [::tu/pages '{v #xt/type [:interval :month-day-nano]}
                                          [[{:v (Interval. 0 0 1)} {:v (Interval. 1 0 0)}]]]]))))
 
+(t/deftest test-discrete-percentile-time-winners-keep-units-and-exclude-nulls
+  (doseq [[time-type last-time]
+          [[#xt/type [:time-local :second] #xt/time "23:59:59"]
+           [#xt/type [:time-local :milli] #xt/time "23:59:59.999"]
+           [#xt/type [:time-local :micro] #xt/time "23:59:59.999999"]
+           [#xt/type [:time-local :nano] #xt/time "23:59:59.999999999"]]
+          block-size [1024 2]]
+    (let [nullable-type (VectorType/maybe time-type)
+          midnight #xt/time "00:00:00"]
+      (binding [order-by/*block-size* (int block-size)]
+        (t/is (= {:res #{{:g 1, :lo midnight, :hi last-time} {:g 2}}
+                  :types {'g #xt/type :i64, 'lo nullable-type, 'hi nullable-type}}
+                 (-> (tu/query-ra [:group-by '{:columns [g {lo (percentile_disc 0.25 [v {:direction :asc}])}
+                                                         {hi (percentile_disc 0.25 [v {:direction :desc}])}]}
+                                   [::tu/pages {'g #xt/type :i64, 'v nullable-type}
+                                    [[{:g 1, :v last-time} {:g 2, :v nil}]
+                                     [{:g 1, :v nil} {:g 1, :v midnight} {:g 1, :v #xt/time "12:00:00"}]]]]
+                                  {:with-types? true})
+                     (update :res set))))))))
+
+(t/deftest test-discrete-percentile-time-winner-invalid-and-wrapping-ticks
+  (doseq [[time-type ticks-per-day]
+          [[#xt/type [:time-local :second] 86400]
+           [#xt/type [:time-local :milli] 86400000]
+           [#xt/type [:time-local :micro] 86400000000]
+           [#xt/type [:time-local :nano] 86400000000000]]]
+    (with-open [^Vector src (tu/open-vec "v" time-type [])
+                ^Vector out (tu/open-vec "p" (VectorType/maybe time-type) [])]
+      (doseq [ticks [-1 ticks-per-day]] (.writeLong src (long ticks)))
+      (doseq [idx [0 1]]
+        (t/is (thrown? DateTimeException (#'group-by/copy-percentile-value! out src idx))))
+      (t/is (zero? (.getValueCount out)))))
+
+  (let [micro-type #xt/type [:time-local :micro]]
+    (with-open [^Vector src (tu/open-vec "v" micro-type [])
+                ^Vector out (tu/open-vec "p" (VectorType/maybe micro-type) [])
+                ^Vector millis (tu/open-vec "truncated" #xt/type [:time-local :milli] [])]
+      (.writeLong src (inc (bit-shift-left 1 61)))
+      (#'group-by/copy-percentile-value! out src 0)
+      (t/is (= 1 (.getLong out 0)))
+      (#'group-by/copy-percentile-value! millis src 0)
+      (t/is (zero? (.getInt millis 0))))))
+
 (t/deftest test-discrete-percentile-second-timestamp-winner-validation
   (doseq [[src-type dst-type] [[#xt/type [:timestamp-local :second] #xt/type [:? [:timestamp-local :second]]]
                                [#xt/type [:timestamp-tz :second "UTC"] #xt/type [:? [:timestamp-tz :second "UTC"]]]]]

@@ -2608,6 +2608,8 @@ surface QueryAccess {
         -- A same-type decimal winner uses a checked positioned write that preserves its coefficient and scale.
         -- A same-type year-month, month-day-nano, or month-day-micro winner supplies its signed components and interval type from the ranked Arrow position to the nullable result.
         -- A second-resolution local or UTC timestamp winner can retain its ticks within the representable calendar range.
+        -- A JVM TIME winner with matching units and physical widths retains its Arrow ticks when they fall within the day.
+        -- Other JVM TIME winners follow the checked time conversion, including existing wraparound during microsecond decoding.
         -- A valid UTF-8 keyword winner retains its spelling and keyword type.
         -- JVM continuous percentiles interpolate the reached primitive numbers without changing the order of the arithmetic.
         -- JVM variable-width extrema compare borrowed candidates in unsigned byte order and retain a copy only when the winner changes.
