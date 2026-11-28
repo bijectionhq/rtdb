@@ -193,10 +193,10 @@ pub fn bind_retired_family_authority(
     {
         return Err(authority_required());
     }
-    controls[index].document = HostedControlDocument::Row(StructFields::from([
+    controls[index].document = HostedControlDocument::Row(HostedControlRow::new(StructFields::from([
         ("_id".into(), Value::Utf8(INSTALLATION_AUTHORITY_ID.into())),
         ("retired_family_grant".into(), Value::Binary(enrollment.to_vec())),
-    ]));
+    ])));
     Ok(())
 }
 
