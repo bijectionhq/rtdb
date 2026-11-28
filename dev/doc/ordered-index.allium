@@ -30,6 +30,7 @@ entity Checkpoint {
 -- Revision replay funds its span and edit storage and carries each retained span allocation with its correction group.
 -- Replay resolves the affected addresses against the same pre-revision root before applying the revision's edits.
 -- Replay can group sorted correction addresses under common page fences, with bounded page reads inside the operation's memory budget.
+-- A grouped read can decode independent legacy branches concurrently under their page reservations.
 -- Plain scalar keys project from selected positions in the source Arrow columns.
 -- Retained projected tuples own compact key batches and their memory reservations.
 -- A contiguous, all-valid selection may share compact, layout-compatible Arrow buffers whose backing capacity is known.

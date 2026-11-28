@@ -13,10 +13,10 @@ use futures::{TryStreamExt, stream::FuturesOrdered};
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_storage::{IoRegion, ObjectKey, cache::BufferPool, object_store::IndexPageScope};
-use rtdb_types::{EventHeader, Iid, Interval, Result, Timestamp};
+use rtdb_types::{AnomalyKind, EventHeader, Iid, Interval, Result, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ring::digest::{SHA256, digest};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use super::{
     correction, format_error, ipc,
@@ -29,6 +29,7 @@ use super::{
 const FANOUT: usize = 64;
 const PAGE_CACHE_LIMIT: usize = 8 << 20;
 const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
+const MIN_PARALLEL_BRANCH_BYTES: usize = 4096;
 type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 fn page_digest(bytes: &[u8]) -> String {
@@ -952,10 +953,10 @@ impl Tree {
     }
 
     async fn open(&self, link: &Link) -> Result<Arc<Node>> {
-        self.open_page(link, true).await
+        self.open_page(link, true, false).await
     }
 
-    async fn open_page(&self, link: &Link, cache: bool) -> Result<Arc<Node>> {
+    async fn open_page(&self, link: &Link, cache: bool, overlap_decode: bool) -> Result<Arc<Node>> {
         let pointer = match link {
             Link::New(node) => return Ok(Arc::clone(node)),
             Link::Stored(pointer) => pointer,
@@ -984,6 +985,43 @@ impl Tree {
             self.admitted(store.get_fresh_exact(&object, pointer.size)),
         )
         .await?;
+        let workers = overlap_decode && self.permit.is_none() && bytes.len() >= MIN_PARALLEL_BRANCH_BYTES
+            && bytes.starts_with(b"{\"Branch\"");
+        let arrow_only = store.ordered_index_arrow_only();
+        let (node, retained) = if workers
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            && runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            let pointer = Arc::clone(pointer);
+            let work = IoRegion::inherit_reading(async move {
+                Self::decode_opened_page(&pointer, bytes, opening, arrow_only)
+            });
+            AbortOnDropHandle::new(runtime.spawn(work)).await
+                .map_err(|error| format_error(format!("Ordered index page decode task failed: {error}")))??
+        } else {
+            Self::decode_opened_page(pointer, bytes, opening, arrow_only)?
+        };
+        if !cache {
+            return Ok(node);
+        }
+        // The read or maintenance operation owns the decoded pages. An idle
+        // replica has no independently retained copy after it releases the tree.
+        let mut decoded = self.decoded.lock();
+        let limit = PAGE_CACHE_LIMIT.min(self.memory.limit_bytes() / 16);
+        if retained <= limit.saturating_sub(decoded.bytes) && !decoded.entries.contains_key(&object)
+        {
+            decoded.entries.insert(object, Arc::clone(&node));
+            decoded.bytes += retained;
+        }
+        Ok(node)
+    }
+
+    fn decode_opened_page(
+        pointer: &Pointer,
+        bytes: Bytes,
+        opening: Arc<MemoryReservation>,
+        arrow_only: bool,
+    ) -> Result<(Arc<Node>, usize)> {
         if bytes.len() != pointer.size
             || page_digest(&bytes) != pointer.digest
         {
@@ -991,10 +1029,11 @@ impl Tree {
         }
         let mut opening = Arc::try_unwrap(opening)
             .map_err(|_| format_error("Ordered index page read still owns its opening grant"))?;
+        let bound = opening.bytes();
         let (page, sidecars) = decode(
             bytes,
             pointer.generation,
-            store.ordered_index_arrow_only(),
+            arrow_only,
             &mut opening,
         )?;
         let entries = page.entry_count()?;
@@ -1021,19 +1060,7 @@ impl Tree {
             measure,
             _memory: memory,
         });
-        if !cache {
-            return Ok(node);
-        }
-        // The read or maintenance operation owns the decoded pages. An idle
-        // replica has no independently retained copy after it releases the tree.
-        let mut decoded = self.decoded.lock();
-        let limit = PAGE_CACHE_LIMIT.min(self.memory.limit_bytes() / 16);
-        if retained <= limit.saturating_sub(decoded.bytes) && !decoded.entries.contains_key(&object)
-        {
-            decoded.entries.insert(object, Arc::clone(&node));
-            decoded.bytes += retained;
-        }
-        Ok(node)
+        Ok((node, retained))
     }
 
     /// Counts the monotone prefix using the immutable cardinalities of
@@ -1139,42 +1166,49 @@ impl Tree {
         let mut children = Vec::with_capacity(addresses.len());
         pages.push((root.clone(), first..end));
         while !pages.is_empty() {
-            for chunk in pages.chunks(READ_AHEAD) {
-                let mut reads = FuturesOrdered::<Work<'_, Arc<Node>>>::new();
-                for (page, _) in chunk {
-                    reads.push_back(Box::pin(self.open(page)));
+            let mut pending = pages.iter();
+            let mut reads = FuturesOrdered::<Work<'_, Arc<Node>>>::new();
+            for (_, range) in &pages {
+                if cancellation.is_cancelled() { return Err(cancelled()); }
+                while reads.len() < READ_AHEAD {
+                    let Some((page, _)) = pending.next() else { break; };
+                    reads.push_back(Box::pin(self.open_page(page, true, pages.len() > 1)));
                 }
-                for (_, range) in chunk {
-                    if cancellation.is_cancelled() { return Err(cancelled()); }
-                    let node = reads.try_next().await?.expect("one read per page");
-                    match &node.page {
-                        Page::Leaf(leaf) => {
-                            for index in range.clone() {
-                                spans[index] = row_spans(leaf, key(index))?;
-                            }
+                let node = match reads.try_next().await {
+                    Err(error) if error.is(AnomalyKind::ResourceExhausted) => {
+                        while reads.try_next().await.transpose().is_some() {}
+                        return Err(error);
+                    }
+                    result => result?.expect("one read per page"),
+                };
+                match &node.page {
+                    Page::Leaf(leaf) => {
+                        for index in range.clone() {
+                            spans[index] = row_spans(leaf, key(index))?;
                         }
-                        Page::Branch(links) => {
-                            let mut first = range.start;
-                            let mut remaining = links.as_slice();
-                            while first < range.end {
-                                let start = remaining.partition_point(|link| link.last().view().compare(key(first)).is_lt());
-                                let Some((child, rest)) = remaining[start..].split_first() else { break; };
-                                remaining = rest;
-                                first += addresses[first..range.end].partition_point(|address| {
-                                    KeyRef::Row(address.view()).compare(child.first().view()).is_lt()
-                                });
-                                let end = first + addresses[first..range.end].partition_point(|address| {
-                                    !KeyRef::Row(address.view()).compare(child.last().view()).is_gt()
-                                });
-                                if end > first {
-                                    children.push((child.clone(), first..end));
-                                }
-                                first = end;
+                    }
+                    Page::Branch(links) => {
+                        let mut first = range.start;
+                        let mut remaining = links.as_slice();
+                        while first < range.end {
+                            let start = remaining.partition_point(|link| link.last().view().compare(key(first)).is_lt());
+                            let Some((child, rest)) = remaining[start..].split_first() else { break; };
+                            remaining = rest;
+                            first += addresses[first..range.end].partition_point(|address| {
+                                KeyRef::Row(address.view()).compare(child.first().view()).is_lt()
+                            });
+                            let end = first + addresses[first..range.end].partition_point(|address| {
+                                !KeyRef::Row(address.view()).compare(child.last().view()).is_gt()
+                            });
+                            if end > first {
+                                children.push((child.clone(), first..end));
                             }
+                            first = end;
                         }
                     }
                 }
             }
+            drop(reads);
             pages.clear();
             std::mem::swap(&mut pages, &mut children);
         }
@@ -1489,7 +1523,7 @@ impl Tree {
                 .bytes
                 .checked_add(pointer.size as u64)
                 .ok_or_else(|| format_error("Ordered index file bytes overflow"))?;
-            let node = self.open_page(&Link::Stored(pointer), false).await?;
+            let node = self.open_page(&Link::Stored(pointer), false, false).await?;
             match &node.page {
                 Page::Branch(children) => {
                     for child in children {
@@ -1936,6 +1970,29 @@ mod count_tests {
         }
         let error = tree.spans_in_order(&root, &[skipped_address], &token).await.unwrap_err();
         assert_eq!(error.message.as_deref(), Some("Ordered index page checksum mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordered_replay_overlapped_branch_decode_validates_the_reference() -> Result<()> {
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let directory = ObjectKey::new("ordered-branch-decode")?;
+        let memory = MemoryBudget::new(16 << 20);
+        let token = CancellationToken::new();
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let edits = (0..1200).map(|n| {
+            (Key::Revision(IndexRevision::through_time(Timestamp(n))), Some(Item::Revision(None)))
+        }).collect();
+        let root = tree.edit(None, edits).await?.unwrap();
+        let mut pointer = tree.persist(&root, 0, &mut BTreeMap::new(), &token).await?;
+        let bytes = storage.object_store().get(&tree.page_key(pointer.generation, &pointer.digest)?).await?;
+        assert!(bytes.starts_with(b"{\"Branch\"") && bytes.len() >= MIN_PARALLEL_BRANCH_BYTES);
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let valid = tree.open_page(&Link::Stored(Arc::clone(&pointer)), false, true).await?;
+        assert_eq!(valid.entries, 1200);
+        Arc::make_mut(&mut pointer).entries += 1;
+        let error = tree.open_page(&Link::Stored(pointer), true, true).await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("Ordered index page count or fences differ from its reference"));
         Ok(())
     }
 
