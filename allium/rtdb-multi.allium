@@ -551,7 +551,9 @@ contract PublishedLineageEvidence {
     @invariant VerificationPinsCatalogRoots
         -- The original Kernel verifies application and control catalog signatures from each catalog's pinned root and signed catalog history.
         -- Leaf inclusion binds the exact stream and position to the verified head and the publication binds the selected application head to the database lineage.
-        -- Leader movement, keeper replacement and key rotation preserve verification for issued heads.
+        -- RTDB pins each catalog root in its journal configuration and refuses authenticated history without it.
+        -- A head verifies only under its stream's current roster in the catalog history exported with it, so retired keys certify nothing.
+        -- Leader movement, keeper replacement and key rotation preserve verification of a proof exported with its head and history.
 
     @invariant RecoveryPublishesApplicationHistory
         -- The activation authority seals or selects a cut, verifies the successor and publishes the segment from the application evidence.
