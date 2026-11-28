@@ -454,7 +454,13 @@ impl Service {
             if forwarded_peer.is_some() {
                 return Err(auth::unauthenticated("Forwarded peer proof is for a new session"));
             }
-            let session = match sessions.lookup(&id.to_owned(), true) {
+            let id = id.to_owned();
+            let found = if matches!(kind, CallKind::SessionClose) {
+                sessions.lookup_for_close(&id)
+            } else {
+                sessions.lookup(&id, true)
+            };
+            let session = match found {
                 Lookup::Found(session) => session,
                 Lookup::Expired(after) => {
                     let message = format!("session expired after {} idle", crate::lease::duration(after));

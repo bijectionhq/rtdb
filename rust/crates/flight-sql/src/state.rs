@@ -191,6 +191,8 @@ impl Leased for Session {
             for (connection, _) in connections.into_values() { connection.close(); }
         }
     }
+    fn retain_close_on_expiry(&self) -> bool { self.store_release.is_some() }
+    fn closed_reads_pending(&self) -> bool { self.store_reads.active.load(Ordering::Acquire) != 0 }
 }
 impl Drop for Session { fn drop(&mut self) { self.close(); } }
 pub(crate) struct Transaction { pub owner: ResourceOwner, pub connection: Arc<ConnectionResource>, _reservation: Arc<MemoryReservation> }

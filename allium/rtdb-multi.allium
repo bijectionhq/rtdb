@@ -4387,6 +4387,7 @@ actor Gateway {
     -- A drain ticket carries no data request authority.
     -- Completion requires the original receiver's explicit Store read drain acknowledgement.
     -- An original receiver with a registered closed session can retry the close acknowledgement at the same placement.
+    -- An expired Store session keeps its close identity while its reads or reply buffers are pending. Only CloseSession can resolve it.
     identified_by: MemberRecord where role = gateway
 }
 

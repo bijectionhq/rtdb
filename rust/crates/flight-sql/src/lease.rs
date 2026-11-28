@@ -6,9 +6,15 @@ use rtdb_types::{Anomaly, Result, Timestamp};
 pub(crate) trait Leased: Send + Sync {
     fn close(&self);
     fn hard_deadline(&self) -> Option<tokio::time::Instant> { None }
+    fn retain_close_on_expiry(&self) -> bool { false }
+    fn closed_reads_pending(&self) -> bool { false }
 }
 struct Live<V> { value: Arc<V>, since: Timestamp, limit: Duration, idle: Duration, users: usize, _reservation: Arc<MemoryReservation> }
-enum Entry<V> { Live(Live<V>), Expired { at: Timestamp, after: Duration, _reservation: Arc<MemoryReservation> } }
+struct PendingClose<V> { value: Arc<V>, drained_at: Option<Timestamp> }
+enum Entry<V> {
+    Live(Live<V>),
+    Expired { at: Timestamp, after: Duration, close: Option<PendingClose<V>>, _reservation: Arc<MemoryReservation> },
+}
 pub(crate) enum Lookup<V> { Found(Arc<V>), Expired(Duration), Unknown }
 /// Leased handles by key; `live` counts the live entries, kept with every transition so the status count is not a scan.
 pub(crate) struct Registry<K, V> { entries: Mutex<BTreeMap<K, Entry<V>>>, live: std::sync::atomic::AtomicUsize, clock: Arc<dyn Clock>, memory: Arc<MemoryBudget> }
@@ -23,12 +29,19 @@ impl<K: Ord + Clone, V: Leased> Registry<K, V> {
         Ok(())
     }
     pub fn lookup(&self, key: &K, acquire: bool) -> Lookup<V> {
+        self.lookup_at(key, acquire, false)
+    }
+    pub fn lookup_for_close(&self, key: &K) -> Lookup<V> {
+        self.lookup_at(key, true, true)
+    }
+    fn lookup_at(&self, key: &K, acquire: bool, close: bool) -> Lookup<V> {
         let now = self.clock.now();
         let mut entries = self.entries.lock().expect("lease lock");
         let Some(entry) = entries.get_mut(key) else { return Lookup::Unknown; };
         self.expire(entry, now);
         match entry {
             Entry::Live(live) => { live.since = now; live.limit = live.idle; live.users += usize::from(acquire); Lookup::Found(Arc::clone(&live.value)) }
+            Entry::Expired { close: Some(retained), .. } if close => Lookup::Found(Arc::clone(&retained.value)),
             Entry::Expired { after, .. } => Lookup::Expired(*after),
         }
     }
@@ -52,8 +65,16 @@ impl<K: Ord + Clone, V: Leased> Registry<K, V> {
     pub fn sweep(&self) {
         let now = self.clock.now();
         self.entries.lock().expect("lease lock").retain(|_, entry| {
-            let remove = matches!(entry, Entry::Expired { at, after, .. } if elapsed(*at, now) >= *after);
-            if !remove { self.expire(entry, now); } !remove
+            self.expire(entry, now);
+            match entry {
+                Entry::Live(_) => true,
+                Entry::Expired { after, close: Some(retained), .. } => {
+                    if retained.value.closed_reads_pending() { return true; }
+                    let drained = *retained.drained_at.get_or_insert(now);
+                    elapsed(drained, now) < *after
+                }
+                Entry::Expired { at, after, .. } => elapsed(*at, now) < *after,
+            }
         });
     }
     pub fn close(&self) {
@@ -89,7 +110,11 @@ fn expire<V: Leased>(entry: &mut Entry<V>, now: Timestamp) -> bool {
         let ceiling_elapsed = live.value.hard_deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
         if ceiling_elapsed || live.users == 0 && elapsed(live.since, now) >= live.limit {
             live.value.close();
-            *entry = Entry::Expired { at: now, after: live.limit, _reservation: Arc::clone(&live._reservation) };
+            let close = live.value.retain_close_on_expiry().then(|| PendingClose {
+                value: Arc::clone(&live.value),
+                drained_at: (!live.value.closed_reads_pending()).then_some(now),
+            });
+            *entry = Entry::Expired { at: now, after: live.limit, close, _reservation: Arc::clone(&live._reservation) };
             return true;
         }
     }
@@ -112,7 +137,7 @@ pub(crate) fn duration(value: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     struct TestClock(AtomicI64);
     impl Clock for TestClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
     struct Resource(AtomicUsize);
@@ -143,6 +168,35 @@ mod tests {
         assert_eq!(resource.0.load(Ordering::Relaxed), 1); registry.sweep(); assert!(memory.used_bytes() > 0);
         clock.0.store(7_000_000, Ordering::Relaxed); registry.sweep(); assert_eq!(memory.used_bytes(), 0); assert!(matches!(registry.lookup(&1, false), Lookup::Unknown));
     }
+    #[test]
+    fn expired_store_session_remains_close_only_until_after_its_last_reply_buffer() {
+        struct StoreSession { closed: AtomicBool, pending: AtomicBool }
+        impl Leased for StoreSession {
+            fn close(&self) { self.closed.store(true, Ordering::Release); }
+            fn retain_close_on_expiry(&self) -> bool { true }
+            fn closed_reads_pending(&self) -> bool { self.pending.load(Ordering::Acquire) }
+        }
+        let clock = Arc::new(TestClock(AtomicI64::new(0)));
+        let registry = Registry::new(clock.clone(), MemoryBudget::new(4096));
+        let original = Arc::new(StoreSession { closed: AtomicBool::new(false), pending: AtomicBool::new(true) });
+        let idle = Duration::from_secs(1);
+        registry.insert(1, original.clone(), idle, idle, false, 8).unwrap();
+        clock.0.store(1_000_000, Ordering::Relaxed);
+        registry.sweep();
+        clock.0.store(3_000_000, Ordering::Relaxed);
+        registry.sweep();
+        assert_eq!(registry.len(), 0);
+        assert!(original.closed.load(Ordering::Acquire));
+        assert!(matches!(registry.lookup(&1, true), Lookup::Expired(_)));
+        assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(value) if Arc::ptr_eq(&value, &original)));
+        original.pending.store(false, Ordering::Release);
+        registry.sweep();
+        assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(_)));
+        clock.0.store(4_000_000, Ordering::Relaxed);
+        registry.sweep();
+        assert!(matches!(registry.lookup_for_close(&1), Lookup::Unknown));
+    }
+
     #[test]
     fn presenting_session_switches_to_idle_limit_and_nested_calls_each_release_once() {
         let clock = Arc::new(TestClock(AtomicI64::new(0))); let registry = Registry::new(clock.clone(), MemoryBudget::new(4096));
