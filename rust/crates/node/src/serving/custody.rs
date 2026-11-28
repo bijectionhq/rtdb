@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet, btree_map::Entry}, sync::Arc};
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::CustodyVault;
@@ -10,6 +10,11 @@ use sha2::{Digest, Sha256};
 use super::{ChangePage, custody_release::CustodyContributors};
 
 pub(crate) use rtdb_tx::transact::prepare_custody as prepare;
+
+struct OpenedSnapshotPayload {
+    cells: StructFields<Value>,
+    remaining_puts: usize,
+}
 
 pub(crate) async fn open(vault: &CustodyVault, group: [u8; 16], stored: &CustodyPayload) -> Result<StructFields<Value>> {
     let clear = vault.open(group, stored.binding, &stored.envelope).await?;
@@ -42,8 +47,15 @@ pub(crate) async fn snapshot_with_contributors(
                     }
                 }
                 let Some(payload) = &image.custody_payload else { continue };
-                if let std::collections::btree_map::Entry::Vacant(entry) = opened.entry((group, payload.binding)) {
-                    entry.insert(open(vault, group, payload).await?);
+                let opened = match opened.entry((group, payload.binding)) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(OpenedSnapshotPayload {
+                        cells: open(vault, group, payload).await?,
+                        remaining_puts: 0,
+                    }),
+                };
+                if !event.valid.is_empty() && event.image_at(event.valid.lower()).is_some() {
+                    opened.remaining_puts += 1;
                 }
             }
         }
@@ -52,14 +64,30 @@ pub(crate) async fn snapshot_with_contributors(
         let mut cells = image.cells.clone();
         if let Some(payload) = &image.custody_payload {
             let group = image.custody_group.ok_or_else(missing_group)?;
-            let protected = opened.get(&(group, payload.binding)).ok_or_else(|| {
-                Anomaly::fault("rtdb/custody-payload", "The selected image has no opened payload")
-            })?;
-            cells.extend(protected.iter().map(|(name, value)| (name.clone(), value.clone())));
+            let Entry::Occupied(mut entry) = opened.entry((group, payload.binding)) else {
+                return Err(Anomaly::fault("rtdb/custody-payload", "The selected image has no opened payload"));
+            };
+            if entry.get().remaining_puts == 1 {
+                cells.extend(entry.remove().cells.into_iter().map(|(name, value)| (name.clone(), reuse_snapshot_cell(value))));
+            } else {
+                let payload = entry.get_mut();
+                payload.remaining_puts -= 1;
+                cells.extend(payload.cells.iter().map(|(name, value)| (name.clone(), value.clone())));
+            }
         }
         Ok(cells)
     })?;
     Ok((snapshot, groups, contributors))
+}
+
+fn reuse_snapshot_cell(value: Value) -> Value {
+    // Staging charges capacities, including excess space that a clone discards.
+    let exact_capacity = match &value {
+        Value::Binary(bytes) | Value::FixedSizeBinary(bytes) | Value::Transit(bytes) => bytes.capacity() == bytes.len(),
+        Value::Utf8(text) | Value::Uri(text) => text.capacity() == text.len(),
+        _ => false,
+    };
+    if exact_capacity { value } else { value.clone() }
 }
 
 pub(crate) async fn check_delivery(index: &BranchIndex, vault: &CustodyVault, groups: &BTreeSet<CustodyGroupId>) -> Result<()> {
@@ -123,6 +151,115 @@ mod tests {
 
     use super::*;
     use crate::serving::{ChangeGroup, ChangeKind, ChangeRow};
+
+    #[test]
+    fn snapshot_reuses_binary_storage_at_the_same_charge_as_a_clone() {
+        let exact = vec![0, 0xff].into_boxed_slice().into_vec();
+        let address = exact.as_ptr();
+        let Value::Binary(moved) = reuse_snapshot_cell(Value::Binary(exact)) else { unreachable!(); };
+        assert_eq!(moved.as_ptr(), address);
+
+        let mut spare = Vec::with_capacity(1024);
+        spare.extend([0, 0xff]);
+        let expected = Value::Binary(spare.clone());
+        let actual = reuse_snapshot_cell(Value::Binary(spare));
+        assert_eq!(actual, expected);
+        assert_eq!(actual.retained_bytes().unwrap(), expected.retained_bytes().unwrap());
+    }
+
+    #[tokio::test]
+    async fn repeated_custody_payloads_keep_branch_history_and_expiry_boundaries() -> Result<()> {
+        use rtdb_index::branches::{BranchCut, BranchEffect, RowImage, WrittenVersion};
+        use rtdb_types::{EventOp, Interval, rtdb_v1::{Basis, WRITTEN_BASIS_COLUMN}};
+
+        let incarnation = [4; 16];
+        let group = [5; 16];
+        let binding = [6; 32];
+        let table = TableRef::new("public", "documents");
+        let vault = CustodyVault::new(Uuid::from_bytes(incarnation), Arc::new(LocalKms::new(|| 11)));
+        vault.create(group).await?;
+        let protected = StructFields::from([
+            ("secret".into(), Value::Binary(vec![0, 0xff])),
+            ("nullable".into(), Value::Null),
+        ]);
+        let envelope = vault.seal(group, binding, &serde_json::to_vec(&protected).unwrap()).await?;
+        let mut index = BranchIndex::new(incarnation);
+        let cut = |position| BranchCut { basis: Basis::new(incarnation, position), system_time: Timestamp(position as i64) };
+        index.advance(cut(1))?;
+        index.apply(BranchEffect::CreateCustodyGroup { group })?;
+        for (position, branch, valid) in [
+            (1, MAIN_BRANCH, Interval::new(Timestamp(10), Timestamp(40))?),
+            (2, "child", Interval::new(Timestamp(20), Timestamp(50))?),
+            (3, "child", Interval::new(Timestamp(35), Timestamp(50))?),
+        ] {
+            if position > 1 { index.advance(cut(position))?; }
+            if position == 2 {
+                index.apply(BranchEffect::Fork {
+                    child: "child".into(), from: (MAIN_BRANCH.into(), cut(1).basis), writable: true, expires_at: None,
+                })?;
+            }
+            let id = EntityId::Integer(1);
+            index.apply(BranchEffect::Write {
+                branch: branch.into(), table: table.clone(),
+                event: BranchEvent {
+                    id: id.clone(), valid, cut: cut(position), written: WrittenVersion::Branch,
+                    image: Some(Arc::new(RowImage {
+                        cells: StructFields::from([("_id".into(), id.as_value())]),
+                        expires_at: Some(Timestamp(35)), custody_group: Some(group),
+                        custody_payload: Some(CustodyPayload { binding, envelope: envelope.clone() }),
+                    })),
+                },
+            })?;
+        }
+
+        let memory = MemoryBudget::new(8 << 20);
+        for (layer, expected) in [(Layer::Merged, [2, 3]), (Layer::Local, [1, 2])] {
+            let view = index.view("child", At::Latest, layer, Timestamp(50))?;
+            let (actual, groups, _) = snapshot(&view, &memory, &vault).await?;
+            assert_eq!(groups, BTreeSet::from([group]));
+            let scalar = rtdb_query::branch_snapshot_with(&view, &memory, |image| {
+                let mut cells = image.cells.clone();
+                cells.extend(protected.clone());
+                Ok(cells)
+            })?;
+            let batches = |snapshot: &Snapshot| {
+                snapshot.iter_segments(&table).flat_map(|segment| segment.batches().cloned()).collect::<Vec<_>>()
+            };
+            let actual = batches(&actual);
+            let scalar = batches(&scalar);
+            assert_eq!(actual.len(), scalar.len());
+            for (actual, scalar) in actual.iter().zip(scalar.iter()) {
+                assert_eq!(actual.arrow(), scalar.arrow());
+            }
+            let mut puts = Vec::new();
+            let mut deletes = 0;
+            for batch in &actual {
+                for row in 0..batch.len() {
+                    let header = batch.header(row)?;
+                    if header.op == EventOp::Put {
+                        let cells = batch.view().read_put_document(row)?;
+                        assert_eq!(cells.get("secret"), protected.get("secret"));
+                        assert_eq!(cells.get("nullable"), protected.get("nullable"));
+                        assert_eq!(header.valid_time.upper(), Timestamp(35));
+                        puts.push((header.system_from.0, cells[WRITTEN_BASIS_COLUMN].clone()));
+                    } else {
+                        assert_eq!(header.op, EventOp::Delete);
+                        assert_eq!(header.valid_time.lower(), Timestamp(35));
+                        deletes += 1;
+                    }
+                }
+            }
+            assert_eq!([puts.len(), deletes], expected);
+            for (position, written) in puts {
+                assert_eq!(written, Value::Binary(cut(position as u64).basis.to_bytes().to_vec()));
+            }
+            assert!(view.history(&table, &EntityId::Integer(1)).iter().all(|event| {
+                let image = event.image.as_ref().unwrap();
+                !image.cells.contains_key("secret") && image.custody_payload.as_ref().unwrap().envelope == envelope
+            }));
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn ranked_capture_retains_inherited_and_shadowing_custody_groups_before_slicing() {

@@ -271,6 +271,7 @@ surface StatelessDatabase {
         -- The shared main fold matches Classic deletes and erases at the exact physical IID observed on the put.
         -- An imported legacy row without transaction provenance returns a null written basis.
         -- For a scoped query, the returned basis uses the reader's projection domain.
+        -- The SQL branch view preserves a retained put's written basis on the visible part of its interval, and a delete masks the expired part of that interval.
 
     @guarantee TokenAuthority
         -- All routes to an incarnation use the same wrapped token key for each published generation.
@@ -374,6 +375,7 @@ surface StatelessDatabase {
         -- The configured original owner may request a sealed read proof bound to its authenticated session, attachment mount, selected basis and key generation.
         -- The same unscoped Original owner Query reports each contributor's physical authoring branch, ordinal and exact retained placement receipt, including inherited contributors and dependencies absent from the result.
         -- The contributor inventory requires an unambiguous enrolled write and a retained applied receipt at its written basis and clock.
+        -- A SQL branch query admitted for custody opens the protected images from its selected history while the retained branch images stay sealed.
         -- A private release preflight binds the exact proof list, full contributor inventory and frame commitment to the independently observed original response part.
         -- Removing the mount or detaching its database closes new handoffs and preserves already ordered release evidence.
         -- The response owner holds every group and occurrence in its authenticated contributor inventory through delivery.
