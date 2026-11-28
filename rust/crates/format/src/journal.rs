@@ -131,6 +131,8 @@ pub struct OrderedStoreHold {
     pub id: [u8; 16],
     pub reader: [u8; 32],
     pub expires_at_micros: i64,
+    /// Keep the exact ordered change suffix as well as snapshot bytes.
+    pub change_history: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

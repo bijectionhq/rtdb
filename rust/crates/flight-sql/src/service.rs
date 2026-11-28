@@ -761,7 +761,7 @@ impl FlightService for Service {
         }
         #[cfg(feature = "multi")]
         if version_hold {
-            reply.metadata_mut().insert(crate::v1::store::HOLD_VERSION_HEADER, tonic::metadata::MetadataValue::from_static("2"));
+            reply.metadata_mut().insert(crate::v1::store::HOLD_VERSION_HEADER, tonic::metadata::MetadataValue::from_static("3"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());

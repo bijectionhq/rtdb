@@ -650,7 +650,7 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
     let old = writes.transact(store_write(1, b"a", Some(b"old"))).await.unwrap().basis;
     let current = writes.transact(store_write(2, b"a", Some(b"new"))).await.unwrap().basis;
     let reader = [1; 32];
-    let retain = StoreVersionHoldRequest::Retain { basis: old, expires_at: Timestamp(40) };
+    let retain = StoreVersionHoldRequest::Retain { basis: old, expires_at: Timestamp(40), change_history: true };
     let memory = rtdb_types::MemoryBudget::new(4096);
     let purge = || writes.publish_store_purge_floor(current, current.position(), 0, Vec::new(), None, memory.try_reserve(1024).unwrap());
 
@@ -699,7 +699,7 @@ async fn store_version_hold_survives_checkpoint_and_replacement_writer() {
     let old = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap().basis;
     let current = writer.transact(&store_write(2, b"a", Some(b"new"))).await.unwrap().basis;
     let reader = [1; 32];
-    let retain = StoreVersionHoldRequest::Retain { basis: old, expires_at: Timestamp(1_000) };
+    let retain = StoreVersionHoldRequest::Retain { basis: old, expires_at: Timestamp(1_000), change_history: false };
     let StoreVersionHoldReply::Held(hold) = writer.store_version_hold(reader, retain).await.unwrap() else { panic!("expected a hold"); };
     let reopen = StoreVersionHoldRequest::Reopen(hold.key);
     let through = writer.state().head;
@@ -719,19 +719,54 @@ async fn store_version_hold_survives_checkpoint_and_replacement_writer() {
     assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap(), StoreVersionHoldReply::Held(hold));
     assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
         "rtdb.store/purge-retention");
-    assert_eq!(successor.enter_held_store_watch(current, [2; 32], hold.key).await.err().unwrap().code,
-        "rtdb/cursor-expired");
-    let turn = successor.enter_held_store_watch(current, reader, hold.key).await.unwrap();
-    let release = StoreVersionHoldRequest::Release(hold.key);
-    assert_eq!(successor.store_version_hold(reader, release).await.unwrap(), StoreVersionHoldReply::Released(hold.key));
     assert_eq!(successor.enter_held_store_watch(current, reader, hold.key).await.err().unwrap().code,
         "rtdb/cursor-expired");
-    successor.check_local_store_basis(current, Some(&turn)).await.unwrap();
-    assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
-        "rtdb.store/purge-retention");
-    drop(turn);
+    let release = StoreVersionHoldRequest::Release(hold.key);
+    assert_eq!(successor.store_version_hold(reader, release).await.unwrap(), StoreVersionHoldReply::Released(hold.key));
     successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap();
     assert_eq!(successor.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
+}
+
+#[tokio::test]
+async fn store_watch_receipt_fences_journal_trim_through_release_and_drain() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let old = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap().basis;
+    let current = writer.transact(&store_write(2, b"a", Some(b"new"))).await.unwrap().basis;
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+
+    let reader = [1; 32];
+    let retain = StoreVersionHoldRequest::Retain { basis: old, expires_at: Timestamp(1_000), change_history: true };
+    let StoreVersionHoldReply::Held(held) = writer.store_version_hold(reader, retain).await.unwrap()
+        else { panic!("expected a watch receipt"); };
+    assert!(held.change_history);
+    assert!(writer.announce_checkpoint(prepared).await.unwrap().manifest().is_none());
+    assert!(writer.checkpoint_retained_suffix(1).await.unwrap().is_none());
+    assert!(writer.fresh_history().await.unwrap().after_floor <= old.position());
+    assert_eq!(writer.enter_held_store_watch(current, [2; 32], held.key).await.err().unwrap().code,
+        "rtdb/cursor-expired");
+    let turn = writer.enter_held_store_watch(current, reader, held.key).await.unwrap();
+    writer.store_version_hold(reader, StoreVersionHoldRequest::Release(held.key)).await.unwrap();
+    assert_eq!(writer.enter_held_store_watch(current, reader, held.key).await.err().unwrap().code,
+        "rtdb/cursor-expired");
+    writer.check_local_store_basis(current, Some(&turn)).await.unwrap();
+    assert!(writer.checkpoint_retained_suffix(1).await.unwrap().is_none());
+    drop(turn);
+
+    let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
+    let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
+    let StoreVersionHoldReply::Held(released) = writer.store_version_hold(reader, retain).await.unwrap()
+        else { panic!("expected a watch receipt"); };
+    writer.store_version_hold(reader, StoreVersionHoldRequest::Release(released.key)).await.unwrap();
+    writer.announce_checkpoint(prepared).await.unwrap().manifest().unwrap();
+    let mut replacement = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    replacement.fresh_index().await.unwrap();
+    assert!(replacement.fresh_history().await.unwrap().after_floor > old.position());
+    assert_eq!(writer.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
 }
 
 async fn text_at(node: &mut MultiDatabase, branch: &str, id: i64) -> Option<Value> {

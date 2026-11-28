@@ -138,6 +138,7 @@ impl MultiDatabase {
         let state = self.state();
         let retained = state.head.0.saturating_add(1).saturating_sub(state.floor.0);
         if retained < limit
+            || !self.preserves_store_watch_history(state.head)?
             || state.transactions.pending_erasure().is_some()
             || state.transactions.recover_pending().is_some()
             || state.rotation.is_some()
@@ -187,6 +188,7 @@ impl MultiDatabase {
         };
         let state = self.state();
         if lease.epoch != prepared.lease.epoch
+            || !self.preserves_store_watch_history(prepared.through)?
             || state.generation != prepared.generation
             || state.coordinates.offset != prepared.coordinates.offset
             || state.coordinates.origin != prepared.coordinates.origin

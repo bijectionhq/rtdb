@@ -502,6 +502,12 @@ impl Committed {
         }
     }
 
+    pub(crate) fn retained_changes_after(&self) -> Result<u64> {
+        Ok(self.coordinates.position(Lsn(self.floor.0 - 1))?
+            .max(self.coordinates.origin.map_or(0, |origin| origin.through))
+            .max(self.transactions.index().store_history_floor()))
+    }
+
     /// Validate a locally materialized Store read against the current ordered
     /// floor while leaving the assigned follower's applied cut untouched.
     pub(crate) async fn require_retained_store_delivery(&self, stream: &Stream, basis: Basis) -> Result<()> {
@@ -806,6 +812,9 @@ impl Committed {
                         return Err(store_delivery_expired());
                     }
                     index.exact(hold.basis)?;
+                    // A deferred checkpoint may move the current journal
+                    // floor after this historical retain and its release.
+                    // The serving writer checks change coverage at admission.
                 }
                 self.store_holds.apply(*change, *lower_bound_micros)?;
                 self.generation

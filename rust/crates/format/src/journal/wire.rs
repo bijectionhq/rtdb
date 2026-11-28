@@ -185,6 +185,8 @@ struct OrderedStoreHold {
     reader: Vec<u8>,
     #[prost(sint64, optional, tag = "4")]
     expires_at_micros: Option<i64>,
+    #[prost(bool, optional, tag = "5")]
+    change_history: Option<bool>,
 }
 
 #[derive(Message)]
@@ -371,7 +373,7 @@ impl TryFrom<Record> for super::Record {
 impl From<&super::OrderedStoreHold> for OrderedStoreHold {
     fn from(hold: &super::OrderedStoreHold) -> Self {
         Self { basis: hold.basis.to_bytes().to_vec(), id: hold.id.to_vec(), reader: hold.reader.to_vec(),
-            expires_at_micros: Some(hold.expires_at_micros) }
+            expires_at_micros: Some(hold.expires_at_micros), change_history: Some(hold.change_history) }
     }
 }
 
@@ -384,6 +386,7 @@ impl TryFrom<OrderedStoreHold> for super::OrderedStoreHold {
             id: hold.id.try_into().map_err(|_| invalid("A Store hold ID has 16 bytes"))?,
             reader: hold.reader.try_into().map_err(|_| invalid("A Store hold reader has 32 bytes"))?,
             expires_at_micros: hold.expires_at_micros.ok_or_else(|| invalid("A Store hold has an absolute deadline"))?,
+            change_history: hold.change_history.ok_or_else(|| invalid("A Store hold names its retention coverage"))?,
         })
     }
 }

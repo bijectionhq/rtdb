@@ -5,7 +5,7 @@ use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
 };
 
-use super::{MultiDatabase, Uuid, store_floor::prefix_unsettled};
+use super::{Lsn, MultiDatabase, Uuid, store_floor::prefix_unsettled};
 
 const MAX_DATABASE_HOLDS: usize = 256;
 const MAX_READER_HOLDS: usize = 32;
@@ -45,22 +45,37 @@ impl StoreReadTurn {
     }
 }
 
+struct InFlightStoreRead {
+    retained_from: Basis,
+    owner: Weak<()>,
+    change_history: bool,
+}
+
 #[derive(Default)]
-pub(super) struct StoreReads(Vec<(Basis, Weak<()>)>);
+pub(super) struct StoreReads(Vec<InFlightStoreRead>);
 
 impl StoreReads {
     fn add(&mut self, turn: &StoreReadTurn) {
         self.reap();
-        self.0.push((turn.retained_from, Arc::downgrade(&turn.owner)));
+        self.0.push(InFlightStoreRead {
+            retained_from: turn.retained_from,
+            owner: Arc::downgrade(&turn.owner),
+            change_history: turn.expires_at.is_some(),
+        });
     }
 
     fn reap(&mut self) {
-        self.0.retain(|(_, owner)| owner.strong_count() > 0);
+        self.0.retain(|read| read.owner.strong_count() > 0);
+    }
+
+    fn retains_changes_before(&self, through: u64) -> bool {
+        self.0.iter().any(|read| read.change_history
+            && read.retained_from.position() < through && read.owner.strong_count() > 0)
     }
 
     pub(super) fn check_floor(&mut self, keep_from: u64) -> Result<()> {
         self.reap();
-        if self.0.iter().any(|(basis, _)| basis.position() < keep_from) {
+        if self.0.iter().any(|read| read.retained_from.position() < keep_from) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/purge-retention",
                 "An active Store read still retains history"));
         }
@@ -78,11 +93,12 @@ pub struct StoreVersionHoldKey {
 pub struct StoreVersionHold {
     pub key: StoreVersionHoldKey,
     pub expires_at: Timestamp,
+    pub change_history: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum StoreVersionHoldRequest {
-    Retain { basis: Basis, expires_at: Timestamp },
+    Retain { basis: Basis, expires_at: Timestamp, change_history: bool },
     Reopen(StoreVersionHoldKey),
     Release(StoreVersionHoldKey),
 }
@@ -138,6 +154,11 @@ impl StoreHolds {
         Ok(())
     }
 
+    fn retains_changes_before(&self, through: u64, lower: i64) -> bool {
+        self.0.values().any(|hold| hold.change_history
+            && hold.basis.position() < through && lower < hold.expires_at_micros)
+    }
+
     fn count_for(&self, reader: [u8; 32], lower: i64) -> usize {
         self.0.values().filter(|hold| hold.reader == reader && lower < hold.expires_at_micros).count()
     }
@@ -176,20 +197,22 @@ impl StoreHolds {
         &self, request: StoreVersionHoldRequest, reader: [u8; 32], lower: i64, upper: i64,
     ) -> Result<(StoreVersionHoldReply, Option<StoreHoldChange>)> {
         match request {
-            StoreVersionHoldRequest::Retain { basis, expires_at } => {
+            StoreVersionHoldRequest::Retain { basis, expires_at, change_history } => {
                 if !(1..=MAX_HOLD_MICROS).contains(&expires_at.0.saturating_sub(upper)) {
                     return Err(Anomaly::incorrect("rtdb.store/hold-deadline",
                         "A Store hold needs a live deadline within its maximum lifetime"));
                 }
                 let id = *Uuid::new_v4().as_bytes();
-                let ordered = OrderedStoreHold { id, reader, basis, expires_at_micros: expires_at.0 };
+                let ordered = OrderedStoreHold { id, reader, basis, expires_at_micros: expires_at.0, change_history };
                 self.check_new(ordered, lower)?;
-                let held = StoreVersionHold { key: StoreVersionHoldKey { basis, id }, expires_at };
+                let held = StoreVersionHold { key: StoreVersionHoldKey { basis, id }, expires_at, change_history };
                 Ok((StoreVersionHoldReply::Held(held), Some(StoreHoldChange::Retain(ordered))))
             },
             StoreVersionHoldRequest::Reopen(key) => {
                 let hold = self.find(key, reader, upper)?;
-                Ok((StoreVersionHoldReply::Held(StoreVersionHold { key, expires_at: Timestamp(hold.expires_at_micros) }), None))
+                Ok((StoreVersionHoldReply::Held(StoreVersionHold {
+                    key, expires_at: Timestamp(hold.expires_at_micros), change_history: hold.change_history,
+                }), None))
             },
             StoreVersionHoldRequest::Release(key) => {
                 let hold = self.find(key, reader, lower)?;
@@ -231,6 +254,9 @@ impl MultiDatabase {
         self.refresh().await?;
         self.settled_store_writer()?;
         let retained = self.state().store_holds.find(hold, reader, self.upper()).map_err(|_| watch_gap())?;
+        if !retained.change_history || hold.basis.position() < self.state().retained_changes_after()? {
+            return Err(watch_gap());
+        }
         self.admit_local_store_read(At::Exactly(after), Some(retained))
     }
 
@@ -275,7 +301,7 @@ impl MultiDatabase {
         let owner = Arc::downgrade(&turn.owner);
         if basis != turn.basis || writer.epoch.0 != turn.epoch || self.state().generation != turn.generation
             || self.durable_transactions().index().store_writer_fence_position() != turn.writer_fence_position
-            || !self.store_reads.0.iter().any(|(at, active)| *at == turn.retained_from && active.ptr_eq(&owner))
+            || !self.store_reads.0.iter().any(|read| read.retained_from == turn.retained_from && read.owner.ptr_eq(&owner))
         {
             return Err(stale_read_turn());
         }
@@ -287,6 +313,12 @@ impl MultiDatabase {
             return Err(prefix_unsettled());
         }
         self.require_authority(writer)
+    }
+
+    pub(super) fn preserves_store_watch_history(&self, through: Lsn) -> Result<bool> {
+        let through = self.state().coordinates.position(through)?;
+        Ok(!self.state().store_holds.retains_changes_before(through, self.lower())
+            && !self.store_reads.retains_changes_before(through))
     }
 
     pub(super) async fn store_version_hold(
@@ -331,6 +363,11 @@ impl MultiDatabase {
             index.view(MAIN_BRANCH, At::Exactly(basis), Layer::Merged, Timestamp(upper))?;
         }
         let (reply, change) = self.state().store_holds.plan(request, reader, lower, upper)?;
+        if matches!(reply, StoreVersionHoldReply::Held(hold) if hold.change_history)
+            && basis.position() < self.state().retained_changes_after()?
+        {
+            return Err(watch_gap());
+        }
         if let Some(change) = change {
             self.append_control(lease, Record::StoreHold { change, lower_bound_micros: lower }).await?;
         }

@@ -54,6 +54,7 @@ fn decode_request(request: proto::HoldVersionRequest) -> Result<([u8; 16], Store
         Operation::Retain(retain) => StoreVersionHoldRequest::Retain {
             basis: exact(incarnation, retain.at)?,
             expires_at: Timestamp(retain.expires_at_micros.ok_or_else(|| error::incorrect("A Store hold states its deadline"))?),
+            change_history: retain.change_history.ok_or_else(|| error::incorrect("A Store hold states its retention coverage"))?,
         },
         Operation::Reopen(key) => StoreVersionHoldRequest::Reopen(hold_key(incarnation, key)?),
         Operation::Release(key) => StoreVersionHoldRequest::Release(hold_key(incarnation, key)?),
@@ -94,7 +95,8 @@ impl Service {
                 if self.0.node.now() >= hold.expires_at {
                     return Err(error::not_found("rtdb.store/hold-unavailable", "The Store Version hold expired before delivery"));
                 }
-                Outcome::Held(proto::HeldVersion { key: Some(encode_key(hold.key)), expires_at_micros: Some(hold.expires_at.0) })
+                Outcome::Held(proto::HeldVersion { key: Some(encode_key(hold.key)),
+                    expires_at_micros: Some(hold.expires_at.0), change_history: Some(hold.change_history) })
             }
             StoreVersionHoldReply::Released(key) => Outcome::Released(encode_key(key)),
         };
@@ -132,12 +134,12 @@ mod tests {
     fn retain_requires_an_explicit_version_including_zero() {
         let request = |at| proto::HoldVersionRequest {
             incarnation: vec![1; 16],
-            operation: Some(Operation::Retain(proto::RetainVersion { at, expires_at_micros: Some(100) })),
+            operation: Some(Operation::Retain(proto::RetainVersion { at, expires_at_micros: Some(100), change_history: Some(true) })),
         };
         assert!(decode_request(request(None)).is_err());
         let (incarnation, operation) = decode_request(request(Some(0))).unwrap();
         assert_eq!(incarnation, [1; 16]);
-        assert!(matches!(operation, StoreVersionHoldRequest::Retain { basis, expires_at: Timestamp(100) }
+        assert!(matches!(operation, StoreVersionHoldRequest::Retain { basis, expires_at: Timestamp(100), change_history: true }
             if basis == Basis::new(incarnation, 0)));
     }
 }

@@ -313,7 +313,7 @@ message WatchRequest {
   // Maximum wait; the server caps it.
   uint64 wait_millis = 4;
   // Exact resume on the ordinary Multi writer. This live receipt belongs
-  // to the authenticated reader and retains a Version at or before after.
+  // to the authenticated reader and retains the change suffix at or before after.
   // An unknown, expired or released receipt reports cursor-expired.
   HeldVersionKey retention = 5;
 }
@@ -398,7 +398,7 @@ message PurgeFloorReply {
 }
 
 // rtdb.store.v1.HoldVersion orders exact byte retention on the current Multi writer.
-// A fresh Store handshake advertises x-rtdb-store-hold-version: 2 for holds and retained watches.
+// A fresh Store handshake advertises x-rtdb-store-hold-version: 3 for holds and retained watches.
 // Reopen and release require database read access for the same authenticated account
 // and issuer in this incarnation. The receipt carries no data authority.
 message HoldVersionRequest {
@@ -416,6 +416,8 @@ message RetainVersion {
   optional uint64 at = 1;
   // Required. Exclusive deadline on the writer clock, in microseconds.
   optional int64 expires_at_micros = 2;
+  // Required. Whether to also retain the ordered change suffix after at.
+  optional bool change_history = 3;
 }
 
 message HeldVersionKey {
@@ -427,6 +429,7 @@ message HeldVersionKey {
 message HeldVersion {
   HeldVersionKey key = 1;
   optional int64 expires_at_micros = 2;
+  optional bool change_history = 3;
 }
 
 message HoldVersionReply {

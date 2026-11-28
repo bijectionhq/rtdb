@@ -787,9 +787,7 @@ impl MultiDatabase {
         self.require_active()?;
         let state = self.state();
         let index = self.durable_transactions().index();
-        let after_floor = state.coordinates.position(Lsn(state.floor.0 - 1))?
-            .max(state.coordinates.origin.map_or(0, |origin| origin.through))
-            .max(index.store_history_floor());
+        let after_floor = state.retained_changes_after()?.max(index.store_history_floor());
         Ok(ChangeHistory {
             index,
             after_floor,
@@ -921,7 +919,9 @@ impl MultiDatabase {
             return Ok(None);
         };
         let retained = state.head.0.saturating_add(1).saturating_sub(state.floor.0);
-        if retained < limit || self.state().transactions.pending_erasure().is_some() {
+        if retained < limit || self.state().transactions.pending_erasure().is_some()
+            || !self.preserves_store_watch_history(state.head)?
+        {
             return Ok(None);
         }
         if self.deferred_checkpoints {
@@ -942,6 +942,9 @@ impl MultiDatabase {
             return Err(erasure_pending());
         }
         self.require_destroyed_generation()?;
+        if !self.preserves_store_watch_history(self.state().head)? {
+            return Err(store_watch_checkpoint_busy());
+        }
         let closure = self.reachability(lease).await?;
         timing.mark("reachability");
         let mut files = files;
@@ -1136,6 +1139,9 @@ impl MultiDatabase {
     ) -> Result<()> {
         Box::pin(async move {
             let covered_through_lsn = Lsn(checkpoint.through);
+            if !self.preserves_store_watch_history(covered_through_lsn)? {
+                return Err(store_watch_checkpoint_busy());
+            }
             let write = self.reserve_control(
                 lease, checkpoint.key_generation, Record::Checkpoint(checkpoint),
             )?;
@@ -1448,6 +1454,11 @@ fn envelope(record: TransactionRecord, coordinates: JournalCoordinates) -> Resul
         TransactionRecord::Settle { tx_lsn } => Record::Settle { tx_lsn: coordinates.lsn(tx_lsn)?.0 },
         TransactionRecord::Refuse { tx_lsn } => Record::Refuse { tx_lsn: coordinates.lsn(tx_lsn)?.0 },
     })
+}
+
+fn store_watch_checkpoint_busy() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Busy, "rtdb.store/watch-checkpoint",
+        "An exact Store watch still retains the ordered change suffix")
 }
 
 fn no_writer() -> Anomaly {

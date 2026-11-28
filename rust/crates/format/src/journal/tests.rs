@@ -71,7 +71,7 @@ fn record_kinds_round_trip_with_fixed_tags() {
         },
         Record::StoreHold {
             change: StoreHoldChange::Retain(OrderedStoreHold {
-                basis: Basis::new([0xab; 16], 12), id: [1; 16], reader: [2; 32], expires_at_micros: 25,
+                basis: Basis::new([0xab; 16], 12), id: [1; 16], reader: [2; 32], expires_at_micros: 25, change_history: true,
             }),
             lower_bound_micros: 4,
         },
@@ -137,7 +137,7 @@ fn manifest_round_trips_complete_file_and_pin_state() {
             manifest: object(ObjectKind::Manifest),
             until: None,
         }],
-        store_holds: vec![OrderedStoreHold { basis: Basis::new([0xab; 16], 12), id: [1; 16], reader: [2; 32], expires_at_micros: 25 }],
+        store_holds: vec![OrderedStoreHold { basis: Basis::new([0xab; 16], 12), id: [1; 16], reader: [2; 32], expires_at_micros: 25, change_history: true }],
         payload: vec![1, 2, 3],
     };
     let encoded = manifest.encode().unwrap();
