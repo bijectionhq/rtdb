@@ -19,10 +19,10 @@ use super::{
 };
 use crate::{QueryContext, context::Execution};
 
-type TextInput<'a> = Input<'a, &'a str>;
+pub(super) type TextInput<'a> = Input<'a, &'a str>;
 
 impl<'a> Input<'a, &'a str> {
-    fn bind_text(
+    pub(super) fn bind_text(
         expr: &'a Expr,
         schema: &Schema,
         batch: &'a ColumnBatch,
@@ -43,7 +43,7 @@ impl<'a> Input<'a, &'a str> {
         )
     }
 
-    fn text(&self, row: usize) -> Option<Option<&'a str>> {
+    pub(super) fn text(&self, row: usize) -> Option<Option<&'a str>> {
         self.read(row, |cell| {
             let array = cell.array.as_any().downcast_ref::<StringArray>()?;
             Some(array.is_valid(cell.row).then(|| array.value(cell.row)))
@@ -532,7 +532,7 @@ fn reverse(
     rows: usize,
     context: &QueryContext,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    project_with_context(rows, context, |row| {
+    project_with_context(rows, context, &ScalarType::Utf8, |row| {
         Some(source.text(row)?.map(Spans::Reverse))
     })
 }
@@ -542,15 +542,18 @@ fn project<'a>(
     execution: &Execution,
     read: impl Fn(usize) -> Option<Option<Spans<'a>>>,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    project_with_context(rows, &execution.context, read)
+    project_with_context(rows, &execution.context, &ScalarType::Utf8, read)
 }
 
 pub(super) fn project_slices<'a>(
     rows: usize,
     context: &QueryContext,
+    output: &ScalarType,
     read: impl Fn(usize) -> Option<Option<&'a str>>,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    match project_with_context(rows, context, |row| Some(read(row)?.map(Spans::Slice))) {
+    match project_with_context(rows, context, output, |row| {
+        Some(read(row)?.map(Spans::Slice))
+    }) {
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
         result => result,
     }
@@ -559,6 +562,7 @@ pub(super) fn project_slices<'a>(
 fn project_with_context<'a>(
     rows: usize,
     context: &QueryContext,
+    output: &ScalarType,
     read: impl Fn(usize) -> Option<Option<Spans<'a>>>,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let mut payload = 0usize;
@@ -599,7 +603,21 @@ fn project_with_context<'a>(
             None => return Ok(None),
         }
     }
-    finish(observed_scalar_column(builder.finish())?, charge).map(Some)
+    let values = builder.finish();
+    let nulls = values.null_count();
+    let column = if *output == ScalarType::Utf8 || nulls == rows {
+        observed_scalar_column(values)?
+    } else {
+        let logical = LogicalType::Scalar(output.clone());
+        let logical = if nulls == 0 { logical } else { logical.maybe() };
+        let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+        Column::Arrow {
+            array: Arc::new(values),
+            field,
+            logical: Some(logical),
+        }
+    };
+    finish(column, charge).map(Some)
 }
 
 fn finish(

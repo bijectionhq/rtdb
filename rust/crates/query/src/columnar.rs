@@ -6144,6 +6144,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tagged_casts_and_keyword_constructor_keep_spelling_and_observed_null_types() {
+        let memory = MemoryBudget::new(1 << 20);
+        let names = field(0, ScalarType::Utf8);
+        let uris = field(1, ScalarType::Utf8);
+        let schema = Schema::new(vec![names.clone(), uris.clone()]).unwrap();
+        let keyword = LogicalType::Scalar(ScalarType::Keyword);
+        let uri = LogicalType::Scalar(ScalarType::Uri);
+        let cast = |input: &Field, target| Expr::Cast {
+            expr: Box::new(input.expression()),
+            target,
+        };
+        let args = vec![names.expression()];
+        let expressions = vec![
+            cast(&names, CastTarget::fixed(keyword.clone())),
+            cast(
+                &names,
+                CastTarget::Checked {
+                    requested: keyword.clone(),
+                    target: Box::new(CastTarget::fixed(keyword)),
+                },
+            ),
+            Expr::Call {
+                name: "keyword".into(),
+                return_type: rtdb_plan::function_type_with_args("keyword", &args).unwrap(),
+                args,
+            },
+            cast(&uris, CastTarget::fixed(uri)),
+        ];
+        let raw_uri = "HtTp://EXAMPLE.com/名%2fb";
+        for all_null in [false, true] {
+            let columns = [
+                [Some("::ns/名"), Some(":"), Some(""), Some("a b"), None],
+                [
+                    Some(raw_uri),
+                    Some(""),
+                    Some("urn:a"),
+                    Some("/relative"),
+                    None,
+                ],
+            ]
+            .into_iter()
+            .zip(schema.fields())
+            .map(|(cells, input)| {
+                let array = StringArray::from_iter(if all_null { [None; 5] } else { cells });
+                Column::Arrow {
+                    array: Arc::new(array),
+                    field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+                    logical: Some(input.data_type.clone()),
+                }
+            })
+            .collect();
+            let batch = ColumnBatch::settled(columns, 5, memory.reserve(4096).unwrap()).unwrap();
+            let mut cursor =
+                record_projection_cursor(batch, schema.clone(), expressions.clone(), &memory);
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            drop(cursor);
+            for (index, (extension, expected)) in [
+                ("xt/clj-keyword", [":ns/名", "", "", "a b"]),
+                ("xt/clj-keyword", [":ns/名", "", "", "a b"]),
+                ("xt/clj-keyword", ["::ns/名", ":", "", "a b"]),
+                ("uri", [raw_uri, "", "urn:a", "/relative"]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let column = &page.columns[index];
+                let Column::Arrow {
+                    array,
+                    field,
+                    logical,
+                } = column
+                else {
+                    panic!("Expected a tagged Arrow result");
+                };
+                if all_null {
+                    assert_eq!(array.data_type(), &DataType::Null);
+                    assert_eq!(logical.as_ref(), Some(&LogicalType::Null));
+                    assert!(field.metadata().is_empty());
+                } else {
+                    assert_eq!(array.data_type(), &DataType::Utf8);
+                    assert_eq!(
+                        field.metadata()[rtdb_columnar::EXTENSION_NAME_KEY],
+                        extension
+                    );
+                    for (row, text) in expected.into_iter().enumerate() {
+                        let expected = if extension == "uri" {
+                            Value::Uri(text.into())
+                        } else {
+                            Value::Keyword(rtdb_types::Keyword::from_name(text))
+                        };
+                        assert_eq!(column.value(row).unwrap(), expected);
+                    }
+                }
+                assert!(field.is_nullable());
+                assert_eq!(column.value(4).unwrap(), Value::Null);
+                assert!(page.column_reservation(index).bytes() >= array.get_array_memory_size());
+            }
+            drop(page);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn uri_cast_validates_reached_text_and_reports_the_first_invalid_spelling() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let cast = Expr::Cast {
+            expr: Box::new(input.expression()),
+            target: CastTarget::fixed(LogicalType::Scalar(ScalarType::Uri)),
+        };
+        let invalid = ["1bad:x", "http://example.com/%"];
+        for [first, second] in [invalid, [invalid[1], invalid[0]]] {
+            let cells = [Some("urn:valid"), None, Some(first), Some(second)];
+            let column = Column::Arrow {
+                array: Arc::new(StringArray::from_iter(cells)),
+                field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+                logical: Some(input.data_type.clone()),
+            };
+            let batch =
+                ColumnBatch::settled(vec![column], cells.len(), memory.reserve(4096).unwrap()).unwrap();
+            let mut cursor =
+                record_projection_cursor(batch, schema.clone(), vec![cast.clone()], &memory);
+            cursor.scalar_fallbacks = Some(0);
+            let expected = rtdb_types::UriParts::parse(first).unwrap_err();
+            let error = cursor.next_batch().await.err().unwrap();
+            assert_eq!(error.code, expected.code);
+            assert_eq!(error.message, expected.message);
+            assert_eq!(cursor.scalar_fallbacks, Some(1));
+            drop(cursor);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn uri_cast_selects_a_bound_text_cell_and_publishes_its_own_funded_bytes() {
+        use arrow_array::RecordBatch;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let source = MemoryBudget::new(1 << 20);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let field = rtdb_columnar::to_field("input", &text).unwrap();
+        let selected = "HtTp://Example.com/é%2fb";
+        let cells = Arc::new(StringArray::from(vec!["invalid URI", selected]));
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![field])),
+            vec![cells],
+        )
+        .unwrap();
+        let binding = rtdb_columnar::OwnedBatch::new(batch, &source).unwrap();
+        let expression = Expr::Cast {
+            expr: Box::new(Expr::Parameter {
+                index: 0,
+                data_type: text.clone(),
+            }),
+            target: CastTarget::fixed(LogicalType::Scalar(ScalarType::Uri)),
+        };
+        let batch = ColumnBatch::settled(vec![], 2, memory.reserve(4096).unwrap()).unwrap();
+        let mut cursor = record_projection_cursor(batch, Schema::default(), vec![expression], &memory);
+        cursor.execution.parameters = Arc::new(
+            crate::parameters::BoundParameters::from_arrow(binding, 1, vec![text], &memory).unwrap(),
+        );
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        drop(cursor);
+        assert_eq!(source.used_bytes(), 0);
+        let Column::Arrow { array, field, .. } = &page.columns[0] else {
+            panic!("Expected an Arrow URI");
+        };
+        assert!(!field.is_nullable());
+        assert_eq!(field.metadata()[rtdb_columnar::EXTENSION_NAME_KEY], "uri");
+        assert_eq!(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some(selected); 2]
+        );
+        assert!(page.column_reservation(0).bytes() >= array.get_array_memory_size());
+        drop(page);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn native_text_projections_write_borrowed_spans_with_observed_nulls() {
         let memory = MemoryBudget::new(1 << 22);
         let schema = Schema::new(vec![

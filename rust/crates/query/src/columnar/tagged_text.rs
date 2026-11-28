@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Array, StringArray};
 use arrow_schema::DataType;
 use rtdb_columnar::{EXTENSION_NAME_KEY, MemoryReservation};
-use rtdb_plan::{Expr, Schema};
+use rtdb_plan::{CastTarget, Expr, Schema};
 use rtdb_types::{LogicalType, Result, ScalarType, UriParts, Value};
 
 use super::{Column, ColumnBatch, binary::Input, plain_scalar, text};
@@ -16,9 +16,24 @@ pub(super) fn column(
     batch: &ColumnBatch,
     execution: &Execution,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    if batch.len == 0 || plain_scalar(output) != Some(&ScalarType::Utf8) {
+    if batch.len == 0 {
         return Ok(None);
     }
+    match plain_scalar(output) {
+        Some(ScalarType::Utf8) => component(expr, schema, batch, execution),
+        Some(output @ (ScalarType::Keyword | ScalarType::Uri)) => {
+            construct(expr, output, schema, batch, execution)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn component(
+    expr: &Expr,
+    schema: &Schema,
+    batch: &ColumnBatch,
+    execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let Expr::Call { name, args, .. } = expr else {
         return Ok(None);
     };
@@ -61,11 +76,56 @@ pub(super) fn column(
     ) else {
         return Ok(None);
     };
-    text::project_slices(batch.len, &execution.context, |row| {
+    text::project_slices(batch.len, &execution.context, &ScalarType::Utf8, |row| {
         let Some(value) = tagged_text(&input, row, &scalar)? else {
             return Some(None);
         };
         select(value)
+    })
+}
+
+fn construct(
+    expr: &Expr,
+    output: &ScalarType,
+    schema: &Schema,
+    batch: &ColumnBatch,
+    execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let (source, cast) = match expr {
+        Expr::Cast { expr, target } => {
+            let mut target = target;
+            while let CastTarget::Checked { target: inner, .. } = target {
+                target = inner;
+            }
+            if !matches!(target, CastTarget::Fixed(target) if plain_scalar(target) == Some(output))
+            {
+                return Ok(None);
+            }
+            (expr.as_ref(), true)
+        }
+        Expr::Call { name, args, .. }
+            if *output == ScalarType::Keyword && name.eq_ignore_ascii_case("keyword") =>
+        {
+            let [source] = args.as_slice() else {
+                return Ok(None);
+            };
+            (source, false)
+        }
+        _ => return Ok(None),
+    };
+    let Some(source) = text::TextInput::bind_text(source, schema, batch, execution) else {
+        return Ok(None);
+    };
+    text::project_slices(batch.len, &execution.context, output, |row| {
+        let Some(mut value) = source.text(row)? else {
+            return Some(None);
+        };
+        if *output == ScalarType::Uri {
+            UriParts::parse(value).ok()?;
+        } else if cast {
+            value = value.strip_prefix(':').unwrap_or(value);
+        }
+        Some(Some(value))
     })
 }
 

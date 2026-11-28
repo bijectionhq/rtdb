@@ -141,6 +141,9 @@
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
 -- Native NAMESPACE and LOCAL_NAME over canonical Arrow Keyword cells write the components at the first slash, preserving empty strings and returning null for an unqualified namespace.
 -- Native URI_SCHEME and URI_HOST over canonical Arrow URI cells validate each reached URI and preserve the raw spelling and absence of its component.
+-- Native casts from plain Arrow UTF-8 to Keyword or URI can write funded Arrow extension cells and use nullable Arrow Null when all results are null.
+-- The Keyword cast strips at most one leading colon, and the Keyword constructor retains the input spelling.
+-- The URI cast validates reached strings in row order and keeps their raw spelling.
 -- Native Binary concatenation and OVERLAY can write reached byte spans directly into a funded Binary result.
 -- Binary TRIM with a Binary token uses its first octet and reports an empty token when both operands are present.
 -- Binary TRIM can read exact plain Arrow signed operands and checks the signed octet range when both operands are present.
