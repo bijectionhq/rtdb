@@ -2,6 +2,26 @@ use std::time::Duration;
 use rtdb_server::{ServerDriver, config::NodeConfiguration};
 use tokio::net::TcpStream;
 
+#[cfg(not(feature = "multi"))]
+#[test]
+fn classic_transit_decimal_preserves_cached_instants() {
+    use rtdb_format::transit::{TransitValue, decode_json};
+
+    let wire = br#"["^ ","~:fuel_consumption",28.7,"~:xt/valid-from",["~#time/instant","2020-01-01T00:05:00Z"],"~:xt/valid-to",["^2","2020-01-01T00:15:00Z"]]"#;
+    let instant = |value: &str| TransitValue::Tagged {
+        tag: "time/instant".into(),
+        representation: Box::new(TransitValue::String(value.into())),
+    };
+    assert_eq!(
+        decode_json(wire).unwrap(),
+        TransitValue::Map(vec![
+            (TransitValue::Keyword("fuel_consumption".into()), TransitValue::Float(28.7)),
+            (TransitValue::Keyword("xt/valid-from".into()), instant("2020-01-01T00:05:00Z")),
+            (TransitValue::Keyword("xt/valid-to".into()), instant("2020-01-01T00:15:00Z")),
+        ]),
+    );
+}
+
 #[tokio::test]
 async fn configured_funded_receiver_reports_that_live_funding_requires_a_kernel() {
     let config = NodeConfiguration::from_yaml_with_environment(

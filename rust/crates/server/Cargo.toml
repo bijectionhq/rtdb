@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2", "dep:tonic"]
+multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2", "dep:tonic", "serde_json/arbitrary_precision"]
 backup-object-holds = ["multi", "rtdb-s3/versioning"]
 kafka = ["rtdb-node/kafka", "dep:rtdb-kafka", "rtdb-metrics/kafka"]
 kafka-connect = ["kafka", "rtdb-node/kafka-connect"]
@@ -74,7 +74,7 @@ hyper = { version = "=1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "=0.1.18", features = ["tokio"] }
 tokio.workspace = true
 tokio-util.workspace = true
-serde_json = { workspace = true, features = ["arbitrary_precision"] }
+serde_json.workspace = true
 serde_yaml.workspace = true
 url.workspace = true
 tokio-rustls = "=0.26.6"

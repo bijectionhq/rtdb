@@ -636,6 +636,7 @@ variant TxMessage : SourceMessage {
     -- Compatible numeric list columns are coalesced from their submitted Arrow buffers in that layout.
     -- Embedded Transit delete and erase arguments retain their ID column in the row writer's source layout, with the request order and valid-time bounds.
     -- Pgwire Transit COPY builds compatible Arrow page columns from ordered field entries and fills omitted cells with nulls.
+    -- The default Classic server reads decimal values and resolves subsequent type tags at their Transit cache indices.
     -- Pgwire Transit COPY joins those pages in input order into one document struct for the source operation.
     -- The source operation preserves the submitted document layout and the original document data used in rejection diagnostics.
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
