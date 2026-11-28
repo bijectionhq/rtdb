@@ -799,6 +799,69 @@ fn admits_discrete_winners(ty: &LogicalType, batches: &[ColumnBatch]) -> bool {
     })
 }
 
+fn unsigned_discrete_winner_type(ty: &LogicalType, batches: &[ColumnBatch]) -> Option<ScalarType> {
+    use ScalarType as S;
+    let (physical, signed) = match without_nullability(ty) {
+        LogicalType::Scalar(S::U8) => (DataType::UInt8, S::I8),
+        LogicalType::Scalar(S::U16) => (DataType::UInt16, S::I16),
+        LogicalType::Scalar(S::U32) => (DataType::UInt32, S::I32),
+        LogicalType::Scalar(S::U64) => (DataType::UInt64, S::I64),
+        _ => return None,
+    };
+    let accepts = |array: &dyn Array, field: &ArrowField, logical: Option<&LogicalType>| {
+        (field.data_type() == &physical || (field.data_type() == &DataType::Null && field.is_nullable()))
+            && field.data_type() == array.data_type() && field.metadata().is_empty()
+            && logical.is_none_or(|ty| rtdb_columnar::from_field(field).is_ok_and(|actual| actual == *ty))
+    };
+    batches.iter().all(|batch| match &batch.columns[0] {
+        Column::Arrow { array, field, logical } => accepts(array.as_ref(), field, logical.as_ref()),
+        Column::Selected(selected) => selected.source_layouts().all(|(array, field, logical)| accepts(array, field, logical)),
+        Column::Values(_) => false,
+    }).then_some(signed)
+}
+
+fn copy_unsigned_winners(
+    batches: &[ColumnBatch], picks: &[Option<(usize, usize)>], signed: ScalarType, context: &crate::QueryContext,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let has_nulls = picks.iter().any(Option::is_none);
+    let logical = if picks.iter().all(Option::is_none) {
+        LogicalType::Null
+    } else {
+        let ty = LogicalType::Scalar(signed.clone());
+        if has_nulls { ty.maybe() } else { ty }
+    };
+    let reservation = context.memory.reserve(rtdb_columnar::estimate_scalar_builder_bytes(
+        &logical, picks.iter().map(|pick| pick.map(|_| (&signed, 0))),
+    )?)?;
+    macro_rules! build {
+        ($arrow:ty, $native:ty) => {{
+            let mut builder = arrow_array::builder::PrimitiveBuilder::<$arrow>::with_capacity(picks.len());
+            for (index, pick) in picks.iter().enumerate() {
+                context.check_cancelled_at(index)?;
+                let value = pick.map(|(page, row)| {
+                    ranked_arrow_cell((&batches[page].columns[0], row)).signed_integer()
+                        .expect("An admitted unsigned percentile winner is present") as $native
+                });
+                builder.append_option(value);
+            }
+            Arc::new(builder.finish())
+        }};
+    }
+    let array: arrow_array::ArrayRef = if logical == LogicalType::Null {
+        Arc::new(arrow_array::NullArray::new(picks.len()))
+    } else {
+        match signed {
+            ScalarType::I8 => build!(Int8Type, i8),
+            ScalarType::I16 => build!(Int16Type, i16),
+            ScalarType::I32 => build!(Int32Type, i32),
+            ScalarType::I64 => build!(Int64Type, i64),
+            _ => unreachable!("Unsigned winners have a signed integer execution width"),
+        }
+    };
+    let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+    Ok((Column::Arrow { array, field, logical: Some(logical) }, reservation))
+}
+
 fn ranked_arrow_cell((column, row): (&Column, usize)) -> ArrowCell<'_> {
     let (array, field, _, row) = column.arrow_cell(row).flatten().expect("A ranked Arrow cell is present");
     ArrowCell { array, field, row }
@@ -1425,7 +1488,10 @@ impl CollectionVectors {
         let direct_gather = kind == PercentileKind::Discrete && direct_rank_type(&output.data_type);
         let borrow_winners = kind == PercentileKind::Discrete && !copy_typed && !direct_gather
             && admits_discrete_winners(&output.data_type, &self.batches);
-        let gather = copy_typed || borrow_winners || direct_gather;
+        let unsigned_winners = if kind == PercentileKind::Discrete && !copy_typed && !direct_gather && !borrow_winners {
+            unsigned_discrete_winner_type(&output.data_type, &self.batches)
+        } else { None };
+        let gather = copy_typed || borrow_winners || direct_gather || unsigned_winners.is_some();
         let mut values = Vec::with_capacity(if kind == PercentileKind::Discrete && !gather { groups } else { 0 });
         let mut picks = Vec::with_capacity(if gather { groups } else { 0 });
         let mut interpolated = Vec::with_capacity(if kind == PercentileKind::Continuous { groups } else { 0 });
@@ -1492,6 +1558,11 @@ impl CollectionVectors {
                         ranked_arrow_cell(source(lower)).validate_decimal_precision()?;
                     }
                 }
+                if unsigned_winners.is_some() {
+                    context.check_cancelled()?;
+                    let lease = Arc::get_mut(&mut reservation).expect("The percentile aggregate owns its result reservation");
+                    lease.grow_to(lease.bytes().checked_add(size_of::<Value>()).ok_or_else(|| invalid("aggregate-size", "Percentile output overflow"))?)?;
+                }
                 picks.push(Some(lower));
                 continue;
             }
@@ -1518,6 +1589,9 @@ impl CollectionVectors {
         if copy_typed {
             let (_, field) = typed.expect("A typed percentile result has a field");
             return copy_ranked_cells(&batches, &picks, field, memory);
+        }
+        if let Some(signed) = unsigned_winners {
+            return copy_unsigned_winners(&batches, &picks, signed, context);
         }
         if gather {
             return crate::columnar::gather_nullable_column(|batch| &batches[batch], &picks, 0, memory);

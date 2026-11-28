@@ -723,6 +723,68 @@ async fn discrete_keyword_percentile_reuses_the_winners_arrow_backing() {
 }
 
 #[tokio::test]
+async fn discrete_unsigned_percentiles_write_signed_winners_at_their_original_width() {
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    for (high_bit, positive, winner) in [
+        (Value::U8(1 << 7), Value::U8(1), Value::I8(i8::MIN)),
+        (Value::U16(1 << 15), Value::U16(1), Value::I16(i16::MIN)),
+        (Value::U32(1 << 31), Value::U32(1), Value::I32(i32::MIN)),
+        (Value::U64(1 << 63), Value::U64(1), Value::I64(i64::MIN)),
+    ] {
+        let ty = high_bit.logical_type().maybe();
+        let int = LogicalType::Scalar(ScalarType::I64);
+        let schema = Schema::new(vec![field(0, int.clone()), field(1, ty.clone())]).unwrap();
+        let group = NamedExpr { field: field(2, int), expr: schema.fields()[0].expression() };
+        let aggregate = AggregateExpr {
+            field: field(3, ty.clone()),
+            function: AggregateFunction::Percentile {
+                kind: PercentileKind::Discrete, fraction: PercentileFraction::Literal(0.0), descending: false,
+            },
+            argument: Some(schema.fields()[1].expression()), distinct: false, filter: None, order_by: vec![],
+        };
+        let output = Schema::new(vec![group.field.clone(), aggregate.field.clone()]).unwrap();
+        let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+            input: Arc::new(Relation::empty(schema.clone())), groups: vec![group.clone()], aggregates: vec![aggregate.clone()],
+        }).unwrap());
+        let runtime = EmittedRelation::emit(relation, &execution.context.catalog, &[], memory, EmissionMode::ArrowFields).unwrap();
+        assert_eq!(runtime.schema().fields()[1].data_type, ty);
+        let keys = Column::Arrow {
+            array: Arc::new(arrow_array::Int64Array::from(vec![1, 1, 2])),
+            field: Arc::new(ArrowField::new("c0", DataType::Int64, false)), logical: None,
+        };
+        let ranks = Column::Arrow {
+            array: rtdb_columnar::copy_array(&ty, &[positive, high_bit, Value::Null]).unwrap(),
+            field: Arc::new(rtdb_columnar::to_field("c1", &ty).unwrap()), logical: Some(ty.clone()),
+        };
+        let batch = ColumnBatch::settled(vec![keys, ranks], 3, memory.reserve(4096).unwrap()).unwrap();
+        let owner = Arc::downgrade(batch.column_reservation(1));
+        let mut cursor = AggregateCursor::from_batches(Box::new(Batches(Some(batch))), false,
+            schema, vec![group], vec![aggregate.clone()], runtime, execution.clone()).unwrap();
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        drop(cursor);
+        let Column::Arrow { array, field, logical } = &result.columns[1] else { panic!("Expected signed Arrow winners"); };
+        let expected = winner.logical_type().maybe();
+        assert_eq!(logical.as_ref(), Some(&expected));
+        assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", &expected).unwrap());
+        assert_eq!(array.data_type(), field.data_type());
+        assert_eq!(array.null_count(), 1);
+        assert_eq!(result.columns[1].value(0).unwrap(), winner);
+        assert_eq!(result.columns[1].value(1).unwrap(), Value::Null);
+        assert!(owner.upgrade().is_none());
+        drop(result);
+
+        let (empty, grant) = CollectionVectors::new(memory, None).unwrap()
+            .finish(1, &aggregate, &aggregate.field, &execution).await.unwrap();
+        assert!(matches!(&empty, Column::Arrow { array, logical: Some(LogicalType::Null), .. }
+            if array.data_type() == &DataType::Null && array.len() == 1));
+        drop((empty, grant));
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
 async fn typed_percentile_ranks_keep_date_peers_and_reach_mixed_timestamp_overflow() {
     let execution = execution(8);
     let baseline = execution.context.memory.used_bytes();

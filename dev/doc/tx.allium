@@ -173,6 +173,8 @@
 -- The sort gathers payload columns by position and uses Arrow IPC for its spill runs.
 -- A sort can compare supported key types directly at selected Arrow positions.
 -- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
+-- Native PERCENTILE_DISC can write winners of one exact unsigned Arrow width as signed Arrow results of that width, preserving the ranked bits.
+-- The result uses the observed nullability and has nullable Arrow Null layout when every group lacks a winner.
 -- A sort can combine computed keys with keys taken directly from its input columns.
 -- Its Arrow spill records retain compatible physical payload layouts.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads, and each spilled page is written whole under its encoding reservation so a budget refusal fails the query.
