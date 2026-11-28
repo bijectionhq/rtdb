@@ -298,16 +298,7 @@ impl GcPlan {
     pub async fn execute(&self, store: &dyn ObjectStore) -> Result<usize> {
         let mut settled = 0;
         for key in &self.keys {
-            let id: ObjectId = key.as_str().parse()?;
-            let result = if id.kind == ObjectKind::Manifest {
-                store.reclaim_unreachable_checkpoint(key).await
-            } else {
-                match store.delete(key).await {
-                    Ok(()) | Err(rtdb_storage::Error::MissingObject(_)) => Ok(true),
-                    Err(error) => Err(error),
-                }
-            };
-            match result {
+            match store.reclaim_unreachable_object(key).await {
                 Ok(true) => settled += 1,
                 Ok(false) => {}
                 Err(error) => return Err(error.into()),

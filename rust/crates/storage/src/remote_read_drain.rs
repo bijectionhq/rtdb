@@ -144,11 +144,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_reclamation_waits_for_the_original_provider_read() {
+    async fn object_reclamation_waits_for_the_original_provider_read() {
         let provider = Arc::new(InMemory::new());
         let worker = Arc::new(RemoteStore::new(provider.clone(), None).with_read_drain(|_| Some("grant")));
         let collector = RemoteStore::new(provider.clone(), None).with_read_drain(|_| Some("grant"));
-        let target = ObjectKey::new("grant/checkpoint").unwrap();
+        let target = ObjectKey::new("grant/file").unwrap();
         collector.put(&target, Bytes::from_static(b"image")).await.unwrap();
 
         let (started, running) = oneshot::channel();
@@ -164,11 +164,11 @@ mod tests {
             }
         });
         running.await.unwrap();
-        assert!(!collector.reclaim_unreachable_checkpoint(&target).await.unwrap());
+        assert!(!collector.reclaim_unreachable_object(&target).await.unwrap());
         assert!(provider.head(&Path::from(target.as_str())).await.is_ok());
         complete.send(()).unwrap();
         read.await.unwrap().unwrap();
-        assert!(collector.reclaim_unreachable_checkpoint(&target).await.unwrap());
+        assert!(collector.reclaim_unreachable_object(&target).await.unwrap());
         assert!(provider.head(&Path::from(target.as_str())).await.is_err());
     }
 

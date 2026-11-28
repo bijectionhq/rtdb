@@ -526,7 +526,7 @@ impl ObjectStore for RemoteStore {
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
         self.io.read_async(self.objects.clone(), directory.cloned(), |objects, directory| async move { objects.list(directory.as_ref()).await }).await
     }
-    async fn reclaim_unreachable_checkpoint(&self, key: &ObjectKey) -> Result<bool> {
+    async fn reclaim_unreachable_object(&self, key: &ObjectKey) -> Result<bool> {
         if self.cell || !self.close_read_admission(key).await? {
             return Ok(false);
         }

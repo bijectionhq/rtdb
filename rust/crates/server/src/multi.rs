@@ -375,7 +375,7 @@ impl MultiRuntime {
                 &rtdb_storage::ObjectKey::new("multi")?,
                 &BTreeMap::new(),
                 Arc::clone(&io),
-                checkpoint_read_census_scope,
+                owned_object_read_census_scope,
             )
             .await?;
         let backends = Backends {
@@ -1513,14 +1513,15 @@ impl Backends {
 }
 
 #[cfg(feature = "s3")]
-fn checkpoint_read_census_scope(key: &rtdb_storage::ObjectKey) -> Option<&str> {
+fn owned_object_read_census_scope(key: &rtdb_storage::ObjectKey) -> Option<&str> {
     use rtdb_format::journal::{ObjectId, ObjectKind};
 
     let id: ObjectId = key.as_str().parse().ok()?;
-    if id.kind != ObjectKind::Manifest {
-        return None;
-    }
-    key.as_str().split_once("/manifest/").map(|(database, _)| database)
+    let delimiter = match id.kind {
+        ObjectKind::Manifest => "/manifest/",
+        ObjectKind::File => "/file/",
+    };
+    key.as_str().split_once(delimiter).map(|(database, _)| database)
 }
 
 fn assignment_peer_profile(auth: &AuthConfig) -> Option<peer::WorkloadProfile> {

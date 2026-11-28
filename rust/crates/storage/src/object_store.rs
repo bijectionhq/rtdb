@@ -427,10 +427,10 @@ pub trait ObjectStore: Send + Sync {
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
     /// Whether block collection may submit offloaded payloads for deferred reclamation.
     fn queues_offloaded_payload_reclamation(&self) -> bool { false }
-    /// Reclaim a permanently unreachable Multi checkpoint. Remote providers must
+    /// Reclaim a permanently unreachable immutable Multi object. Remote providers must
     /// close new reads on the exact immutable name and confirm older provider work
     /// drained. A false result leaves the collector's obligation pending.
-    async fn reclaim_unreachable_checkpoint(&self, _key: &ObjectKey) -> Result<bool> {
+    async fn reclaim_unreachable_object(&self, _key: &ObjectKey) -> Result<bool> {
         Ok(false)
     }
     /// Collects an eligible checkpoint or offloaded replica file unless recovery still retains its block.
@@ -475,7 +475,7 @@ fn checked_range(key: &ObjectKey, range: Range<u64>, length: u64) -> Result<Rang
 #[async_trait]
 impl ObjectStore for MemoryStore {
     // The map hands readers owned bytes before the atomic removal.
-    async fn reclaim_unreachable_checkpoint(&self, key: &ObjectKey) -> Result<bool> {
+    async fn reclaim_unreachable_object(&self, key: &ObjectKey) -> Result<bool> {
         self.delete(key).await?;
         Ok(true)
     }
@@ -933,7 +933,7 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 #[async_trait]
 impl ObjectStore for LocalStore {
     // An opened immutable inode survives unlink. An unopened one retries the new replay base.
-    async fn reclaim_unreachable_checkpoint(&self, key: &ObjectKey) -> Result<bool> {
+    async fn reclaim_unreachable_object(&self, key: &ObjectKey) -> Result<bool> {
         self.delete(key).await?;
         Ok(true)
     }
