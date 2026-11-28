@@ -5,7 +5,7 @@ use rtdb_index::Snapshot;
 use rtdb_plan::Catalog;
 use rtdb_query::{OwnedJournalHeader, read_owned_change_entry, read_owned_journal_header};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, Interval, OWNED_CHANGE_GROUP_BYTES,
+    Anomaly, AnomalyCategory, EntityId, Interval, ListValue, OWNED_CHANGE_GROUP_BYTES,
     OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS, OwnedChange, OwnedChangeGroup,
     OwnedRelation, Result, Timestamp, TransactionKey, TxId, Value, change_feed_uncovered,
 };
@@ -754,10 +754,7 @@ impl OwnedReadSession {
                 }
 
                 let charge = self.context.memory.reserve(retained)?;
-                let touches = touches
-                    .iter()
-                    .map(|value| OwnedChange::from_value(value.as_ref()))
-                    .collect::<Result<Vec<_>>>()?;
+                let touches = decode_touches(touches)?;
                 let sequence =
                     u64::try_from(journal.revision).map_err(|_| change_feed_uncovered())?;
                 changes.push(OwnedRelationChanges {
@@ -1090,7 +1087,7 @@ pub async fn archived_changes_at_cut(
             break;
         }
         let reservation = context.memory.reserve(bytes)?;
-        let touches = touches.iter().map(|value| OwnedChange::from_value(value.as_ref())).collect::<Result<Vec<_>>>()?;
+        let touches = decode_touches(touches)?;
         if touches.iter().any(|touch| !matches!(touch.kind,
             rtdb_types::OwnedChangeKind::Put | rtdb_types::OwnedChangeKind::Delete))
         {
@@ -1389,6 +1386,13 @@ async fn validate_journal_head(
         return Err(change_feed_uncovered());
     }
     Ok(())
+}
+
+fn decode_touches(mut touches: ListValue) -> Result<Vec<OwnedChange>> {
+    if let Some(values) = touches.values_mut() {
+        return values.drain(..).map(OwnedChange::from_owned_value).collect();
+    }
+    touches.iter().map(|touch| OwnedChange::from_value(touch.as_ref())).collect()
 }
 
 fn require_path_touch(

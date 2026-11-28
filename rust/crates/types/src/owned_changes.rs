@@ -69,6 +69,25 @@ impl OwnedChange {
             .ok_or_else(change_feed_uncovered)?
             .owned_entity_id()
             .map_err(|_| change_feed_uncovered())?;
+        Self::decode_fields(fields, id)
+    }
+
+    /// Decodes a retained journal touch and takes ownership of its identity payload.
+    pub fn from_owned_value(value: Value) -> Result<Self> {
+        let Value::Struct(mut fields) = value else {
+            return Err(change_feed_uncovered());
+        };
+        let id = fields.get_mut("_id").ok_or_else(change_feed_uncovered)?;
+        let id = match std::mem::replace(id, Value::Undefined) {
+            Value::Utf8(value) => EntityId::String(value),
+            Value::Keyword(value) => EntityId::Keyword(value),
+            Value::Binary(value) => EntityId::Binary(value),
+            value => value.owned_entity_id().map_err(|_| change_feed_uncovered())?,
+        };
+        Self::decode_fields(&fields, id)
+    }
+
+    fn decode_fields(fields: &StructFields<Value>, id: EntityId) -> Result<Self> {
         let kind = match fields.get("op") {
             Some(Value::Utf8(op)) if op == "put" => OwnedChangeKind::Put,
             Some(Value::Utf8(op)) if op == "delete" => OwnedChangeKind::Delete,
@@ -163,4 +182,78 @@ pub fn change_feed_uncovered() -> Anomaly {
         "rtdb.owned/change-feed-uncovered",
         "The held cut does not cover this owned change feed",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_touch_takes_the_decoded_identity_allocation() {
+        for value in [
+            Value::Binary(vec![0, 255, 0, 1]),
+            Value::Utf8("text/λ".into()),
+            Value::Keyword(crate::Keyword::from_name(":stored/name")),
+        ] {
+            let address = match &value {
+                Value::Binary(value) => value.as_ptr(),
+                Value::Utf8(value) => value.as_ptr(),
+                Value::Keyword(value) => value.as_str().as_ptr(),
+                _ => unreachable!(),
+            };
+            let touch = Value::Struct(StructFields::from([
+                ("_id".into(), value),
+                ("op".into(), Value::Utf8("put".into())),
+                ("valid_from_micros".into(), Value::I64(20)),
+                ("valid_to_micros".into(), Value::Null),
+                ("assertion_ordinal".into(), Value::I64(7)),
+            ]));
+            let expected = OwnedChange::from_value(&touch).unwrap();
+            let decoded = OwnedChange::from_owned_value(touch).unwrap();
+            assert_eq!(decoded, expected);
+            let actual = match &decoded.id {
+                EntityId::Binary(value) => value.as_ptr(),
+                EntityId::String(value) => value.as_ptr(),
+                EntityId::Keyword(value) => value.as_str().as_ptr(),
+                _ => unreachable!(),
+            };
+            assert_eq!(actual, address);
+        }
+    }
+
+    #[test]
+    fn retained_touch_matches_checked_identity_and_shape_admission() {
+        let touch = |id, ordinal| Value::Struct(StructFields::from([
+            ("_id".into(), id),
+            ("op".into(), Value::Utf8("put".into())),
+            ("valid_from_micros".into(), Value::I64(20)),
+            ("valid_to_micros".into(), Value::I64(21)),
+            ("created_micros".into(), Value::Undefined),
+            ("expiry_micros".into(), Value::Null),
+            ("assertion_ordinal".into(), ordinal),
+        ]));
+        for value in [
+            touch(Value::I8(-1), Value::Undefined),
+            touch(Value::I16(-257), Value::Null),
+            touch(Value::I32(-65_537), Value::I64(2)),
+            touch(Value::I64(i64::MIN), Value::I64(3)),
+            touch(Value::Uuid([0xa3; 16]), Value::I64(1)),
+        ] {
+            assert_eq!(OwnedChange::from_owned_value(value.clone()).unwrap(), OwnedChange::from_value(&value).unwrap());
+        }
+        for value in [
+            touch(Value::U8(1), Value::Null),
+            touch(Value::FixedSizeBinary(vec![0; 16]), Value::I64(1)),
+            touch(Value::Binary(vec![0xff]), Value::I64(0)),
+            {
+                let Value::Struct(mut fields) = touch(Value::Uuid([0xa3; 16]), Value::Null) else {
+                    unreachable!();
+                };
+                fields.insert("extra".into(), Value::Null);
+                Value::Struct(fields)
+            },
+        ] {
+            assert_eq!(OwnedChange::from_owned_value(value.clone()).unwrap_err().code, OwnedChange::from_value(&value).unwrap_err().code);
+        }
+    }
 }
