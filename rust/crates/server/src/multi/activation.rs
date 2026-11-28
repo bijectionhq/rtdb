@@ -11,7 +11,7 @@ use journal_contract::{
     Lsn, StreamId, WriterFence, WriterSessionId,
     reference::{FileJournal, Limits},
 };
-use rtdb_db::{ServingAuthority, ServingPermit};
+use rtdb_db::{ServingAuthority, ServingPermit, StreamAuthentication};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -370,13 +370,13 @@ impl ActivationAuthority {
         if self.access.is_local() {
             self.journal.create(stream).await
         } else if let Some(journal) = &self.authenticated_journal {
-            match journal.require_authenticated(stream).await {
-                Ok(()) => Ok(()),
-                Err(JournalError::NotFound) => match journal.create_authenticated(stream).await {
+            match StreamAuthentication::of(journal, stream).await {
+                Ok(StreamAuthentication::Authenticated) => Ok(()),
+                Ok(StreamAuthentication::Missing) => match journal.create_authenticated(stream).await {
                     Err(JournalError::Unsupported) => self.journal.create_immutable(stream).await,
                     result => result,
                 },
-                Err(JournalError::Unsupported) => self.journal.create_immutable(stream).await,
+                Ok(StreamAuthentication::Unsupported) => self.journal.create_immutable(stream).await,
                 Err(error) => Err(error),
             }
         } else {
@@ -612,11 +612,8 @@ impl ActivationAuthority {
 
     async fn supports_lineage(&self, stream: StreamId) -> Result<bool> {
         let Some(journal) = &self.authenticated_journal else { return Ok(false); };
-        match journal.require_authenticated(stream).await {
-            Ok(()) => Ok(true),
-            Err(JournalError::Unsupported | JournalError::NotFound) => Ok(false),
-            Err(error) => Err(journal_error(error)),
-        }
+        let authentication = StreamAuthentication::of(journal, stream).await.map_err(journal_error)?;
+        Ok(authentication == StreamAuthentication::Authenticated)
     }
 
     pub(super) async fn supports_lineage_for(&self, name: &str) -> Result<bool> {

@@ -25,6 +25,25 @@ pub struct TimedOriginal {
     pub cutoff: TimedJournalCutoff,
 }
 
+/// Whether a consensus journal holds one stream as authenticated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamAuthentication {
+    Authenticated,
+    Missing,
+    Unsupported,
+}
+
+impl StreamAuthentication {
+    pub async fn of(journal: &ConsensusJournal, stream: StreamId) -> journal_contract::Result<Self> {
+        match journal.require_authenticated(stream).await {
+            Ok(()) => Ok(Self::Authenticated),
+            Err(JournalError::NotFound) => Ok(Self::Missing),
+            Err(JournalError::Unsupported) => Ok(Self::Unsupported),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// The immutable journal bytes named by a timed append commitment.
 pub(crate) struct PreparedTimedAppend {
     original: TimedOriginal,
@@ -225,16 +244,16 @@ impl Stream {
             .await?;
         if let Some(session) = &self.session {
             if let Some(authenticated) = self.authenticated_journal.as_ref().filter(|_| self.create_authenticated) {
-                match authenticated.require_authenticated(self.id()).await {
-                    Ok(()) => (),
-                    Err(JournalError::NotFound) => authenticated.create_authenticated(self.id()).await.map_err(|error| match error {
+                match StreamAuthentication::of(authenticated, self.id()).await.map_err(journal_error)? {
+                    StreamAuthentication::Authenticated => (),
+                    StreamAuthentication::Missing => authenticated.create_authenticated(self.id()).await.map_err(|error| match error {
                         JournalError::Unsupported => Anomaly::unsupported(
                             "rtdb/lineage-application-catalog",
                             "This database settles against its lineage, so its application catalog must support authenticated streams. Finalize level 14 on application catalogs before the control catalog.",
                         ),
                         error => journal_error(error),
                     })?,
-                    Err(error) => return Err(journal_error(error)),
+                    StreamAuthentication::Unsupported => return Err(journal_error(JournalError::Unsupported)),
                 }
             } else {
                 self.journal.create_immutable(self.id()).await.map_err(journal_error)?;

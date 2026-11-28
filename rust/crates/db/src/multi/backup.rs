@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use stream_logkeeper::stream::consensus::{ConsensusJournal, authenticated::{Archive, CatalogRoot, Head}};
 use uuid::Uuid;
 
-use crate::{journal::{Stream, journal_error}, replay::{BackupAuthentication, BackupSource, Committed, JournalCoordinates, RestoreOrigin}};
+use crate::{journal::{Stream, StreamAuthentication, journal_error}, replay::{BackupAuthentication, BackupSource, Committed, JournalCoordinates, RestoreOrigin}};
 
 use super::{Lease, MultiDatabase, next, no_writer};
 
@@ -665,10 +665,10 @@ impl MultiDatabase {
 }
 
 async fn has_authentication(journal: &ConsensusJournal, stream: StreamId) -> Result<bool> {
-    match journal.require_authenticated(stream).await {
-        Ok(()) => Ok(true),
-        Err(JournalError::Unsupported) => Ok(false),
-        Err(error) => Err(journal_error(error)),
+    match StreamAuthentication::of(journal, stream).await.map_err(journal_error)? {
+        StreamAuthentication::Authenticated => Ok(true),
+        StreamAuthentication::Unsupported => Ok(false),
+        StreamAuthentication::Missing => Err(journal_error(JournalError::NotFound)),
     }
 }
 
