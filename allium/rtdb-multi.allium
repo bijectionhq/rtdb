@@ -1260,6 +1260,10 @@ contract EpochScopedStorage {
         -- In default mode the confirmed leader supplies the retained checkpoint, replica records, pins and inputs of admitted reads and compaction under its term.
         -- The collector deletes database objects from earlier epochs outside the closure of the retained records, checkpoints and pins.
         -- After a certified trim through a checkpoint covering the authorized store floor, the Multi writer may also delete the exact manifests of superseded checkpoints outside that closure.
+        -- Each remote manifest read registers with its original object provider before checking that exact name's retirement fence.
+        -- The collector closes admission to the exact manifest and observes the provider's drain before deleting it.
+        -- An interrupted or ambiguous provider body keeps its registration. An unavailable drain keeps reclamation pending.
+        -- A reader refused by the retired publication re-anchors at an authenticated replay base.
         -- A replica that raced the trim loads the replacement base and applies its retained suffix.
         -- A follower returning a Store Read, Rank or Watch reply confirms its earliest consulted basis against floor advances at a current authenticated journal prefix.
         -- On a Store Watch that basis is the caller's original resume position.

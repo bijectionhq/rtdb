@@ -1106,8 +1106,7 @@ impl MultiDatabase {
             .map_err(Anomaly::from)?;
         let plan = closure.plan_gc(listing.iter().map(|object| &object.key));
         self.require_authority(lease)?;
-        plan.execute(self.store.as_ref()).await?;
-        Ok(plan.keys().len())
+        plan.execute(self.store.as_ref()).await
     }
 
     fn validate_files(&self, closure: &Reachability, files: &[ObjectId]) -> Result<()> {

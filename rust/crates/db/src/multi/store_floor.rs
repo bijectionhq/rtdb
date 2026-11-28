@@ -27,7 +27,9 @@ impl MultiDatabase {
         let writer = self.writer.as_ref().ok_or_else(no_writer)?;
         let plan = closure.plan_store_history_gc(listing.iter().map(|object| &object.key), &writer.retired_store_checkpoints)?;
         self.require_authority(lease)?;
-        plan.execute(self.store.as_ref()).await?;
+        if plan.execute(self.store.as_ref()).await? != plan.keys().len() {
+            return Ok(());
+        }
         let writer = self.writer.as_mut().ok_or_else(no_writer)?;
         writer.retired_store_checkpoints.retain(|&id| closure.contains(id));
         writer.reclaimed_store_history_through = Some(floor);

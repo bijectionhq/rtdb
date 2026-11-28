@@ -371,10 +371,11 @@ impl MultiRuntime {
         let activation = activation::installed(&journal_url, config.multi_journal.immutable_streams).await?;
         let io = IoRegion::new();
         let store = s3
-            .open(
+            .open_with_read_drain(
                 &rtdb_storage::ObjectKey::new("multi")?,
                 &BTreeMap::new(),
                 Arc::clone(&io),
+                checkpoint_read_census_scope,
             )
             .await?;
         let backends = Backends {
@@ -1509,6 +1510,17 @@ impl Backends {
             },
         }
     }
+}
+
+#[cfg(feature = "s3")]
+fn checkpoint_read_census_scope(key: &rtdb_storage::ObjectKey) -> Option<&str> {
+    use rtdb_format::journal::{ObjectId, ObjectKind};
+
+    let id: ObjectId = key.as_str().parse().ok()?;
+    if id.kind != ObjectKind::Manifest {
+        return None;
+    }
+    key.as_str().split_once("/manifest/").map(|(database, _)| database)
 }
 
 fn assignment_peer_profile(auth: &AuthConfig) -> Option<peer::WorkloadProfile> {

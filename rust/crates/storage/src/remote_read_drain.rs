@@ -56,7 +56,7 @@ impl<'a> ReadDrain<'a> {
 
         let result = work.await;
         // An interrupted body or ambiguous transport failure leaves the entry protected.
-        if matches!(&result, Ok(_) | Err(Error::MissingObject(_) | Error::ConflictingObject(_))) {
+        if matches!(&result, Ok(_) | Err(Error::MissingObject(_))) {
             self.forget(&reader).await;
         }
         result
@@ -141,6 +141,35 @@ mod tests {
         complete.send(()).unwrap();
         worker.close_and_wait().await;
         assert!(custodian.close_read_admission(&target).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reclamation_waits_for_the_original_provider_read() {
+        let provider = Arc::new(InMemory::new());
+        let worker = Arc::new(RemoteStore::new(provider.clone(), None).with_read_drain(|_| Some("grant")));
+        let collector = RemoteStore::new(provider.clone(), None).with_read_drain(|_| Some("grant"));
+        let target = ObjectKey::new("grant/checkpoint").unwrap();
+        collector.put(&target, Bytes::from_static(b"image")).await.unwrap();
+
+        let (started, running) = oneshot::channel();
+        let (complete, wait) = oneshot::channel();
+        let read = tokio::spawn({
+            let target = target.clone();
+            async move {
+                worker.objects.with_read(&target, async {
+                    started.send(()).unwrap();
+                    wait.await.unwrap();
+                    Ok(())
+                }).await
+            }
+        });
+        running.await.unwrap();
+        assert!(!collector.reclaim_unreachable_checkpoint(&target).await.unwrap());
+        assert!(provider.head(&Path::from(target.as_str())).await.is_ok());
+        complete.send(()).unwrap();
+        read.await.unwrap().unwrap();
+        assert!(collector.reclaim_unreachable_checkpoint(&target).await.unwrap());
+        assert!(provider.head(&Path::from(target.as_str())).await.is_err());
     }
 
     #[tokio::test]

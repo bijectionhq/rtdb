@@ -150,7 +150,17 @@ impl S3Config {
     /// Credential aliases are resolved at opening; default credentials refresh during requests.
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
-        self.open_classic(storage_root, remotes, io, RemoteKeyLayout::Escaped).await
+        Ok(self.open_classic(storage_root, remotes, io, RemoteKeyLayout::Escaped).await?)
+    }
+
+    /// Opens an ordinary S3 store with a provider census shared by every
+    /// serving replica and collector using this allocation.
+    pub async fn open_with_read_drain(
+        &self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>,
+        scope: fn(&ObjectKey) -> Option<&str>,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        let store = self.open_classic(storage_root, remotes, io, RemoteKeyLayout::Escaped).await?;
+        Ok(Arc::new(Arc::unwrap_or_clone(store).with_read_drain(scope)))
     }
 
     pub fn ranked_allocation(&self, root: &ObjectKey) -> Result<(S3ObjectNamespace, String)> {
@@ -202,15 +212,15 @@ impl S3Config {
         {
             return Err(Anomaly::incorrect("rtdb.s3/classic-key-scope", "Literal S3 requires the declared provider addressing"));
         }
-        self.open_classic(storage_root, remotes, io, RemoteKeyLayout::LiteralS3).await
+        Ok(self.open_classic(storage_root, remotes, io, RemoteKeyLayout::LiteralS3).await?)
     }
 
-    async fn open_classic(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, layout: RemoteKeyLayout) -> Result<Arc<dyn ObjectStore>> {
+    async fn open_classic(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, layout: RemoteKeyLayout) -> Result<Arc<RemoteStore>> {
         if self.terminal_scope.is_some() {
             return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "A terminal S3 allocation must be opened as a cell"));
         }
         self.require_cell_root(storage_root)?;
-        Ok(self.open_store(storage_root, remotes, io, StoreKind::Classic(layout)).await?)
+        self.open_store(storage_root, remotes, io, StoreKind::Classic(layout)).await
     }
 
     /// Opens the cell's immutable namespace. Any result that leaves an

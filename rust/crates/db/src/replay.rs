@@ -353,7 +353,11 @@ impl Committed {
         previous: Option<Self>,
     ) -> std::result::Result<Self, ReplayError> {
         match Self::read_prefix(stream, store, end, previous).await {
-            Err(ReplayError::Failed { error, .. }) if error.is(rtdb_types::AnomalyKind::MissingObject) => {
+            Err(ReplayError::Failed { error, .. })
+                if error.is(rtdb_types::AnomalyKind::MissingObject) || error.code == "rtdb.storage/closed" =>
+            {
+                // A retired manifest may still exist with its read admission
+                // closed. Re-anchor at the current authenticated replay base.
                 Self::read_prefix(stream, store, end, None).await
             }
             Err(ReplayError::Failed { error, resume }) if error.code == "rtdb/erased-under-view" => {
