@@ -4,7 +4,7 @@ use futures::{FutureExt, TryStreamExt};
 use rtdb_format::entity_history::{self, HistoryRoot};
 use rtdb_index::{CatalogTrie, TrieState};
 use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease}};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, AnomalyKind, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result};
 
 use crate::{LocatedHistoryEvent, ResolvedSearchRow, ScanRequest, SearchRowLocation, resolve_located_point};
 
@@ -48,10 +48,14 @@ pub async fn table_point_rows(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -
         return Ok(None);
     }
     if let Some(rows) = crate::entity_directory::resolve_points(request, keys).await? { return Ok(Some(rows)); }
-    read_history(request, keys).await
+    let read_ahead = request.memory.snapshot_budget().is_some();
+    match read_history(request, keys, read_ahead).await {
+        Err(error) if read_ahead && error.is(AnomalyKind::ResourceExhausted) => read_history(request, keys, false).await,
+        result => result,
+    }
 }
 
-async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result<Option<Vec<ResolvedSearchRow>>> {
+async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>, read_ahead: bool) -> Result<Option<Vec<ResolvedSearchRow>>> {
     let table = &request.scan.table.name.table;
     let mut charge = request.memory.reserve(4096usize.saturating_add(keys.len().saturating_mul(480)))?;
     let mut histories = BTreeMap::<Iid, Vec<LocatedHistoryEvent<()>>>::new();
@@ -79,7 +83,7 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
                     Ok(true)
                 };
                 let Some(record) = record else {
-                    crate::scan::primary_point_events(request, &table.slug, &trie.key, Some(crate::IidScope::Set(keys)), usize::MAX, visit).await?;
+                    crate::scan::primary_point_events(request, &table.slug, &trie.key, Some(crate::IidScope::Set(keys)), usize::MAX, read_ahead, visit).await?;
                     return Ok::<_, Anomaly>((rows, reservation, key_bytes));
                 };
                 let root = HistoryRoot::decode(record.stats(), record.file_size())?;
@@ -163,7 +167,7 @@ pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_for
     trie: &CatalogTrie, scope: Option<crate::IidScope<'_>>, max_rows: usize,
     mut visit: impl FnMut(LocatedHistoryEvent<()>, Option<&[u8]>) -> Result<bool>) -> Result<Option<usize>> {
     let Some(record) = trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION) else {
-        return crate::scan::primary_point_events(request, slug, &trie.key, scope, max_rows, visit).await;
+        return crate::scan::primary_point_events(request, slug, &trie.key, scope, max_rows, false, visit).await;
     };
     let key = ObjectKey::new(slug.recorded_artefact_key(&trie.key, record)?)?;
     let root = HistoryRoot::decode(record.stats(), record.file_size())?;

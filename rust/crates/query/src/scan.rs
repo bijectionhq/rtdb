@@ -13,6 +13,7 @@ use arrow_buffer::Buffer;
 use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use futures::{StreamExt, future::BoxFuture, stream::FuturesOrdered};
 use rtdb_columnar::{BufferIdentity, IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_columnar::arrow_flow;
 use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, PageProjection, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
@@ -27,6 +28,8 @@ use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, HOSTED_RECEIPT_TX_ID, OWNED_EVE
 use crate::columnar::{BatchCursor, BatchFilter, BoxBatchCursor, Column, ColumnBatch, admitted_predicate_selection};
 use crate::compiled::{Admission, Predicates};
 use crate::{CandidateIids, ConstantEvaluator, PreparedSearchQuery, QueryContext, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
+
+const POINT_READ_AHEAD_WORKSPACE: usize = 32 << 10;
 
 struct DataFileReader {
     storage: Arc<BufferPool>,
@@ -64,6 +67,14 @@ impl DataFileReader {
         Ok(self.opened.as_ref().expect("the data file is open"))
     }
 
+    fn open_cached_layout(&mut self, memory: &Arc<MemoryBudget>) -> bool {
+        if !self.storage.object_store().supports_scan_ranges(&self.key) { return false; }
+        let Some(layout) = self.storage.view::<CachedLayout>(&self.key, View::Layout) else { return false; };
+        let Some(opening) = memory.try_reserve(layout._reservation.bytes()) else { return false; };
+        self.opened = Some(OpenedLayout { layout, _opening: opening, whole: None });
+        true
+    }
+
     async fn page_rows(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<usize> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
@@ -77,6 +88,12 @@ impl DataFileReader {
     ) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.storage.record_batch_requested();
         self.open(memory).await?;
+        self.decode_opened_event_page(page, memory, projection, include_builder_bound).await
+    }
+
+    async fn decode_opened_event_page(
+        &self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>, include_builder_bound: bool,
+    ) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
@@ -196,6 +213,33 @@ impl DataFileReader {
             decoder, builder_bound: OnceLock::new(), _reservation: Arc::clone(&opening), _dictionaries: dictionaries,
         });
         Ok((layout, opening))
+    }
+}
+
+async fn visit_buffered_pages<'a, T: 'a>(
+    mut pages: impl Iterator<Item = usize>,
+    read: impl Fn(usize) -> BoxFuture<'a, Result<T>>,
+    mut visit: impl FnMut(usize, T) -> Result<bool>,
+) -> Result<bool> {
+    const READ_AHEAD: usize = 4;
+    loop {
+        let group: [_; READ_AHEAD] = std::array::from_fn(|_| pages.next());
+        if group[0].is_none() { return Ok(true); }
+        let mut reads = FuturesOrdered::new();
+        for &page in group.iter().flatten() { reads.push_back(read(page)); }
+        for page in group.into_iter().flatten() {
+            let result = reads.next().await.expect("one read per page").and_then(|value| visit(page, value));
+            match result {
+                Ok(true) => (),
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    if error.is(AnomalyKind::ResourceExhausted) {
+                        while reads.next().await.is_some() {}
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
 }
 
@@ -358,6 +402,7 @@ async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<
 /// `None` once more than `max_rows` rows would be inspected.
 pub(crate) async fn primary_point_events(
     request: &crate::ScanRequest<'_>, slug: &TableSlug, trie: &TrieKey, keys: Option<crate::IidScope<'_>>, max_rows: usize,
+    read_ahead: bool,
     mut visit: impl FnMut(crate::LocatedHistoryEvent<()>, Option<&[u8]>) -> Result<bool>,
 ) -> Result<Option<usize>> {
     let memory = request.memory;
@@ -380,6 +425,40 @@ pub(crate) async fn primary_point_events(
     }
     let mut file = DataFileReader::new(request.storage, ObjectKey::new(slug.data_key(trie))?);
     let mut inspected = 0usize;
+    let mut visit_page = |page: usize, batch: &EventBatch| -> Result<bool> {
+        let page = u32::try_from(page).map_err(|error| invalid("point-page", error))?;
+        if batch.is_empty() { return Ok(true); }
+        let iids = batch.iids()?;
+        for row in 0..batch.len() {
+            let iid = iids.get(row)?;
+            if keys.is_some_and(|keys| !keys.contains(&iid)) { continue; }
+            let event = crate::LocatedHistoryEvent { header: batch.header(row)?, origin: batch.origin(row)?, witness: None,
+                location: crate::SearchRowLocation::Persisted { trie: trie.clone(), page,
+                    row: u32::try_from(row).map_err(|error| invalid("point-row", error))? } };
+            if !visit(event, batch.entity_key(row)?)? { return Ok(false); }
+        }
+        Ok(true)
+    };
+    if read_ahead && max_rows == usize::MAX && keys.is_some() && pages.len() > 1
+        && let Ok(_buffering) = memory.reserve(POINT_READ_AHEAD_WORKSPACE)
+        && file.open_cached_layout(memory)
+    {
+        let file = &file;
+        let complete = visit_buffered_pages(pages.into_iter(), |page| Box::pin(async move {
+            if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
+            file.storage.record_batch_requested();
+            if let Some(held) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+                return Ok((held.batch.view().clone(), memory.reserve(held.bound)?));
+            }
+            let (batch, charge) = file.decode_opened_event_page(page, memory, DataProjection::PutColumns(&[]), true).await?;
+            Ok((EventBatch::new(batch)?, charge))
+        }), |page, (batch, _charge)| {
+            if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
+            inspected = inspected.saturating_add(batch.len());
+            visit_page(page, &batch)
+        }).await?;
+        return Ok(complete.then_some(inspected));
+    }
     for page in pages {
         if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
         let remaining = max_rows - inspected;
@@ -414,15 +493,7 @@ pub(crate) async fn primary_point_events(
             }
         }
         inspected += rows;
-        let page = u32::try_from(page).map_err(|error| invalid("point-page", error))?;
-        for row in 0..rows {
-            let iid = batch.iid(row)?;
-            if keys.is_some_and(|keys| !keys.contains(&iid)) { continue; }
-            let event = crate::LocatedHistoryEvent { header: batch.header(row)?, origin: batch.origin(row)?, witness: None,
-                location: crate::SearchRowLocation::Persisted { trie: trie.clone(), page,
-                    row: u32::try_from(row).map_err(|error| invalid("point-row", error))? } };
-            if !visit(event, batch.entity_key(row)?)? { return Ok(None); }
-        }
+        if !visit_page(page, &batch)? { return Ok(None); }
     }
     Ok(Some(inspected))
 }
@@ -2213,7 +2284,7 @@ impl ScanVerifier<'_> {
     async fn gather_search_rows(&self, scan: &Scan, rows: &[crate::ResolvedSearchRow], reuse: Option<&RankedGather<'_>>)
         -> Result<crate::columnar::ColumnBatch> {
         use crate::SearchRowLocation;
-        use futures::{StreamExt, TryStreamExt};
+        use futures::TryStreamExt;
 
         let table = &scan.table.name.table;
         let memory = &self.execution.context.memory;
@@ -2242,6 +2313,28 @@ impl ScanVerifier<'_> {
             }
             let mut file = DataFileReader::new(self.storage, ObjectKey::new(entry.slug.data_key(&trie))?);
             let mut loaded = Vec::with_capacity(pages.len());
+            if pages.len() > 1 && memory.snapshot_budget().is_some()
+                && let Ok(buffering) = memory.reserve(POINT_READ_AHEAD_WORKSPACE) && file.open_cached_layout(memory)
+            {
+                let file = &file;
+                let result = visit_buffered_pages(pages.iter().map(|page| *page as usize), |page| Box::pin(async move {
+                    file.storage.record_batch_requested();
+                    if let Some(cached) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+                        return Ok(Arc::clone(&cached.batch));
+                    }
+                    let (batch, lease) = file.decode_opened_event_page(page, memory, DataProjection::PutColumns(put_columns), true).await?;
+                    IndexBatch::from_owned(OwnedBatch::with_reservation(batch, lease)?)
+                }), |page, batch| {
+                    self.execution.context.check_cancelled()?;
+                    loaded.push(((trie.clone(), page as u32), batch));
+                    Ok(true)
+                }).await;
+                drop(buffering);
+                match result {
+                    Err(error) if error.is(AnomalyKind::ResourceExhausted) => loaded.clear(),
+                    result => { result?; return Ok(loaded); }
+                }
+            }
             for page in pages {
                 let cached = (!memory.is_prepaid()).then(|| file.storage.view::<CachedPage>(&file.key, View::Page(page as usize))).flatten();
                 let batch = match cached {
@@ -4710,6 +4803,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_primary_points_surface_a_page_fault_only_when_the_visitor_reaches_it() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let value = state.value();
+        let entry = value.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(value.live().block_index()).unwrap();
+        let key = ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
+        let storage = Arc::new(BufferPool::new(store.clone(), 8 << 20));
+        let snapshot = value.snapshot();
+        let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
+        let search_queries = SearchQueries::default();
+        let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
+            storage: &storage, canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
+        let point = Interval::at(Timestamp(150)).unwrap();
+        let request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
+            bounds: TemporalBounds { valid_time: point, system_time: point }, memory: &memory,
+            current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
+            constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+        let mut reader = DataFileReader::new(&storage, key.clone());
+        let bad = reader.open(&memory).await.unwrap().layout.decoder.page_range(1).unwrap().start as usize;
+        assert!(reader.open_cached_layout(&memory));
+        drop(reader);
+        let mut bytes = store.get(&key).await.unwrap().to_vec();
+        bytes[bad..bad + 8].fill(0);
+        store.delete(&key).await.unwrap();
+        store.put(&key, bytes.into()).await.unwrap();
+
+        let keys = events.iter().map(|event| event.iid).collect::<BTreeSet<_>>();
+        let scope = Some(crate::IidScope::Set(&keys));
+        for (continue_after_first, read_ahead) in [(false, true), (true, true), (true, false)] {
+            let mut visited = Vec::new();
+            let result = primary_point_events(&request, &entry.slug, &trie, scope, usize::MAX, read_ahead,
+                |event, _| { visited.push(event.header.iid); Ok(continue_after_first) }).await;
+            assert_eq!(visited, [events[0].iid]);
+            if continue_after_first { assert!(result.is_err()); } else { assert_eq!(result.unwrap(), None); }
+        }
+    }
+
+    #[tokio::test]
     async fn primary_points_keep_the_origins_locations_and_exact_keys_of_colliding_rows() {
         let (state, table, events, store, _) = persisted_page_fixture().await;
         let value = state.value();
@@ -4743,7 +4875,7 @@ mod tests {
             constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
         let keys = [events[0].iid].into();
         let mut recorded = Vec::new();
-        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(crate::IidScope::Set(&keys)), usize::MAX, |event, key| {
+        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(crate::IidScope::Set(&keys)), usize::MAX, false, |event, key| {
             let crate::SearchRowLocation::Persisted { trie: actual, page, row } = event.location else {
                 panic!("Expected a persisted point location");
             };
@@ -4799,7 +4931,7 @@ mod tests {
             constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
         let before = memory.used_bytes();
         let mut visited = Vec::new();
-        assert_eq!(primary_point_events(&request, &entry.slug, &trie, None, 2, |event, _| {
+        assert_eq!(primary_point_events(&request, &entry.slug, &trie, None, 2, false, |event, _| {
             assert!(memory.used_bytes() > before);
             if event.header.iid == events[0].iid { visited.push(event.header.iid); }
             Ok(true)
