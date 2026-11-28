@@ -82,6 +82,7 @@ enum Command {
         after: Basis,
         reader: [u8; 32],
         hold: StoreVersionHoldKey,
+        receiver: [u8; 16],
         id: [u8; 16],
         drain: StoreWatchDrain,
         reply: Reply<StoreReadTurn>,
@@ -89,6 +90,7 @@ enum Command {
     FinishStoreWatch {
         key: StoreVersionHoldKey,
         reader: [u8; 32],
+        receiver: [u8; 16],
     },
     BoundJournal { limit: u64, reply: Reply<Option<rtdb_format::journal::ObjectId>> },
     /// A deferred checkpoint built off the database lock, ready to announce.
@@ -156,7 +158,7 @@ impl WritePipeline {
     }
 
     pub async fn enter_held_store_watch(
-        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey,
+        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: [u8; 16],
     ) -> Result<StoreReadTurn> {
         let id = *Uuid::new_v4().as_bytes();
         let key = StoreVersionHoldKey { basis: hold.basis, id };
@@ -164,12 +166,12 @@ impl WritePipeline {
         let runtime = tokio::runtime::Handle::current();
         let drain = StoreWatchDrain::new(move || {
             runtime.spawn(async move {
-                let _ = input.send(Command::FinishStoreWatch { key, reader }).await;
+                let _ = input.send(Command::FinishStoreWatch { key, reader, receiver }).await;
             });
         });
         // The queue owns the drain before attempting the append. A lost
         // append acknowledgement or a cancelled caller cannot lose it.
-        self.request(|reply| Command::EnterStoreWatch { after, reader, hold, id, drain, reply }).await
+        self.request(|reply| Command::EnterStoreWatch { after, reader, hold, receiver, id, drain, reply }).await
     }
 
     /// Keeps an admitted publication in the writer's queue after the caller drops its reply.
@@ -514,18 +516,18 @@ async fn run(
                 let result = Box::pin(async { database.lock().await.store_version_hold(reader, request).await }).await;
                 let _ = reply.send(result);
             }
-            Command::EnterStoreWatch { after, reader, hold, id, drain, reply } => {
+            Command::EnterStoreWatch { after, reader, hold, receiver, id, drain, reply } => {
                 let result = Box::pin(async {
-                    database.lock().await.enter_held_store_watch(after, reader, hold, id).await
+                    database.lock().await.enter_held_store_watch(after, reader, hold, id, receiver).await
                 }).await.map(|mut turn| {
                     turn.settle_watch_on_drop(drain);
                     turn
                 });
                 let _ = reply.send(result);
             }
-            Command::FinishStoreWatch { key, reader } => {
+            Command::FinishStoreWatch { key, reader, receiver } => {
                 let result = Box::pin(async {
-                    database.lock().await.finish_held_store_watch(key, reader).await
+                    database.lock().await.finish_held_store_watch(key, reader, receiver).await
                 }).await;
                 if let Err(error) = result {
                     tracing::warn!(code = %error.code, "An ordered Store watch turn still needs settlement");

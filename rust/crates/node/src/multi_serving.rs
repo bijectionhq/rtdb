@@ -1033,12 +1033,12 @@ impl ServingDriver for MultiServing {
     }
 
     async fn enter_held_store_watch(
-        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, cancellation: &CancellationToken,
+        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: [u8; 16], cancellation: &CancellationToken,
     ) -> Result<StoreReadTurn> {
         if self.classic_workload_fence.is_some() {
             return Err(workload::denied());
         }
-        cancellation.run_until_cancelled(self.serve(self.writes.enter_held_store_watch(after, reader, hold)))
+        cancellation.run_until_cancelled(self.serve(self.writes.enter_held_store_watch(after, reader, hold, receiver)))
             .await.ok_or_else(interrupted)?
     }
 

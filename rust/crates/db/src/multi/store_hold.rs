@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::{Arc, Weak}};
 
-use rtdb_format::journal::{OrderedStoreHold, Record, StoreHoldChange};
+use rtdb_format::journal::{OrderedStoreHold, OrderedStoreWatchTurn, Record, StoreHoldChange};
 use rtdb_index::branches::BranchIndex;
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
@@ -27,7 +27,7 @@ pub struct StoreReadTurn {
     generation: u64,
     writer_fence_position: Option<u64>,
     owner: Arc<()>,
-    watch: Option<StoreVersionHoldKey>,
+    watch: Option<(StoreVersionHoldKey, OrderedStoreWatchTurn)>,
     drain: Option<StoreWatchDrain>,
 }
 
@@ -146,11 +146,12 @@ pub enum StoreVersionHoldReply {
 pub(crate) struct StoreHolds(BTreeMap<[u8; 16], OrderedStoreHold>);
 
 fn retains(hold: &OrderedStoreHold, lower: i64) -> bool {
-    hold.watch_receipt.is_some() || lower < hold.expires_at_micros
+    hold.watch_turn.is_some() || lower < hold.expires_at_micros
 }
 
 fn valid_watch_admission(hold: &OrderedStoreHold) -> bool {
-    hold.watch_receipt.is_none_or(|parent| hold.change_history && parent != [0; 16] && parent != hold.id)
+    hold.watch_turn.is_none_or(|turn| hold.change_history && turn.receipt != [0; 16]
+        && turn.receipt != hold.id && turn.receiver != [0; 16])
 }
 
 impl StoreHolds {
@@ -201,8 +202,8 @@ impl StoreHolds {
         {
             return Err(invalid_hold("A Store hold must be new, live and bound to its reader"));
         }
-        if let Some(parent) = hold.watch_receipt {
-            let key = StoreVersionHoldKey { basis: hold.basis, id: parent };
+        if let Some(turn) = hold.watch_turn {
+            let key = StoreVersionHoldKey { basis: hold.basis, id: turn.receipt };
             let receipt = self.find(key, hold.reader, lower)?;
             if !receipt.change_history || receipt.expires_at_micros != hold.expires_at_micros {
                 return Err(invalid_hold("A Store watch turn must match its exact live receipt"));
@@ -245,7 +246,7 @@ impl StoreHolds {
                 }
                 let id = *Uuid::new_v4().as_bytes();
                 let ordered = OrderedStoreHold {
-                    id, reader, basis, expires_at_micros: expires_at.0, change_history, watch_receipt: None,
+                    id, reader, basis, expires_at_micros: expires_at.0, change_history, watch_turn: None,
                 };
                 self.check_new(ordered, lower)?;
                 let held = StoreVersionHold { key: StoreVersionHoldKey { basis, id }, expires_at, change_history };
@@ -265,12 +266,12 @@ impl StoreHolds {
     }
 
     fn in_flight(&self, key: StoreVersionHoldKey) -> Option<OrderedStoreHold> {
-        self.0.get(&key.id).filter(|hold| hold.watch_receipt.is_some() && hold.basis == key.basis).copied()
+        self.0.get(&key.id).filter(|hold| hold.watch_turn.is_some() && hold.basis == key.basis).copied()
     }
 
     fn find(&self, key: StoreVersionHoldKey, reader: [u8; 32], now: i64) -> Result<OrderedStoreHold> {
         self.0.get(&key.id)
-            .filter(|hold| hold.watch_receipt.is_none() && hold.reader == reader && hold.basis == key.basis && now < hold.expires_at_micros)
+            .filter(|hold| hold.watch_turn.is_none() && hold.reader == reader && hold.basis == key.basis && now < hold.expires_at_micros)
             .copied().ok_or_else(unavailable)
     }
 }
@@ -311,7 +312,7 @@ impl MultiDatabase {
     /// The receipt lookup and the in-flight byte turn share the writer lock
     /// with hold release and floor publication.
     pub(super) async fn enter_held_store_watch(
-        &mut self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, id: [u8; 16],
+        &mut self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, id: [u8; 16], receiver: [u8; 16],
     ) -> Result<StoreReadTurn> {
         if hold.basis.incarnation() != after.incarnation() || hold.basis.position() > after.position() {
             return Err(watch_gap());
@@ -328,20 +329,23 @@ impl MultiDatabase {
         }
         let mut turn = self.admit_store_turn(StoreReadPoint::Watch(after), Some(retained))?;
         let lower = self.lower();
-        let use_record = OrderedStoreHold { id, watch_receipt: Some(hold.id), ..retained };
+        let admission = OrderedStoreWatchTurn { receipt: hold.id, receiver };
+        let use_record = OrderedStoreHold { id, watch_turn: Some(admission), ..retained };
         self.state().store_holds.check_new(use_record, lower)?;
         self.append_control(lease, Record::StoreHold {
             change: StoreHoldChange::Retain(use_record), lower_bound_micros: lower,
         }).await?;
         turn.require_unexpired(self.upper())?;
-        turn.watch = Some(StoreVersionHoldKey { basis: hold.basis, id });
+        turn.watch = Some((StoreVersionHoldKey { basis: hold.basis, id }, admission));
         Ok(turn)
     }
 
-    pub(super) async fn finish_held_store_watch(&mut self, key: StoreVersionHoldKey, reader: [u8; 32]) -> Result<()> {
+    pub(super) async fn finish_held_store_watch(
+        &mut self, key: StoreVersionHoldKey, reader: [u8; 32], receiver: [u8; 16],
+    ) -> Result<()> {
         self.refresh().await?;
         let Some(hold) = self.state().store_holds.in_flight(key) else { return Ok(()); };
-        if hold.reader != reader {
+        if hold.reader != reader || hold.watch_turn.is_none_or(|turn| turn.receiver != receiver) {
             return Err(stale_read_turn());
         }
         let lease = self.settled_store_writer()?;
@@ -416,7 +420,8 @@ impl MultiDatabase {
         require_plain_store(index)?;
         if basis != turn.basis || writer.epoch.0 != turn.epoch || self.state().generation != turn.generation
             || index.store_writer_fence_position() != turn.writer_fence_position
-            || turn.watch.is_some_and(|key| self.state().store_holds.in_flight(key).is_none())
+            || turn.watch.is_some_and(|(key, admission)| self.state().store_holds.in_flight(key)
+                .is_none_or(|hold| hold.watch_turn != Some(admission)))
             || !self.store_reads.0.iter().any(|read| read.retained_from == turn.retained_from && read.owner.ptr_eq(&owner))
         {
             return Err(stale_read_turn());

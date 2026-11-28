@@ -692,7 +692,7 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
 
     let StoreVersionHoldReply::Held(second) = writes.store_version_hold(reader, retain).await.unwrap() else { panic!("expected a hold"); };
     assert_ne!(first.key.id, second.key.id);
-    let turn = database.lock().await.enter_held_store_watch(current, reader, second.key, [9; 16]).await.unwrap();
+    let turn = database.lock().await.enter_held_store_watch(current, reader, second.key, [9; 16], [8; 16]).await.unwrap();
     cluster.at(35);
     assert_eq!(database.lock().await.check_local_store_basis(current, Some(&turn)).await.unwrap_err().code,
         "rtdb/cursor-expired");
@@ -703,7 +703,7 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
     assert_eq!(purge().await.unwrap_err().code, "rtdb.store/purge-retention");
     drop(turn);
     assert_eq!(purge().await.unwrap_err().code, "rtdb.store/purge-retention");
-    database.lock().await.finish_held_store_watch(StoreVersionHoldKey { basis: old, id: [9; 16] }, reader).await.unwrap();
+    database.lock().await.finish_held_store_watch(StoreVersionHoldKey { basis: old, id: [9; 16] }, reader, [8; 16]).await.unwrap();
     purge().await.unwrap();
     assert_eq!(writes.store_version_hold(reader, StoreVersionHoldRequest::Reopen(second.key)).await.unwrap_err().code,
         "rtdb/cursor-expired");
@@ -741,7 +741,7 @@ async fn store_version_hold_survives_checkpoint_and_replacement_writer() {
     assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap(), StoreVersionHoldReply::Held(hold));
     assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
         "rtdb.store/purge-retention");
-    assert_eq!(successor.enter_held_store_watch(current, reader, hold.key, [9; 16]).await.err().unwrap().code,
+    assert_eq!(successor.enter_held_store_watch(current, reader, hold.key, [9; 16], [8; 16]).await.err().unwrap().code,
         "rtdb/cursor-expired");
     let release = StoreVersionHoldRequest::Release(hold.key);
     assert_eq!(successor.store_version_hold(reader, release).await.unwrap(), StoreVersionHoldReply::Released(hold.key));
@@ -778,16 +778,16 @@ async fn store_watch_receipt_fences_journal_trim_through_release_and_drain() {
     let ordinary = writer.enter_local_store_watch(control).await.unwrap();
     writer.check_local_store_basis(control, Some(&ordinary)).await.unwrap();
     drop(ordinary);
-    assert_eq!(writer.enter_held_store_watch(control, [2; 32], held.key, [9; 16]).await.err().unwrap().code,
+    assert_eq!(writer.enter_held_store_watch(control, [2; 32], held.key, [9; 16], [8; 16]).await.err().unwrap().code,
         "rtdb/cursor-expired");
-    let turn = writer.enter_held_store_watch(control, reader, held.key, [9; 16]).await.unwrap();
+    let turn = writer.enter_held_store_watch(control, reader, held.key, [9; 16], [8; 16]).await.unwrap();
     writer.store_version_hold(reader, StoreVersionHoldRequest::Release(held.key)).await.unwrap();
-    assert_eq!(writer.enter_held_store_watch(control, reader, held.key, [9; 16]).await.err().unwrap().code,
+    assert_eq!(writer.enter_held_store_watch(control, reader, held.key, [9; 16], [8; 16]).await.err().unwrap().code,
         "rtdb/cursor-expired");
     writer.check_local_store_basis(control, Some(&turn)).await.unwrap();
     assert!(writer.checkpoint_retained_suffix(1).await.unwrap().is_none());
     drop(turn);
-    writer.finish_held_store_watch(StoreVersionHoldKey { basis: old, id: [9; 16] }, reader).await.unwrap();
+    writer.finish_held_store_watch(StoreVersionHoldKey { basis: old, id: [9; 16] }, reader, [8; 16]).await.unwrap();
 
     let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
     let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
@@ -816,7 +816,7 @@ async fn admitted_store_watch_retains_history_after_release_and_writer_replaceme
     let StoreVersionHoldReply::Held(hold) = writer.store_version_hold(reader, acquire).await.unwrap()
         else { panic!("expected a watch receipt"); };
     let use_key = StoreVersionHoldKey { basis: old, id: [9; 16] };
-    let body = writer.enter_held_store_watch(current, reader, hold.key, use_key.id).await.unwrap();
+    let body = writer.enter_held_store_watch(current, reader, hold.key, use_key.id, [8; 16]).await.unwrap();
     writer.store_version_hold(reader, StoreVersionHoldRequest::Release(hold.key)).await.unwrap();
 
     cluster.at(200);
@@ -827,13 +827,14 @@ async fn admitted_store_watch_retains_history_after_release_and_writer_replaceme
     assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
         "rtdb.store/purge-retention");
     assert!(successor.checkpoint_retained_suffix(1).await.unwrap().is_none());
-    assert_eq!(successor.finish_held_store_watch(use_key, [2; 32]).await.unwrap_err().code, "rtdb.store/stale-read-turn");
+    assert_eq!(successor.finish_held_store_watch(use_key, [2; 32], [8; 16]).await.unwrap_err().code, "rtdb.store/stale-read-turn");
+    assert_eq!(successor.finish_held_store_watch(use_key, reader, [7; 16]).await.unwrap_err().code, "rtdb.store/stale-read-turn");
 
     drop(body);
     // The fixture observes the original provider's body drain in process.
     // Production only invokes this settlement from its receiver's drop.
-    successor.finish_held_store_watch(use_key, reader).await.unwrap();
-    successor.finish_held_store_watch(use_key, reader).await.unwrap();
+    successor.finish_held_store_watch(use_key, reader, [8; 16]).await.unwrap();
+    successor.finish_held_store_watch(use_key, reader, [8; 16]).await.unwrap();
     successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap();
 }
 
@@ -853,12 +854,12 @@ async fn store_watch_receipt_survives_trim_of_controls_after_its_cut() {
         else { panic!("expected a watch receipt"); };
     let control = writer.fresh_history().await.unwrap().through;
     assert!(control > current.position());
-    let active = writer.enter_held_store_watch(current, reader, hold.key, [9; 16]).await.unwrap();
+    let active = writer.enter_held_store_watch(current, reader, hold.key, [9; 16], [8; 16]).await.unwrap();
     writer.checkpoint(Vec::new()).await.unwrap();
     assert_eq!(writer.fresh_history().await.unwrap().after_floor, current.position());
     writer.check_local_store_basis(current, Some(&active)).await.unwrap();
     drop(active);
-    writer.finish_held_store_watch(StoreVersionHoldKey { basis: current, id: [9; 16] }, reader).await.unwrap();
+    writer.finish_held_store_watch(StoreVersionHoldKey { basis: current, id: [9; 16] }, reader, [8; 16]).await.unwrap();
     assert_eq!(writer.enter_local_store_watch(old).await.err().unwrap().code, "rtdb/cursor-expired");
 
     cluster.at(200);
@@ -871,7 +872,7 @@ async fn store_watch_receipt_survives_trim_of_controls_after_its_cut() {
     let history = successor.fresh_history().await.unwrap();
     assert_eq!(history.groups.len(), 1);
     assert_eq!(history.groups[0].cut.basis, new);
-    let _turn = successor.enter_held_store_watch(current, reader, hold.key, [9; 16]).await.unwrap();
+    let _turn = successor.enter_held_store_watch(current, reader, hold.key, [9; 16], [8; 16]).await.unwrap();
     assert!(successor.checkpoint_retained_suffix(1).await.unwrap().is_none());
 }
 
