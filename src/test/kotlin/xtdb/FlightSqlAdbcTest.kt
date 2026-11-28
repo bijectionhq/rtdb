@@ -1666,6 +1666,35 @@ class FlightSqlAdbcTest {
     }
 
     @Test
+    fun `a prepared ticket keeps its parameter schema and snapshot after a rebind`() {
+        insertData("INSERT INTO foo RECORDS {_id: 1}")
+
+        fsqlClient.prepare("SELECT _id, ? AS x, ? AS y FROM foo ORDER BY _id", *emptyCallOpts).use { ps ->
+            val first = withParams(42, 43) { params ->
+                ps.setParameters(params)
+                ps.execute(*emptyCallOpts)
+            }
+
+            insertData("INSERT INTO foo RECORDS {_id: 2}")
+            val field = Field.nullable("client-name", ArrowType.Utf8())
+            val second = VectorSchemaRoot.create(Schema(listOf(field, field)), al).use { params ->
+                (params.getVector(0) as VarCharVector).setSafe(0, Text("é"))
+                (params.getVector(1) as VarCharVector).setSafe(0, Text("second"))
+                params.rowCount = 1
+                ps.setParameters(params)
+                ps.execute(*emptyCallOpts)
+            }
+
+            assertEquals(first.schema, first.streamedSchema())
+            assertEquals(second.schema, second.streamedSchema())
+            assertEquals(listOf(ArrowType.Int(64, true), ArrowType.Int(64, true)), first.schema.fields.drop(1).map { it.type })
+            assertEquals(listOf(ArrowType.Utf8(), ArrowType.Utf8()), second.schema.fields.drop(1).map { it.type })
+            assertEquals(listOf(mapOf("_id" to 1L, "x" to 42L, "y" to 43L)), first.readRows(plainClient()))
+            assertEquals(listOf(1L, 2L).map { mapOf("_id" to it, "x" to "é", "y" to "second") }, second.readRows())
+        }
+    }
+
+    @Test
     fun `a prepared update with no parameters bound runs once`() {
         fsqlClient.prepare("INSERT INTO foo RECORDS {_id: 1}", *emptyCallOpts).use { ps ->
             ps.executeUpdate(*emptyCallOpts)

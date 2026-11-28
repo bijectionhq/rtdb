@@ -108,6 +108,7 @@
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- A Flight SQL statement ticket carries its SQL, Arrow parameters, read basis and clock for stateless redemption within the transport size limit.
 -- The ticket keeps the parameter types admitted for its result description across later bindings of the prepared statement.
+-- JVM GetFlightInfo can use plain scalar parameter fields captured when writing the ticket IPC, and reads the first record batch for other layouts before planning the result schema.
 -- A run ticket is encoded in XTDB's `QueryTicket.Run` JSON (`type`, `dbName`, `sql`, base64 Arrow `params` and `basis` with the read cut as an XTDB snapshot token), and an empty ticket is `{"type":"empty"}`, so any session redeems it across restarts and against XTDB.
 -- A run ticket carries the RTDB-only `searchPath` field when the path differs from `public`.
 -- The read basis is acquired after awaiting the issuing session's writes, so the ticket carries the visible cut without a separate await floor.

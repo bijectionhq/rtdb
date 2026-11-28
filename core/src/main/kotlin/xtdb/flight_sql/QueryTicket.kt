@@ -14,6 +14,9 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.ipc.ArrowStreamReader
 import org.apache.arrow.vector.ipc.ArrowStreamWriter
+import org.apache.arrow.vector.types.FloatingPointPrecision
+import org.apache.arrow.vector.types.pojo.ArrowType
+import org.apache.arrow.vector.types.pojo.Field
 import xtdb.InternalApi
 import xtdb.api.error.Incorrect
 import xtdb.api.query.QueryBasis
@@ -23,14 +26,35 @@ import java.io.ByteArrayOutputStream
 import java.nio.channels.Channels
 import java.util.Base64
 
+private fun Field.hasPlainParameterLayout(): Boolean {
+    if (dictionary != null || metadata.isNotEmpty() || children.isNotEmpty()) return false
+
+    return when (val type = type) {
+        is ArrowType.Bool, is ArrowType.Utf8, is ArrowType.Binary -> true
+        is ArrowType.Int -> type.isSigned && when (type.bitWidth) {
+            8, 16, 32, 64 -> true
+            else -> false
+        }
+        is ArrowType.FloatingPoint ->
+            type.precision == FloatingPointPrecision.SINGLE || type.precision == FloatingPointPrecision.DOUBLE
+        else -> false
+    }
+}
+
 @Serializable(QueryParams.Serde::class)
-internal class QueryParams private constructor(private val bytes: ByteArray) {
+internal class QueryParams private constructor(
+    private val bytes: ByteArray,
+    private val writtenFields: List<Field>? = null,
+) {
 
     fun <R> read(allocator: BufferAllocator, f: (VectorSchemaRoot) -> R): R =
         ArrowStreamReader(ByteArrayInputStream(bytes), allocator).use { rdr ->
             rdr.loadNextBatch()
             f(rdr.vectorSchemaRoot)
         }
+
+    fun parameterFields(allocator: BufferAllocator): List<Field> =
+        writtenFields ?: read(allocator) { it.schema.fields }
 
     internal object Serde : KSerializer<QueryParams> {
         override val descriptor = PrimitiveSerialDescriptor("xtdb.flight-sql.query-params", PrimitiveKind.STRING)
@@ -42,17 +66,25 @@ internal class QueryParams private constructor(private val bytes: ByteArray) {
     }
 
     companion object {
-        fun of(root: VectorSchemaRoot) = QueryParams(
-            ByteArrayOutputStream()
-                .also { out ->
-                    ArrowStreamWriter(root, null, Channels.newChannel(out)).use { wtr ->
-                        wtr.start()
-                        wtr.writeBatch()
-                        wtr.end()
-                    }
+        fun fromFlightRoot(root: VectorSchemaRoot): QueryParams {
+            val out = ByteArrayOutputStream()
+            ArrowStreamWriter(root, null, Channels.newChannel(out)).use { wtr ->
+                wtr.start()
+                wtr.writeBatch()
+                wtr.end()
+            }
+
+            val vectors = root.fieldVectors
+            val fields = root.schema.fields.takeIf { fields ->
+                fields.size == vectors.size && fields.indices.all { idx ->
+                    val field = fields[idx]
+                    val vector = vectors[idx]
+                    field.hasPlainParameterLayout() && field == vector.field && vector.valueCount == root.rowCount
                 }
-                .toByteArray()
-        )
+            }
+
+            return QueryParams(out.toByteArray(), fields)
+        }
     }
 }
 

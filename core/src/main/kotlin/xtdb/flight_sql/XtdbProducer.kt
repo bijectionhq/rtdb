@@ -407,7 +407,7 @@ class XtdbProducer(
         ackStream.reportingErrors {
             val ps = preparedStatement(ctx, cmd.preparedStatementHandle)
             flightStream.next()
-            ps.params = if (flightStream.bindsNoParameters) null else QueryParams.of(flightStream.root)
+            ps.params = if (flightStream.bindsNoParameters) null else QueryParams.fromFlightRoot(flightStream.root)
             ackStream.onCompleted()
         }
     }
@@ -451,8 +451,8 @@ class XtdbProducer(
 
         val schema =
             if (params == null) stmt.executeSchema()
-            else stmt.executeSchema(params.read(allocator) { root ->
-                root.schema.fields.mapIndexed { idx, f -> Field("?_$idx", f.fieldType, f.children) }
+            else stmt.executeSchema(params.parameterFields(allocator).mapIndexed { idx, f ->
+                Field("?_$idx", f.fieldType, f.children)
             })
 
         return flightInfo(ticket, schema, descriptor)
