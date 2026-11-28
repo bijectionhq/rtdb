@@ -2513,6 +2513,7 @@ surface QueryAccess {
         -- A spatial refinement scan can project the requested put children from persisted pages.
         -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
         -- A point read can overlap reads of selected pages under a retained file layout and consumes their results in page order.
+        -- After a memory refusal, a point read releases the failed attempt's read-ahead reservations before retrying without per-file read-ahead.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- A literal false filter rejects its input before predicates above it can evaluate those rows.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.

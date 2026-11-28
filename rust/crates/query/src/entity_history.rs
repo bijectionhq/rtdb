@@ -107,10 +107,21 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>, read_ahea
                 Ok((rows, reservation, key_bytes))
             }.boxed());
         }
-        let Some((rows, _held, key_bytes)) = reads.try_next().await? else { break; };
-        count = count.saturating_add(rows.len());
-        retained_keys = retained_keys.saturating_add(key_bytes);
-        charge_history(&mut charge, count, retained_keys)?;
+        let next = reads.try_next().await.and_then(|batch| {
+            if let Some((rows, _, key_bytes)) = &batch {
+                count = count.saturating_add(rows.len());
+                retained_keys = retained_keys.saturating_add(*key_bytes);
+                charge_history(&mut charge, count, retained_keys)?;
+            }
+            Ok(batch)
+        });
+        let Some((rows, _held, _)) = (match next {
+            Err(error) if read_ahead && error.is(AnomalyKind::ResourceExhausted) => {
+                while reads.try_next().await.transpose().is_some() {}
+                return Err(error);
+            }
+            result => result?,
+        }) else { break; };
         for (row, key) in rows {
             if !same_identity(&mut identities, row.header.iid, key) { return Ok(None); }
             histories.entry(row.header.iid).or_default().push(row);

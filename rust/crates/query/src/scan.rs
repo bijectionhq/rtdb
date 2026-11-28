@@ -2316,13 +2316,13 @@ impl ScanVerifier<'_> {
             if pages.len() > 1 && memory.snapshot_budget().is_some()
                 && let Ok(buffering) = memory.reserve(POINT_READ_AHEAD_WORKSPACE) && file.open_cached_layout(memory)
             {
-                let file = &file;
+                let opened_file = &file;
                 let result = visit_buffered_pages(pages.iter().map(|page| *page as usize), |page| Box::pin(async move {
-                    file.storage.record_batch_requested();
-                    if let Some(cached) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+                    opened_file.storage.record_batch_requested();
+                    if let Some(cached) = opened_file.storage.view::<CachedPage>(&opened_file.key, View::Page(page)) {
                         return Ok(Arc::clone(&cached.batch));
                     }
-                    let (batch, lease) = file.decode_opened_event_page(page, memory, DataProjection::PutColumns(put_columns), true).await?;
+                    let (batch, lease) = opened_file.decode_opened_event_page(page, memory, DataProjection::PutColumns(put_columns), true).await?;
                     IndexBatch::from_owned(OwnedBatch::with_reservation(batch, lease)?)
                 }), |page, batch| {
                     self.execution.context.check_cancelled()?;
@@ -2331,7 +2331,10 @@ impl ScanVerifier<'_> {
                 }).await;
                 drop(buffering);
                 match result {
-                    Err(error) if error.is(AnomalyKind::ResourceExhausted) => loaded.clear(),
+                    Err(error) if error.is(AnomalyKind::ResourceExhausted) => {
+                        loaded.clear();
+                        file.opened = None;
+                    }
                     result => { result?; return Ok(loaded); }
                 }
             }
@@ -4839,6 +4842,32 @@ mod tests {
             assert_eq!(visited, [events[0].iid]);
             if continue_after_first { assert!(result.is_err()); } else { assert_eq!(result.unwrap(), None); }
         }
+    }
+
+    #[tokio::test]
+    async fn buffered_primary_points_drain_pending_page_reservations_on_exhaustion() {
+        let memory = &MemoryBudget::new(1024);
+        let both_reads = &tokio::sync::Barrier::new(2);
+        let finished = &std::sync::atomic::AtomicBool::new(false);
+        let read = |page| -> BoxFuture<'_, Result<Arc<MemoryReservation>>> {
+            Box::pin(async move {
+                if page == 0 {
+                    both_reads.wait().await;
+                    return memory.reserve(2048);
+                }
+                let lease = memory.reserve(1024)?;
+                both_reads.wait().await;
+                tokio::task::yield_now().await;
+                finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(lease)
+            })
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5),
+            visit_buffered_pages([0, 1].into_iter(), read, |_, _| panic!("The first page failed")),
+        ).await.unwrap();
+        assert!(result.unwrap_err().is(AnomalyKind::ResourceExhausted));
+        assert!(finished.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[tokio::test]
