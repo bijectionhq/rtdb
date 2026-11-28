@@ -246,11 +246,11 @@ impl Call {
     }
 
     #[cfg(feature = "multi")]
-    pub(crate) fn require_retained_watch_transport(&self) -> Result<(), Status> {
+    pub(crate) fn require_retained_store_transport(&self) -> Result<(), Status> {
         if self.isolated_watch && self.session.store_drain_enrolled && self.egress.is_some() {
             return Ok(());
         }
-        Err(Status::failed_precondition("A retained Store watch requires its enrolled, isolated gateway transport"))
+        Err(Status::failed_precondition("A retained Store read requires its enrolled, isolated gateway transport"))
     }
 
     #[cfg(feature = "multi")]
@@ -795,6 +795,7 @@ impl FlightService for Service {
         #[cfg(feature = "multi")]
         if version_hold {
             reply.metadata_mut().insert(crate::v1::store::HOLD_VERSION_HEADER, tonic::metadata::MetadataValue::from_static("5"));
+            reply.metadata_mut().insert(crate::v1::store::READ_HOLD_HEADER, tonic::metadata::MetadataValue::from_static("1"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());

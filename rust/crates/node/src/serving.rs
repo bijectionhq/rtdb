@@ -457,6 +457,13 @@ pub trait ServingDriver: Send + Sync {
     }
 
     #[cfg(feature = "multi")]
+    async fn enter_held_store_read(
+        &self, _basis: Basis, _reader: [u8; 32], _hold: StoreVersionHoldKey, _receiver: rtdb_format::journal::StoreWatchReceiver, _cancellation: &CancellationToken,
+    ) -> Result<StoreReadTurn> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.store/hold-unsupported", "This route cannot admit an exact retained Store read"))
+    }
+
+    #[cfg(feature = "multi")]
     async fn enter_held_store_watch(
         &self, _after: Basis, _reader: [u8; 32], _hold: StoreVersionHoldKey, _receiver: rtdb_format::journal::StoreWatchReceiver, _cancellation: &CancellationToken,
     ) -> Result<StoreReadTurn> {

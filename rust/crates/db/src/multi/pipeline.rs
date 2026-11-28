@@ -14,7 +14,7 @@ use rtdb_tx::transact::{
     TransactPipeline, TransactState, TransactionRecord, TxKey, ROW_CUSTODY, prepare_custody, workload,
 };
 use rtdb_index::branches::{BranchCut, store::{KeyRange, StoreWriterClaim}};
-use rtdb_types::{Anomaly, AnomalyCategory, MemoryReservation, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryReservation, Result, Timestamp, rtdb_v1::{At, Basis, ClaimVerifier, LabelScope}};
 use tokio::{
     sync::{Mutex, OnceCell, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
@@ -26,7 +26,7 @@ use crate::journal::{PreparedTimedAppend, TimedOriginalProof};
 use super::{
     Entry, Lease, MultiDatabase, PinnedExport, Role, StoreReadTurn, StoreVersionHoldKey, StoreVersionHoldReply,
     StoreVersionHoldRequest, Stream, Uuid, missing_receipt, next, no_writer,
-    store_hold::StoreWatchDrain,
+    store_hold::{StoreReadPoint, StoreWatchDrain},
 };
 use super::timed_store::{TimedStoreAppend, TimedStoreReceipt};
 
@@ -78,8 +78,8 @@ enum Command {
         request: StoreVersionHoldRequest,
         reply: Reply<StoreVersionHoldReply>,
     },
-    EnterStoreWatch {
-        after: Basis,
+    EnterHeldStoreRead {
+        point: StoreReadPoint,
         reader: [u8; 32],
         hold: StoreVersionHoldKey,
         receiver: StoreWatchReceiver,
@@ -160,6 +160,18 @@ impl WritePipeline {
     pub async fn enter_held_store_watch(
         &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: StoreWatchReceiver,
     ) -> Result<StoreReadTurn> {
+        self.enter_held_store_turn(StoreReadPoint::Watch(after), reader, hold, receiver).await
+    }
+
+    pub async fn enter_held_store_read(
+        &self, basis: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: StoreWatchReceiver,
+    ) -> Result<StoreReadTurn> {
+        self.enter_held_store_turn(StoreReadPoint::Read(At::Exactly(basis)), reader, hold, receiver).await
+    }
+
+    async fn enter_held_store_turn(
+        &self, point: StoreReadPoint, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: StoreWatchReceiver,
+    ) -> Result<StoreReadTurn> {
         let id = *Uuid::new_v4().as_bytes();
         let key = StoreVersionHoldKey { basis: hold.basis, id };
         let input = self.input.clone();
@@ -171,7 +183,7 @@ impl WritePipeline {
         });
         // The queue owns the drain before attempting the append. A lost
         // append acknowledgement or a cancelled caller cannot lose it.
-        self.request(|reply| Command::EnterStoreWatch { after, reader, hold, receiver, id, drain, reply }).await
+        self.request(|reply| Command::EnterHeldStoreRead { point, reader, hold, receiver, id, drain, reply }).await
     }
 
     /// Keeps an admitted publication in the writer's queue after the caller drops its reply.
@@ -516,9 +528,9 @@ async fn run(
                 let result = Box::pin(async { database.lock().await.store_version_hold(reader, request).await }).await;
                 let _ = reply.send(result);
             }
-            Command::EnterStoreWatch { after, reader, hold, receiver, id, drain, reply } => {
+            Command::EnterHeldStoreRead { point, reader, hold, receiver, id, drain, reply } => {
                 let result = Box::pin(async {
-                    database.lock().await.enter_held_store_watch(after, reader, hold, id, receiver).await
+                    database.lock().await.enter_held_store_turn(point, reader, hold, id, receiver).await
                 }).await.map(|mut turn| {
                     turn.settle_watch_on_drop(drain);
                     turn
@@ -530,7 +542,7 @@ async fn run(
                     database.lock().await.finish_held_store_watch(key, reader, receiver).await
                 }).await;
                 if let Err(error) = result {
-                    tracing::warn!(code = %error.code, "An ordered Store watch turn still needs settlement");
+                    tracing::warn!(code = %error.code, "An ordered Store read turn still needs settlement");
                 }
             }
             Command::BoundJournal { limit, reply } => {

@@ -61,6 +61,8 @@ pub(super) use sizes::STORAGE_SIZES;
 pub(crate) const HOLD_VERSION: &str = "rtdb.store.v1.HoldVersion";
 #[cfg(feature = "multi")]
 pub(crate) const HOLD_VERSION_HEADER: &str = "x-rtdb-store-hold-version";
+#[cfg(feature = "multi")]
+pub(crate) const READ_HOLD_HEADER: &str = "x-rtdb-store-read-hold";
 pub(crate) const ACTIONS: &[&str] = &[
     READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR, FENCE_WRITER, CLAIM_WRITER,
     #[cfg(feature = "multi")]
@@ -140,7 +142,10 @@ impl ::store::source::RangeSource for StoreRanges<'_> {
                 let after = read.after.clone().filter(|after| range.contains(after));
                 StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: read.reverse }
             });
-            let batch = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation).await?;
+            let batch = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation,
+                #[cfg(feature = "multi")]
+                None,
+            ).await?;
             {
                 let mut oldest = self.oldest.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
                 #[cfg(feature = "multi")]
@@ -287,6 +292,7 @@ impl Service {
         &self, driver: &dyn rtdb_node::serving::ServingDriver,
         reads: &mut (dyn ExactSizeIterator<Item = StoreRead> + Send), at: At, incarnation: [u8; 16], now: Timestamp,
         cancellation: &tokio_util::sync::CancellationToken,
+        #[cfg(feature = "multi")] retained: Option<rtdb_node::serving::StoreReadTurn>,
     ) -> Result<StoreBatch, Status> {
         let expected_pages = reads.len();
         #[cfg(feature = "multi")]
@@ -302,7 +308,10 @@ impl Service {
             }
             (pages, delivery, None)
         } else {
-            let hold = driver.enter_local_store_read(at, cancellation).await.map_err(error::anomaly)?;
+            let hold = match retained {
+                Some(turn) => Some(turn),
+                None => driver.enter_local_store_read(at, cancellation).await.map_err(error::anomaly)?,
+            };
             let at = hold.as_ref().map_or(at, |hold| At::Exactly(hold.basis()));
             let pages = driver.read_store_batch(reads, at, now, cancellation).await.map_err(error::anomaly)?;
             (pages, None, hold)
@@ -386,6 +395,29 @@ impl Service {
         reads_within(scope, &read_ranges)?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let at = request.at.map_or(At::Latest, |at| At::Exactly(Basis::new(incarnation, at)));
+        #[cfg(feature = "multi")]
+        let (retained, retention) = match request.retention {
+            Some(key) => {
+                let At::Exactly(basis) = at else {
+                    return Err(error::incorrect("A retained Store read states its exact Version"));
+                };
+                if self.follower_only() || self.follower().is_some() || call.session.fresh_replica {
+                    return Err(error::unsupported("rtdb.store.v1.Read with exact retention"));
+                }
+                let (reader, receiver) = hold_version::retained_receiver(call, incarnation)?;
+                let key = hold_version::hold_key(incarnation, key)?;
+                let turn = driver.enter_held_store_read(basis, reader, key, receiver, &call.cancellation)
+                    .await.map_err(error::anomaly)?;
+                (Some(turn), Some(hold_version::encode_key(key)))
+            },
+            None => (None, None),
+        };
+        #[cfg(not(feature = "multi"))]
+        let retention = if request.retention.is_some() {
+            return Err(error::unsupported("rtdb.store.v1.Read with exact retention"));
+        } else {
+            None
+        };
         let limit = (request.limit as usize).clamp(1, MAX_PAGE_ENTRIES);
         let projection = match proto::Projection::try_from(request.projection)
             .map_err(|_| error::incorrect("Invalid store projection"))?
@@ -403,7 +435,10 @@ impl Service {
             StoreRead { range, after, limit, projection, filter: filter.clone(), reverse: request.reverse }
         });
         let clock = self.0.node.now();
-        let batch = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation).await?;
+        let batch = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation,
+            #[cfg(feature = "multi")]
+            retained,
+        ).await?;
         let pages = batch.pages.into_iter().map(|page| proto::RangePage {
             entries: page.entries.into_iter().map(|entry| proto::Entry {
                 key: entry.key, value: entry.value, written: entry.written.position(),
@@ -415,6 +450,7 @@ impl Service {
             at: batch.basis.position(),
             pages,
             clock_micros: Some(clock.0),
+            retention,
         }.encode_to_vec();
         #[cfg(feature = "multi")]
         {
@@ -611,16 +647,8 @@ impl Service {
                 if self.follower_only() || call.session.fresh_replica {
                     return Err(error::unsupported("rtdb.store.v1.Watch with exact retention"));
                 }
-                call.require_retained_watch_transport()?;
-                let account = hold_version::reader_account(call)?;
-                let reader = hold_version::reader_identity(incarnation, account);
+                let (reader, receiver) = hold_version::retained_receiver(call, incarnation)?;
                 let key = hold_version::hold_key(incarnation, retention)?;
-                let session = uuid::Uuid::parse_str(&call.session.id)
-                    .map_err(|_| Status::internal("The Store session has no receiver identity"))?;
-                let receiver = rtdb_format::journal::StoreWatchReceiver {
-                    session: *session.as_bytes(),
-                    drain_key: call.store_watch_signer()?.public_key(),
-                };
                 let turn = driver.enter_held_store_watch(original, reader, key, receiver, &call.cancellation)
                     .await.map_err(error::anomaly)?;
                 (Some(turn), Some(hold_version::encode_key(key)))

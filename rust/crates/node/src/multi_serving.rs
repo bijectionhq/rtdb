@@ -1032,6 +1032,16 @@ impl ServingDriver for MultiServing {
         }).await
     }
 
+    async fn enter_held_store_read(
+        &self, basis: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: rtdb_format::journal::StoreWatchReceiver, cancellation: &CancellationToken,
+    ) -> Result<StoreReadTurn> {
+        if self.classic_workload_fence.is_some() {
+            return Err(workload::denied());
+        }
+        cancellation.run_until_cancelled(self.serve(self.writes.enter_held_store_read(basis, reader, hold, receiver)))
+            .await.ok_or_else(interrupted)?
+    }
+
     async fn enter_held_store_watch(
         &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: rtdb_format::journal::StoreWatchReceiver, cancellation: &CancellationToken,
     ) -> Result<StoreReadTurn> {

@@ -747,8 +747,23 @@ async fn store_version_hold_survives_checkpoint_and_replacement_writer() {
         "rtdb.store/purge-retention");
     assert_eq!(successor.enter_held_store_watch(current, reader, hold.key, [9; 16], watch_receiver(8)).await.err().unwrap().code,
         "rtdb/cursor-expired");
+    use super::store_hold::StoreReadPoint;
+    let receiver = watch_receiver(8);
+    let id = [9; 16];
+    let wrong = StoreReadPoint::Read(At::Exactly(current));
+    assert_eq!(successor.enter_held_store_turn(wrong, reader, hold.key, id, receiver).await.err().unwrap().code,
+        "rtdb/cursor-expired");
+    let exact = StoreReadPoint::Read(At::Exactly(old));
+    let turn = successor.enter_held_store_turn(exact, reader, hold.key, id, receiver).await.unwrap();
     let release = StoreVersionHoldRequest::Release(hold.key);
     assert_eq!(successor.store_version_hold(reader, release).await.unwrap(), StoreVersionHoldReply::Released(hold.key));
+    successor.check_local_store_basis(old, Some(&turn)).await.unwrap();
+    drop(turn);
+    assert_eq!(successor.enter_held_store_turn(exact, reader, hold.key, id, receiver).await.err().unwrap().code,
+        "rtdb/cursor-expired");
+    assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
+        "rtdb.store/purge-retention");
+    successor.finish_held_store_watch(StoreVersionHoldKey { basis: old, id }, reader, receiver).await.unwrap();
     successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap();
     assert_eq!(successor.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
 }

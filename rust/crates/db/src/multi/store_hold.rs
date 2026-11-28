@@ -24,6 +24,7 @@ pub(super) fn stale_read_turn() -> Anomaly {
 pub struct StoreReadTurn {
     basis: Basis,
     retained_from: Basis,
+    change_history: bool,
     deadline: Option<StoreWatchDeadline>,
     epoch: u64,
     generation: u64,
@@ -94,7 +95,7 @@ impl StoreReads {
         self.0.push(InFlightStoreRead {
             retained_from: turn.retained_from,
             owner: Arc::downgrade(&turn.owner),
-            change_history: turn.deadline.is_some(),
+            change_history: turn.change_history,
         });
     }
 
@@ -162,8 +163,8 @@ fn retains(hold: &OrderedStoreHold, lower: i64) -> bool {
     hold.watch_turn.is_some() || lower < hold.expires_at_micros
 }
 
-fn valid_watch_admission(hold: &OrderedStoreHold) -> bool {
-    hold.watch_turn.is_none_or(|turn| hold.change_history && turn.receipt != [0; 16]
+fn valid_read_admission(hold: &OrderedStoreHold) -> bool {
+    hold.watch_turn.is_none_or(|turn| turn.receipt != [0; 16]
         && turn.receipt != hold.id && turn.receiver.session != [0; 16] && turn.receiver.drain_key != [0; 32])
 }
 
@@ -177,7 +178,7 @@ impl StoreHolds {
             || holds.iter().any(|hold| hold.basis.incarnation() != head.incarnation()
                 || !(floor..=head.position()).contains(&hold.basis.position())
                 || hold.id == [0; 16] || hold.reader == [0; 32] || hold.expires_at_micros == i64::MIN
-                || !valid_watch_admission(hold))
+                || !valid_read_admission(hold))
         {
             return Err(invalid_hold("The checkpoint has an invalid Store hold inventory"));
         }
@@ -211,15 +212,15 @@ impl StoreHolds {
 
     fn check_new(&self, hold: OrderedStoreHold, lower: i64) -> Result<()> {
         if hold.id == [0; 16] || hold.reader == [0; 32] || self.0.contains_key(&hold.id) || hold.expires_at_micros <= lower
-            || !valid_watch_admission(&hold)
+            || !valid_read_admission(&hold)
         {
             return Err(invalid_hold("A Store hold must be new, live and bound to its reader"));
         }
         if let Some(turn) = hold.watch_turn {
             let key = StoreVersionHoldKey { basis: hold.basis, id: turn.receipt };
             let receipt = self.find(key, hold.reader, lower)?;
-            if !receipt.change_history || receipt.expires_at_micros != hold.expires_at_micros {
-                return Err(invalid_hold("A Store watch turn must match its exact live receipt"));
+            if (hold.change_history && !receipt.change_history) || receipt.expires_at_micros != hold.expires_at_micros {
+                return Err(invalid_hold("A Store read turn must match its exact live receipt"));
             }
         }
         if self.0.values().filter(|hold| retains(hold, lower)).count() >= MAX_DATABASE_HOLDS
@@ -318,7 +319,8 @@ fn watch_gap() -> Anomaly {
         "The exact Store watch has no current retention receipt")
 }
 
-enum StoreReadPoint {
+#[derive(Clone, Copy)]
+pub(super) enum StoreReadPoint {
     Read(At),
     Watch(Basis),
 }
@@ -344,10 +346,23 @@ impl MultiDatabase {
 
     /// The receipt lookup and the in-flight byte turn share the writer lock
     /// with hold release and floor publication.
+    #[cfg(test)]
     pub(super) async fn enter_held_store_watch(
         &mut self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, id: [u8; 16], receiver: StoreWatchReceiver,
     ) -> Result<StoreReadTurn> {
-        if hold.basis.incarnation() != after.incarnation() || hold.basis.position() > after.position() {
+        self.enter_held_store_turn(StoreReadPoint::Watch(after), reader, hold, id, receiver).await
+    }
+
+    pub(super) async fn enter_held_store_turn(
+        &mut self, point: StoreReadPoint, reader: [u8; 32], hold: StoreVersionHoldKey, id: [u8; 16], receiver: StoreWatchReceiver,
+    ) -> Result<StoreReadTurn> {
+        let change_history = match point {
+            StoreReadPoint::Read(At::Exactly(basis)) if basis == hold.basis => false,
+            StoreReadPoint::Watch(after)
+                if hold.basis.incarnation() == after.incarnation() && hold.basis.position() <= after.position() => true,
+            _ => return Err(watch_gap()),
+        };
+        if hold.basis.incarnation() != self.incarnation() {
             return Err(watch_gap());
         }
         self.stream.require_serving().await?;
@@ -357,13 +372,13 @@ impl MultiDatabase {
             return Err(prefix_unsettled());
         }
         let retained = self.state().store_holds.find(hold, reader, self.upper()).map_err(|_| watch_gap())?;
-        if !retained.change_history || hold.basis.position() < self.state().retained_changes_after()? {
+        if change_history && (!retained.change_history || hold.basis.position() < self.state().retained_changes_after()?) {
             return Err(watch_gap());
         }
-        let mut turn = self.admit_store_turn(StoreReadPoint::Watch(after), Some(retained))?;
+        let mut turn = self.admit_store_turn(point, Some(retained))?;
         let lower = self.lower();
         let admission = OrderedStoreWatchTurn { receipt: hold.id, receiver };
-        let use_record = OrderedStoreHold { id, watch_turn: Some(admission), ..retained };
+        let use_record = OrderedStoreHold { id, change_history, watch_turn: Some(admission), ..retained };
         self.state().store_holds.check_new(use_record, lower)?;
         self.append_control(lease, Record::StoreHold {
             change: StoreHoldChange::Retain(use_record), lower_bound_micros: lower,
@@ -448,6 +463,7 @@ impl MultiDatabase {
         let turn = StoreReadTurn {
             basis,
             retained_from,
+            change_history: matches!(point, StoreReadPoint::Watch(_)) && retained.is_some(),
             deadline,
             epoch: writer.epoch.0,
             generation: state.generation,

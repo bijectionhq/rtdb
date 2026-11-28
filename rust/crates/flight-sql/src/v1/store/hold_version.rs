@@ -49,6 +49,19 @@ pub(super) fn encode_key(key: StoreVersionHoldKey) -> proto::HeldVersionKey {
     proto::HeldVersionKey { hold_id: key.id.to_vec(), at: Some(key.basis.position()) }
 }
 
+pub(super) fn retained_receiver(
+    call: &Call, incarnation: [u8; 16],
+) -> Result<([u8; 32], rtdb_format::journal::StoreWatchReceiver), Status> {
+    call.require_retained_store_transport()?;
+    let reader = reader_identity(incarnation, reader_account(call)?);
+    let session = uuid::Uuid::parse_str(&call.session.id)
+        .map_err(|_| Status::internal("The Store session has no receiver identity"))?;
+    Ok((reader, rtdb_format::journal::StoreWatchReceiver {
+        session: *session.as_bytes(),
+        drain_key: call.store_watch_signer()?.public_key(),
+    }))
+}
+
 fn decode_request(request: proto::HoldVersionRequest) -> Result<([u8; 16], StoreVersionHoldRequest), Status> {
     let incarnation = incarnation(&request.incarnation)?;
     let operation = match request.operation.ok_or_else(|| error::incorrect("A Store hold names an operation"))? {

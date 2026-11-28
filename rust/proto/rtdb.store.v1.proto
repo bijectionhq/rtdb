@@ -71,6 +71,9 @@ message ReadRequest {
   // the range's end, and resume names the smallest key returned. A reverse
   // read equals the ascending read at the same version reversed.
   bool reverse = 11;
+  // Retains this exact Version through final delivery on the enrolled
+  // isolated writer session. Requires a matching same-reader receipt.
+  HeldVersionKey retention = 12;
 }
 
 enum Projection {
@@ -95,6 +98,7 @@ message ReadReply {
   // The store's clock sample in microseconds when this read opened, giving the
   // host one clock domain with commit stamps.
   optional int64 clock_micros = 4;
+  HeldVersionKey retention = 5;
 }
 
 message Write {
