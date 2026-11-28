@@ -101,16 +101,13 @@ impl ActivationStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "recovery::PublicationRecord", into = "recovery::PublicationRecord")]
 struct Publication {
     operation: Uuid,
     predecessor: Binding,
     manifest_digest: [u8; 32],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     destination_cell: Option<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<recovery::Completed>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     segment: Option<rtdb_lineage::LineageSegment>,
 }
 

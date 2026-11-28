@@ -6,6 +6,7 @@ use super::{
 
 use journal_contract::{Epoch, Journal, JournalError, Lsn, SealReceipt, StreamId, WriterSessionId};
 use rtdb_db::{AuthenticatedCut, InstallationAnchor};
+use rtdb_lineage::LineageSegment;
 use rtdb_stream_journal::ConsensusJournal;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
@@ -131,8 +132,9 @@ pub(super) struct Pending {
     sealed_head: Option<AuthenticatedCut>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(try_from = "CompletedRecord", into = "CompletedRecord")]
+/// A published recovery. Its source cut is the publication's lineage
+/// segment's, so it keeps only the anchor of its installation.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Completed {
     pub(super) ranked_closure: Option<super::ranked::RankedClosure>,
     loss_policy: LossPolicy,
@@ -141,12 +143,28 @@ pub(super) struct Completed {
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     journal_hold: Option<RetainedJournal>,
     objects_sha256: Option<[u8; 32]>,
-    authentication: Option<Authentication>,
+    anchor: Option<InstallationAnchor>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+/// The persisted form of a publication, which older activation readers
+/// parse: its recovery repeats the segment's source cut as `source_head`.
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CompletedRecord {
+pub(super) struct PublicationRecord {
+    operation: Uuid,
+    predecessor: Binding,
+    manifest_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_cell: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<CompletedRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segment: Option<LineageSegment>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ranked_closure: Option<super::ranked::RankedClosure>,
     loss_policy: LossPolicy,
@@ -165,36 +183,60 @@ pub(super) struct CompletedRecord {
     installation_anchor: Option<InstallationAnchor>,
 }
 
-impl TryFrom<CompletedRecord> for Completed {
+impl TryFrom<PublicationRecord> for Publication {
     type Error = &'static str;
 
-    fn try_from(record: CompletedRecord) -> std::result::Result<Self, Self::Error> {
+    fn try_from(record: PublicationRecord) -> std::result::Result<Self, Self::Error> {
+        let source = record.segment.as_ref().map(|segment| segment.source);
+        let recovery = record.recovery.map(|completed| {
+            if completed.source_head != source {
+                return Err("a recovery's source cut differs from its lineage segment's");
+            }
+            if Authentication::from_parts(completed.source_head, completed.installation_anchor).is_none() {
+                return Err(UNPAIRED_AUTHENTICATION);
+            }
+            Ok(Completed {
+                ranked_closure: completed.ranked_closure,
+                loss_policy: completed.loss_policy,
+                source_cut: completed.source_cut,
+                sealed_segment_end: completed.sealed_segment_end,
+                key_hold: completed.key_hold,
+                journal_hold: completed.journal_hold,
+                objects_sha256: completed.objects_sha256,
+                anchor: completed.installation_anchor,
+            })
+        }).transpose()?;
         Ok(Self {
-            ranked_closure: record.ranked_closure,
-            loss_policy: record.loss_policy,
-            source_cut: record.source_cut,
-            sealed_segment_end: record.sealed_segment_end,
-            key_hold: record.key_hold,
-            journal_hold: record.journal_hold,
-            objects_sha256: record.objects_sha256,
-            authentication: Authentication::from_parts(record.source_head, record.installation_anchor)
-                .ok_or(UNPAIRED_AUTHENTICATION)?,
+            operation: record.operation,
+            predecessor: record.predecessor,
+            manifest_digest: record.manifest_digest,
+            destination_cell: record.destination_cell,
+            recovery,
+            segment: record.segment,
         })
     }
 }
 
-impl From<Completed> for CompletedRecord {
-    fn from(completed: Completed) -> Self {
+impl From<Publication> for PublicationRecord {
+    fn from(publication: Publication) -> Self {
+        let source_head = publication.segment.as_ref().map(|segment| segment.source);
         Self {
-            ranked_closure: completed.ranked_closure,
-            loss_policy: completed.loss_policy,
-            source_cut: completed.source_cut,
-            sealed_segment_end: completed.sealed_segment_end,
-            key_hold: completed.key_hold,
-            journal_hold: completed.journal_hold,
-            objects_sha256: completed.objects_sha256,
-            source_head: completed.authentication.map(|authentication| authentication.source),
-            installation_anchor: completed.authentication.map(|authentication| authentication.anchor),
+            operation: publication.operation,
+            predecessor: publication.predecessor,
+            manifest_digest: publication.manifest_digest,
+            destination_cell: publication.destination_cell,
+            recovery: publication.recovery.map(|completed| CompletedRecord {
+                ranked_closure: completed.ranked_closure,
+                loss_policy: completed.loss_policy,
+                source_cut: completed.source_cut,
+                sealed_segment_end: completed.sealed_segment_end,
+                key_hold: completed.key_hold,
+                journal_hold: completed.journal_hold,
+                objects_sha256: completed.objects_sha256,
+                source_head,
+                installation_anchor: completed.anchor,
+            }),
+            segment: publication.segment,
         }
     }
 }
@@ -246,7 +288,7 @@ fn custody_protocol(
 
 impl State {
     fn installation_anchor(&self) -> Option<InstallationAnchor> {
-        Some(self.publication.as_ref()?.recovery.as_ref()?.authentication?.anchor)
+        self.publication.as_ref()?.recovery.as_ref()?.anchor
     }
 
     /// Whether a cut through `end` keeps every append the serving
@@ -295,13 +337,12 @@ impl State {
         let publication_valid = self.publication.as_ref().is_some_and(|publication| {
             if let Some(completed) = &publication.recovery {
                 completed.source_cut.lsn != 0
-                    && completed.installation(publication.manifest_digest)
-                        .valid_authentication(self.uses_lineage(), publication.predecessor, None)
+                    && publication.installation()
+                        .is_some_and(|installation| installation.valid_authentication(self.uses_lineage(), publication.predecessor, None))
                     && publication.segment.is_some() == self.uses_lineage()
                     && publication.segment.as_ref().is_none_or(|segment| {
                         segment.predecessor == publication.predecessor && segment.successor == self.binding
                             && segment.end() == Lsn(completed.source_cut.lsn)
-                            && completed.authentication.is_some_and(|authentication| authentication.source == segment.source)
                     })
                     && custody_protocol(completed.key_hold, completed.journal_hold, completed.objects_sha256)
                         .is_some_and(|protocol| self.recovery_protocol() >= protocol)
@@ -358,23 +399,25 @@ impl Publication {
                 loss_policy: completed.loss_policy,
             },
             binding,
-            installation: completed.installation(self.manifest_digest),
+            installation: self.installation().ok_or_else(conflict)?,
             sealed_segment_end: completed.sealed_segment_end,
             ranked_closure: completed.ranked_closure,
         })
     }
 }
 
-impl Completed {
-    fn installation(&self, manifest_digest: [u8; 32]) -> Installation {
-        Installation {
-            manifest_digest,
-            source_cut: self.source_cut,
-            key_hold: self.key_hold,
-            journal_hold: self.journal_hold,
-            objects_sha256: self.objects_sha256,
-            authentication: self.authentication,
-        }
+impl Publication {
+    fn installation(&self) -> Option<Installation> {
+        let completed = self.recovery.as_ref()?;
+        Some(Installation {
+            manifest_digest: self.manifest_digest,
+            source_cut: completed.source_cut,
+            key_hold: completed.key_hold,
+            journal_hold: completed.journal_hold,
+            objects_sha256: completed.objects_sha256,
+            authentication: self.segment.as_ref().zip(completed.anchor)
+                .map(|(segment, anchor)| Authentication { source: segment.source, anchor }),
+        })
     }
 }
 
@@ -528,9 +571,9 @@ impl ActivationAuthority {
             }
             if publication.destination_cell == cell
                 && (state.binding.revision > selected_revision || state.binding.incarnation == candidate)
-                && let Some(completed) = publication.recovery
+                && let Some(installation) = publication.installation()
             {
-                return Ok(CustodySettlement::Published(completed.installation(publication.manifest_digest)));
+                return Ok(CustodySettlement::Published(installation));
             }
         }
         Err(Anomaly::new(
@@ -831,7 +874,7 @@ impl ActivationAuthority {
                 key_hold: installation.key_hold,
                 journal_hold: installation.journal_hold,
                 objects_sha256: installation.objects_sha256,
-                authentication: installation.authentication,
+                anchor: installation.authentication.map(|authentication| authentication.anchor),
             }),
             segment,
         };
@@ -957,6 +1000,43 @@ mod tests {
                 catalog: Uuid::from_u128(10), catalog_root: rtdb_db::CatalogRoot([11; 32]), position: Lsn(12),
             },
         })
+    }
+
+    #[test]
+    fn published_recovery_repeats_its_segments_source_cut() {
+        let installation = recorded_installation();
+        let source: AuthenticatedCut = serde_json::from_value(installation["source_head"].clone()).unwrap();
+        let segment = LineageSegment {
+            authority: Uuid::from_u128(13),
+            database: "xtdb".into(),
+            predecessor: Binding { incarnation: Uuid::from_u128(2), revision: 1 },
+            successor: Binding { incarnation: Uuid::from_u128(14), revision: 2 },
+            source,
+            previous: None,
+        };
+        let recorded = serde_json::json!({
+            "operation": Uuid::from_u128(15),
+            "predecessor": segment.predecessor,
+            "manifest_digest": installation["manifest_digest"],
+            "recovery": {
+                "loss_policy": "lossless",
+                "source_cut": installation["source_cut"],
+                "final_source_lsn": 3,
+                "source_head": source,
+                "installation_anchor": installation["installation_anchor"],
+            },
+            "segment": segment,
+        });
+        let publication: Publication = serde_json::from_value(recorded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&publication.installation().unwrap()).unwrap(), installation);
+        assert_eq!(serde_json::to_value(&publication).unwrap(), recorded);
+
+        let mut diverged = recorded.clone();
+        diverged["recovery"]["source_head"]["catalog_root"] = serde_json::to_value([16u8; 32]).unwrap();
+        assert!(serde_json::from_value::<Publication>(diverged).is_err());
+        let mut unpaired = recorded;
+        unpaired["recovery"].as_object_mut().unwrap().remove("installation_anchor");
+        assert!(serde_json::from_value::<Publication>(unpaired).is_err());
     }
 
     #[test]
