@@ -116,21 +116,10 @@ impl DataFileReader {
         let reader = &opened.layout.decoder;
         let wire = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
         let bound = opened.layout.page_decode_bound(page, &wire, true)?;
-
-        if let Some(reservation) = self.storage.admit(bound) {
-            let range = reader.page_metadata_range(page)?;
-            let end = usize::try_from(range.end - range.start).map_err(|error| invalid("page-metadata", error))?;
-            let metadata = wire.as_slice().get(..end).ok_or_else(|| invalid("page-metadata", "Arrow page header exceeds its block"))?;
-            let rows = reader.page_rows(page, metadata)?;
-            // A full fill must fit the cache and query budgets at the same time.
-            if let Some(headers) = self.storage.admit(IndexBatch::header_bytes(rows)?)
-                && let Ok(charged) = memory.reserve(bound)
-            {
-                let batch = reader.decode_page(page, page_buffer(wire))?;
-                let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(batch, reservation)?, headers)?;
-                return Ok((batch, Some(charged)));
-            }
-        }
+        let wire = match self.decode_admitted_page(page, wire, bound, memory)? {
+            Ok((batch, charged)) => return Ok((batch, Some(charged))),
+            Err(wire) => wire,
+        };
 
         let selected = put_columns();
         let projected = match reader.narrow_put_projection(&selected) {
@@ -144,6 +133,23 @@ impl DataFileReader {
             (reader.decode_page(page, page_buffer(wire))?, charged)
         };
         Ok((IndexBatch::from_owned(OwnedBatch::with_reservation(batch, charged)?)?, None))
+    }
+
+    /// Decodes the whole page against the pool's budget where both the pool and the query can hold it, and otherwise returns its bytes.
+    fn decode_admitted_page(
+        &self, page: usize, wire: CacheLease, bound: usize, memory: &Arc<MemoryBudget>,
+    ) -> Result<std::result::Result<(Arc<IndexBatch>, Arc<MemoryReservation>), CacheLease>> {
+        let reader = &self.opened.as_ref().expect("the data file is open").layout.decoder;
+        let Some(reservation) = self.storage.admit(bound) else { return Ok(Err(wire)) };
+        let range = reader.page_metadata_range(page)?;
+        let end = usize::try_from(range.end - range.start).map_err(|error| invalid("page-metadata", error))?;
+        let metadata = wire.as_slice().get(..end).ok_or_else(|| invalid("page-metadata", "Arrow page header exceeds its block"))?;
+        let rows = reader.page_rows(page, metadata)?;
+        let Some(headers) = self.storage.admit(IndexBatch::header_bytes(rows)?) else { return Ok(Err(wire)) };
+        let Ok(charged) = memory.reserve(bound) else { return Ok(Err(wire)) };
+        let batch = reader.decode_page(page, page_buffer(wire))?;
+        let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(batch, reservation)?, headers)?;
+        Ok(Ok((batch, charged)))
     }
 
     async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>, expected_metadata: Option<&[u8]>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
@@ -615,6 +621,18 @@ impl ActiveRows {
     }
     fn header(&self, index: usize) -> Result<EventHeader> {
         match self { Self::Live { rows, .. } => Ok(rows.headers[index]), Self::File(batch) => batch.header(index) }
+    }
+    fn check_path_order(&self, lower: Iid, upper: Iid) -> Result<()> {
+        let mut previous: Option<EventHeader> = None;
+        for index in 0..self.len() {
+            let header = self.row(index)?.header()?;
+            if header.iid < lower || header.iid > upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
+            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.precedence() < header.precedence())) {
+                return Err(invalid("page-order", "Data page is not in IID and descending system-position order"));
+            }
+            previous = Some(header);
+        }
+        Ok(())
     }
 
     fn after_iid(&self, head: Head, upper: Iid) -> Result<Option<Head>> {
@@ -2764,18 +2782,8 @@ impl PartitionScan {
         {
             return Err(invalid("owned-entity-key", "Data page has the wrong physical entity-key layout"));
         }
-        let mut previous: Option<EventHeader> = None;
         // A live page is a slice of this process's own trie, ordered as it was built; a file page is checked when first decoded.
-        let validated = if matches!(rows, ActiveRows::Live { .. }) || cached { 0 } else { rows.len() };
-        for index in 0..validated {
-            let source = rows.row(index)?;
-            let header = source.header()?;
-            if header.iid < page.lower || header.iid > page.upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
-            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.precedence() < header.precedence())) {
-                return Err(invalid("page-order", "Data page is not in IID and descending system-position order"));
-            }
-            previous = Some(header);
-        }
+        if matches!(rows, ActiveRows::File(_)) && !cached { rows.check_path_order(page.lower, page.upper)?; }
         if let (Some((batch, bound)), PageSource::File { file, page: page_index, .. }) = (admitted, &page.source) {
             let data = &self.files.entries[*file].reader;
             data.storage.insert_view(&data.key, View::Page(*page_index), Arc::new(CachedPage { batch, bound }));
