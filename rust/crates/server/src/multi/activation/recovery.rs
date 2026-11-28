@@ -42,22 +42,83 @@ pub(crate) struct SourceCut {
     pub(super) system_time: i64,
 }
 
+/// The authenticated source cut a lineage installation inherits, and the
+/// committed installation that anchors it in the destination journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Authentication {
+    pub(super) source: AuthenticatedCut,
+    pub(super) anchor: InstallationAnchor,
+}
+
+impl Authentication {
+    fn from_parts(source: Option<AuthenticatedCut>, anchor: Option<InstallationAnchor>) -> Option<Option<Self>> {
+        match (source, anchor) {
+            (Some(source), Some(anchor)) => Some(Some(Self { source, anchor })),
+            (None, None) => Some(None),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "InstallationRecord", into = "InstallationRecord")]
 pub(crate) struct Installation {
     pub(super) manifest_digest: [u8; 32],
     pub(super) source_cut: SourceCut,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) journal_hold: Option<RetainedJournal>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) objects_sha256: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) source_head: Option<AuthenticatedCut>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) installation_anchor: Option<InstallationAnchor>,
+    pub(super) authentication: Option<Authentication>,
 }
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallationRecord {
+    manifest_digest: [u8; 32],
+    source_cut: SourceCut,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal_hold: Option<RetainedJournal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    objects_sha256: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_head: Option<AuthenticatedCut>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installation_anchor: Option<InstallationAnchor>,
+}
+
+impl TryFrom<InstallationRecord> for Installation {
+    type Error = &'static str;
+
+    fn try_from(record: InstallationRecord) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            manifest_digest: record.manifest_digest,
+            source_cut: record.source_cut,
+            key_hold: record.key_hold,
+            journal_hold: record.journal_hold,
+            objects_sha256: record.objects_sha256,
+            authentication: Authentication::from_parts(record.source_head, record.installation_anchor)
+                .ok_or(UNPAIRED_AUTHENTICATION)?,
+        })
+    }
+}
+
+impl From<Installation> for InstallationRecord {
+    fn from(installation: Installation) -> Self {
+        Self {
+            manifest_digest: installation.manifest_digest,
+            source_cut: installation.source_cut,
+            key_hold: installation.key_hold,
+            journal_hold: installation.journal_hold,
+            objects_sha256: installation.objects_sha256,
+            source_head: installation.authentication.map(|authentication| authentication.source),
+            installation_anchor: installation.authentication.map(|authentication| authentication.anchor),
+        }
+    }
+}
+
+const UNPAIRED_AUTHENTICATION: &str = "an installation names its source cut without its anchor, or the reverse";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -71,10 +132,23 @@ pub(super) struct Pending {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "CompletedRecord", into = "CompletedRecord")]
 pub(super) struct Completed {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) ranked_closure: Option<super::ranked::RankedClosure>,
+    loss_policy: LossPolicy,
+    source_cut: SourceCut,
+    sealed_segment_end: Option<Lsn>,
+    key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
+    journal_hold: Option<RetainedJournal>,
+    objects_sha256: Option<[u8; 32]>,
+    authentication: Option<Authentication>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CompletedRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ranked_closure: Option<super::ranked::RankedClosure>,
     loss_policy: LossPolicy,
     source_cut: SourceCut,
     #[serde(rename = "final_source_lsn")]
@@ -89,6 +163,40 @@ pub(super) struct Completed {
     source_head: Option<AuthenticatedCut>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installation_anchor: Option<InstallationAnchor>,
+}
+
+impl TryFrom<CompletedRecord> for Completed {
+    type Error = &'static str;
+
+    fn try_from(record: CompletedRecord) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            ranked_closure: record.ranked_closure,
+            loss_policy: record.loss_policy,
+            source_cut: record.source_cut,
+            sealed_segment_end: record.sealed_segment_end,
+            key_hold: record.key_hold,
+            journal_hold: record.journal_hold,
+            objects_sha256: record.objects_sha256,
+            authentication: Authentication::from_parts(record.source_head, record.installation_anchor)
+                .ok_or(UNPAIRED_AUTHENTICATION)?,
+        })
+    }
+}
+
+impl From<Completed> for CompletedRecord {
+    fn from(completed: Completed) -> Self {
+        Self {
+            ranked_closure: completed.ranked_closure,
+            loss_policy: completed.loss_policy,
+            source_cut: completed.source_cut,
+            sealed_segment_end: completed.sealed_segment_end,
+            key_hold: completed.key_hold,
+            journal_hold: completed.journal_hold,
+            objects_sha256: completed.objects_sha256,
+            source_head: completed.authentication.map(|authentication| authentication.source),
+            installation_anchor: completed.authentication.map(|authentication| authentication.anchor),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -138,7 +246,7 @@ fn custody_protocol(
 
 impl State {
     fn installation_anchor(&self) -> Option<InstallationAnchor> {
-        self.publication.as_ref()?.recovery.as_ref()?.installation_anchor
+        Some(self.publication.as_ref()?.recovery.as_ref()?.authentication?.anchor)
     }
 
     /// Whether a cut through `end` keeps every append the serving
@@ -193,7 +301,7 @@ impl State {
                     && publication.segment.as_ref().is_none_or(|segment| {
                         segment.predecessor == publication.predecessor && segment.successor == self.binding
                             && segment.end() == Lsn(completed.source_cut.lsn)
-                            && completed.source_head == Some(segment.source)
+                            && completed.authentication.is_some_and(|authentication| authentication.source == segment.source)
                     })
                     && custody_protocol(completed.key_hold, completed.journal_hold, completed.objects_sha256)
                         .is_some_and(|protocol| self.recovery_protocol() >= protocol)
@@ -265,8 +373,7 @@ impl Completed {
             key_hold: self.key_hold,
             journal_hold: self.journal_hold,
             objects_sha256: self.objects_sha256,
-            source_head: self.source_head,
-            installation_anchor: self.installation_anchor,
+            authentication: self.authentication,
         }
     }
 }
@@ -275,15 +382,15 @@ impl Installation {
     #[cfg(feature = "backup-object-holds")]
     pub(in crate::multi) fn lineage_custody(self) -> Option<([u8; 32], rtdb_crypt::RecoveryKeyHold, [u8; 32], AuthenticatedCut)> {
         self.journal_hold?;
-        Some((self.manifest_digest, self.key_hold?, self.objects_sha256?, self.source_head?))
+        Some((self.manifest_digest, self.key_hold?, self.objects_sha256?, self.authentication?.source))
     }
 
     fn valid_authentication(self, lineage: bool, predecessor: Binding, inherited: Option<InstallationAnchor>) -> bool {
-        match (lineage, self.source_head, self.installation_anchor) {
-            (true, Some(source), Some(anchor)) => anchor.valid()
+        match (lineage, self.authentication) {
+            (true, Some(Authentication { source, anchor })) => anchor.valid()
                 && source.matches(*predecessor.incarnation.as_bytes(), Lsn(self.source_cut.lsn))
                 && inherited.is_none_or(|anchor| anchor.is_in(source)),
-            (false, None, None) => inherited.is_none(),
+            (false, None) => inherited.is_none(),
             _ => false,
         }
     }
@@ -502,8 +609,8 @@ impl ActivationAuthority {
             key_hold: installed.key_hold,
             journal_hold: installed.journal_hold,
             objects_sha256: installed.objects_sha256,
-            source_head: installed.source_head,
-            installation_anchor: installed.installation_anchor,
+            authentication: Authentication::from_parts(installed.source_head, installed.installation_anchor)
+                .ok_or_else(conflict)?,
         };
         let stream = self.stream_id(name)?;
         let lineage = self.supports_lineage(stream).await?;
@@ -550,10 +657,10 @@ impl ActivationAuthority {
             if lineage != state.uses_lineage()
                 || !installation.valid_authentication(lineage, operation.predecessor, state.installation_anchor())
                 || pending.sealed_head.is_some_and(|sealed| {
-                    installation.source_head.is_none_or(|source| !same_source_tree(sealed, source))
+                    installation.authentication.is_none_or(|authentication| !same_source_tree(sealed, authentication.source))
                 })
                 || pending.intent.loss_policy == LossPolicy::Lossless
-                    && (installation.source_head.is_some() != pending.sealed_head.is_some())
+                    && (installation.authentication.is_some() != pending.sealed_head.is_some())
             {
                 return Err(conflict());
             }
@@ -702,7 +809,7 @@ impl ActivationAuthority {
             incarnation: successor,
             revision: operation.predecessor.revision.checked_add(1).ok_or_else(conflict)?,
         };
-        let segment = installation.source_head.map(|source| rtdb_lineage::LineageSegment {
+        let segment = installation.authentication.map(|Authentication { source, .. }| rtdb_lineage::LineageSegment {
             authority: self.identity,
             database: name.to_owned(),
             predecessor: operation.predecessor,
@@ -724,8 +831,7 @@ impl ActivationAuthority {
                 key_hold: installation.key_hold,
                 journal_hold: installation.journal_hold,
                 objects_sha256: installation.objects_sha256,
-                source_head: installation.source_head,
-                installation_anchor: installation.installation_anchor,
+                authentication: installation.authentication,
             }),
             segment,
         };
@@ -833,6 +939,38 @@ mod tests {
         time::Duration,
     };
     use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+    fn recorded_installation() -> serde_json::Value {
+        let head = rtdb_stream_journal::authenticated::Head {
+            catalog: Uuid::from_u128(1),
+            stream: StreamId(2),
+            size: 3,
+            root: [4; 32],
+            timestamp_micros: 5,
+            authority_sha256: [6; 32],
+        };
+        serde_json::json!({
+            "manifest_digest": Some([7u8; 32]),
+            "source_cut": SourceCut { lsn: 3, position: 1, system_time: 8 },
+            "source_head": AuthenticatedCut { head, catalog_root: rtdb_db::CatalogRoot([9; 32]) },
+            "installation_anchor": InstallationAnchor {
+                catalog: Uuid::from_u128(10), catalog_root: rtdb_db::CatalogRoot([11; 32]), position: Lsn(12),
+            },
+        })
+    }
+
+    #[test]
+    fn recorded_installation_pairs_its_source_cut_with_its_anchor() {
+        let recorded = recorded_installation();
+        let installation: Installation = serde_json::from_value(recorded.clone()).unwrap();
+        assert!(installation.authentication.is_some());
+        assert_eq!(serde_json::to_value(installation).unwrap(), recorded);
+        for field in ["source_head", "installation_anchor"] {
+            let mut unpaired = recorded.clone();
+            unpaired.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Installation>(unpaired).is_err(), "{field}");
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lineage_floor_settles_a_serving_incarnation_and_binds_later_cuts() {

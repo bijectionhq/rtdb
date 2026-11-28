@@ -267,8 +267,8 @@ impl Attestation {
                     && (selected.loss_policy != LossPolicy::Lossless || sealed_segment_end == Some(Lsn(evidence.source_lsn)))
                     && installation.is_none_or(|prior| {
                         prior.manifest_digest == evidence.manifest_sha256 && prior.key_hold == Some(hold)
-                            && prior.source_head == evidence.source_head
-                            && prior.installation_anchor == evidence.installation_anchor
+                            && prior.authentication.map(|authentication| authentication.source) == evidence.source_head
+                            && prior.authentication.map(|authentication| authentication.anchor) == evidence.installation_anchor
                             && prior.source_cut == SourceCut {
                                 lsn: evidence.source_lsn,
                                 position: evidence.source_position,
