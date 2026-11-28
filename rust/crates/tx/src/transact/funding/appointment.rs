@@ -462,6 +462,7 @@ impl FundedReceipt {
             key: key.to_vec(), basis: order.cut.basis, system_time: order.cut.system_time,
             outcome: Outcome::Then, replayed: true, erasure: None,
             decision_clock: Some(Self { phase: Phase::Appointment(Appointment { stage, ..state }), ..self }),
+            store_reading: None,
         }
     }
 

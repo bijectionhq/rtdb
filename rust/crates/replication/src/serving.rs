@@ -710,6 +710,13 @@ impl NativeServing {
             && self.durable().tx_status(&request.transaction.key).is_err()
     }
 
+    pub(crate) fn last_store_reading(&self) -> Option<Timestamp> {
+        match &self.pipeline {
+            Some(pipeline) => pipeline.last_store_reading(),
+            None => self.durable().index().last_store_reading(),
+        }
+    }
+
     pub(crate) fn decide_source(&mut self, source: SourcePosition, now: Timestamp, request: Result<SourceRequest>) -> Result<proto::NoOp> {
         if !self.source_ready() { return Err(invalid()); }
         let request = match request {

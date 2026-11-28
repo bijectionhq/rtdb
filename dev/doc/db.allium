@@ -465,6 +465,9 @@ value TransactionKey {
     -- system_time is the strictly increasing projection used by temporal SQL.
     -- Without a supplied system time the resolver projects it from the append observation.
     -- That projection advances by a chronon when an observed clock ties or regresses.
+    -- Store appends also record the raw ordering sample for their stamps, windows, and timed admission.
+    -- The Store ordering point waits for a sample at least as great as the last raw Store reading in the ordered prefix.
+    -- A promoted writer inherits the prefix's last Store reading.
     -- A supplied system time is used unchanged or aborts the transaction; see AdmitSuppliedSystemTime.
     -- Native source outcomes retain the unmodified append observation in xt.txs.source_log_time.
     -- Strictness is what lets a read basis name a transaction by its system_time — see snapshot_token.

@@ -165,17 +165,16 @@ fn a_store_append_judges_the_sample_independently_of_system_time() {
     assert_eq!(&page.entries[0].key[4..], stamp.as_slice());
     assert_eq!(page.entries[0].value.as_deref(), Some(stamp.as_slice()));
 
-    // A sample at or below the head's time commits one tick past it, as XTDB smooths system time.
-    for sample in [99, 100] {
-        let smoothed = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, sample, DEFAULT);
-        let TransactionRecord::Tx(resolved) = smoothed.record() else { panic!("expected a transaction record") };
-        assert_eq!((resolved.receipt.basis, resolved.receipt.system_time), (basis(2), Timestamp(101)), "{sample}");
-    }
-    // The raw sample is inside this window even though system time is not.
     let window = Window { not_before: Some(Timestamp(100)), before: Some(Timestamp(101)) };
-    let smoothed = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], window), 2, 100, DEFAULT);
-    let smoothed_receipt = apply(&mut state, 2, smoothed.record()).unwrap();
-    assert_eq!((smoothed_receipt.basis, smoothed_receipt.system_time, smoothed_receipt.outcome), (basis(2), Timestamp(101), Outcome::Then));
+    let request = store_append(2, 1, Vec::new(), vec![stamped.clone()], window);
+    assert_eq!(refused(&state, &request, 2, 99), "rtdb.tx/system-time");
+    let tied = plan(&state, &request, 2, 100, DEFAULT);
+    let receipt = apply(&mut state, 2, tied.record()).unwrap();
+    assert_eq!((receipt.basis, receipt.system_time, receipt.store_reading), (basis(2), Timestamp(101), Some(Timestamp(100))));
+    let page = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(101)).unwrap().store_page(&read).unwrap();
+    let tied_stamp = StoreStamp { micros: 100, version: 2 }.encode();
+    assert_eq!(&page.entries[1].key[4..], tied_stamp.as_slice());
+    assert_eq!(page.entries[1].value.as_deref(), Some(tied_stamp.as_slice()));
     // Outside the window nothing is decided.
     let closed = Window { not_before: None, before: Some(Timestamp(150)) };
     let unopened = Window { not_before: Some(Timestamp(300)), before: None };
@@ -213,9 +212,6 @@ fn store_append_requires_an_exact_basis_at_the_inclusive_floor() {
     assert_eq!(commit(&mut state, 3, &request).outcome, Outcome::Then);
 }
 
-/// In shared main a classic transaction becomes the branch index head, stamped by XTDB's rule: one tick
-/// past a stalled predecessor, or at a supplied time ahead of the writer's clock. The next store append
-/// follows it one tick later instead of faulting as a clock regression.
 #[test]
 fn a_store_append_follows_a_classic_head_stamped_past_its_clock() {
     let mut state = TransactState::new(INCARNATION);
@@ -238,9 +234,15 @@ fn a_store_append_follows_a_classic_head_stamped_past_its_clock() {
     let committed = plan(&state, &store_append(3, 0, Vec::new(), vec![write(3)], Window::default()), 5, 201, DEFAULT);
     let receipt = apply(&mut state, 5, committed.record()).unwrap();
     assert_eq!((receipt.basis, receipt.system_time, receipt.outcome), (basis(5), Timestamp(5_002), Outcome::Then));
-    // The window is judged at the smoothed time, as the commit is stamped at it.
-    let closed = Window { not_before: None, before: Some(Timestamp(5_003)) };
-    assert_eq!(refused(&state, &store_append(4, 0, Vec::new(), vec![write(4)], closed), 6, 300), STORE_OUTSIDE_LATE);
+    assert_eq!(receipt.store_reading, Some(Timestamp(201)));
+
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let recovered = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    assert_eq!(recovered.index().last_store_reading(), Some(Timestamp(201)));
+    let closed = Window { not_before: None, before: Some(Timestamp(201)) };
+    let request = store_append(4, 0, Vec::new(), vec![write(4)], closed);
+    assert_eq!(refused(&recovered, &request, 6, 200), "rtdb.tx/system-time");
+    assert_eq!(refused(&recovered, &request, 6, 201), STORE_OUTSIDE_LATE);
 }
 
 /// The SHA-256 of Bijection's `crates/fact_store/src/persistence/judge.rs`.
@@ -2036,7 +2038,7 @@ fn a_transaction_record_round_trips_with_its_refusal_context_and_encodes_determi
         fingerprint: request.logical_sha256().unwrap(),
         receipt: Receipt {
             key: request.key.clone(), basis: basis(4), system_time: Timestamp(40), outcome: Outcome::Refused { error: error.clone() },
-            replayed: false, erasure: Some(Erasure::Armed { unreadable_by: Timestamp(50) }), decision_clock: None,
+            replayed: false, erasure: Some(Erasure::Armed { unreadable_by: Timestamp(50) }), decision_clock: None, store_reading: None,
         },
         effects: Vec::new(), before: None, receipt_namespace: Some([3; 32]), admitted_at: Timestamp(39),
         workload: None, workload_digest: None, request: Some(request.canonical_request().unwrap()),

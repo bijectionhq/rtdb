@@ -2486,8 +2486,14 @@ impl ReplicationDriver {
                 request = Err(rtdb_tx::transact::funding_unsupported());
             }
         }
+        let floor = request.as_ref().ok().and_then(|request| {
+            request.transaction.store_append().and_then(|_| serving.last_store_reading())
+        });
+        let now = self.cancellation.run_until_cancelled(rtdb_tx::transact::sample_store_clock(
+            &*self.clock, floor, SERVING_CLOCK_UNCERTAINTY_MICROS,
+        )).await.ok_or_else(stopped)?;
         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
-        let message = serving.decide_source(position, (self.clock)(), request)?;
+        let message = serving.decide_source(position, now, request)?;
         let block = self.partition.value().live().block_index();
         leader.cycle.resolved(1)?;
         leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;

@@ -575,7 +575,7 @@ async fn burst(
     let mut queued = vec![first];
     fill(input, barrier, &mut queued, CAPACITY);
     let mut staged = VecDeque::new();
-    stage_batch(&mut *database.lock().await, &mut staged, queued);
+    stage_batch(&mut *database.lock().await, &mut staged, queued).await;
     let mut input_open = true;
     while let Some(front) = staged.front() {
         let authority = database
@@ -625,7 +625,7 @@ async fn burst(
                             Some(Command::Transact(work)) if work.batchable() => {
                                 let mut group = vec![work];
                                 fill(input, barrier, &mut group, CAPACITY - occupied);
-                                stage_batch(&mut *database.lock().await, &mut staged, group);
+                                stage_batch(&mut *database.lock().await, &mut staged, group).await;
                             }
                             Some(command) => *barrier = Some(command),
                             None => input_open = false,
@@ -656,7 +656,7 @@ async fn burst(
                 let terminal = database_guard.decide_terminal(authority.lease, position, upper);
                 let result = terminal.and_then(|(write, redecide)| {
                     let queued = take_redecisions(&mut staged, &redecide)?;
-                    stage_batch(&mut database_guard, &mut staged, queued);
+                    stage_batch(&mut database_guard, &mut staged, queued).await;
                     Ok(write)
                 });
                 match result {
@@ -725,7 +725,7 @@ fn fill(
     }
 }
 
-fn stage_batch(database: &mut MultiDatabase, staged: &mut VecDeque<Staged>, queued: Vec<Work>) {
+async fn stage_batch(database: &mut MultiDatabase, staged: &mut VecDeque<Staged>, queued: Vec<Work>) {
     if database.stream.batch.is_some()
         && queued.len() > 1
         && queued
@@ -734,7 +734,7 @@ fn stage_batch(database: &mut MultiDatabase, staged: &mut VecDeque<Staged>, queu
     {
         let requests: Vec<_> = queued.iter().map(|work| work.request.clone()).collect();
         let claims = VerifiedClaims::union(queued.iter().map(|work| &work.claims));
-        match database.decide_group(&requests, &claims) {
+        match database.decide_group(&requests, &claims).await {
             Ok(decisions) => {
                 for (work, decision) in queued.into_iter().zip(decisions) {
                     stage(database, staged, work, decision);
@@ -752,7 +752,7 @@ fn stage_batch(database: &mut MultiDatabase, staged: &mut VecDeque<Staged>, queu
                 &work.request,
                 work.scope.as_ref().map(Scope::authority),
                 &work.claims,
-            );
+            ).await;
             stage(database, staged, work, decision);
         }
     }
@@ -937,13 +937,13 @@ impl MultiDatabase {
         TransactPipeline::new(copy, state.coordinates.position(next(state.head)?)?, CAPACITY)
     }
 
-    pub(super) fn decide_one(
+    pub(super) async fn decide_one(
         &mut self,
         request: &Transact,
         scope: Option<ScopedTransact<'_>>,
         claims: &dyn ClaimVerifier,
     ) -> Result<Planned> {
-        let now = (self.clock)();
+        let now = self.sample_ordering_clock(request).await;
         let features = self.write_features();
         let decide = |pipeline: &mut TransactPipeline| match scope {
             Some(scope) => {
@@ -971,7 +971,7 @@ impl MultiDatabase {
         plan(decision, lease, generation, coordinates)
     }
 
-    fn decide_group(
+    async fn decide_group(
         &mut self,
         requests: &[Transact],
         claims: &dyn ClaimVerifier,
@@ -980,16 +980,26 @@ impl MultiDatabase {
         self.require_armed_rotation()?;
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;
-        // Each request samples the clock at its own ordering point (`decide_batch`).
-        let clock = Arc::clone(&self.clock);
         let features = self.write_features();
-        let writer = self.writer.as_mut().ok_or_else(no_writer)?;
-        Ok(writer
-            .pipeline
-            .decide_batch(requests, &*clock, features, claims)
-            .into_iter()
-            .map(|decision| decision.and_then(|decision| plan(decision, lease, generation, coordinates)))
-            .collect())
+        let mut decisions = Vec::with_capacity(requests.len());
+        for request in requests {
+            let now = self.sample_ordering_clock(request).await;
+            let decision = self.authority().and_then(|current| {
+                if current.epoch != lease.epoch { return Err(no_writer()); }
+                self.writer.as_mut().ok_or_else(no_writer)?.pipeline.decide(request, now, features, claims)
+            });
+            decisions.push(decision.and_then(|decision| plan(decision, lease, generation, coordinates)));
+        }
+        Ok(decisions)
+    }
+
+    pub(super) fn sample_ordering_clock(&self, request: &Transact)
+        -> impl std::future::Future<Output = Timestamp> + use<>
+    {
+        let floor = request.store_append().and_then(|_| self.writer.as_ref()?.pipeline.last_store_reading());
+        let clock = Arc::clone(&self.clock);
+        let skew = self.options.drift_micros;
+        async move { rtdb_tx::transact::sample_store_clock(&*clock, floor, skew).await }
     }
 
     pub(super) async fn managed_workload(&mut self, request: workload::Request) -> Result<workload::Reply> {

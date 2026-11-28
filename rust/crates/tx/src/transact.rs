@@ -31,6 +31,7 @@ mod funding;
 mod operations;
 mod pipeline;
 mod store_clock;
+pub use store_clock::sample_store_clock;
 mod store_writer;
 pub mod workload;
 use workload::Family as WorkloadFamily;
@@ -379,10 +380,9 @@ pub const STORE_CLAIM: &str = "rtdb.store/claim";
 /// A store-ordered denial selected and committed its alternative effects.
 pub const STORE_DENIAL_COMMITTED: &str = "rtdb.store/denial-committed";
 
-/// The append's time is smoothed past the head's, so the judge never sees a
-/// regressed reading.
+/// Defence in depth for an ordering point that failed to wait for its clock.
 fn store_time_order() -> Anomaly {
-    Anomaly::fault("rtdb.tx/system-time", "The store append's time does not follow the head's")
+    Anomaly::fault("rtdb.tx/system-time", "The ordering clock is behind the last Store reading")
 }
 
 fn timed_store_shape() -> Anomaly {
@@ -525,6 +525,8 @@ pub struct Receipt {
     pub erasure: Option<Erasure>,
     #[serde(default)]
     pub decision_clock: Option<FundedReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_reading: Option<Timestamp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,9 +588,10 @@ const APPOINTMENT_RECORD_VERSION: u8 = 8;
 const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 9;
 const PRUNED_STORE_CHECKPOINT_VERSION: u8 = 10;
 const FENCED_STORE_CHECKPOINT_VERSION: u8 = 11;
-const TIMED_STORE_RECORD_VERSION: u8 = 12;
-const TIMED_STORE_CHECKPOINT_VERSION: u8 = 12;
 const STORE_WRITER_GENERATION_CHECKPOINT_VERSION: u8 = 13;
+const STORE_RECORD_VERSION: u8 = 14;
+const TIMED_STORE_RECORD_VERSION: u8 = 15;
+const STORE_READING_CHECKPOINT_VERSION: u8 = 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TimedStoreEvidence {
@@ -632,7 +635,7 @@ impl TimedStoreEvidence {
 
     fn check_receipt(self, receipt: &Receipt) -> Result<()> {
         self.cutoff()?;
-        if receipt.outcome != Outcome::Then || receipt.system_time >= self.before
+        if receipt.outcome != Outcome::Then || receipt.store_reading.is_none_or(|reading| reading >= self.before)
             || receipt.decision_clock.is_some() || receipt.erasure.is_some()
         {
             return Err(invalid_record());
@@ -667,8 +670,8 @@ impl TransactionRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (&version, record) = bytes.split_first().ok_or_else(unknown_transaction_version)?;
         let decode_error = |error: bincode::Error| Anomaly::fault("rtdb/transaction-decoding", error.to_string());
-        let record: Self = match version {
-            RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION => encoding::decode(record).map_err(decode_error)?,
+        let mut record: Self = match version {
+            RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION | STORE_RECORD_VERSION => encoding::decode(record).map_err(decode_error)?,
             TIMED_STORE_RECORD_VERSION => {
                 let (mut record, timing): (Self, TimedStoreEvidence) = encoding::decode(record).map_err(decode_error)?;
                 let Self::Tx(tx) = &mut record else { return Err(invalid_record()); };
@@ -677,6 +680,10 @@ impl TransactionRecord {
             }
             _ => return Err(unknown_transaction_version()),
         };
+        if matches!(version, STORE_RECORD_VERSION | TIMED_STORE_RECORD_VERSION) {
+            let Self::Tx(tx) = &mut record else { return Err(invalid_record()); };
+            tx.receipt.store_reading = Some(tx.admitted_at);
+        }
         if version != record.version() { return Err(unknown_transaction_version()); }
         if let Self::Tx(tx) = &record {
             tx.validate_admission()?;
@@ -687,6 +694,7 @@ impl TransactionRecord {
     fn version(&self) -> u8 {
         match self {
             Self::Tx(tx) if tx.timed_store.is_some() => TIMED_STORE_RECORD_VERSION,
+            Self::Tx(tx) if tx.receipt.store_reading.is_some() => STORE_RECORD_VERSION,
             Self::Tx(tx) => tx.receipt.record_version(tx.receipt_namespace),
             _ => RECORD_VERSION,
         }
@@ -698,7 +706,7 @@ impl TransactionRecord {
 
     pub fn timed_journal_cutoff(bytes: &[u8]) -> Result<Option<TimedJournalCutoff>> {
         match bytes.first().copied() {
-            Some(RECORD_VERSION) => return Ok(None),
+            Some(RECORD_VERSION | STORE_RECORD_VERSION) => return Ok(None),
             Some(FUNDED_RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION | TIMED_STORE_RECORD_VERSION) => (),
             _ => return Err(unknown_transaction_version()),
         }
@@ -729,9 +737,28 @@ impl Receipt {
     }
 }
 
+// The binary record keeps the existing receipt layout. Store records carry
+// their raw reading in admitted_at and identify it with a Store record version.
+mod record_receipt {
+    use super::*;
+
+    type Fields = (Vec<u8>, Basis, Timestamp, Outcome, bool, Option<Erasure>, Option<FundedReceipt>);
+
+    pub(super) fn serialize<S: Serializer>(receipt: &Receipt, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        (&receipt.key, receipt.basis, receipt.system_time, &receipt.outcome, receipt.replayed,
+            receipt.erasure, receipt.decision_clock).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Receipt, D::Error> {
+        let (key, basis, system_time, outcome, replayed, erasure, decision_clock) = Fields::deserialize(deserializer)?;
+        Ok(Receipt { key, basis, system_time, outcome, replayed, erasure, decision_clock, store_reading: None })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResolvedTransact {
     fingerprint: [u8; 32],
+    #[serde(with = "record_receipt")]
     receipt: Receipt,
     effects: Vec<BranchEffect>,
     before: Option<Timestamp>,
@@ -778,6 +805,15 @@ impl ResolvedTransact {
         if self.workload_digest.is_some() && (self.workload.is_none() || self.request.is_none()) {
             return Err(invalid_record());
         }
+        if let Some(reading) = self.receipt.store_reading {
+            let canonical = self.request.as_ref().ok_or_else(invalid_record)?;
+            let request = canonical.decode().map_err(|_| invalid_record())?;
+            if request.store_append().is_none() || reading != self.admitted_at
+                || self.before.is_some() || self.receipt.decision_clock.is_some()
+            {
+                return Err(invalid_record());
+            }
+        }
         if let Some(timing) = self.timed_store {
             let canonical = self.request.as_ref().ok_or_else(invalid_record)?;
             let request = canonical.decode().map_err(|_| invalid_record())?;
@@ -787,7 +823,7 @@ impl ResolvedTransact {
                 || self.effects.is_empty() || request.key != self.receipt.key || timing.fingerprint(canonical) != self.fingerprint
                 || self.admitted_at > self.receipt.system_time
                 || request.store_append().and_then(|append| append.window.not_before)
-                    .is_none_or(|start| self.receipt.system_time < start)
+                    .is_none_or(|start| self.admitted_at < start)
             {
                 return Err(invalid_record());
             }
@@ -1196,6 +1232,7 @@ impl TransactState {
     }
 
     fn checkpoint_version<'a>(index: &BranchIndex, receipts: impl Iterator<Item = &'a StoredReceipt>) -> u8 {
+        if index.last_store_reading().is_some() { return STORE_READING_CHECKPOINT_VERSION; }
         if index.has_store_writer_generations() { return STORE_WRITER_GENERATION_CHECKPOINT_VERSION; }
         let floor_version = if index.has_store_writer_fence() {
             FENCED_STORE_CHECKPOINT_VERSION
@@ -1204,10 +1241,8 @@ impl TransactState {
         } else {
             RECORD_VERSION
         };
-        receipts.map(|stored| {
-            if stored.timed_store.is_some() { TIMED_STORE_CHECKPOINT_VERSION }
-            else { stored.receipt.record_version(stored.receipt_namespace) }
-        }).fold(floor_version, u8::max)
+        receipts.map(|stored| stored.receipt.record_version(stored.receipt_namespace))
+            .fold(floor_version, u8::max)
     }
 
     /// The checkpoint of [`Self::encode_checkpoint`] in CBOR instead of JSON:
@@ -1249,6 +1284,8 @@ impl TransactState {
             let receipt = &stored.receipt;
             validate_key(&receipt.key).map_err(|_| invalid())?;
             if receipt.replayed || state.index.exact(receipt.basis)?.system_time != receipt.system_time
+                || receipt.basis.position() >= state.index.store_history_floor()
+                    && state.index.store_reading_at(receipt.basis.position()) != receipt.store_reading
                 || stored.workload_digest.is_some() && stored.workload.is_none()
             {
                 return Err(invalid());
@@ -1607,7 +1644,7 @@ impl TransactState {
         let receipt = Receipt {
             key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome, replayed: false,
             erasure: effects.iter().any(|effect| matches!(effect, BranchEffect::Erase { .. })).then_some(Erasure::Pending),
-            decision_clock,
+            decision_clock, store_reading: None,
         };
         if validation {
             Ok((Resolution::Answer(receipt), None))
@@ -1680,13 +1717,15 @@ impl TransactState {
         let head = view.index.head();
         let mutates = !append.writes.is_empty() || !append.bounds.is_empty() || !decoded_derives.is_empty();
         let receipt = |basis: Basis, system_time: Timestamp, outcome: Outcome| Receipt {
-            key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None,
+            key: request.key.clone(), basis, system_time, outcome, replayed: false, erasure: None, decision_clock: None, store_reading: Some(now),
         };
 
-        let last = (head.basis.position() > 0).then_some(head.system_time.0);
+        let last_sql_time = (head.basis.position() > 0).then_some(head.system_time.0);
         let sample = now;
-        let now = crate::system_time::automatic_time(last, sample.0).map(Timestamp)
-            .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))?;
+        let last_reading = view.index.last_store_reading().map(|reading| reading.0);
+        if last_reading.is_some_and(|last| sample.0 < last) {
+            return Err(store_time_order());
+        }
         let guard_time = sample;
         if let Some(basis) = retained_basis {
             view.index.check_retained_store_basis(basis)?;
@@ -1699,7 +1738,7 @@ impl TransactState {
         if failed.is_empty() {
             match store_clock::judge_store_clock(
                 head.basis.position(),
-                None,
+                last_reading,
                 sample.0,
                 not_before.map(|t| t.0),
                 before.map(|t| t.0),
@@ -1760,7 +1799,7 @@ impl TransactState {
         // and before plain writes (T3). Applying them never changes the
         // outcome; the unique claims they make are judged once they all
         // apply, on their filled keys (Bijection T7-4).
-        let stamp = StoreStamp { micros: now.0, version: position };
+        let stamp = StoreStamp { micros: sample.0, version: position };
         let mut failed_claim: Option<usize> = None;
         let mut selected_denial = append.alternative.as_ref().is_some_and(|denial| {
             matches!(&denial.check, StoreDenialCheck::Bound(ordinal) if failed_bound == Some(*ordinal))
@@ -1785,15 +1824,15 @@ impl TransactState {
             bound_updates.clear();
         }
         let commits = selected_denial || (mutates && failed.is_empty() && failed_bound.is_none() && failed_claim.is_none());
-        if timed_store.is_some_and(|timing| !commits || now >= timing.before) {
+        if timed_store.is_some_and(|timing| !commits || sample >= timing.before) {
             return Err(timed_store_refused());
         }
-        // Every store record takes the append's time: a conflict's, a bound
-        // refusal's and a validation's too.
-        let system_time = now;
+        let system_time = crate::system_time::automatic_time(last_sql_time, sample.0).map(Timestamp)
+            .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))?;
         let cut = BranchCut { basis: Basis::new(head.basis.incarnation(), position), system_time };
         let mut index = view.index.clone();
         index.advance(cut)?;
+        index.record_store_reading(sample)?;
         let (outcome, effects, after) = if !failed.is_empty() {
             (Outcome::Otherwise { failed }, Vec::new(), index)
         } else if let Some(bound_idx) = failed_bound.filter(|_| !selected_denial) {
@@ -2092,6 +2131,9 @@ impl TransactState {
                timed_store: Option<TimedStoreEvidence>) -> Result<Receipt> {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
+        if let Some(reading) = receipt.store_reading {
+            candidate.record_store_reading(reading)?;
+        }
         for effect in effects {
             if let BranchEffect::StoreWriterFence { incarnation, fence } = &effect
                 && (receipt_namespace != Some(store_writer::receipt_namespace())

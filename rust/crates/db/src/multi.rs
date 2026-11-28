@@ -618,7 +618,7 @@ impl MultiDatabase {
             .tokens
             .verify_claims_in(request.claims(), scope.map(|scope| scope.labels))
             .await;
-        let write = match self.decide_one(request, scope, &claims)? {
+        let write = match self.decide_one(request, scope, &claims).await? {
             Planned::Answer(receipt) => return Ok(receipt),
             Planned::Append(write) => write,
         };

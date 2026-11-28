@@ -524,6 +524,8 @@ contract PublishedLineageEvidence {
         -- The original Kernel captures a predecessor authorization exactly once after verifying inclusion of its exact timed leaf in the published segment.
         -- The leaf binds a quorum durability bound strictly before the authorized journal cutoff.
         -- An application head alone leaves the authorization pending.
+        -- A replacement writer waits at Store ordering until its own reading reaches the recovered prefix's last Store reading.
+        -- Store stamps take the raw reading and position.
         -- A plain Store append receipt records the application version and leaves a predecessor authorization pending until the Kernel obtains settlement evidence.
         -- An untimed Store append can settle a predeclared refusal alternative in the same decision, after its shared read and clock premises.
         -- An included record at the authorized position with matching identity and missing timing evidence leaves the authorization pending.

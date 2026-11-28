@@ -426,7 +426,8 @@ fn append_reply(
             Ok(receipt) => match receipt.outcome {
                     Outcome::Then if validation => proto::append_reply::Outcome::Validated(receipt.basis.position()),
                     Outcome::Then => proto::append_reply::Outcome::Committed(proto::Stamp {
-                        micros: receipt.system_time.0, version: receipt.basis.position(),
+                        micros: receipt.store_reading.ok_or_else(|| Status::internal("The Store receipt has no clock reading"))?.0,
+                        version: receipt.basis.position(),
                     }),
                     Outcome::Otherwise { failed } => {
                         let first = failed.first().copied().ok_or_else(|| Status::internal("A failed append names no read"))?;

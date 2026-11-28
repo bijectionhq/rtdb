@@ -223,7 +223,7 @@ async fn a_native_erase_rewrites_classic_and_native_rows_into_independent_files(
         outcome: Outcome::Then,
         replayed: false,
         erasure: None,
-        decision_clock: None,
+        decision_clock: None, store_reading: None,
     };
     let write = serving::classic::stage_source(
         partition.snapshot(), &prior, SourcePosition(2), &receipt(2), &[write], &memory,

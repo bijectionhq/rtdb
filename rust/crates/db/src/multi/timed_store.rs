@@ -87,7 +87,8 @@ impl MultiDatabase {
         history.verify(application_root).map_err(|_| invalid("The writer serves a different application catalog"))?;
 
         let claims = self.tokens.verify_claims_in(std::iter::empty(), None).await;
-        let now = (self.clock)();
+        let now = self.sample_ordering_clock(&preview).await;
+        authority.check_timed_window(decision_before, journal_cutoff)?;
         let features = self.write_features();
         let generation = self.state().generation;
         let coordinates = self.state().coordinates;

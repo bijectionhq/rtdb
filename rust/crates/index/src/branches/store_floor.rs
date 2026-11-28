@@ -31,6 +31,10 @@ impl BranchIndex {
             return;
         }
         self.store_history_floor = Some(keep_from);
+        if let Some((&anchor, _)) = self.store_readings.range(..keep_from).next_back() {
+            self.store_readings = self.store_readings.range(anchor..)
+                .map(|(&position, &reading)| (position, reading)).collect();
+        }
         let main = Arc::make_mut(self.branches.get_mut(MAIN_BRANCH).expect("main branch"));
         let Some(rows) = main.tables.get_mut(&store_table()) else { return; };
         let rows = Arc::make_mut(rows);

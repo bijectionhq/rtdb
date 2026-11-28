@@ -253,6 +253,8 @@ pub struct BranchIndex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     store_history_floor: Option<u64>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
+    store_readings: Map<u64, Timestamp>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
     store_writer_fences: Map<u64, store::StoreWriterState>,
     branches: Map<Branch, Arc<BranchData>>,
     #[serde(with = "entries")]
@@ -300,11 +302,27 @@ impl BranchIndex {
             custody_transfers: Map::new(), inherited_custody: None,
             scoped_holds: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
             visibility_projection: false, used_custody_placements: imbl::OrdSet::new(),
-            store_sizes: Default::default(), store_writer_fences: Map::new(),
+            store_sizes: Default::default(), store_writer_fences: Map::new(), store_readings: Map::new(),
         }
     }
 
     pub fn head(&self) -> BranchCut { self.head }
+
+    pub fn last_store_reading(&self) -> Option<Timestamp> {
+        self.store_readings.iter().next_back().map(|(_, &reading)| reading)
+    }
+
+    pub fn store_reading_at(&self, position: u64) -> Option<Timestamp> {
+        self.store_readings.get(&position).copied()
+    }
+
+    pub fn record_store_reading(&mut self, reading: Timestamp) -> Result<()> {
+        if self.last_store_reading().is_some_and(|last| reading < last) {
+            return Err(Anomaly::fault("rtdb.tx/system-time", "An ordered Store reading regressed"));
+        }
+        self.store_readings.insert(self.head.basis.position(), reading);
+        Ok(())
+    }
 
     pub fn has_store_writer_fence(&self) -> bool { !self.store_writer_fences.is_empty() }
 
@@ -382,6 +400,8 @@ impl BranchIndex {
         retained.store_sizes = Default::default();
         retained.writes = Arc::default();
         retained.times = self.times.range(..=at.position()).map(|(&position, &time)| (position, time)).collect();
+        retained.store_readings = self.store_readings.range(..=at.position())
+            .map(|(&position, &reading)| (position, reading)).collect();
         retained.store_writer_fences = self.store_writer_fences.range(..=at.position())
             .map(|(&position, &fence)| (position, fence)).collect();
         retained.catalog = self.catalog.iter().filter_map(|(table, definitions)| {

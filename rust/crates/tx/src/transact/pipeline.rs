@@ -112,6 +112,8 @@ impl TransactPipeline {
 
     pub fn into_durable(self) -> TransactState { self.durable }
 
+    pub fn last_store_reading(&self) -> Option<Timestamp> { self.speculative.last_store_reading() }
+
     pub fn next_position(&self) -> u64 { self.next_position }
 
     pub fn in_flight(&self) -> usize { self.in_flight.len() }

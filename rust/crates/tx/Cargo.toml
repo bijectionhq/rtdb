@@ -27,6 +27,7 @@ bincode.workspace = true
 serde_json.workspace = true
 ciborium.workspace = true
 imbl.workspace = true
+tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -37,6 +38,5 @@ store_judge = { package = "bijection-store-judge", path = "../../vendor/bijectio
 
 [dev-dependencies]
 rtdb-metrics.workspace = true
-tokio.workspace = true
 rtdb-trie.workspace = true
 tempfile.workspace = true

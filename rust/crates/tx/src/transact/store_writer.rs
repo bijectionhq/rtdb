@@ -68,7 +68,7 @@ pub(super) fn resolve_change(
     let namespace = Some(receipt_namespace());
     let receipt = |cut: BranchCut| Receipt {
         key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome: Outcome::Then,
-        replayed: false, erasure: None, decision_clock: None,
+        replayed: false, erasure: None, decision_clock: None, store_reading: None,
     };
     let prior = view.receipts.get(&namespace).and_then(|receipts| receipts.get(&request.key));
     let effect = if let Some(attempt) = attempt {

@@ -126,7 +126,6 @@ It always reports how far it inspected, so a caller resumes from there.
 == Invariants
 
 * Keys are compared bytewise and ranges are half-open.
-* Append windows judge the writer's raw `source_log_time` observation, independent of the strictly increasing SQL `system_time`.
 * A version is a commit position within one incarnation of the database.
   A restore or reset starts a new incarnation, and a request naming another one is refused.
 * The conflict condition is range intersection only.
@@ -134,16 +133,17 @@ It always reports how far it inspected, so a caller resumes from there.
   The host makes labels key partitions, so a write the reader's label does not admit lies outside the reader's ranges and never refuses it.
 * Validation and invalidation are the same matching: `Watch` reports exactly the versions that would refuse an `Append` reading the same ranges.
   Conflicts are judged over the stamped keys.
-* *Stamp micros strictly increase along versions*, as XTDB's system time does (`TxResolver`: `max(now, latest + 1 µs)`).
-  An append's time is its writer's clock sample, or one microsecond past the head's when the sample does not exceed it (`tx/src/system_time.rs`: `automatic_time`), whatever wrote the head: a store append, a v1 transaction, or a classic transaction stamped one tick past its predecessor or at a supplied time ahead of the clock.
-  Whether an append is `outside` depends on that time and its window alone.
-  The store decides the window and the stamp through Bijection's `fact_store::persistence::judge::admit`, which RTDB vendors byte for byte as `rust/vendor/bijection-store-judge` (pinned by SHA-256 in both repositories).
-* The writer's clock never issues a sample below one it has issued, and the clock's own contract ensures it, not the appends.
-  A Multi writer holds a durable clock lease (`Record::Lease { until }`), renewed on the clock's schedule and never per append: it samples only while its clock plus the drift bound is before `until`, and a successor writer starts only once its clock passes the predecessor's `until` plus the drift bound.
-  The successor waits once, at takeover, and that wait depends on the lease alone, never on whether the last commits were hidden.
-  A sample at or below the head's time is smoothed past it, never refused and never waited out, so the judge's regression outcome is unreachable.
-* A commit's system time is its smoothed time, and so is a conflict's, a bound refusal's and a validation's record time.
-  The writer samples its clock for each append at that append's ordering point, a batched group included; samples taken in one microsecond get successive times, and nothing waits.
+* A store append's stamp micros is the ordering point's raw clock reading, recorded as `source_log_time`.
+  It never decreases along versions, and tied readings are ordered by version.
+  Append windows, timed admission and stamped placeholders all use that reading.
+  The store judges the window and stamp through the vendored Bijection `fact_store::persistence::judge::admit`.
+* The ordering point waits while its raw sample is below the last ordered store reading.
+  A replacement writer starts with the last reading in its recovered prefix and follows the same rule.
+  A wait beyond the configured clock skew bound raises an operator clock fault.
+  The vendored judge's regression result is an ordering-point fault.
+* XTDB SQL `system_time` strictly increases through store appends as through other transactions (`max(now, latest + 1 µs)`).
+  A supplied SQL time at or before the latest aborts with `invalid-system-time`.
+  SQL system time belongs to `TransactionKey` and does not cross `rtdb.store.v1`.
 
 == Atomic multi-place commits
 
@@ -158,10 +158,13 @@ A lower place learns the landing only through the keys written into it: its own 
 The store is one relation, `store.entries`, on the main branch of the v1 branch index.
 An entry's id is its key bytes and its `v` cell holds the value.
 `Append` is a v1 transaction whose guards are `Guard::Unwritten { range, since }` and whose one operation is `Op::Store`, its writes, bounds and window.
-The resolver judges the guards over the same branch index every other guard reads, then the window against its clock sample, which becomes the commit's system time, and then each `Bound` against the live 8-byte signed big-endian entry (absent = `0`).
+The resolver judges the guards over the same branch index every other guard reads, then the window against its raw clock sample, and then each `Bound` against the live 8-byte signed big-endian entry (absent = `0`).
 It fills the placeholders and applies the stamped writes and updated bound counters as puts and deletes of `store.entries`.
-A failing bound with no matching alternative records `Outcome::Refused` with `rtdb.store/bound` and its index as a receipt under the append's key. A selected alternative writes its effects and records `Outcome::StoreDenied` under the same key.
-The append's smoothed time is judged by `store_judge::admit` (the vendored `judge.rs`): outside the window it answers `outside`; otherwise a write-free append validates and any other commits with stamp `{ time, position }`.
+A failing bound with no matching alternative records `Outcome::Refused` with `rtdb.store/bound` and its index as a receipt under the append's key.
+A selected alternative writes its effects and records `Outcome::StoreDenied` under the same key.
+The vendored `store_judge::admit` judges the raw sample against the prior store reading and the window.
+Outside the window the append answers `outside`.
+Inside it a write-free append validates and a successful write commits with the stamp `{ micros: sample, version: position }`.
 No pending timed v1 transaction blocks a store append, and no shared-main time floor raises one: each append settles at its own position.
 
 === Multi history reclamation
@@ -178,7 +181,7 @@ The writer can then collect superseded manifests outside the retained checkpoint
 An installation's appends share one version line.
 Today one holder bounds ordering, resolution and its resident set (object storage is elastic).
 RTDB's target splits an ordering tier from place-sharded resolvers and storage, with epoch-fenced place handoff and no change to commit order (`verification/tla/ShardedOrder.tla`).
-A conflict and a validation carry no stamp, and their records take the sample as their time, as a commit does.
+A conflict and a validation record the raw sample alongside their SQL coordinate and return their ordinary reply shape.
 A write-free append is therefore not a v1 validation (`Transact::validates_only`), which answers at the acquired basis without a record: it is ordered and appended like a commit, so every append needs write access.
 `Read` reads a branch view at the selected cut, and `Watch` filters the v1 change feed by key range.
 
@@ -208,8 +211,9 @@ The transaction buffer positions every staged event (`EventPosition { transactio
 
 == Verification obligations (T7)
 
-* V9′: `TransactState::resolve_store`'s clock decision equals `judge::admit(head, last, time, not_before, before, write_free)`, where `time` is the sample smoothed past the head (`automatic_time`, Verus area `system_time`).
-  Control: re-adding `stamped && now == floor` must break it.
+* V9′: `TransactState::resolve_store`'s clock decision equals `judge::admit(head, last, sample, not_before, before, write_free)` with the raw sample and last store reading.
+  Control: smoothing the sample past the head must break it.
 * `PositionNamedRecovery.tla`: recovery groups events by position and keeps transactions atomic (`TxAtomic`); grouping by system time with ties merges two transactions (control config).
-* `WriterClockLease.tla`: samples stay monotone across takeover and restore, and the takeover wait is independent of hidden appends; fencing on the last stamp keeps monotonicity but breaks the paired-history invariant (control config).
+* Clock continuity: a writer waits for a sample at least equal to the last store reading in its inherited prefix.
+  The wait contributes to ordering-point timing.
 
