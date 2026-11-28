@@ -587,6 +587,7 @@ variant TxMessage : SourceMessage {
     -- The JVM source log table renders the first operation page as EDN when tx_ops is requested.
     -- A truncated frame encountered while reading that page produces the diagnostic marker `<error decoding tx-ops>`.
     -- Source replay decodes each Arrow IPC message from its retained transaction bytes.
+    -- Hosted row replacements serialize their admitted document under the existing operation tag and field order for both source and receipt encoding.
     -- SQL source replay decodes the argument stream from the selected Arrow binary cell.
     -- Native SQL source replay can retain an aligned plain Binary run value under the source allocation through nested IPC decoding.
     -- JVM SQL source replay borrows plain binary argument bytes through nested IPC decoding while the source relation owns the cell buffers.

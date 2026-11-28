@@ -837,11 +837,11 @@ pub fn bind_installed_authority(
 ) -> Result<()> {
     let (index, control) = installed_authority_control(controls.iter())?;
     if !proof.matches_revision(control.expected()) { return Err(authority_required()); }
-    controls[index].document = HostedControlDocument::Row(StructFields::from([
+    controls[index].document = HostedControlDocument::Row(HostedControlRow::new(StructFields::from([
         ("_id".into(), Value::Utf8(INSTALLATION_AUTHORITY_ID.into())),
         ("incarnation".into(), Value::Binary(proof.incarnation.to_vec())),
         ("writer".into(), Value::Binary(proof.writer.to_vec())),
-    ]));
+    ])));
     Ok(())
 }
 
@@ -858,8 +858,20 @@ pub struct HostedControlWrite {
 
 #[derive(Clone, Debug)]
 enum HostedControlDocument {
-    Row(StructFields<Value>),
+    Row(HostedControlRow),
     Arrow { documents: crate::ArrowDocuments, bytes: usize },
+}
+
+#[derive(Clone, Debug)]
+struct HostedControlRow(Value);
+
+impl HostedControlRow {
+    fn new(fields: StructFields<Value>) -> Self { Self(Value::Struct(fields)) }
+
+    fn fields(&self) -> &StructFields<Value> {
+        let Value::Struct(fields) = &self.0 else { unreachable!("A hosted control row is a source struct") };
+        fields
+    }
 }
 
 impl HostedControlWrite {
@@ -889,7 +901,7 @@ impl HostedControlWrite {
             scope,
             id,
             expected,
-            document: HostedControlDocument::Row(document),
+            document: HostedControlDocument::Row(HostedControlRow::new(document)),
             check_only: false,
         };
         if result.retained_bytes()? > 1024 * 1024 {
@@ -1006,10 +1018,8 @@ impl HostedControlWrite {
         self.expected
     }
     pub fn replacement(&self) -> Option<&StructFields<Value>> {
-        match &self.document {
-            HostedControlDocument::Row(document) if !self.check_only => Some(document),
-            _ => None,
-        }
+        if self.check_only { return None; }
+        self.source_row()
     }
 
     pub(crate) fn installed_authority(&self) -> Result<HostedAuthority> {
@@ -1026,7 +1036,7 @@ impl HostedControlWrite {
 
     pub fn retained_bytes(&self) -> Result<usize> {
         let document = match &self.document {
-            HostedControlDocument::Row(document) => Value::document_retained_bytes(document)?,
+            HostedControlDocument::Row(document) => Value::document_retained_bytes(document.fields())?,
             HostedControlDocument::Arrow { bytes, .. } => *bytes,
         };
         document
@@ -1048,7 +1058,14 @@ impl HostedControlWrite {
 
     pub(crate) fn source_row(&self) -> Option<&StructFields<Value>> {
         match &self.document {
-            HostedControlDocument::Row(document) => Some(document),
+            HostedControlDocument::Row(document) => Some(document.fields()),
+            HostedControlDocument::Arrow { .. } => None,
+        }
+    }
+
+    pub(crate) fn source_row_value(&self) -> Option<&Value> {
+        match &self.document {
+            HostedControlDocument::Row(document) => Some(&document.0),
             HostedControlDocument::Arrow { .. } => None,
         }
     }

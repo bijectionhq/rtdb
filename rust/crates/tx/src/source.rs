@@ -770,6 +770,7 @@ struct SourceOperation<'a> {
 
 enum SourceOperationBody<'a> {
     Values { fields: StructFields<Value>, arguments: Option<i32> },
+    HostedReplacement { header: StructFields<Value>, document: &'a Value },
     Path {
         relation: &'a str,
         name: &'a str,
@@ -1106,10 +1107,16 @@ fn operation_value<'a>(
                 body.insert("field_presence".into(), arrow_field_presence(documents)?);
                 docs = Some((control.name().to_owned(), SourceDocuments::Arrow(documents)));
                 "rtdb-hosted-catalog-arrow-v1"
-            } else {
+            } else if control.is_check() {
                 let document = control.source_row().ok_or_else(|| invalid("Hosted control has no source document"))?;
                 body.insert("document".into(), Value::Struct(document.clone()));
-                if control.is_check() { "rtdb-hosted-control-check-v1" } else { "rtdb-hosted-control-v1" }
+                "rtdb-hosted-control-check-v1"
+            } else {
+                let document = control.source_row_value().ok_or_else(|| invalid("Hosted control has no source document"))?;
+                return Ok(("rtdb-hosted-control-v1".into(), SourceOperation {
+                    body: SourceOperationBody::HostedReplacement { header: body, document },
+                    iids: identities, documents: docs,
+                }));
             }
         }
         Operation::Public(TxOp::HostedConstraintRefusal) => {
@@ -1420,16 +1427,24 @@ fn operation_leg(
     let mut arguments = Vec::with_capacity(values.len());
     let mut documents = Vec::with_capacity(values.len());
     for value in values {
-        let SourceOperationBody::Values { fields, arguments: sql_arguments } = value.body else {
-            return Err(invalid("Transaction operation leg mixes path and value layouts"));
+        let (fields, sql_arguments, hosted_document) = match value.body {
+            SourceOperationBody::Values { fields, arguments } => (fields, arguments, None),
+            SourceOperationBody::HostedReplacement { header, document } => (header, None, Some(document)),
+            SourceOperationBody::Path { .. } => return Err(invalid("Transaction operation leg mixes path and value layouts")),
         };
         iids.push(value.iids);
-        bodies.push(fields);
+        bodies.push((fields, hosted_document));
         arguments.push(sql_arguments);
         documents.push(value.documents);
     }
     let values = bodies;
-    let types = values.iter().map(|value| LogicalType::Struct(value.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect())).collect::<Vec<_>>();
+    let types = values.iter().map(|(fields, hosted_document)| {
+        let mut types = fields.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<StructFields<_>>();
+        if let Some(document) = hosted_document {
+            types.insert("document".into(), document.logical_type());
+        }
+        LogicalType::Struct(types)
+    }).collect::<Vec<_>>();
     let LogicalType::Struct(mut types) = LogicalType::join_all(&types) else { return Err(invalid("Transaction operation leg has no struct layout")); };
     for temporal in ["_valid_from", "_valid_to"] {
         if let Some(ty) = types.get_mut(temporal) {
@@ -1453,7 +1468,10 @@ fn operation_leg(
         } else if name == "args" {
             argument_column(&arguments, argument_values.take(), arrays)?
         } else {
-            let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
+            let cells = || values.iter().map(|(fields, hosted_document)| {
+                if let Some(document) = hosted_document && name == "document" { return *document; }
+                struct_field_cell(fields, &name, &ty)
+            });
             let bound = estimate_builder_bytes_refs(&ty, cells())?;
             arrays.column(bound, || copy_array_refs(&ty, &cells().collect::<Vec<_>>()))?
         };
@@ -3814,6 +3832,63 @@ mod tests {
         }
         let Operation::Public(TxOp::HostedControl(legacy)) = &restored.operations[2] else { panic!("expected legacy control"); };
         assert_eq!(legacy.replacement().unwrap().get("generation"), Some(&Value::I64(7)));
+    }
+
+    #[test]
+    fn hosted_row_source_borrows_replacements_in_the_legacy_operation_layout() {
+        use rtdb_types::{OwnedRelation, PlacedAttemptScope};
+
+        let memory = budget();
+        let scope = PlacedAttemptScope::new("hosted-replacement", 1).unwrap();
+        let relation = OwnedRelation::new("bj_fact_root_admission").unwrap();
+        let first = StructFields::from([
+            ("_id".into(), Value::Utf8("first".into())),
+            ("payload".into(), Value::Binary(vec![1, 2, 3])),
+            ("optional".into(), Value::Null),
+        ]);
+        let second = StructFields::from([
+            ("_id".into(), Value::Utf8("second".into())),
+            ("payload".into(), Value::Utf8("different leg".into())),
+        ]);
+        let controls = [
+            crate::HostedControlWrite::new(relation.clone(), scope, Some(Timestamp(7)), first).unwrap(),
+            crate::HostedControlWrite::new(relation, scope, None, second).unwrap(),
+        ];
+        let transaction = SourceTransaction::new(controls.iter().cloned().map(TxOp::HostedControl).collect(),
+            SubmitOptions::default(), &memory).unwrap();
+
+        for operation in &transaction.operations {
+            let Operation::Public(TxOp::HostedControl(control)) = operation else { panic!("Expected hosted replacement"); };
+            let (tag, source) = operation_value(operation, &memory, SourcePurpose::Log, &mut None).unwrap();
+            let SourceOperationBody::HostedReplacement { document, .. } = source.body else { panic!("Expected borrowed document"); };
+            assert_eq!(tag, "rtdb-hosted-control-v1");
+            assert!(std::ptr::eq(document, control.source_row_value().unwrap()));
+        }
+        let actual = transaction.operation_batch(None, SourcePurpose::Receipt).unwrap();
+        let mut arrays = BatchBuilder::new(1 << 20, &memory).unwrap();
+        let legacy = named_union(controls.iter().map(|control| {
+            let mut fields = control.source_header();
+            fields.insert("document".into(), Value::Struct(control.replacement().unwrap().clone()));
+            ("rtdb-hosted-control-v1".into(), SourceOperation {
+                body: SourceOperationBody::Values { fields, arguments: None },
+                iids: Cow::Borrowed(&[]), documents: None,
+            })
+        }), |leg| operation_leg(leg, &mut arrays, &memory, &mut None)).unwrap();
+        assert_eq!(actual.batch().column(0).to_data(), legacy.to_data());
+        let legacy = RecordBatch::try_new(actual.batch().schema(), vec![legacy]).unwrap();
+        assert_eq!(crate::ipc::encode(legacy.schema_ref(), [&legacy], &memory).unwrap().as_slice(),
+            crate::ipc::encode(actual.batch().schema_ref(), [actual.batch()], &memory).unwrap().as_slice());
+
+        let restored = roundtrip(&transaction);
+        assert_eq!(restored.body_digest().unwrap(), transaction.body_digest().unwrap());
+        for (control, operation) in controls.iter().zip(&restored.operations) {
+            let Operation::Public(TxOp::HostedControl(replayed)) = operation else { panic!("Expected hosted replacement"); };
+            assert_eq!(replayed.id(), control.id());
+            assert_eq!(replayed.scope(), scope);
+            assert_eq!(replayed.expected(), control.expected());
+            assert_eq!(replayed.replacement().unwrap().get("payload"), control.replacement().unwrap().get("payload"));
+            assert!(!replayed.is_check());
+        }
     }
 
     #[test]
