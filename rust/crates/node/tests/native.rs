@@ -6716,6 +6716,11 @@ async fn root_identity_output_pages_keep_the_typed_order_and_hold_fences() {
     assert!(initial.committed(), "{:?}", initial.error());
     let held = session.open_owned_read().await.unwrap();
     let cut = held.system_time();
+    let update = session.state_mut().execute_tx(vec![put(&text, &[EntityId::String("z".into())])],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert!(update.committed(), "{:?}", update.error());
+    let current = session.open_owned_read().await.unwrap();
+    assert!(current.system_time() > cut);
     for (relation, keys, after, ty) in [
         (&text, &text_keys, OwnedIdentityScan::text(None), arrow_schema::DataType::Utf8),
         (&binary, &binary_keys, OwnedIdentityScan::binary(None), arrow_schema::DataType::Binary),
@@ -6725,16 +6730,18 @@ async fn root_identity_output_pages_keep_the_typed_order_and_hold_fences() {
             (OwnedIdentityScan::seek(&keys[0]).unwrap(), &keys[1..], false),
             (OwnedIdentityScan::seek(&keys[1]).unwrap(), &keys[2..], false),
         ] {
-            let output = held.identity_page_output(relation, cut, cut, &bound, 1).await.unwrap();
-            let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
-            assert_eq!(page.more, more);
-            assert_eq!(page.ids().data_type(), &ty);
-            let field = arrow_schema::Field::new("_id", ty.clone(), false);
-            let actual = (0..page.ids().len()).map(|row| read_owned_entity_id(&field, page.ids().as_ref(), row).unwrap().into_owned())
-                .collect::<Vec<_>>();
-            assert_eq!(actual, expected);
-            let owned = held.identity_page(relation, cut, cut, &bound, 1).await.unwrap();
-            assert_eq!((owned.keys.as_slice(), owned.more), (expected, more));
+            for read in [&held, &current] {
+                let output = read.identity_page_output(relation, cut, cut, &bound, 1).await.unwrap();
+                let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
+                assert_eq!(page.more, more);
+                assert_eq!(page.ids().data_type(), &ty);
+                let field = arrow_schema::Field::new("_id", ty.clone(), false);
+                let actual = (0..page.ids().len()).map(|row| read_owned_entity_id(&field, page.ids().as_ref(), row).unwrap().into_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                let owned = read.identity_page(relation, cut, cut, &bound, 1).await.unwrap();
+                assert_eq!((owned.keys.as_slice(), owned.more), (expected, more));
+            }
         }
         for limit in [0, 129] {
             let error = held.identity_page_output(relation, cut, cut, &after, limit).await.err().unwrap();
@@ -6742,14 +6749,6 @@ async fn root_identity_output_pages_keep_the_typed_order_and_hold_fences() {
         }
     }
 
-    let update = session.state_mut().execute_tx(vec![put(&text, &[EntityId::String("z".into())])],
-        AutonomousTxOptions::default()).await.unwrap();
-    assert!(update.committed(), "{:?}", update.error());
-    let current = session.open_owned_read().await.unwrap();
-    let historical = current.identity_page_output(&text, cut, cut, &OwnedIdentityScan::text(None), 2).await.unwrap();
-    let OwnedIdentityPageOutput::Rows(historical) = historical else { panic!("Expected historical owned keys"); };
-    assert_eq!(historical.keys, text_keys);
-    assert!(!historical.more);
     let erase = session.state_mut().execute_tx(vec![TxOp::OwnedErase { relation: binary.clone(), id: binary_keys[0].clone() }],
         AutonomousTxOptions::default()).await.unwrap();
     assert!(erase.committed(), "{:?}", erase.error());
@@ -6761,8 +6760,10 @@ async fn root_identity_output_pages_keep_the_typed_order_and_hold_fences() {
     let original = after_erase.identity_page(&binary, cut, cut, &scan, 2).await;
     let output = after_erase.identity_page_output(&binary, cut, cut, &scan, 2).await;
     match (original, output) {
-        (Ok(original), Ok(OwnedIdentityPageOutput::Rows(page))) => {
-            assert_eq!((page.keys.as_slice(), page.more), (original.keys.as_slice(), original.more));
+        (Ok(original), Ok(OwnedIdentityPageOutput::Arrow(page))) => {
+            let ids = page.ids().as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+            assert_eq!(ids.iter().collect::<Vec<_>>(), [Some(&[0_u8, 255, 0][..])]);
+            assert_eq!(page.more, original.more);
             assert_eq!(original.keys, [binary_keys[1].clone()]);
             assert!(!original.more);
         }
@@ -6803,6 +6804,11 @@ async fn all_valid_arrow_identity_pages_reseek_after_repeated_valid_slices() {
     assert!(tx.committed(), "{:?}", tx.error());
     let held = writer.open_owned_read().await.unwrap();
     let cut = held.system_time();
+    let later = EntityId::String("z".into());
+    let tx = writer.state_mut().execute_tx(vec![put(&text, &later, 0)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(tx.committed(), "{:?}", tx.error());
+    let current = writer.open_owned_read().await.unwrap();
+    assert!(current.system_time() > cut);
     for (relation, keys, scan, ty) in [
         (&text, &text_keys, OwnedIdentityScan::text(None), arrow_schema::DataType::Utf8),
         (&binary, &binary_keys, OwnedIdentityScan::binary(None), arrow_schema::DataType::Binary),
@@ -6814,16 +6820,20 @@ async fn all_valid_arrow_identity_pages_reseek_after_repeated_valid_slices() {
             (OwnedIdentityScan::seek(&keys[0]).unwrap(), 1, &keys[1..], false),
             (OwnedIdentityScan::seek(&keys[1]).unwrap(), 1, &keys[2..], false),
         ] {
-            let output = held.identity_page_all_valid_output(relation, cut, &bound, limit).await.unwrap();
-            let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
-            assert_eq!(page.ids().data_type(), &ty);
-            let actual = (0..page.ids().len()).map(|row| {
-                read_owned_entity_id(&field, page.ids().as_ref(), row).unwrap().into_owned()
-            }).collect::<Vec<_>>();
-            assert_eq!((actual.as_slice(), page.more), (expected, more));
+            for read in [&held, &current] {
+                let output = read.identity_page_all_valid_output(relation, cut, &bound, limit).await.unwrap();
+                let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
+                assert_eq!(page.ids().data_type(), &ty);
+                let actual = (0..page.ids().len()).map(|row| {
+                    read_owned_entity_id(&field, page.ids().as_ref(), row).unwrap().into_owned()
+                }).collect::<Vec<_>>();
+                assert_eq!((actual.as_slice(), page.more), (expected, more));
+                let owned = read.identity_page_all_valid(relation, cut, &bound, limit).await.unwrap();
+                assert_eq!((owned.keys.as_slice(), owned.more), (expected, more));
+            }
         }
     }
-    drop((held, writer));
+    drop((current, held, writer));
     stop(&node, driver).await;
 }
 
@@ -6862,8 +6872,10 @@ async fn binary_owned_history_keeps_original_positions_and_refuses_duplicate_cre
     assert_eq!(first_page.keys, [short.clone()]);
     assert!(first_page.more);
     let output = held.identity_page_all_valid_output(&relation, cut, &OwnedIdentityScan::binary(None), 1).await.unwrap();
-    let OwnedIdentityPageOutput::Rows(output) = output else { panic!("Expected historical owned keys"); };
-    assert_eq!((output.keys, output.more), (first_page.keys, first_page.more));
+    let OwnedIdentityPageOutput::Arrow(output) = output else { panic!("Expected historical Arrow keys"); };
+    let ids = output.ids().as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+    assert_eq!(ids.iter().collect::<Vec<_>>(), [Some(&[0_u8, 255][..])]);
+    assert_eq!(output.more, first_page.more);
     let next_page = held.identity_page_all_valid(&relation, cut, &OwnedIdentityScan::seek(&short).unwrap(), 1).await.unwrap();
     assert_eq!(next_page.keys, [long.clone()]);
     assert!(!next_page.more);

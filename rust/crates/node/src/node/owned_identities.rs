@@ -313,7 +313,7 @@ impl OwnedReadSession {
         }
     }
 
-    /// Reads a typed Root page, using compact funded Arrow keys at the held head.
+    /// Reads a typed Root page, using compact funded Arrow keys for Text and Binary scans.
     pub async fn identity_page_output(
         &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: &OwnedIdentityScan<'_>,
         limit: usize,
@@ -334,7 +334,7 @@ impl OwnedReadSession {
     }
 
     /// Returns the same keys and continuation as `Self::identity_page_all_valid`.
-    /// At the held head a typed scan can return funded Arrow keys.
+    /// A typed scan can return funded Arrow keys at either an admitted historical cut or the held head.
     pub async fn identity_page_all_valid_output(
         &self, relation: &OwnedRelation, system: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
     ) -> Result<OwnedIdentityPageOutput> {
@@ -355,7 +355,7 @@ impl OwnedReadSession {
         let context = self.relation_context(relation)?;
         let mut charge = self.context.memory.reserve(FETCH * 128)?;
         let count = limit + 1;
-        let mut keys = PageKeys::new((at_head && arrow).then_some(after), count);
+        let mut keys = PageKeys::new(arrow.then_some(after), count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
         let bound = identity_bound(after);
@@ -431,7 +431,7 @@ impl OwnedReadSession {
         let context = self.relation_context(relation)?;
         let count = limit + 1;
         let mut charge = self.context.memory.reserve(count * 128)?;
-        let mut keys = PageKeys::new((at_head && arrow).then_some(after), count);
+        let mut keys = PageKeys::new(arrow.then_some(after), count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
         let bound = identity_bound(after);
