@@ -666,6 +666,8 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
     cluster.at(35);
     assert_eq!(writes.store_version_hold(reader, StoreVersionHoldRequest::Reopen(second.key)).await.unwrap_err().code,
         "rtdb.store/hold-unavailable");
+    assert_eq!(purge().await.unwrap_err().code, "rtdb.store/purge-retention");
+    cluster.at(40 + DRIFT);
     purge().await.unwrap();
     assert_eq!(writes.store_version_hold(reader, StoreVersionHoldRequest::Reopen(second.key)).await.unwrap_err().code,
         "rtdb/cursor-expired");

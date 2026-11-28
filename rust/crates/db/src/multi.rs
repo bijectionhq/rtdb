@@ -1408,6 +1408,10 @@ impl MultiDatabase {
         (self.clock)().0.saturating_add(self.options.drift_micros)
     }
 
+    fn lower(&self) -> i64 {
+        (self.clock)().0.saturating_sub(self.options.drift_micros)
+    }
+
     /// The writer clock lease (T7): a writer samples only while its clock plus
     /// the drift bound is before its durable lease end, so every sample it
     /// issues lies below `until`.

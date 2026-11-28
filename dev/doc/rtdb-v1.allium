@@ -264,6 +264,7 @@ surface StatelessDatabase {
         -- The writer assigns a quota-accounted opaque identity and an exclusive deadline.
         -- Reopen and Release require the original identity, exact Version and verified reader binding.
         -- A live hold prevents the writer from advancing the Store floor past its Version.
+        -- Reopen stops at the upper clock bound. Expiry alone releases floor protection only once the lower bound has reached the deadline.
         -- Released and expired holds and holds from an earlier writer or key generation cannot reopen.
         -- Flight dispatch requires matching guarded consumers on the admitted reader route.
 

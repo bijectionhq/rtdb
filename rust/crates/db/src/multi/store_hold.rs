@@ -54,12 +54,12 @@ struct Held {
 pub(super) struct StoreHolds(BTreeMap<[u8; 16], Held>);
 
 impl StoreHolds {
-    fn expire(&mut self, upper: i64, generation: u64) {
-        self.0.retain(|_, held| held.generation == generation && upper < held.hold.expires_at.0);
+    fn expire(&mut self, lower: i64, generation: u64) {
+        self.0.retain(|_, held| held.generation == generation && lower < held.hold.expires_at.0);
     }
 
-    pub(super) fn check_floor(&mut self, keep_from: u64, upper: i64, generation: u64) -> Result<()> {
-        self.expire(upper, generation);
+    pub(super) fn check_floor(&mut self, keep_from: u64, lower: i64, generation: u64) -> Result<()> {
+        self.expire(lower, generation);
         if self.0.values().any(|held| held.hold.key.basis.position() < keep_from) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/purge-retention",
                 "An admitted Store reader still retains history"));
@@ -68,9 +68,9 @@ impl StoreHolds {
     }
 
     fn apply(
-        &mut self, request: StoreVersionHoldRequest, reader: [u8; 32], upper: i64, generation: u64,
+        &mut self, request: StoreVersionHoldRequest, reader: [u8; 32], lower: i64, upper: i64, generation: u64,
     ) -> Result<StoreVersionHoldReply> {
-        self.expire(upper, generation);
+        self.expire(lower, generation);
         match request {
             StoreVersionHoldRequest::Retain { basis, expires_at } => {
                 if !(1..=MAX_HOLD_MICROS).contains(&expires_at.0.saturating_sub(upper)) {
@@ -91,7 +91,13 @@ impl StoreHolds {
                 entry.insert(Held { reader, generation, hold });
                 Ok(StoreVersionHoldReply::Held(hold))
             }
-            StoreVersionHoldRequest::Reopen(key) => Ok(StoreVersionHoldReply::Held(self.find(key, reader)?)),
+            StoreVersionHoldRequest::Reopen(key) => {
+                let hold = self.find(key, reader)?;
+                if upper >= hold.expires_at.0 {
+                    return Err(unavailable());
+                }
+                Ok(StoreVersionHoldReply::Held(hold))
+            },
             StoreVersionHoldRequest::Release(key) => {
                 self.find(key, reader)?;
                 self.0.remove(&key.id);
@@ -132,6 +138,7 @@ impl MultiDatabase {
         }
         self.require_authority(lease)?;
         let upper = self.upper();
+        let lower = self.lower();
 
         if !matches!(request, StoreVersionHoldRequest::Release(_)) {
             let state = self.state();
@@ -146,7 +153,7 @@ impl MultiDatabase {
             }
             index.view(MAIN_BRANCH, At::Exactly(basis), Layer::Merged, Timestamp(upper))?;
         }
-        self.writer.as_mut().ok_or_else(no_writer)?.store_holds.apply(request, reader, upper, generation)
+        self.writer.as_mut().ok_or_else(no_writer)?.store_holds.apply(request, reader, lower, upper, generation)
     }
 }
 

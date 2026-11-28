@@ -80,9 +80,9 @@ impl MultiDatabase {
         if self.authority()?.epoch != lease.epoch || self.state().head != head || self.state().floor != journal_floor {
             return Err(prefix_unsettled());
         }
-        let now = self.upper();
+        let lower = self.lower();
         let generation = self.state().generation;
-        self.writer.as_mut().ok_or_else(no_writer)?.store_holds.check_floor(keep_from, now, generation)?;
+        self.writer.as_mut().ok_or_else(no_writer)?.store_holds.check_floor(keep_from, lower, generation)?;
         // The journal compares the next slot and writer fence when the caller appends.
         Ok(Some(lease))
     }
