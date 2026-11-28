@@ -1798,16 +1798,24 @@
             (.add ks (.toLowerCase s java.util.Locale/ROOT))))))
     ks))
 
+(def ^:private ^java.util.Set sql-keyword-buffers
+  (into #{} (map #(.asReadOnlyBuffer (resolve-utf8-buf %))) sql-keywords))
+
 (defn quote-ident ^String [^String s]
   (if (and (re-matches #"[a-z_][a-z0-9_]*" s)
            (not (.contains sql-keywords s)))
     s
     (str \" (.replace s "\"" "\"\"") \")))
 
+(defn try-write-simple-quote-ident [^VariableWidthVector out value]
+  (TextSlices/tryWriteSimpleQuoteIdent out value sql-keyword-buffers))
+
 (defmethod codegen-call [:quote_ident :utf8] [_]
-  {:return-type #xt/type :utf8
-   :->call-code (fn [[s]]
-                  `(resolve-utf8-buf (quote-ident (resolve-string ~s))))})
+  (with-byte-transform
+    {:return-type #xt/type :utf8
+     :->call-code (fn [[s]]
+                    `(resolve-utf8-buf (quote-ident (resolve-string ~s))))}
+    (fn [out value] `(try-write-simple-quote-ident ~out ~value))))
 
 (defn- strings->list-reader ^xtdb.arrow.ListValueReader [^objects arr]
   (let [box (ValueBox.)
@@ -1927,7 +1935,11 @@
 (defmethod codegen-call [:parse_ident :utf8] [_]
   {:return-type #xt/type [:list :utf8]
    :->call-code (fn [[s]]
-                  `(parse-ident (resolve-string ~s)))})
+                  `(parse-ident (resolve-string ~s)))
+   :->write-code (fn [out [s]]
+                   `(let [source# ~s]
+                      (when-not (TextSlices/tryWriteSimpleParseIdent ~out source#)
+                        (.writeObject ~out (parse-ident (resolve-string source#))))))})
 
 (defmethod codegen-call [:overlay :varbinary :varbinary :int :int] [_]
   (codegen-overlay #xt/type :varbinary `resolve-buf `StringUtil/sqlBinOverlay `StringUtil/sqlBinOverlayParts))

@@ -2452,6 +2452,9 @@ surface QueryAccess {
     @guarantee JvmTextTransformProjections
         -- JVM UPPER and LOWER use the default locale at evaluation and can write ASCII directly when the locale admits ASCII case mapping.
         -- JVM REVERSE can write reached ASCII in reverse byte order and applies JVM character reversal to other text.
+        -- JVM QUOTE_IDENT can write simple lowercase ASCII identifiers directly when the lexer does not classify them as keywords.
+        -- JVM PARSE_IDENT can write dot-separated simple lowercase ASCII parts directly to a plain UTF-8 list.
+        -- Other identifiers use the existing decoding, quoting, case folding, and parse errors.
         -- JVM REPLACE can write reached well-formed UTF-8 directly for a nonempty literal target and a literal replacement, substituting non-overlapping matches in source order.
         -- An empty target uses Java's UTF-16 insertion semantics, and malformed source bytes use the existing text decoding.
         -- A JVM text-to-binary cast can write even-length ASCII hex directly after validating every digit, preserving the diagnostics and additional digits accepted by the JVM hex decoder.

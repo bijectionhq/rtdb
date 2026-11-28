@@ -572,6 +572,38 @@
                (run-projection rel split)))
       (t/is (= ["東京"] (:res (run-projection rel (list 'nth split 1))))))))
 
+(t/deftest quote-ident-projection-preserves-keywords-quoting-and-decoding
+  (with-open [^Vector source (tu/open-vec "s" #xt/type [:? :utf8]
+                                         ["alpha2" "_x" "select" "local_date" "Foo" "a\"b" "café" "" nil])]
+    (.writeBytes source (byte-array [97 -1]))
+    (t/is (= {:res ["alpha2" "_x" "\"select\"" "\"local_date\"" "\"Foo\"" "\"a\"\"b\"" "\"café\"" "\"\"" nil "\"a�\""]
+              :res-type #xt/type [:? :utf8]}
+             (run-projection (vr/rel-reader [source]) '(quote_ident s))))))
+
+(t/deftest parse-ident-projection-preserves-parts-folding-and-reached-errors
+  (with-open [rel (tu/open-rel {:s ["|a2._b.select" "|\"a.b\".FOO" "|İ.東京" nil]})]
+    (t/is (= {:res [["a2" "_b" "select"] ["a.b" "foo"] ["i\u0307" "東京"] nil]
+              :res-type #xt/type [:? [:list :utf8]]}
+             (run-projection rel '(parse_ident (substring s 2))))))
+  (with-open [^Vector source (tu/open-vec "s" #xt/type :utf8 [])]
+    (.writeBytes source (byte-array [97 46 -1]))
+    (t/is (= {:res [["a" "�"]], :res-type #xt/type [:list :utf8]}
+             (run-projection (vr/rel-reader [source]) '(parse_ident s)))))
+  (with-open [rel (tu/open-rel {:s ["a.b" "c..d" "\"x"]})]
+    (t/is (thrown-with-msg? Incorrect #"zero-length identifier in: c\.\.d"
+                           (run-projection rel '(parse_ident s)))))
+  (with-open [rel (tu/open-rel {:s ["a."]})]
+    (t/is (thrown-with-msg? Incorrect #"zero-length identifier"
+                           (run-projection rel '(parse_ident s))))))
+
+(t/deftest identifier-projections-offer-writers-for-plain-results
+  (let [opts {:var-types {'s #xt/type :utf8}, :projection? true}]
+    (doseq [form ['(quote_ident s) '(parse_ident s)]]
+      (t/is (some? (-> (expr/form->expr form opts)
+                       (#'expr/emit-row-expr opts)
+                       :continue-projection))
+            (pr-str form)))))
+
 (t/deftest null-delimiter-projections-preserve-utf16-units-and-list-layout
   (with-open [rel (tu/open-rel {:s ["_a\u0000\u007f" "_" "_é😀" nil "_x,y"], :delimiter [nil nil nil nil ","]})]
     (let [split '(string_to_array (substring s 2) delimiter)]

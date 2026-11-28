@@ -66,6 +66,64 @@ object TextSlices {
         return true
     }
 
+    private fun ByteBuffer.simpleIdentifierEnd(start: Int): Int {
+        val end = limit()
+        if (start == end) return start
+        val first = get(start).toInt()
+        if (first !in 'a'.code..'z'.code && first != '_'.code) return start
+        var index = start + 1
+        while (index < end) {
+            val octet = get(index).toInt()
+            if (octet !in 'a'.code..'z'.code && octet !in '0'.code..'9'.code && octet != '_'.code) break
+            index++
+        }
+        return index
+    }
+
+    @JvmStatic
+    fun tryWriteSimpleQuoteIdent(out: VariableWidthVector, source: Any?, keywords: Set<ByteBuffer>): Boolean {
+        val input = source as? ByteBuffer ?: return false
+        if (!input.hasRemaining() || input.simpleIdentifierEnd(input.position()) != input.limit() || input in keywords)
+            return false
+
+        out.writeSlice(input, input.position(), input.remaining())
+        return true
+    }
+
+    @JvmStatic
+    fun tryWriteSimpleParseIdent(out: ListVector, source: Any?): Boolean {
+        val input = source as? ByteBuffer ?: return false
+        val elements = out.listElements as? Utf8Vector ?: return false
+        val end = input.limit()
+
+        var start = input.position()
+        var parts = 0
+        while (true) {
+            val partEnd = input.simpleIdentifierEnd(start)
+            if (partEnd == start) return false
+            parts++
+            if (partEnd == end) break
+            if (input[partEnd].toInt() != '.'.code) return false
+            start = partEnd + 1
+        }
+
+        val bytes = input.remaining() - (parts - 1)
+        if (elements.valueCount + parts.toLong() > Int.MAX_VALUE ||
+            elements.dataBuffer.writerIndex + bytes > Int.MAX_VALUE
+        ) return false
+
+        start = input.position()
+        for (index in start until end) {
+            if (input[index].toInt() == '.'.code) {
+                elements.writeSlice(input, start, index - start)
+                start = index + 1
+            }
+        }
+        elements.writeSlice(input, start, end - start)
+        out.endList()
+        return true
+    }
+
     @JvmStatic
     fun tryWriteKeywordPart(out: VariableWidthVector, input: ByteBuffer, namespace: Boolean): Boolean {
         if (Charset.defaultCharset() != Charsets.UTF_8 || !input.isWellFormedUtf8()) return false
