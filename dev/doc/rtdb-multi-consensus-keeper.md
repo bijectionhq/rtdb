@@ -364,6 +364,7 @@ Keep current-name visibility on the held versions for the later `attest` step.
 Finish acquisition and save the signed installation proof before recording the installation.
 To settle an acquisition interrupted before attestation, first supersede the candidate in the activation authority.
 Run `rtdb multi-backup abandon-object-acquisition --stage-receipt FILE --authority-socket PATH --journal-url URL --journal-custodian-tls-dir DIR --key-vault DIR --bucket BUCKET` with the original destination providers.
+The command checks the original vault's exact generation record before changing keeper or object custody.
 To recover a saved acquisition when the local stage receipt is lost, configure the destination's `object_namespace` in the broker's `destination_journal_readers` entry with `require_object_custody` enabled.
 Use the bucket, endpoint and region reported in the stage receipt for the commissioned allocation.
 Run the same command with `--authority-id UUID --incarnation UUID` in place of `--stage-receipt FILE` to load the plan from that allocation.

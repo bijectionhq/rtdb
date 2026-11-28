@@ -86,6 +86,18 @@ impl FileKms {
             .await.map_err(vault_task_error)?
     }
 
+    pub async fn require_recovery_key_custody(&self, hold: RecoveryKeyHold) -> Result<()> {
+        validate_hold(hold)?;
+        self.access(hold.generation, move |slot, state, _| {
+            match state.ok_or_else(unknown_generation)?.custody {
+                Custody::Recovery(RecoveryCustody::Held { hold: existing }
+                    | RecoveryCustody::Released { hold: existing, .. }
+                    | RecoveryCustody::Abandoned { hold: existing }) if existing == hold => slot.sync(),
+                _ => Err(conflict("This generation has no matching recovery custody record")),
+            }
+        }).await
+    }
+
     pub async fn abandon_recovery_key(&self, identity: Uuid, hold: RecoveryKeyHold) -> Result<()> {
         validate_hold(hold)?;
         self.access(hold.generation, move |slot, state, _| {

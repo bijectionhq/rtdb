@@ -1001,14 +1001,21 @@ mod tests {
         let empty_vault = home.path().join("empty-custody-vault");
         FileKms::create_directory(&empty_vault).unwrap();
         assert!(discover(abandoned, &empty_vault).await.is_err());
+        assert!(reader.journal.checkpoint_custody(journal_stream).await.unwrap().is_none());
+        let planned_versions = plan.pinned_versions();
+        for version in &planned_versions {
+            let listed = aws("list-object-versions", &["--prefix", &version.key]);
+            assert!(listed["Versions"].as_array().unwrap().iter().any(|entry| {
+                entry["Key"] == version.key && entry["VersionId"] == version.version
+            }));
+        }
         let original_keys = FileKms::open(&vault, || SystemClock.now().0).unwrap();
         original_keys.require_recovery_key(plan.key_hold.unwrap()).await.unwrap();
         let abandoned_result = discover(abandoned, &vault).await.unwrap();
-        let retired_versions = plan.pinned_versions();
-        assert_eq!(abandoned_result["retired_versions"], retired_versions.len());
+        assert_eq!(abandoned_result["retired_versions"], planned_versions.len());
         assert_eq!(discover(abandoned, &vault).await.unwrap(), abandoned_result);
         assert_eq!(observe_hold(&unrelated)["LegalHold"]["Status"], "ON");
-        for version in &retired_versions {
+        for version in &planned_versions {
             let listed = aws("list-object-versions", &["--prefix", &version.key]);
             assert!(listed["Versions"].as_array().into_iter().flatten().all(|entry| entry["VersionId"] != version.version));
         }

@@ -100,6 +100,13 @@ impl Abandon {
             {
                 return Err(invalid_plan());
             }
+            if let Some(order) = staged::read_staging_order(store.as_ref(), authority, candidate).await? {
+                if order.intent != intent || order.key_hold != hold || order.destination_journal_sha256 != custodian.connection_sha256 {
+                    return Err(invalid_plan());
+                }
+                keys.require_recovery_vault(order.vault_identity).await?;
+            }
+            keys.require_recovery_key_custody(hold).await?;
             let targets = plan.targets(&inventory)?;
             let retired_versions = targets.len();
             let journal = authorize_abandoned_acquisition(
