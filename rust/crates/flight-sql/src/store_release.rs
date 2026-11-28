@@ -1,12 +1,13 @@
 use tonic::{Status, metadata::{Ascii, MetadataMap, MetadataValue}};
 
-pub(crate) const HEADER: &str = "x-rtdb-store-release";
+pub const HEADER: &str = "x-rtdb-store-release";
+pub const LINKED_RELEASE: &str = ::store::CONTRACT_VERSION;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StoreRelease(&'static str);
 
 impl StoreRelease {
-    const LINKED: Self = Self(::store::CONTRACT_VERSION);
+    const LINKED: Self = Self(LINKED_RELEASE);
 
     pub(crate) fn negotiate(headers: &MetadataMap, verified_credential: bool) -> Result<Self, Status> {
         if !verified_credential {

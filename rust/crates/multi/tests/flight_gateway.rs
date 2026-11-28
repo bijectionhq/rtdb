@@ -5,6 +5,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arrow_flight::{Action, FlightDescriptor, HandshakeRequest, Ticket, flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient}};
+use base64::Engine as _;
 use futures::TryStreamExt;
 use prost::Message;
 use rtdb_multi::{admin, flight_gateway, gateway::GatewayOptions};
@@ -149,6 +150,24 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     assert_eq!(raw.do_get(request(ticket.clone(), "invalid", None)).await.unwrap_err().code(), Code::Unauthenticated);
     assert_eq!(raw.do_get(request(ticket.clone(), &route, Some("another"))).await.unwrap_err().code(), Code::PermissionDenied);
 
+    let startup = |store: bool| {
+        let mut request = Request::new(futures::stream::iter([HandshakeRequest::default()]));
+        let credentials = base64::engine::general_purpose::STANDARD.encode("xtdb:cell-test");
+        request.metadata_mut().insert("authorization", format!("Basic {credentials}").parse().unwrap());
+        request.metadata_mut().insert("x-xtdb-database", selector.parse().unwrap());
+        request.metadata_mut().insert("x-rtdb-request-store-drain", "1".parse().unwrap());
+        if store {
+            request.metadata_mut().insert(rtdb_flight_sql::STORE_RELEASE_HEADER, rtdb_flight_sql::LINKED_STORE_RELEASE.parse().unwrap());
+        }
+        request
+    };
+    let ordinary = raw.handshake(startup(false)).await.unwrap();
+    assert!(!ordinary.metadata().contains_key("x-rtdb-store-drain-ticket"));
+    let _: Vec<_> = ordinary.into_inner().try_collect().await.unwrap();
+    let enrolled = raw.handshake(startup(true)).await.unwrap();
+    let drain = enrolled.metadata().get("x-rtdb-store-drain-ticket").unwrap().clone();
+    let _: Vec<_> = enrolled.into_inner().try_collect().await.unwrap();
+
     let holder = cell.holder("shop").await.unwrap();
     let target = 1 - holder;
     let holder_server = cell.node(holder).server.addresses().flight_sql.unwrap();
@@ -160,6 +179,16 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
 
     admin::move_deployment(cell.directory.as_ref(), "shop", &cell.node(target).lease.id(), &control()).await.unwrap();
     assert_eq!(raw.do_get(request(ticket, &route, None)).await.unwrap_err().code(), Code::Unavailable);
+
+    let mut close = Request::new(Action { r#type: "CloseSession".to_owned(), body: Default::default() });
+    close.metadata_mut().insert("x-rtdb-store-drain-ticket", drain);
+    let confirmation = raw.do_action(close).await.unwrap();
+    assert!(!confirmation.metadata().contains_key("authorization"));
+    assert!(!confirmation.metadata().contains_key("set-cookie"));
+    let mut results = confirmation.into_inner();
+    let result = results.message().await.unwrap().unwrap();
+    assert_eq!(result.body.as_ref(), &[8, 1, 16, 1]);
+    assert!(results.message().await.unwrap().is_none());
 
     let mut replacement = FlightSqlServiceClient::new(channel(address).await);
     replacement.set_header("x-xtdb-database", &selector);

@@ -4382,7 +4382,7 @@ actor Gateway {
     -- The writer authenticates the session with the peer in that proof.
     -- Each Flight SQL call using a session token resolves its original writer placement.
     -- A displaced Flight SQL session must establish a new authenticated session.
-    -- An authenticated Flight handshake can request a separately sealed drain ticket for its session.
+    -- An authenticated Flight handshake with an acknowledged Store release can request a separately sealed drain ticket for its session.
     -- The gateway accepts that ticket only for a single uncompressed CloseSession action and routes it to the ticket's original placement.
     -- A drain ticket carries no data request authority.
     -- Completion requires the original receiver's explicit Store read drain acknowledgement.

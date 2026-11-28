@@ -9,7 +9,7 @@ use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExe
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
-use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER};
+use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER, LINKED_STORE_RELEASE, STORE_RELEASE_HEADER};
 use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -576,7 +576,9 @@ impl Router {
         target.acknowledge_fresh(headers);
         let session = SessionRoute { target, session };
         let route = self.encode(ROUTE_CONTEXT, &session)?;
-        if issue_drain && headers.contains_key(header::AUTHORIZATION) {
+        if issue_drain && headers.contains_key(header::AUTHORIZATION)
+            && single_header(headers, STORE_RELEASE_HEADER)? == Some(LINKED_STORE_RELEASE)
+        {
             let mut ticket = header_value(&self.encode(DRAIN_CONTEXT, &session)?)?;
             ticket.set_sensitive(true);
             headers.insert(DRAIN_HEADER, ticket);
