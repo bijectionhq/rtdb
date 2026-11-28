@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::{Arc, Weak}};
 
-use rtdb_format::journal::{OrderedStoreHold, OrderedStoreWatchTurn, Record, StoreHoldChange};
+use rtdb_format::journal::{OrderedStoreHold, OrderedStoreWatchTurn, Record, StoreHoldChange, StoreWatchReceiver};
 use rtdb_index::branches::BranchIndex;
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
@@ -151,7 +151,7 @@ fn retains(hold: &OrderedStoreHold, lower: i64) -> bool {
 
 fn valid_watch_admission(hold: &OrderedStoreHold) -> bool {
     hold.watch_turn.is_none_or(|turn| hold.change_history && turn.receipt != [0; 16]
-        && turn.receipt != hold.id && turn.receiver != [0; 16])
+        && turn.receipt != hold.id && turn.receiver.session != [0; 16] && turn.receiver.drain_key != [0; 32])
 }
 
 impl StoreHolds {
@@ -312,7 +312,7 @@ impl MultiDatabase {
     /// The receipt lookup and the in-flight byte turn share the writer lock
     /// with hold release and floor publication.
     pub(super) async fn enter_held_store_watch(
-        &mut self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, id: [u8; 16], receiver: [u8; 16],
+        &mut self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, id: [u8; 16], receiver: StoreWatchReceiver,
     ) -> Result<StoreReadTurn> {
         if hold.basis.incarnation() != after.incarnation() || hold.basis.position() > after.position() {
             return Err(watch_gap());
@@ -341,7 +341,7 @@ impl MultiDatabase {
     }
 
     pub(super) async fn finish_held_store_watch(
-        &mut self, key: StoreVersionHoldKey, reader: [u8; 32], receiver: [u8; 16],
+        &mut self, key: StoreVersionHoldKey, reader: [u8; 32], receiver: StoreWatchReceiver,
     ) -> Result<()> {
         self.refresh().await?;
         let Some(hold) = self.state().store_holds.in_flight(key) else { return Ok(()); };

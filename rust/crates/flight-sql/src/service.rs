@@ -275,6 +275,11 @@ impl Call {
         }
     }
 
+    pub(crate) fn store_watch_signer(&self) -> Result<rtdb_crypt::store_watch_drain::Signer, Status> {
+        let session = Uuid::parse_str(&self.session.id).map_err(arrow)?;
+        self.service.0.auth.store_watch_signer(session)
+    }
+
     pub async fn close_session(&self) {
         self.service.fence_session(&self.session);
         // Keep the closed session's identity through the normal idle bound.

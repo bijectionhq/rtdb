@@ -8,7 +8,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use journal_contract::{Epoch, JournalError, Lsn};
 use rtdb_crypt::tokens::{TokenAuthority, VerifiedClaims};
-use rtdb_format::journal::Record;
+use rtdb_format::journal::{Record, StoreWatchReceiver};
 use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, Decision, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
     TransactPipeline, TransactState, TransactionRecord, TxKey, ROW_CUSTODY, prepare_custody, workload,
@@ -82,7 +82,7 @@ enum Command {
         after: Basis,
         reader: [u8; 32],
         hold: StoreVersionHoldKey,
-        receiver: [u8; 16],
+        receiver: StoreWatchReceiver,
         id: [u8; 16],
         drain: StoreWatchDrain,
         reply: Reply<StoreReadTurn>,
@@ -90,7 +90,7 @@ enum Command {
     FinishStoreWatch {
         key: StoreVersionHoldKey,
         reader: [u8; 32],
-        receiver: [u8; 16],
+        receiver: StoreWatchReceiver,
     },
     BoundJournal { limit: u64, reply: Reply<Option<rtdb_format::journal::ObjectId>> },
     /// A deferred checkpoint built off the database lock, ready to announce.
@@ -158,7 +158,7 @@ impl WritePipeline {
     }
 
     pub async fn enter_held_store_watch(
-        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: [u8; 16],
+        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: StoreWatchReceiver,
     ) -> Result<StoreReadTurn> {
         let id = *Uuid::new_v4().as_bytes();
         let key = StoreVersionHoldKey { basis: hold.basis, id };

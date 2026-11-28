@@ -11,7 +11,7 @@ fn refused() -> Status {
     Status::permission_denied("The Store drain proof must name its original Flight receiver and session")
 }
 
-pub(super) struct VerifiedStoreDrain(String);
+pub(super) struct VerifiedStoreDrain(Uuid);
 
 impl Service {
     pub(super) fn store_drain_proof(
@@ -37,7 +37,7 @@ impl Service {
         if !self.0.auth.verify_store_drain(session, database, proof.as_encoded_bytes()) {
             return Err(refused());
         }
-        Ok(Some(VerifiedStoreDrain(session_key)))
+        Ok(Some(VerifiedStoreDrain(session)))
     }
 
     pub(super) fn confirm_forgotten_store_drain(
@@ -46,7 +46,7 @@ impl Service {
         // A signed session starts registered. Sweep forgets an enrolled
         // session only after fencing it and observing no outstanding reads.
         // Shutdown discards the registry and cancels the service first.
-        if self.0.sessions.contains(&proof.0) {
+        if self.0.sessions.contains(&proof.0.to_string()) {
             return Ok(None);
         }
         if self.0.cancellation.is_cancelled() {
@@ -54,7 +54,8 @@ impl Service {
         }
         let permit = self.0.permits.clone().try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
-        let result = CloseResult { status: 1, store_reads_drained: true };
+        let store_watch_drain = self.0.auth.store_watch_signer(proof.0)?.drained();
+        let result = CloseResult { status: 1, store_reads_drained: true, store_watch_drain };
         let charge = self.memory().reserve(wire::add(result.encoded_len(), 256)?).map_err(status)?;
         let body = wire::retain(result.encode_to_vec(), charge);
         let stream: Output<_> = Box::pin(futures::stream::once(async move {

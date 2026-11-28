@@ -141,7 +141,13 @@ pub struct OrderedStoreHold {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderedStoreWatchTurn {
     pub receipt: [u8; 16],
-    pub receiver: [u8; 16],
+    pub receiver: StoreWatchReceiver,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreWatchReceiver {
+    pub session: [u8; 16],
+    pub drain_key: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

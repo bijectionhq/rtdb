@@ -28,6 +28,9 @@ pub(crate) struct CloseResult {
     /// Store calls and Flight-owned reply buffers of this closed session.
     #[prost(bool, tag = "2")]
     pub store_reads_drained: bool,
+    /// An exact original Store session and its signed terminal evidence.
+    #[prost(bytes, tag = "3")]
+    pub store_watch_drain: Vec<u8>,
 }
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct PreparedResult {

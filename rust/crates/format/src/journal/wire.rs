@@ -197,6 +197,8 @@ struct OrderedStoreWatchTurn {
     receipt: Vec<u8>,
     #[prost(bytes, tag = "2")]
     receiver: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    drain_key: Vec<u8>,
 }
 
 #[derive(Message)]
@@ -385,7 +387,8 @@ impl From<&super::OrderedStoreHold> for OrderedStoreHold {
         Self { basis: hold.basis.to_bytes().to_vec(), id: hold.id.to_vec(), reader: hold.reader.to_vec(),
             expires_at_micros: Some(hold.expires_at_micros), change_history: Some(hold.change_history),
             watch_turn: hold.watch_turn.map(|turn| OrderedStoreWatchTurn {
-                receipt: turn.receipt.to_vec(), receiver: turn.receiver.to_vec(),
+                receipt: turn.receipt.to_vec(), receiver: turn.receiver.session.to_vec(),
+                drain_key: turn.receiver.drain_key.to_vec(),
             }) }
     }
 }
@@ -403,7 +406,10 @@ impl TryFrom<OrderedStoreHold> for super::OrderedStoreHold {
             watch_turn: hold.watch_turn.map(|turn| -> Result<super::OrderedStoreWatchTurn> {
                 Ok(super::OrderedStoreWatchTurn {
                     receipt: turn.receipt.try_into().map_err(|_| invalid("A Store watch receipt ID has 16 bytes"))?,
-                    receiver: turn.receiver.try_into().map_err(|_| invalid("A Store watch receiver has 16 bytes"))?,
+                    receiver: super::StoreWatchReceiver {
+                        session: turn.receiver.try_into().map_err(|_| invalid("A Store watch receiver has 16 bytes"))?,
+                        drain_key: turn.drain_key.try_into().map_err(|_| invalid("A Store watch drain key has 32 bytes"))?,
+                    },
                 })
             }).transpose()?,
         })

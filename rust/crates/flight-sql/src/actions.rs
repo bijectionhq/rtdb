@@ -497,7 +497,14 @@ impl Service {
                     protocol::Empty::decode(action.body.as_ref()).map_err(arrow)?;
                     call.close_session().await;
                     if call.minted { return Err(Status::not_found("No session to close")); }
-                    let result = protocol::CloseResult { status: 1, store_reads_drained: true };
+                    let store_watch_drain = if call.session.store_release.is_some()
+                        && call.session.caller.verified_credential
+                    {
+                        call.store_watch_signer()?.drained()
+                    } else {
+                        Vec::new()
+                    };
+                    let result = protocol::CloseResult { status: 1, store_reads_drained: true, store_watch_drain };
                     let charge = call.reserve(wire::add(result.encoded_len(), 256)?)?;
                     Ok(vec![Ok(ActionResult { body: wire::retain(result.encode_to_vec(), charge) })])
                 }

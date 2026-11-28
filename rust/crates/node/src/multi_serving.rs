@@ -1033,7 +1033,7 @@ impl ServingDriver for MultiServing {
     }
 
     async fn enter_held_store_watch(
-        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: [u8; 16], cancellation: &CancellationToken,
+        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, receiver: rtdb_format::journal::StoreWatchReceiver, cancellation: &CancellationToken,
     ) -> Result<StoreReadTurn> {
         if self.classic_workload_fence.is_some() {
             return Err(workload::denied());

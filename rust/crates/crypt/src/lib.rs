@@ -7,6 +7,7 @@ mod file;
 mod local;
 pub mod receiver_clock;
 mod source;
+pub mod store_watch_drain;
 pub use source::SourceAdmissionKey;
 pub mod tokens;
 

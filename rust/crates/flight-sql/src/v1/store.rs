@@ -609,9 +609,13 @@ impl Service {
                 let account = hold_version::reader_account(call)?;
                 let reader = hold_version::reader_identity(incarnation, account);
                 let key = hold_version::hold_key(incarnation, retention)?;
-                let receiver = uuid::Uuid::parse_str(&call.session.id)
+                let session = uuid::Uuid::parse_str(&call.session.id)
                     .map_err(|_| Status::internal("The Store session has no receiver identity"))?;
-                let turn = driver.enter_held_store_watch(original, reader, key, *receiver.as_bytes(), &call.cancellation)
+                let receiver = rtdb_format::journal::StoreWatchReceiver {
+                    session: *session.as_bytes(),
+                    drain_key: call.store_watch_signer()?.public_key(),
+                };
+                let turn = driver.enter_held_store_watch(original, reader, key, receiver, &call.cancellation)
                     .await.map_err(error::anomaly)?;
                 (Some(turn), Some(hold_version::encode_key(key)))
             },

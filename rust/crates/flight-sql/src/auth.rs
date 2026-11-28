@@ -68,6 +68,14 @@ impl Authentication {
     pub fn issue_store_drain(&self, session: Uuid, database: &str) -> String {
         URL_SAFE_NO_PAD.encode(self.store_drain_mac(session, database).finalize().into_bytes())
     }
+    pub fn store_watch_signer(&self, session: Uuid) -> Result<rtdb_crypt::store_watch_drain::Signer, Status> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.store_drain_key.as_ref()).expect("HMAC key");
+        mac.update(b"rtdb.flight.store-watch-signing-key.v1\0");
+        mac.update(session.as_bytes());
+        let seed = Zeroizing::new(mac.finalize().into_bytes().into());
+        rtdb_crypt::store_watch_drain::Signer::from_seed(&seed, *session.as_bytes())
+            .map_err(crate::error::status)
+    }
     pub fn verify_store_drain(&self, session: Uuid, database: &str, proof: &[u8]) -> bool {
         proof.len() == 43 && URL_SAFE_NO_PAD.decode(proof).ok().is_some_and(|proof| {
             self.store_drain_mac(session, database).verify_slice(&proof).is_ok()
