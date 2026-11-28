@@ -500,11 +500,13 @@ Authenticated RTDB recovery publishes the surviving application lineage and can 
 Unknown-tail publication permanently fences the discarded suffix from the surviving lineage.
 An isolated predecessor quorum can still commit previously staged bytes outside that lineage.
 
-Commissioned funded dispatch remains fenced.
-The original Kernel still needs to bind each exact timed append to its booking and stage before dispatch, consume lineage proofs after recovery, and update the original task and obligation fates.
+The Kernel binds each commissioned timed append to its original booking and stage before dispatch.
+After recovery, the Kernel uses the published lineage to reconcile the original task and obligation fates before readmitting the recovered scope.
 The authorization binds the application catalog, original stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
 The receiver clock supplies the journal clock scale, and the source quorum authenticates the durable timing bound.
-The commissioned Store path must reserve two adjacent positions under the current writer. It must prepare the final sealed effect for the second position, commit the Kernel's authorization at the first, and dispatch those exact effect bytes only after the authorization is durable. The authorization must remain discoverable through the original obligation until settlement, including after the slot expires.
+The commissioned Store path prepares the sealed effect at the second of two adjacent positions under the current writer.
+The Kernel commits its authorization at the first position before confirming those exact effect bytes.
+The original obligation keeps the authorization discoverable until settlement, including after the slot expires.
 The current Store path orders the Kernel's commit window and reports the application version.
 A plain Store receipt alone leaves a predecessor authorization pending.
 For an included record at the authorized position that matches the append's identity, missing timing evidence also leaves the authorization pending.
