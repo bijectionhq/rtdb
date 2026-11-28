@@ -767,13 +767,22 @@ async fn store_watch_receipt_fences_journal_trim_through_release_and_drain() {
     assert!(writer.announce_checkpoint(prepared).await.unwrap().manifest().is_none());
     assert!(writer.checkpoint_retained_suffix(1).await.unwrap().is_none());
     assert!(writer.fresh_history().await.unwrap().after_floor <= old.position());
-    assert_eq!(writer.enter_held_store_watch(current, [2; 32], held.key).await.err().unwrap().code,
+    let control = Basis::new(current.incarnation(), writer.fresh_history().await.unwrap().through);
+    assert!(control > current);
+    assert_eq!(writer.enter_local_store_read(At::Exactly(control)).await.err().unwrap().code,
+        "rtdb/unknown-basis");
+    let ahead = Basis::new(current.incarnation(), control.position() + 1);
+    assert_eq!(writer.enter_local_store_watch(ahead).await.err().unwrap().code, "rtdb/change-basis-ahead");
+    let ordinary = writer.enter_local_store_watch(control).await.unwrap();
+    writer.check_local_store_basis(control, Some(&ordinary)).await.unwrap();
+    drop(ordinary);
+    assert_eq!(writer.enter_held_store_watch(control, [2; 32], held.key).await.err().unwrap().code,
         "rtdb/cursor-expired");
-    let turn = writer.enter_held_store_watch(current, reader, held.key).await.unwrap();
+    let turn = writer.enter_held_store_watch(control, reader, held.key).await.unwrap();
     writer.store_version_hold(reader, StoreVersionHoldRequest::Release(held.key)).await.unwrap();
-    assert_eq!(writer.enter_held_store_watch(current, reader, held.key).await.err().unwrap().code,
+    assert_eq!(writer.enter_held_store_watch(control, reader, held.key).await.err().unwrap().code,
         "rtdb/cursor-expired");
-    writer.check_local_store_basis(current, Some(&turn)).await.unwrap();
+    writer.check_local_store_basis(control, Some(&turn)).await.unwrap();
     assert!(writer.checkpoint_retained_suffix(1).await.unwrap().is_none());
     drop(turn);
 
@@ -786,6 +795,7 @@ async fn store_watch_receipt_fences_journal_trim_through_release_and_drain() {
     let mut replacement = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
     replacement.fresh_index().await.unwrap();
     assert!(replacement.fresh_history().await.unwrap().after_floor > old.position());
+    assert_eq!(writer.enter_local_store_watch(old).await.err().unwrap().code, "rtdb/cursor-expired");
     assert_eq!(writer.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
 }
 

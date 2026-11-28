@@ -613,7 +613,7 @@ impl Service {
                 (Some(turn), Some(hold_version::encode_key(key)))
             },
             None if self.follower().is_none() => (
-                driver.enter_local_store_read(At::Exactly(original), &call.cancellation).await.map_err(error::anomaly)?,
+                driver.enter_local_store_watch(original, &call.cancellation).await.map_err(error::anomaly)?,
                 None,
             ),
             None => (None, None),

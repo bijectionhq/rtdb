@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::{Arc, Weak}};
 
 use rtdb_format::journal::{OrderedStoreHold, Record, StoreHoldChange};
+use rtdb_index::branches::BranchIndex;
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
 };
@@ -237,10 +238,28 @@ fn watch_gap() -> Anomaly {
         "The exact Store watch has no current retention receipt")
 }
 
+enum StoreReadPoint {
+    Read(At),
+    Watch(Basis),
+}
+
+fn require_plain_store(index: &BranchIndex) -> Result<()> {
+    if index.has_custody_groups() || index.has_visibility_history() {
+        return Err(Anomaly::unsupported("rtdb.store/unsupported",
+            "The ordered-bytes store serves only an unlabelled database"));
+    }
+    Ok(())
+}
+
 impl MultiDatabase {
     pub async fn enter_local_store_read(&mut self, at: At) -> Result<StoreReadTurn> {
         self.refresh().await?;
-        self.admit_local_store_read(at, None)
+        self.admit_store_turn(StoreReadPoint::Read(at), None)
+    }
+
+    pub async fn enter_local_store_watch(&mut self, after: Basis) -> Result<StoreReadTurn> {
+        self.refresh().await?;
+        self.admit_store_turn(StoreReadPoint::Watch(after), None)
     }
 
     /// The receipt lookup and the in-flight byte turn share the writer lock
@@ -257,28 +276,45 @@ impl MultiDatabase {
         if !retained.change_history || hold.basis.position() < self.state().retained_changes_after()? {
             return Err(watch_gap());
         }
-        self.admit_local_store_read(At::Exactly(after), Some(retained))
+        self.admit_store_turn(StoreReadPoint::Watch(after), Some(retained))
     }
 
-    fn admit_local_store_read(&mut self, at: At, retained: Option<OrderedStoreHold>) -> Result<StoreReadTurn> {
+    fn admit_store_turn(&mut self, point: StoreReadPoint, retained: Option<OrderedStoreHold>) -> Result<StoreReadTurn> {
         self.require_active()?;
         let writer = self.authority()?;
         let state = self.state();
         let index = self.durable_transactions().index();
-        if index.has_custody_groups() || index.has_visibility_history() {
-            return Err(Anomaly::unsupported("rtdb.store/unsupported",
-                "The ordered-bytes store serves only an unlabelled database"));
-        }
+        require_plain_store(index)?;
         let floor = state.store_purge_floor.max(index.store_history_floor());
-        if matches!(at, At::Exactly(basis) if basis.incarnation() == self.incarnation() && basis.position() < floor) {
-            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
-                "The requested basis precedes the admitted Store floor"));
-        }
-        let basis = index.cut(at)?.basis;
-        if basis.position() < floor {
-            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
-                "The requested basis precedes the admitted Store floor"));
-        }
+        let expired = || Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
+            "The requested basis precedes the admitted Store floor");
+        let basis = match point {
+            StoreReadPoint::Read(at) => {
+                if matches!(at, At::Exactly(basis) if basis.incarnation() == self.incarnation() && basis.position() < floor) {
+                    return Err(expired());
+                }
+                let basis = index.cut(at)?.basis;
+                if basis.position() < floor {
+                    return Err(expired());
+                }
+                basis
+            }
+            StoreReadPoint::Watch(after) => {
+                if after.incarnation() != index.head().basis.incarnation() {
+                    return Err(Anomaly::incorrect("rtdb/foreign-basis", "The watch cursor belongs to another database incarnation"));
+                }
+                if after.position() < floor.max(state.retained_changes_after()?) {
+                    return Err(expired());
+                }
+                // A completed page can end on a control record. A watch
+                // selects an inspected prefix, while a read selects a cut.
+                if after.position() > state.coordinates.position(state.head)? {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/change-basis-ahead",
+                        "The requested basis has not applied"));
+                }
+                after
+            }
+        };
         let retained_from = retained.map_or(basis, |hold| hold.basis);
         if retained_from.position() < floor {
             return Err(watch_gap());
@@ -299,8 +335,10 @@ impl MultiDatabase {
     pub(super) async fn require_local_store_turn(&mut self, basis: Basis, turn: &StoreReadTurn) -> Result<()> {
         let writer = self.authority()?;
         let owner = Arc::downgrade(&turn.owner);
+        let index = self.durable_transactions().index();
+        require_plain_store(index)?;
         if basis != turn.basis || writer.epoch.0 != turn.epoch || self.state().generation != turn.generation
-            || self.durable_transactions().index().store_writer_fence_position() != turn.writer_fence_position
+            || index.store_writer_fence_position() != turn.writer_fence_position
             || !self.store_reads.0.iter().any(|read| read.retained_from == turn.retained_from && read.owner.ptr_eq(&owner))
         {
             return Err(stale_read_turn());

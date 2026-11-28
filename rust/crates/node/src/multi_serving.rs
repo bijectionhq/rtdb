@@ -1024,6 +1024,14 @@ impl ServingDriver for MultiServing {
         }).await
     }
 
+    async fn enter_local_store_watch(&self, after: Basis, cancellation: &CancellationToken) -> Result<Option<StoreReadTurn>> {
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.enter_local_store_watch(after).await.map(Some)
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
     async fn enter_held_store_watch(
         &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, cancellation: &CancellationToken,
     ) -> Result<StoreReadTurn> {

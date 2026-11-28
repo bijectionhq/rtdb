@@ -452,6 +452,11 @@ pub trait ServingDriver: Send + Sync {
     }
 
     #[cfg(feature = "multi")]
+    async fn enter_local_store_watch(&self, _after: Basis, _cancellation: &CancellationToken) -> Result<Option<StoreReadTurn>> {
+        Ok(None)
+    }
+
+    #[cfg(feature = "multi")]
     async fn enter_held_store_watch(
         &self, _after: Basis, _reader: [u8; 32], _hold: StoreVersionHoldKey, _cancellation: &CancellationToken,
     ) -> Result<StoreReadTurn> {

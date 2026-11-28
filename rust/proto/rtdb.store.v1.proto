@@ -308,6 +308,8 @@ message AppendReply {
 
 message WatchRequest {
   repeated KeyRange ranges = 1;
+  // Exclusive prefix cursor. Resume from a previous reply's through while
+  // that prefix remains retained.
   uint64 after = 2;
   bytes incarnation = 3;
   // Maximum wait; the server caps it.
@@ -322,7 +324,8 @@ message WatchReply {
   bytes incarnation = 1;
   // The first version after `after` that wrote into a range, if one exists.
   optional uint64 touched = 2;
-  // Every version through this one was inspected.
+  // Inspected journal prefix, including control records. Continue watching
+  // from this cursor, which may fall between committed read cuts.
   uint64 through = 3;
   // Exact key admitted for a retained watch.
   HeldVersionKey retention = 4;
