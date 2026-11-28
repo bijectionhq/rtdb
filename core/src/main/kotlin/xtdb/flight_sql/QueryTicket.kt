@@ -41,13 +41,28 @@ private fun Field.hasPlainParameterLayout(): Boolean {
     }
 }
 
+internal fun VectorSchemaRoot.plainParameterFields(): List<Field>? {
+    val vectors = fieldVectors
+    return schema.fields.takeIf { fields ->
+        fields.size == vectors.size && fields.indices.all { idx ->
+            val field = fields[idx]
+            val vector = vectors[idx]
+            field.hasPlainParameterLayout() && field == vector.field && vector.valueCount == rowCount
+        }
+    }
+}
+
+internal sealed interface PreparedParams {
+    fun <R> read(allocator: BufferAllocator, f: (VectorSchemaRoot) -> R): R
+}
+
 @Serializable(QueryParams.Serde::class)
 internal class QueryParams private constructor(
     private val bytes: ByteArray,
     private val writtenFields: List<Field>? = null,
-) {
+) : PreparedParams {
 
-    fun <R> read(allocator: BufferAllocator, f: (VectorSchemaRoot) -> R): R =
+    override fun <R> read(allocator: BufferAllocator, f: (VectorSchemaRoot) -> R): R =
         ArrowStreamReader(ByteArrayInputStream(bytes), allocator).use { rdr ->
             rdr.loadNextBatch()
             f(rdr.vectorSchemaRoot)
@@ -74,16 +89,7 @@ internal class QueryParams private constructor(
                 wtr.end()
             }
 
-            val vectors = root.fieldVectors
-            val fields = root.schema.fields.takeIf { fields ->
-                fields.size == vectors.size && fields.indices.all { idx ->
-                    val field = fields[idx]
-                    val vector = vectors[idx]
-                    field.hasPlainParameterLayout() && field == vector.field && vector.valueCount == root.rowCount
-                }
-            }
-
-            return QueryParams(out.toByteArray(), fields)
+            return QueryParams(out.toByteArray(), root.plainParameterFields())
         }
     }
 }

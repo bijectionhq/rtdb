@@ -173,11 +173,26 @@ private sealed interface PreparedScope {
     data class InTx(val txHandle: TxHandle) : PreparedScope
 }
 
+private sealed interface PreparedBinding {
+    data class Query(val params: QueryParams?) : PreparedBinding
+    data class Update(val params: PreparedParams?) : PreparedBinding
+}
+
 private class PreparedStatement(
-    val sql: String, val scope: PreparedScope, val owner: Caller, override val lease: Lease
+    val sql: String, val scope: PreparedScope, val owner: Caller, isUpdate: Boolean, override val lease: Lease
 ) : Leased {
     @Volatile
-    var params: QueryParams? = null
+    var binding: PreparedBinding = if (isUpdate) PreparedBinding.Update(null) else PreparedBinding.Query(null)
+        private set
+
+    fun bind(root: VectorSchemaRoot?) {
+        binding = when (binding) {
+            is PreparedBinding.Query -> PreparedBinding.Query(root?.let { QueryParams.fromFlightRoot(it) })
+            is PreparedBinding.Update -> PreparedBinding.Update(root?.let {
+                UpdateParams.fromFlightRoot(it) ?: QueryParams.fromFlightRoot(it)
+            })
+        }
+    }
 
     override fun close() = Unit
 }
@@ -407,7 +422,7 @@ class XtdbProducer(
         ackStream.reportingErrors {
             val ps = preparedStatement(ctx, cmd.preparedStatementHandle)
             flightStream.next()
-            ps.params = if (flightStream.bindsNoParameters) null else QueryParams.fromFlightRoot(flightStream.root)
+            ps.bind(if (flightStream.bindsNoParameters) null else flightStream.root)
             ackStream.onCompleted()
         }
     }
@@ -499,12 +514,15 @@ class XtdbProducer(
         cmd: CommandPreparedStatementQuery, ctx: CallContext?, descriptor: FlightDescriptor
     ): FlightInfo = flightCall {
         val ps = preparedStatement(ctx, cmd.preparedStatementHandle)
-        val params = ps.params
+        val binding = ps.binding
         ps.withStatement(ctx) { conn, stmt ->
-            if (stmt.isUpdate) {
-                params?.read(allocator) { stmt.bind(it) }
-                runUpdate(stmt, descriptor)
-            } else issueQueryTicket(stmt, conn.dbName, ps.sql, params, descriptor)
+            when (binding) {
+                is PreparedBinding.Query -> issueQueryTicket(stmt, conn.dbName, ps.sql, binding.params, descriptor)
+                is PreparedBinding.Update -> {
+                    binding.params?.read(allocator) { stmt.bind(it) }
+                    runUpdate(stmt, descriptor)
+                }
+            }
         }
     }
 
@@ -527,7 +545,8 @@ class XtdbProducer(
                     ByteString.copyFrom(xtdbStmt.parameterSchema.serializeAsMessageInterruptibly())
                 )
 
-            if (xtdbStmt.isUpdate) {
+            val isUpdate = xtdbStmt.isUpdate
+            if (isUpdate) {
                 resultBuilder.setUnknownFields(IS_UPDATE)
             } else {
                 resultBuilder.setDatasetSchema(
@@ -538,7 +557,7 @@ class XtdbProducer(
             val scope = if (txHandle != null) PreparedScope.InTx(txHandle) else PreparedScope.Session(conn.dbName)
             stmts.add(
                 psId,
-                PreparedStatement(sql, scope, session(ctx).caller, Lease(clock, config.preparedStatementIdleTimeout))
+                PreparedStatement(sql, scope, session(ctx).caller, isUpdate, Lease(clock, config.preparedStatementIdleTimeout))
             )
             listener.onNext(packResult(resultBuilder.build()))
             listener.onCompleted()

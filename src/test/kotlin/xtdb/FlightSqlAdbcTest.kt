@@ -522,6 +522,29 @@ class FlightSqlAdbcTest {
     }
 
     @Test
+    fun `a bound query-shaped update expires with its prepared handle`() {
+        withClockedServer { client, clock ->
+            client.prepare("INSERT INTO users (_id, n) VALUES (?, ?)", *emptyCallOpts).use { ps ->
+                withParams(11, 22) { params ->
+                    ps.setParameters(params)
+                    assertTrue(ps.execute(*emptyCallOpts).readRows(client).isEmpty())
+                    ps.setParameters(null)
+                }
+
+                clock.advance(Duration.ofMinutes(31))
+                val ex = assertThrows(FlightRuntimeException::class.java) { ps.execute(*emptyCallOpts) }
+                assertEquals(FlightStatusCode.NOT_FOUND, ex.status().code())
+                assertTrue(ex.message!!.contains("prepared statement expired"), ex.message)
+            }
+
+            assertEquals(
+                listOf(mapOf("_id" to 11L, "n" to 22L)),
+                client.execute("SELECT _id, n FROM users FOR ALL SYSTEM_TIME", *emptyCallOpts).readRows(client),
+            )
+        }
+    }
+
+    @Test
     fun `a prepared-statement handle the server never issued is NOT_FOUND`() {
         val cmd = CommandPreparedStatementQuery.newBuilder()
             .setPreparedStatementHandle(ByteString.copyFromUtf8("no-such-handle"))
@@ -1871,6 +1894,42 @@ class FlightSqlAdbcTest {
         assertEquals(
             listOf(mapOf("_id" to "jms", "name" to "James")),
             fsqlClient.execute("SELECT _id, name FROM users", *emptyCallOpts).readRows()
+        )
+    }
+
+    @Test
+    fun `query-shaped updates use the latest upload and their tickets never write again`() {
+        val handle = createPreparedStatementRaw("INSERT INTO users (_id, name) VALUES (?, 'bound')")
+            .preparedStatementHandle
+        val descriptor = FlightDescriptor.command(
+            ProtoAny.pack(CommandPreparedStatementQuery.newBuilder().setPreparedStatementHandle(handle).build())
+                .toByteArray()
+        )
+        val schema = Schema(listOf(Field.nullable("", ArrowType.Int(64, true))))
+
+        fun upload(vararg ids: Long) {
+            VectorSchemaRoot.create(schema, al).use { root ->
+                val id = root.getVector(0) as BigIntVector
+                ids.forEachIndexed { idx, value -> id.setSafe(idx, value) }
+                root.rowCount = ids.size
+                val listener = flightClient.startPut(descriptor, root, AsyncPutListener(), *emptyCallOpts)
+                listener.putNext()
+                listener.completed()
+                listener.getResult()
+            }
+        }
+
+        upload(1, 2)
+        val first = flightClient.getInfo(descriptor, *emptyCallOpts)
+        upload(3)
+        val second = flightClient.getInfo(descriptor, *emptyCallOpts)
+        repeat(2) {
+            assertTrue(first.readRows().isEmpty())
+            assertTrue(second.readRows().isEmpty())
+        }
+        assertEquals(
+            listOf(1L, 2L, 3L).map { mapOf("_id" to it, "name" to "bound") },
+            fsqlClient.execute("SELECT _id, name FROM users FOR ALL SYSTEM_TIME ORDER BY _id", *emptyCallOpts).readRows(),
         )
     }
 
