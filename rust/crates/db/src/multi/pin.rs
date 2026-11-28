@@ -111,6 +111,20 @@ impl PinnedExport {
 }
 
 impl MultiDatabase {
+    pub(super) async fn pin_has_independent_store_history(&self, pin: &Pin) -> Result<bool> {
+        let image = rtdb_store::read_fresh_manifest(self.store.as_ref(), self.stream.kms.as_ref(), pin.manifest).await?;
+        let manifest = image.contents();
+        if !manifest.payload.starts_with(EXACT_EXPORT) || !manifest.pins.is_empty() || !manifest.files.is_empty() {
+            return Ok(false);
+        }
+        let (cut, checkpoint) = exact_payload(&image)?;
+        if cut.basis.incarnation() != self.incarnation() {
+            return Ok(false);
+        }
+        TransactState::decode_checkpoint(checkpoint, cut)?;
+        Ok(true)
+    }
+
     /// Publish an immutable checkpoint for one exact applied basis and order
     /// its pin before returning the reference. The caller supplies the pin ID
     /// so it can retry the same export after an uncertain append.

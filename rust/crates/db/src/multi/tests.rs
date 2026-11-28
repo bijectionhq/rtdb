@@ -402,13 +402,13 @@ async fn store_purge_preflight_checks_committed_bases_and_preserves_native_reten
     let empty = KeyRange { start: b"a".to_vec(), end: Some(b"a".to_vec()) };
     assert_eq!(writer.check_store_purge_floor(current, floor, 0, &[empty], None).await.unwrap_err().code, "rtdb.store/empty-range");
 
-    let id = Uuid::from_u128(9);
-    writer.pin_checkpoint_at(id, old, None).await.unwrap();
+    let checkpoint = writer.checkpoint(Vec::new()).await.unwrap();
+    let pin = writer.pin_checkpoint(checkpoint, None).await.unwrap();
     let control = writer.state().coordinates.position(writer.state().head).unwrap();
     let control = Basis::new(current.incarnation(), control);
     assert_eq!(writer.check_store_purge_floor(control, floor, 0, &reads, None).await.unwrap_err().code, "rtdb/unknown-basis");
     assert_eq!(writer.publish_store_purge_floor(current, floor, 0, &reads, None).await.unwrap_err().code, "rtdb.store/purge-pin");
-    writer.release_pin(id).await.unwrap();
+    writer.release_pin(pin.id).await.unwrap();
 
     writer.transact(&request(3, Op::Fork {
         child: "held".into(), from: (MAIN_BRANCH.into(), old), writable: false, expires_at: None,
@@ -500,11 +500,13 @@ async fn permission_only_store_floor_can_be_reclaimed_by_an_authorized_retry() {
     let index = successor.fresh_index().await.unwrap();
     let view = index.view(MAIN_BRANCH, At::Exactly(old), Layer::Merged, Timestamp(200)).unwrap();
     assert_eq!(view.store_value(b"a").unwrap(), Some(b"old".as_slice()));
-    assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
-        "rtdb.store/purge-pin");
-    successor.release_pin(pin.id).await.unwrap();
     successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap();
     assert_eq!(successor.fresh_index().await.unwrap().store_history_floor(), current.position());
+    let export = successor.open_export(pin.id).await.unwrap();
+    let (cut, captured) = export.exact_checkpoint().await.unwrap();
+    assert_eq!(cut.basis, old);
+    let view = captured.index().view(MAIN_BRANCH, At::Exactly(old), Layer::Merged, Timestamp(200)).unwrap();
+    assert_eq!(view.store_value(b"a").unwrap(), Some(b"old".as_slice()));
 }
 
 #[tokio::test]

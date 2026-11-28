@@ -83,9 +83,12 @@ impl MultiDatabase {
         }
         index.check_store_purge_branch_retention(keep_from)?;
         self.require_destroyed_generation()?;
-        if self.reachability(lease).await?.pins().next().is_some() {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/purge-pin",
-                "An ordered checkpoint pin still retains history"));
+        let reachability = self.reachability(lease).await?;
+        for pin in reachability.pins() {
+            if !self.pin_has_independent_store_history(pin).await? {
+                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/purge-pin",
+                    "An ordered checkpoint pin still retains history"));
+            }
         }
         self.refresh().await?;
         if self.authority()?.epoch != lease.epoch || self.state().head != head || self.state().floor != journal_floor {

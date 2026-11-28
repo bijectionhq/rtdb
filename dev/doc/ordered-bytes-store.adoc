@@ -176,7 +176,8 @@ No pending timed v1 transaction blocks a store append, and no shared-main time f
 === Multi history reclamation
 
 The Multi writer can order an exclusive history floor at a settled, guarded cut.
-An advancing request is refused while an ordered pin, scoped hold or surviving native branch ancestry protects the affected history.
+An advancing request is refused while a scoped hold, surviving native branch ancestry or an ordered pin still depends on the live Store history.
+A pin for a freshly verified, self-contained exact export retains its own immutable manifest and can outlive reclamation of the live Store history.
 A successful reclaim authorization closes older cuts to new snapshots, range guards, watches, forks and exports.
 The retained fold preserves the byte value visible at the floor, newer events and exact append receipts.
 The normal checkpoint cycle publishes that fold and trims under the existing journal recovery rules.
