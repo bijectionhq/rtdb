@@ -5734,6 +5734,7 @@ name = "rtdb-server"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-flight",
  "arrow-schema",
  "async-trait",
  "aws-config",
@@ -5751,6 +5752,7 @@ dependencies = [
  "libc",
  "logkeeper",
  "mimalloc",
+ "prost",
  "rcgen",
  "regex",
  "reqwest 0.13.4",

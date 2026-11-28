@@ -23,6 +23,8 @@ mod history;
 pub mod lineage;
 pub(super) mod journal_custody;
 pub(crate) mod operator;
+#[cfg(test)]
+mod timed_store_flight_tests;
 pub(super) mod recovery;
 mod ranked;
 pub use operator::{HELP as ACTIVATION_HELP, Options as ActivationOptions};

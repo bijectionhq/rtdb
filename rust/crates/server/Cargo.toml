@@ -87,6 +87,8 @@ libc = "0.2"
 tracing.workspace = true
 
 [dev-dependencies]
+arrow-flight = "=58.4.1"
+prost.workspace = true
 rcgen = "=0.14.10"
 tokio-postgres = "0.7"
 stream-logkeeper = { workspace = true, features = ["consensus-testing"] }
