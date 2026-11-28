@@ -98,19 +98,20 @@ impl MultiFollower {
     pub async fn read_store(
         &self, read: StoreRead, at: At, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<StorePage> {
-        let (page, generation) = self.serving.serve(async {
+        self.serving.serve(async {
             cancellation.run_until_cancelled(async {
-                let (index, generation) = self.serving.database.lock().await.follower_view(&self.owner)?;
+                let database = self.serving.database.lock().await;
+                let (index, generation) = database.follower_view(&self.owner)?;
                 require_plain_follower(&index)?;
                 if let At::Exactly(basis) = at {
                     index.cut(At::AtLeast(basis))?;
                 }
                 let page = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now)?.store_page(&read)?;
-                Ok((page, generation))
+                database.check_follower_store_basis(&self.owner, page.cut.basis).await?;
+                database.check_generation(generation).await?;
+                Ok(page)
             }).await.ok_or_else(interrupted)?
-        }).await?;
-        self.check_retained_delivery(generation, cancellation).await?;
-        Ok(page)
+        }).await
     }
 
     pub async fn store_changes(&self, request: Changes, cancellation: &CancellationToken) -> Result<ChangePage> {
@@ -1473,7 +1474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_local_multi_writer_publishes_a_guarded_store_floor() {
+    async fn the_multi_writer_fences_purge_and_older_follower_reads() {
         use rtdb_index::branches::store::{Projection, StoreWriterFence};
         use rtdb_tx::transact::{Guard, StoreAppend, StoreWrite};
 
@@ -1494,7 +1495,6 @@ mod tests {
         let follower = Arc::new(MultiServing::new(open(
             IpAddr::from([127, 0, 0, 2]), Identity::from_static("urn:rtdb:test:2"),
         ), Arc::clone(&memory)));
-        let _assignment = follower.assign_follower().await.unwrap();
         let cancellation = CancellationToken::new();
         let store_write = |request_key, key: &[u8], value: &[u8]| Transact {
             custody_request_digest: None,
@@ -1513,6 +1513,7 @@ mod tests {
             otherwise: Vec::new(),
         };
         let first = writer.transact(store_write(1, b"a", b"original"), &cancellation).await.unwrap().basis;
+        let assigned = follower.assign_follower().await.unwrap();
         let floor = writer.transact(store_write(2, b"a", b"replacement"), &cancellation).await.unwrap().basis;
         let incarnation = floor.incarnation();
         let fence = StoreWriterFence { epoch: 1, writer: Some([2; 16]) };
@@ -1527,6 +1528,8 @@ mod tests {
             after: None, limit: 1, projection: Projection::Values, filter: None, reverse: false,
         };
         let original = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
+        assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
+        let original = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
 
         assert!(!follower.supports_store_purge_floor().await);
@@ -1550,6 +1553,8 @@ mod tests {
             .await.unwrap();
 
         let expired = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap_err();
+        assert_eq!(expired.code, "rtdb/cursor-expired");
+        let expired = assigned.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap_err();
         assert_eq!(expired.code, "rtdb/cursor-expired");
         let retained = writer.read_store(read(), At::Exactly(floor), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(retained.entries[0].value.as_deref(), Some(b"replacement".as_slice()));

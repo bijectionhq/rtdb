@@ -270,6 +270,11 @@ pub(crate) fn typed_recovery(recoveries: &[(Lsn, RecoveryEntry)], lsn: Lsn) -> O
     recoveries.iter().find(|(at, _)| *at == lsn).map(|(_, entry)| entry)
 }
 
+fn store_delivery_expired() -> Anomaly {
+    Anomaly::new(rtdb_types::AnomalyCategory::NotFound, "rtdb/cursor-expired",
+        "The requested basis precedes the retained store history")
+}
+
 pub(crate) struct Committed {
     pub(crate) transactions: TransactState,
     pub(crate) floor: Lsn,
@@ -488,6 +493,61 @@ impl Committed {
             from = following;
             previous = Some(state);
         }
+    }
+
+    /// Validate a locally materialized Store read against the current ordered
+    /// floor while leaving the assigned follower's applied cut untouched.
+    pub(crate) async fn require_retained_store_delivery(&self, stream: &Stream, basis: Basis) -> Result<()> {
+        let floor = self.store_purge_floor.max(self.transactions.index().store_history_floor());
+        if basis.position() < floor {
+            return Err(store_delivery_expired());
+        }
+        let end = stream.head().await?;
+        if end < self.head {
+            return Err(journal_shortened(end, self.head));
+        }
+        let verify_seed = !stream.immutable_history() && !self.records.is_empty();
+        if end == self.head && !verify_seed {
+            return Ok(());
+        }
+        let from = if verify_seed { self.head } else { next(self.head)? };
+        let page = stream.read_through(from, end).await.map_err(journal_error)?;
+        let mut expected = from;
+        for (lsn, bytes) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= end) {
+            if lsn != expected {
+                return Err(journal_error(JournalError::Unavailable));
+            }
+            let recovery = typed_recovery(&page.recoveries, lsn);
+            if verify_seed && lsn == self.head {
+                if !self.replayed(stream, lsn, &bytes, recovery).await? {
+                    return Err(journal_rewritten(self.head));
+                }
+            } else {
+                if recovery.is_some() {
+                    return Err(journal_rewritten(self.head));
+                }
+                // This scan admits no transaction effects. Timed transaction
+                // sidecars are verified by replay when it applies the prefix.
+                match stream.decode_unproven(lsn, &bytes).await?.record {
+                    Record::StorePurgeFloor { keep_from, .. } | Record::StorePurgeReclaim { keep_from, .. }
+                        if basis.position() < keep_from => return Err(store_delivery_expired()),
+                    Record::Recovered { .. } => return Err(journal_rewritten(self.head)),
+                    Record::Checkpoint(cut) if cut.restore || cut.recovery_epoch > self.recovery_epoch =>
+                        return Err(journal_rewritten(self.head)),
+                    Record::DeploymentRetirement { .. } => return Err(Anomaly::new(
+                        rtdb_types::AnomalyCategory::NotFound, "rtdb/deployment-retired",
+                        "The deployment has permanently closed admission",
+                    )),
+                    _ => {},
+                }
+            }
+            if lsn == end {
+                return Ok(());
+            }
+            expected = next(lsn)?;
+        }
+        Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb/follower-unavailable",
+            "The assigned follower must catch up before it can confirm the Store floor"))
     }
 
     /// Records the digest of the journal bytes of the record just applied at

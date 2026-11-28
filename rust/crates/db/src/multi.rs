@@ -743,6 +743,10 @@ impl MultiDatabase {
         Ok((state.transactions.index().clone(), state.generation))
     }
 
+    pub async fn check_follower_store_basis(&self, owner: &Arc<()>, basis: Basis) -> Result<()> {
+        self.follower_state(owner)?.require_retained_store_delivery(&self.stream, basis).await
+    }
+
     fn follower_state(&self, owner: &Arc<()>) -> Result<&Committed> {
         if !self.assigned_follower.ptr_eq(&Arc::downgrade(owner)) || self.writer.is_some() {
             return Err(follower_unavailable());
