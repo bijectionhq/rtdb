@@ -43,7 +43,7 @@ enum Kind {
     #[prost(message, tag = "15")]
     StorePurgeFloor(StorePurgeFloor),
     #[prost(message, tag = "16")]
-    StorePurgeReclaim(StorePurgeFloor),
+    StorePurgeReclaim(StorePurgeReclaim),
 }
 
 #[derive(Message)]
@@ -146,6 +146,18 @@ struct StorePurgeFloor {
 }
 
 #[derive(Message)]
+struct StorePurgeReclaim {
+    #[prost(bytes, tag = "1")]
+    since: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    keep_from: u64,
+    #[prost(sint64, optional, tag = "3")]
+    census_micros: Option<i64>,
+    #[prost(sint64, optional, tag = "4")]
+    lower_bound_micros: Option<i64>,
+}
+
+#[derive(Message)]
 struct TimedDecision {
     #[prost(uint64, tag = "1")]
     tx_lsn: u64,
@@ -212,10 +224,15 @@ impl TryFrom<&super::Record> for Record {
                 since: since.to_bytes().to_vec(),
                 keep_from: *keep_from,
             }),
-            StorePurgeReclaim { since, keep_from } => Kind::StorePurgeReclaim(self::StorePurgeFloor {
-                since: since.to_bytes().to_vec(),
-                keep_from: *keep_from,
-            }),
+            StorePurgeReclaim { since, keep_from, clock } => {
+                if !clock.covers_census() {
+                    return Err(invalid("The Store purge census is ahead of its lower clock bound"));
+                }
+                Kind::StorePurgeReclaim(self::StorePurgeReclaim {
+                    since: since.to_bytes().to_vec(), keep_from: *keep_from,
+                    census_micros: Some(clock.census_micros), lower_bound_micros: Some(clock.lower_bound_micros),
+                })
+            },
         };
         Ok(Self { kind: Some(kind) })
     }
@@ -286,10 +303,19 @@ impl TryFrom<Record> for super::Record {
                         .map_err(|_| invalid("The store purge floor has an invalid basis"))?,
                     keep_from: floor.keep_from,
                 },
-                Kind::StorePurgeReclaim(floor) => Self::StorePurgeReclaim {
-                    since: Basis::from_bytes(&floor.since)
-                        .map_err(|_| invalid("The store purge floor has an invalid basis"))?,
-                    keep_from: floor.keep_from,
+                Kind::StorePurgeReclaim(floor) => {
+                    let clock = super::StorePurgeClock {
+                        census_micros: floor.census_micros.ok_or_else(|| invalid("A Store purge records its census clock"))?,
+                        lower_bound_micros: floor.lower_bound_micros.ok_or_else(|| invalid("A Store purge records its lower clock bound"))?,
+                    };
+                    if !clock.covers_census() {
+                        return Err(invalid("The Store purge census is ahead of its lower clock bound"));
+                    }
+                    Self::StorePurgeReclaim {
+                        since: Basis::from_bytes(&floor.since)
+                            .map_err(|_| invalid("The store purge floor has an invalid basis"))?,
+                        keep_from: floor.keep_from, clock,
+                    }
                 },
             },
         )

@@ -1,4 +1,4 @@
-use rtdb_format::journal::Record;
+use rtdb_format::journal::{Record, StorePurgeClock};
 use rtdb_index::branches::store::{KeyRange, StoreWriterClaim};
 use rtdb_store::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::Basis};
@@ -49,15 +49,15 @@ impl MultiDatabase {
     pub async fn publish_store_purge_floor(
         &mut self, since: Basis, keep_from: u64, retention_micros: i64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
     ) -> Result<()> {
-        if let Some(lease) = self.admit_store_purge_floor(since, keep_from, retention_micros, reads, writer).await? {
-            self.append_control(lease, Record::StorePurgeReclaim { since, keep_from }).await?;
+        if let Some((lease, clock)) = self.admit_store_purge_floor(since, keep_from, retention_micros, reads, writer).await? {
+            self.append_control(lease, Record::StorePurgeReclaim { since, keep_from, clock }).await?;
         }
         Ok(())
     }
 
     async fn admit_store_purge_floor(
         &mut self, since: Basis, keep_from: u64, retention_micros: i64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
-    ) -> Result<Option<Lease>> {
+    ) -> Result<Option<(Lease, StorePurgeClock)>> {
         self.stream.require_serving().await?;
         self.refresh().await?;
         let lease = self.settled_store_writer()?;
@@ -72,8 +72,8 @@ impl MultiDatabase {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
                 "The purge basis precedes the effective Store floor"));
         }
-        let lower = self.lower();
-        if !(0..=lower.max(0)).contains(&retention_micros) {
+        let clock = StorePurgeClock { census_micros: retention_micros, lower_bound_micros: self.lower() };
+        if !clock.covers_census() {
             return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.store/purge-clock",
                 "The writer's lower clock bound has not certified the retention census"));
         }
@@ -96,9 +96,9 @@ impl MultiDatabase {
         }
         let generation = self.state().generation;
         self.store_reads.check_floor(keep_from)?;
-        self.writer.as_mut().ok_or_else(no_writer)?.store_holds.check_floor(keep_from, lower, generation)?;
+        self.writer.as_mut().ok_or_else(no_writer)?.store_holds.check_floor(keep_from, clock.lower_bound_micros, generation)?;
         // The journal compares the next slot and writer fence when the caller appends.
-        Ok(Some(lease))
+        Ok(Some((lease, clock)))
     }
 
     pub(super) fn settled_store_writer(&self) -> Result<Lease> {

@@ -123,6 +123,19 @@ pub struct Pin {
     pub until: Option<i64>,
 }
 
+/// The requested retention census and the ordered writer's lower time bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorePurgeClock {
+    pub census_micros: i64,
+    pub lower_bound_micros: i64,
+}
+
+impl StorePurgeClock {
+    pub fn covers_census(self) -> bool {
+        (0..=self.lower_bound_micros.max(0)).contains(&self.census_micros)
+    }
+}
+
 /// All fields measured in journal positions are unsigned LSN values.
 /// All wall-clock fields are UTC microseconds.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +196,7 @@ pub enum Record {
     StorePurgeReclaim {
         since: Basis,
         keep_from: u64,
+        clock: StorePurgeClock,
     },
 }
 

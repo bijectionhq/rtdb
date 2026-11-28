@@ -438,6 +438,7 @@ async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
     let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
 
     let second = writer.transact(&store_write(2, b"a", Some(b"second"))).await.unwrap().basis;
+    let lower_bound_micros = writer.lower();
     faults.inject(Fault::DropAppendReply);
     assert_eq!(writer.publish_store_purge_floor(second, second.position(), 0, &[], None).await.unwrap_err().category,
         AnomalyCategory::Interrupted);
@@ -446,6 +447,7 @@ async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
     assert_eq!(writer.state().transactions.index().head().basis, second);
     assert_eq!(first_record(&writer, publication).await, Record::StorePurgeReclaim {
         since: second, keep_from: second.position(),
+        clock: rtdb_format::journal::StorePurgeClock { census_micros: 0, lower_bound_micros },
     });
     writer.publish_store_purge_floor(second, second.position(), 0, &[], None).await.unwrap();
     assert_eq!(writer.publish_store_purge_floor(first, first.position(), 0, &[], None)

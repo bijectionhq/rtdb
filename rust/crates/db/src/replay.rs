@@ -749,7 +749,12 @@ impl Committed {
                 }
                 self.generation
             }
-            Record::StorePurgeFloor { since, keep_from } | Record::StorePurgeReclaim { since, keep_from } => {
+            Record::StorePurgeFloor { since, keep_from } | Record::StorePurgeReclaim { since, keep_from, .. } => {
+                if let Record::StorePurgeReclaim { clock, .. } = &entry.record
+                    && (!clock.covers_census() || self.lease.is_none_or(|(_, until)| clock.lower_bound_micros >= until))
+                {
+                    return Err(invalid("The Store purge clock is outside its settled writer lease"));
+                }
                 let reclaim = matches!(&entry.record, Record::StorePurgeReclaim { .. });
                 let index = self.transactions.index();
                 let advances = *keep_from > self.store_purge_floor || reclaim && *keep_from > index.store_history_floor();

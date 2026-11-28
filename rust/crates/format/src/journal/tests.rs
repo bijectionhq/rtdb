@@ -67,6 +67,7 @@ fn record_kinds_round_trip_with_fixed_tags() {
         Record::StorePurgeReclaim {
             since: Basis::new([0xab; 16], u64::MAX),
             keep_from: u64::MAX - 1,
+            clock: StorePurgeClock { census_micros: 7, lower_bound_micros: 8 },
         },
     ];
     for (i, record) in records.into_iter().enumerate() {
@@ -79,6 +80,18 @@ fn record_kinds_round_trip_with_fixed_tags() {
         }
         assert_eq!(Record::decode(&encoded).unwrap(), record);
     }
+}
+
+#[test]
+fn store_purge_census_requires_ordered_clock_coverage() {
+    let since = Basis::new([0xab; 16], 8);
+    let record = |census_micros, lower_bound_micros| Record::StorePurgeReclaim {
+        since, keep_from: 7, clock: StorePurgeClock { census_micros, lower_bound_micros },
+    };
+    assert!(record(7, 6).encode().is_err());
+    assert!(record(-1, 6).encode().is_err());
+    let before_first_sample = record(0, -1);
+    assert_eq!(Record::decode(&before_first_sample.encode().unwrap()).unwrap(), before_first_sample);
 }
 
 #[test]

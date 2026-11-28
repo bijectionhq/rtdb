@@ -4393,6 +4393,7 @@ actor Gateway {
     -- The gateway resolves close-only tickets against the original worker's enrollment and Flight endpoint. Placement replacement does not route a close to the new worker.
     -- Multi writer Store reads, ranks and watches acquire a byte-basis turn before reading. Final delivery checks the same ordered Store writer claim or fence, journal writer and runtime generation.
     -- A replacement Store claim fences the previous turn's delivery even if the journal writer stays in place. Its original in-flight buffers retain their byte protection until released.
+    -- An ordered Store purge records its census time and the writer lower-clock bound used for expiry. Replay checks those coordinates against the writer lease.
     identified_by: MemberRecord where role = gateway
 }
 
