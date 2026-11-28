@@ -5609,40 +5609,51 @@ mod tests {
                 [Value::list(vec![Value::Binary(vec![])]), Value::list(vec![first, second.clone()])]
             };
             let array = rtdb_columnar::copy_array(&ty, &values).unwrap();
-            let child = if fixed {
-                Arc::clone(array.as_any().downcast_ref::<FixedSizeListArray>().unwrap().values())
-            } else {
-                Arc::clone(array.as_any().downcast_ref::<ListArray>().unwrap().values())
-            };
             let source = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![array]).unwrap();
             let backing = memory.reserve(source.get_array_memory_size()).unwrap();
             let schema_owner = memory.reserve(4096).unwrap();
             let source_schema_charge = Arc::downgrade(&schema_owner);
             let source = rtdb_columnar::OwnedBatch::with_reservation(source, backing).unwrap().with_schema_reservation(schema_owner);
+            let array = source.batch().column(0);
+            let child = if fixed {
+                Arc::clone(array.as_any().downcast_ref::<FixedSizeListArray>().unwrap().values())
+            } else {
+                Arc::clone(array.as_any().downcast_ref::<ListArray>().unwrap().values())
+            };
             let charge = Arc::downgrade(source.reservation());
+            let result_type = LogicalType::Scalar(ScalarType::Binary).maybe();
             let expression = Expr::Subscript {
                 expr: Box::new(Expr::Parameter { index: 0, data_type: ty.clone() }),
                 index: Box::new(Expr::Literal(Value::I64(1))),
-                data_type: LogicalType::Scalar(ScalarType::Binary).maybe(),
+                data_type: result_type.clone(),
             };
             let batch = ColumnBatch::settled(vec![], 2, memory.reserve(4096).unwrap()).unwrap();
-            let mut cursor = record_projection_cursor(batch, Schema::default(), vec![expression], &memory);
-            cursor.execution.parameters = Arc::new(crate::parameters::BoundParameters::from_arrow(source, 1, vec![ty], &memory).unwrap());
-            let page = cursor.next_batch().await.unwrap().unwrap();
+            let parameters = Arc::new(crate::parameters::BoundParameters::from_arrow(source, 1, vec![ty], &memory).unwrap());
+            let schema = Schema::default();
+            let (selected, owner) = if fixed {
+                let mut execution = record_projection_execution(&memory);
+                execution.parameters = parameters;
+                projection::list_subscript(&expression, &result_type, &schema, &batch, &execution).unwrap().unwrap()
+            } else {
+                let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
+                cursor.execution.parameters = parameters;
+                let mut page = cursor.next_batch().await.unwrap().unwrap();
+                let owner = Arc::clone(page.column_reservation(0));
+                (page.columns.pop().unwrap(), owner)
+            };
             for row in 0..2 {
-                assert_eq!(page.columns[0].value(row).unwrap(), second);
-                let cell = page.columns[0].funded_arrow_cell(row, page.column_reservation(0)).unwrap().unwrap();
+                assert_eq!(selected.value(row).unwrap(), second);
+                let cell = selected.funded_arrow_cell(row, &owner).unwrap().unwrap();
                 assert!(Arc::ptr_eq(cell.array, &child));
                 assert_eq!(cell.row, if fixed { 3 } else { 2 });
                 assert_eq!(cell.field.name(), "value");
                 assert!(cell.owner.bytes() >= cell.field.size());
                 assert!(cell.owner.backing().iter().any(|owner| Arc::downgrade(owner).ptr_eq(&charge)));
             }
-            drop(cursor);
             drop(child);
             assert!(charge.upgrade().is_some());
             assert!(source_schema_charge.upgrade().is_none());
-            drop(page);
+            drop((selected, owner));
             assert!(charge.upgrade().is_none());
         }
     }
