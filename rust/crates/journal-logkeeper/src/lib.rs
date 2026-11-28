@@ -4,7 +4,7 @@ use bytes::Bytes;
 use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
 use stream_logkeeper::stream::{transport::TcpTransport, writer::Writer};
 
-pub use stream_logkeeper::stream::consensus::{ConsensusJournal, JournalConfig};
+pub use stream_logkeeper::stream::consensus::{ConsensusJournal, JournalConfig, authenticated};
 pub use stream_logkeeper::stream::transport::Credentials;
 
 /// The URL scheme that selects keeper-hosted consensus streams. The rest of
@@ -27,7 +27,7 @@ pub fn connect_consensus(url: &str, credentials: &Credentials) -> Option<io::Res
     })())
 }
 pub use stream_logkeeper::stream::{
-    timed::{TimedCommitment, TimedOriginal, TimedOriginalProof, TimedOriginalVerifier},
+    timed::{TimedOriginal, TimedOriginalProof, TimedOriginalVerifier},
     wire::KeeperId,
 };
 

@@ -14,7 +14,7 @@ use super::{configuration, conflict, journal_error};
 use crate::multi::{CONSENSUS_SCHEME, Credentials, JournalConfig, io_error};
 
 pub(in crate::multi) struct KeeperJournal {
-    pub journal: Arc<dyn Journal>,
+    pub journal: Arc<rtdb_stream_journal::ConsensusJournal>,
     pub connection_sha256: [u8; 32],
 }
 

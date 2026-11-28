@@ -106,6 +106,10 @@ impl Stage {
         if backup.source_basis().incarnation() != *self.operation.predecessor.incarnation.as_bytes() {
             return Err(stage_source());
         }
+        let lineage = authority.supports_lineage_for(&self.destination.name).await?;
+        if backup.authenticated_cut().is_some() != lineage {
+            return Err(stage_source());
+        }
         let candidate = Candidate::pending(authority, &self.destination.name, self.operation, source_lsn).await?;
         let evidence = KeyEvidence {
             generation: 1,
@@ -117,8 +121,9 @@ impl Stage {
         let inventory = self.destination.objects.versioned_inventory(&root, &remotes).await?;
         inventory.require_versioned().await?;
         let credentials = crate::cli::journal_credentials(&self.destination.journal_tls)?;
-        let JournalBackend { journal, batch, .. } =
+        let JournalBackend { journal, batch, placement } =
             connect_stream_journal(&self.destination.journal_url, &credentials).await?;
+        let placement = placement.ok_or_else(stage_source)?;
         let keys = Arc::new(FileKms::open(&self.destination.key_vault, || SystemClock.now().0)?);
         let mut order = StagingOrder {
             intent: candidate.intent.clone(), key_hold: hold,
@@ -157,7 +162,9 @@ impl Stage {
                     drift_micros: CLOCK_DRIFT_MICROS,
                 },
                 journal.clone(), store, keys.clone(), Arc::new(|| SystemClock.now()),
-            )?.with_immutable_journal().with_batch_appender(batch).with_activation_scope(candidate.scope)?
+            )?.with_immutable_journal()
+                .with_authenticated_journal(placement.journal, lineage)
+                .with_batch_appender(batch).with_activation_scope(candidate.scope)?
                 .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));
             match journal.head(database.journal_stream()).await {
                 Ok(Lsn(0)) | Err(JournalError::NotFound) if can_write => database.create().await?,
@@ -206,12 +213,12 @@ impl Stage {
 
 impl Candidate {
     async fn pending(authority: &ActivationAuthority, name: &str, operation: Operation, source_lsn: Lsn) -> Result<Self> {
-        let Status::Pending { intent, candidate: incarnation, final_source_lsn, installation: None, .. } =
+        let Status::Pending { intent, candidate: incarnation, sealed_segment_end, installation: None, .. } =
             authority.recovery_status(name, operation).await?
         else {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/backup-stage-intent", "Staging requires a pending recovery before installation is recorded"));
         };
-        if intent.loss_policy == LossPolicy::Lossless && final_source_lsn != Some(source_lsn) {
+        if intent.loss_policy == LossPolicy::Lossless && sealed_segment_end != Some(source_lsn) {
             return Err(stage_source());
         }
         let cell = intent.destination_cell.ok_or_else(|| Anomaly::incorrect(

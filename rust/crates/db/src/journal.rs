@@ -7,6 +7,7 @@ use rtdb_format::journal::Record;
 use rtdb_tx::transact::TransactionRecord;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, TimedJournalCutoff, Timestamp};
 use sha2::{Digest, Sha256};
+use stream_logkeeper::stream::consensus::ConsensusJournal;
 use uuid::Uuid;
 
 use crate::{ActivationScope, commissioning};
@@ -85,6 +86,8 @@ pub trait JournalBatchAppender: Send + Sync {
 pub(crate) struct Stream {
     pub(crate) database: Uuid,
     journal: Arc<dyn Journal>,
+    pub(crate) authenticated_journal: Option<Arc<ConsensusJournal>>,
+    create_authenticated: bool,
     pub(crate) serving_authority: Option<Arc<dyn crate::ServingAuthority>>,
     pub(crate) activation_scope: Option<ActivationScope>,
     pub(crate) batch: Option<Arc<dyn JournalBatchAppender>>,
@@ -157,6 +160,8 @@ impl Stream {
         Self {
             database,
             journal,
+            authenticated_journal: None,
+            create_authenticated: false,
             serving_authority: None,
             activation_scope: None,
             batch: None,
@@ -173,6 +178,13 @@ impl Stream {
             fence: RwLock::new(None),
             verified_history: tokio::sync::OnceCell::new(),
         }));
+        self
+    }
+
+    pub(crate) fn with_authenticated_journal(mut self, journal: Arc<ConsensusJournal>, create: bool) -> Self {
+        self.journal = journal.clone();
+        self.authenticated_journal = Some(journal);
+        self.create_authenticated = create;
         self
     }
 
@@ -196,7 +208,15 @@ impl Stream {
             })
             .await?;
         if let Some(session) = &self.session {
-            self.journal.create_immutable(self.id()).await.map_err(journal_error)?;
+            if let Some(authenticated) = self.authenticated_journal.as_ref().filter(|_| self.create_authenticated) {
+                match authenticated.require_authenticated(self.id()).await {
+                    Ok(()) => (),
+                    Err(JournalError::NotFound) => authenticated.create_authenticated(self.id()).await.map_err(journal_error)?,
+                    Err(error) => return Err(journal_error(error)),
+                }
+            } else {
+                self.journal.create_immutable(self.id()).await.map_err(journal_error)?;
+            }
             let _ = session.verified_history.set(());
             Ok(())
         } else {

@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchivedControlRecord {
+    position: Lsn,
+    record: String,
+}
+
 impl ActivationAuthority {
     fn history_stream(&self, name: &str, predecessor: Binding) -> Result<StreamId> {
         let activation = self.stream_id(name)?;
@@ -11,8 +18,7 @@ impl ActivationAuthority {
         Ok(StreamId(u128::from_be_bytes(digest.finalize()[..16].try_into().unwrap())))
     }
 
-    pub(super) async fn preserve_publication(&self, name: &str, state: &State) -> Result<()> {
-        // Copy the decision already committed in the authority's previous binding before replacing it.
+    pub(super) async fn preserve_publication(&self, name: &str, state: &State, position: Lsn, record: Bytes) -> Result<()> {
         let Some(publication) = state.publication.as_ref().filter(|publication| publication.recovery.is_some()) else {
             return Ok(());
         };
@@ -23,10 +29,15 @@ impl ActivationAuthority {
         } else {
             self.journal.create_immutable(stream).await
         }.map_err(journal_error)?;
-        let bytes = Bytes::from(serde_json::to_vec(publication).map_err(|_| corrupt())?);
+        let bytes = if publication.segment.is_some() {
+            let record = std::str::from_utf8(&record).map_err(|_| corrupt())?.to_owned();
+            serde_json::to_vec(&ArchivedControlRecord { position, record })
+        } else {
+            serde_json::to_vec(publication)
+        }.map(Bytes::from).map_err(|_| corrupt())?;
         let mut epoch = Epoch(u64::from(local));
         for _ in 0..ATTEMPTS {
-            if let Some(prior) = self.read_publication(stream).await? {
+            if let Some((prior, _)) = self.read_publication(stream).await? {
                 return if &prior == publication { Ok(()) } else { Err(corrupt()) };
             }
             let fence = match self.seal_fence(stream, epoch).await {
@@ -54,14 +65,39 @@ impl ActivationAuthority {
 
     pub(super) async fn archived_publication(&self, name: &str, predecessor: Binding) -> Result<Option<Publication>> {
         let stream = self.history_stream(name, predecessor)?;
-        let found = self.read_publication(stream).await?;
+        let found = self.read_publication(stream).await?.map(|(publication, _)| publication);
         if found.as_ref().is_some_and(|publication| publication.predecessor != predecessor || publication.recovery.is_none()) {
             return Err(corrupt());
         }
         Ok(found)
     }
 
-    async fn read_publication(&self, stream: StreamId) -> Result<Option<Publication>> {
+    pub(crate) async fn lineage_publication_proof(&self, name: &str, predecessor: Binding) -> Result<lineage::PublicationProof> {
+        let journal = self.authenticated_journal.as_ref().ok_or_else(unavailable)?;
+        let stream = self.stream_id(name)?;
+        let (position, observed) = self.read_record(stream).await?;
+        let (state, record) = observed.ok_or_else(unavailable)?;
+        let history = self.history_stream(name, predecessor)?;
+        let (position, record) = if let Some((publication, archived)) = self.read_publication(history).await? {
+            if publication.predecessor != predecessor || publication.segment.is_none() { return Err(conflict()); }
+            let archived = archived.ok_or_else(corrupt)?;
+            (archived.position, archived.record.into_bytes())
+        } else if state.publication.as_ref().is_some_and(|publication| {
+            publication.predecessor == predecessor && publication.segment.is_some()
+        }) {
+            (position, record.to_vec())
+        } else {
+            return Err(unavailable());
+        };
+        let inclusion = journal.inclusion(stream, position, Some(position.0)).await.map_err(journal_error)?;
+        let leaf = inclusion.verify(inclusion.history.genesis.root()).map_err(|_| corrupt())?;
+        if leaf.at != position || leaf.stream != stream || leaf.payload_sha256 != <[u8; 32]>::from(Sha256::digest(&record)) {
+            return Err(corrupt());
+        }
+        Ok(lineage::PublicationProof { control_record: record, control_inclusion: inclusion })
+    }
+
+    async fn read_publication(&self, stream: StreamId) -> Result<Option<(Publication, Option<ArchivedControlRecord>)>> {
         let position = Lsn(1);
         if !self.access.is_local() {
             match self.journal.require_immutable(stream).await {
@@ -82,8 +118,18 @@ impl ActivationAuthority {
             self.journal.read_page(stream, position, position, 1, Duration::ZERO).await
         }.map_err(journal_error)?;
         match page.records.as_slice() {
-            [(at, bytes)] if *at == position && page.head == position =>
-                serde_json::from_slice(bytes).map(Some).map_err(|_| corrupt()),
+            [(at, bytes)] if *at == position && page.head == position => {
+                if let Ok(archived) = serde_json::from_slice::<ArchivedControlRecord>(bytes) {
+                    let state = serde_json::from_str::<State>(&archived.record).map_err(|_| corrupt())?;
+                    let publication = state.publication.filter(|publication| publication.segment.is_some()).ok_or_else(corrupt)?;
+                    if archived.position.0 == 0 || state.version != LINEAGE_PROTOCOL { return Err(corrupt()); }
+                    Ok(Some((publication, Some(archived))))
+                } else {
+                    let publication: Publication = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
+                    if publication.segment.is_some() { return Err(corrupt()); }
+                    Ok(Some((publication, None)))
+                }
+            }
             _ => Err(corrupt()),
         }
     }

@@ -21,6 +21,7 @@ const CHECKPOINT_SOURCE: u8 = 4;
 const BINARY_STATE: u8 = 8;
 const PORTABLE_BACKUP_SOURCE: u8 = 16;
 const PORTABLE_FILE_INDEX: u8 = 32;
+const AUTHENTICATED_BACKUP: u8 = 128;
 const STORE_PURGE_FLOOR: u8 = 64;
 
 pub struct AppliedEffects {
@@ -58,6 +59,14 @@ pub(crate) struct RestoreOrigin {
 pub(crate) struct BackupSource {
     pub(crate) cut: BranchCut,
     pub(crate) through_lsn: Lsn,
+    pub(crate) authentication: BackupAuthentication,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BackupAuthentication {
+    pub(crate) source: Option<crate::AuthenticatedCut>,
+    pub(crate) installation: Option<crate::InstallationAnchor>,
 }
 
 /// The original ordered pin and cut, authenticated by the source manifest and retained by the destination.
@@ -852,10 +861,9 @@ impl Committed {
         let system_time = Timestamp(i64::from_be_bytes(header[8..16].try_into().unwrap()));
         let until = i64::from_be_bytes(header[16..24].try_into().unwrap());
         let flags = header[24];
-        if flags & !(ROTATING_CHECKPOINT | RESTORED_HISTORY | CHECKPOINT_SOURCE | BINARY_STATE | PORTABLE_BACKUP_SOURCE | PORTABLE_FILE_INDEX | STORE_PURGE_FLOOR) != 0
-            || flags & (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE) != 0 && flags & RESTORED_HISTORY == 0
+        if flags & (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE) != 0 && flags & RESTORED_HISTORY == 0
             || flags & (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE) == (CHECKPOINT_SOURCE | PORTABLE_BACKUP_SOURCE)
-            || flags & PORTABLE_FILE_INDEX != 0 && flags & PORTABLE_BACKUP_SOURCE == 0
+            || flags & (PORTABLE_FILE_INDEX | AUTHENTICATED_BACKUP) != 0 && flags & PORTABLE_BACKUP_SOURCE == 0
         {
             return Err(invalid("The checkpoint has an unknown generation marker"));
         }
@@ -883,16 +891,35 @@ impl Committed {
             let (backup, rest) = if flags & PORTABLE_BACKUP_SOURCE != 0 {
                 let (basis, rest) = rest.split_first_chunk::<24>().ok_or_else(|| invalid("The checkpoint has no backup basis"))?;
                 let (time, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("The checkpoint has no backup system time"))?;
-                let (lsn, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("The checkpoint has no backup source LSN"))?;
+                let (source_lsn, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("The checkpoint has no backup source LSN"))?;
                 let basis = Basis::from_bytes(basis)?;
                 let time = Timestamp(i64::from_be_bytes(*time));
-                let through_lsn = Lsn(u64::from_be_bytes(*lsn));
+                let through_lsn = Lsn(u64::from_be_bytes(*source_lsn));
                 if basis.incarnation() == [0; 16] || basis.incarnation() == *stream.database.as_bytes()
                     || basis.position() != through || through_lsn.0 == 0 || checkpoint.restore && time != system_time
                 {
                     return Err(invalid("The backup source does not match the restored cut"));
                 }
-                (Some(BackupSource { cut: BranchCut { basis, system_time: time }, through_lsn }), rest)
+                let (authentication, rest) = if flags & AUTHENTICATED_BACKUP != 0 {
+                    let (length, rest) = rest.split_first_chunk::<2>()
+                        .ok_or_else(|| invalid("The checkpoint has no authenticated backup length"))?;
+                    let (encoded, rest) = rest.split_at_checked(u16::from_be_bytes(*length) as usize)
+                        .ok_or_else(|| invalid("The checkpoint has no authenticated backup"))?;
+                    let authentication: BackupAuthentication = serde_json::from_slice(encoded)
+                        .map_err(|_| invalid("The checkpoint has an invalid authenticated backup"))?;
+                    if authentication == BackupAuthentication::default()
+                        || authentication.source.is_some_and(|source| !source.matches(basis.incarnation(), through_lsn))
+                        || authentication.installation.is_some_and(|anchor| {
+                            !anchor.valid() || anchor.position > lsn || checkpoint.restore && anchor.position != lsn
+                        })
+                    {
+                        return Err(invalid("The authenticated backup does not match the restored cut"));
+                    }
+                    (authentication, rest)
+                } else {
+                    (BackupAuthentication::default(), rest)
+                };
+                (Some(BackupSource { cut: BranchCut { basis, system_time: time }, through_lsn, authentication }), rest)
             } else {
                 (None, rest)
             };
@@ -988,15 +1015,20 @@ impl Committed {
         let bytes = if binary { transactions.encode_binary_checkpoint()? } else { transactions.encode_checkpoint()? };
         let source = coordinates.origin.and_then(|origin| origin.source);
         let backup = coordinates.origin.and_then(|origin| origin.backup);
+        let authentication = backup.map(|backup| backup.authentication).filter(|value| *value != BackupAuthentication::default())
+            .map(|value| serde_json::to_vec(&value).map_err(|_| invalid("The backup authentication cannot be encoded")))
+            .transpose()?;
         let portable_file_index = coordinates.origin.and_then(|origin| origin.portable_file_index).map(|id| id.to_string());
         let flags = if rotating { ROTATING_CHECKPOINT } else { 0 }
             | if binary { BINARY_STATE } else { 0 }
             | if coordinates.origin.is_some() { RESTORED_HISTORY } else { 0 }
             | if source.is_some() { CHECKPOINT_SOURCE } else { 0 }
             | if backup.is_some() { PORTABLE_BACKUP_SOURCE } else { 0 }
+            | if authentication.is_some() { AUTHENTICATED_BACKUP } else { 0 }
             | if portable_file_index.is_some() { PORTABLE_FILE_INDEX } else { 0 }
             | if store_purge_floor != 0 { STORE_PURGE_FLOOR } else { 0 };
         let extra = coordinates.origin.map_or(0, |_| 48) + source.map_or(0, |_| 48) + backup.map_or(0, |_| 40)
+            + authentication.as_ref().map_or(0, |value| 2 + value.len())
             + portable_file_index.as_ref().map_or(0, |key| 2 + key.len())
             + if store_purge_floor != 0 { 8 } else { 0 };
         let mut payload = Vec::with_capacity(25 + extra + bytes.len());
@@ -1018,6 +1050,11 @@ impl Committed {
             payload.extend_from_slice(&backup.cut.basis.to_bytes());
             payload.extend_from_slice(&backup.cut.system_time.0.to_be_bytes());
             payload.extend_from_slice(&backup.through_lsn.0.to_be_bytes());
+        }
+        if let Some(authentication) = authentication {
+            let length = u16::try_from(authentication.len()).map_err(|_| invalid("The backup authentication is too long"))?;
+            payload.extend_from_slice(&length.to_be_bytes());
+            payload.extend_from_slice(&authentication);
         }
         if let Some(key) = portable_file_index {
             let length = u16::try_from(key.len()).map_err(|_| invalid("The portable file index key is too long"))?;

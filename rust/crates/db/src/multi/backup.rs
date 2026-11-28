@@ -1,21 +1,24 @@
 use std::{ops::AsyncFnOnce, sync::Arc};
 
-use journal_contract::{CheckpointAnchor, Lsn};
+use journal_contract::{CheckpointAnchor, JournalError, Lsn, StreamId};
 use rtdb_crypt::{Context, Generation, Kms, RecoveryKeyHold};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Record};
 use rtdb_index::branches::BranchCut;
 use rtdb_store::{ObjectStore, ObjectVersionHold, read_file_bounded, read_fresh_manifest, read_versioned_file, read_versioned_manifest};
-use rtdb_tx::transact::{FundedSettlement, Receipt, TransactState};
+use rtdb_tx::transact::{Receipt, TransactState};
 use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
+use stream_logkeeper::stream::consensus::{ConsensusJournal, authenticated::{Archive, CatalogRoot, Head}};
 use uuid::Uuid;
 
-use crate::{journal::Stream, replay::{BackupSource, Committed, JournalCoordinates, RestoreOrigin}};
+use crate::{journal::{Stream, journal_error}, replay::{BackupAuthentication, BackupSource, Committed, JournalCoordinates, RestoreOrigin}};
 
 use super::{Lease, MultiDatabase, next, no_writer};
 
 const BACKUP_HEADER: &[u8; 8] = b"RTDBBKP\x01";
 const BACKUP_FILES_HEADER: &[u8; 8] = b"RTDBBKP\x02";
+const AUTHENTICATED_BACKUP_HEADER: &[u8; 8] = b"RTDBBKP\x03";
+const AUTHENTICATED_BACKUP_FILES_HEADER: &[u8; 8] = b"RTDBBKP\x04";
 const HEADER_BYTES: usize = BACKUP_HEADER.len() + Basis::WIDTH + 8 + 8;
 
 mod files;
@@ -24,6 +27,93 @@ use files::ArchivedFiles;
 
 pub struct PortableBackup(Vec<u8>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedCut {
+    pub head: Head,
+    pub catalog_root: CatalogRoot,
+}
+
+impl AuthenticatedCut {
+    pub fn matches(self, incarnation: [u8; 16], at: Lsn) -> bool {
+        self.catalog_root.0 != [0; 32] && self.head.valid()
+            && self.head.stream == StreamId(u128::from_be_bytes(incarnation))
+            && self.head.size == at.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationAnchor {
+    pub catalog: Uuid,
+    pub catalog_root: CatalogRoot,
+    pub position: Lsn,
+}
+
+impl InstallationAnchor {
+    pub fn valid(self) -> bool {
+        !self.catalog.is_nil() && self.catalog_root.0 != [0; 32] && self.position.0 != 0
+    }
+
+    pub fn is_in(self, cut: AuthenticatedCut) -> bool {
+        cut.head.catalog == self.catalog && cut.catalog_root == self.catalog_root && cut.head.size >= self.position.0
+    }
+}
+
+struct BackupHeader<'a> {
+    cut: BranchCut,
+    through_lsn: Lsn,
+    with_files: bool,
+    proof: Option<&'a [u8]>,
+    context: &'a [u8],
+    ciphertext: &'a [u8],
+}
+
+impl<'a> BackupHeader<'a> {
+    fn parse(bytes: &'a [u8]) -> Result<Self> {
+        if bytes.len() > PortableBackup::MAX_BYTES { return Err(backup_too_large()); }
+        let (header, body) = bytes.split_first_chunk::<HEADER_BYTES>().ok_or_else(invalid_backup)?;
+        let (with_files, authenticated) = match &header[..BACKUP_HEADER.len()] {
+            marker if marker == BACKUP_HEADER => (false, false),
+            marker if marker == BACKUP_FILES_HEADER => (true, false),
+            marker if marker == AUTHENTICATED_BACKUP_HEADER => (false, true),
+            marker if marker == AUTHENTICATED_BACKUP_FILES_HEADER => (true, true),
+            _ => return Err(invalid_backup()),
+        };
+        let coordinates = &header[BACKUP_HEADER.len()..];
+        let (basis, coordinates) = coordinates.split_first_chunk::<{ Basis::WIDTH }>().unwrap();
+        let (time, lsn) = coordinates.split_first_chunk::<8>().unwrap();
+        let basis = Basis::from_bytes(basis)?;
+        let through_lsn = Lsn(u64::from_be_bytes(lsn.try_into().unwrap()));
+        if basis.incarnation() == [0; 16] || through_lsn.0 == 0 { return Err(invalid_backup()); }
+        let (proof, ciphertext) = if authenticated {
+            let (length, body) = body.split_first_chunk::<4>().ok_or_else(invalid_backup)?;
+            let (proof, ciphertext) = body.split_at_checked(u32::from_be_bytes(*length) as usize).ok_or_else(invalid_backup)?;
+            (Some(proof), ciphertext)
+        } else {
+            (None, body)
+        };
+        Ok(Self {
+            cut: BranchCut { basis, system_time: Timestamp(i64::from_be_bytes(*time)) },
+            through_lsn, with_files, proof, context: &bytes[..bytes.len() - ciphertext.len()], ciphertext,
+        })
+    }
+
+    fn archive(&self) -> Result<Option<Archive>> {
+        let Some(proof) = self.proof else { return Ok(None); };
+        let mut proof = proof;
+        let archive = Archive::read_from(&mut proof).map_err(|_| invalid_backup())?;
+        if !proof.is_empty() { return Err(invalid_backup()); }
+        let source = archive_cut(&archive);
+        if !source.matches(self.cut.basis.incarnation(), self.through_lsn) { return Err(invalid_backup()); }
+        Ok(Some(archive))
+    }
+}
+
+fn archive_cut(archive: &Archive) -> AuthenticatedCut {
+    AuthenticatedCut { head: archive.signed_head.head, catalog_root: archive.history.genesis.root() }
+}
+
 impl PortableBackup {
     pub const MAX_BYTES: usize = 256 << 20;
 
@@ -31,27 +121,27 @@ impl PortableBackup {
         self.0
     }
 
+    pub fn lineage_archive(bytes: &[u8], catalog_root: CatalogRoot) -> Result<Option<Archive>> {
+        let archive = BackupHeader::parse(bytes)?.archive()?;
+        if let Some(archive) = &archive {
+            archive.verify(catalog_root).map_err(|_| invalid_backup())?;
+        }
+        Ok(archive)
+    }
+
     pub async fn verify(bytes: &[u8], source_kms: Arc<dyn Kms>) -> Result<VerifiedBackup> {
-        if bytes.len() > Self::MAX_BYTES {
-            return Err(backup_too_large());
-        }
         require_durable_custody(source_kms.as_ref())?;
-        let (header, ciphertext) = bytes.split_first_chunk::<HEADER_BYTES>().ok_or_else(invalid_backup)?;
-        let with_files = header.starts_with(BACKUP_FILES_HEADER);
-        let coordinates = header.strip_prefix(if with_files { BACKUP_FILES_HEADER } else { BACKUP_HEADER })
-            .ok_or_else(invalid_backup)?;
-        let (basis, coordinates) = coordinates.split_first_chunk::<{ Basis::WIDTH }>().unwrap();
-        let (time, lsn) = coordinates.split_first_chunk::<8>().unwrap();
-        let basis = Basis::from_bytes(basis)?;
-        let through_lsn = Lsn(u64::from_be_bytes(lsn.try_into().unwrap()));
-        let incarnation = Uuid::from_bytes(basis.incarnation());
-        if incarnation.is_nil() || through_lsn.0 == 0 {
-            return Err(invalid_backup());
-        }
-        let cut = BranchCut { basis, system_time: Timestamp(i64::from_be_bytes(*time)) };
-        let plaintext = rtdb_crypt::open(source_kms.as_ref(), incarnation, backup_context(header), ciphertext).await?;
+        let header = BackupHeader::parse(bytes)?;
+        let cut = header.cut;
+        let incarnation = Uuid::from_bytes(cut.basis.incarnation());
+        let plaintext = rtdb_crypt::open(source_kms.as_ref(), incarnation, backup_context(header.context), header.ciphertext).await?;
+        let source = header.archive()?.map(|archive| -> Result<AuthenticatedCut> {
+            let source = archive_cut(&archive);
+            archive.verify(source.catalog_root).map_err(|_| invalid_backup())?;
+            Ok(source)
+        }).transpose()?;
         let source_generation = plaintext.generation;
-        let (transactions, files) = if with_files {
+        let (transactions, files) = if header.with_files {
             let (transactions, files) = ArchivedFiles::decode(plaintext, cut)?;
             (transactions, Some(files))
         } else {
@@ -60,7 +150,7 @@ impl PortableBackup {
         transactions.require_portable_checkpoint()?;
         source_kms.check_readable(source_generation).await?;
         Ok(VerifiedBackup {
-            source: BackupSource { cut, through_lsn },
+            source: BackupSource { cut, through_lsn: header.through_lsn, authentication: BackupAuthentication { source, installation: None } },
             manifest_sha256: Sha256::digest(bytes).into(),
             transactions,
             files,
@@ -80,8 +170,8 @@ pub struct VerifiedBackup {
 }
 
 impl VerifiedBackup {
-    pub fn funded_inventory_sha256(&self) -> Result<Option<[u8; 32]>> {
-        self.transactions.funded_inventory_digest(self.source.cut.basis.incarnation())
+    pub fn authenticated_cut(&self) -> Option<AuthenticatedCut> {
+        self.source.authentication.source
     }
 
     pub fn source_basis(&self) -> Basis {
@@ -112,7 +202,6 @@ pub struct InstalledBackup {
     destination_basis: Basis,
     manifest_sha256: [u8; 32],
     activation_scope: Option<crate::ActivationScope>,
-    funded_inventory_sha256: Option<[u8; 32]>,
 }
 
 pub struct BackupObjectReadback {
@@ -125,8 +214,12 @@ pub struct BackupObjectReadback {
 }
 
 impl InstalledBackup {
-    pub fn funded_inventory_sha256(&self) -> Option<[u8; 32]> {
-        self.funded_inventory_sha256
+    pub fn authenticated_cut(&self) -> Option<AuthenticatedCut> {
+        self.source.authentication.source
+    }
+
+    pub fn installation_anchor(&self) -> Option<InstallationAnchor> {
+        self.source.authentication.installation
     }
 
     pub fn source_incarnation(&self) -> Uuid {
@@ -160,22 +253,6 @@ impl InstalledBackup {
 
 impl MultiDatabase {
     pub async fn portable_backup(&mut self) -> Result<PortableBackup> {
-        self.capture_portable_backup(None).await
-    }
-
-    /// Exports a commissioned immutable cut after applying the authority's reconciled bookings.
-    pub async fn portable_backup_with_funding(
-        &mut self, final_source_lsn: Option<Lsn>, settlements: &[FundedSettlement],
-    ) -> Result<PortableBackup> {
-        if !self.stream.immutable_history() || self.stream.activation_scope.is_none() {
-            return Err(invalid_backup());
-        }
-        self.capture_portable_backup(Some((final_source_lsn, settlements))).await
-    }
-
-    async fn capture_portable_backup(
-        &mut self, funded: Option<(Option<Lsn>, &[FundedSettlement])>,
-    ) -> Result<PortableBackup> {
         Box::pin(async move {
             require_durable_custody(self.stream.kms.as_ref())?;
             self.refresh().await?;
@@ -204,21 +281,33 @@ impl MultiDatabase {
                 return Err(backup_dependencies());
             }
             let transactions = if writer_lease.is_some() { self.durable_transactions() } else { &state.transactions };
-            let settled = if let Some((expected, settlements)) = funded {
-                if expected.is_some_and(|expected| expected != through_lsn)
-                    || settlements.iter().any(|settled| settled.outcome.activation_lsn.into_iter()
-                        .chain(settled.outcome.consumption_lsn).any(|lsn| lsn > through_lsn.0))
-                {
-                    return Err(invalid_backup());
+            let cut = transactions.index().head();
+            let proof = if let Some(journal) = &self.stream.authenticated_journal {
+                let stream = self.journal_stream();
+                if has_authentication(journal, stream).await? {
+                    let archive = journal.authenticated_archive(stream, Some(through_lsn.0)).await.map_err(journal_error)?;
+                    let source = archive_cut(&archive);
+                    if !source.matches(self.incarnation(), through_lsn) {
+                        return Err(invalid_backup());
+                    }
+                    archive.verify(source.catalog_root).map_err(|_| invalid_backup())?;
+                    let mut proof = Vec::new();
+                    archive.write_to(&mut proof).map_err(|_| invalid_backup())?;
+                    Some(proof)
+                } else {
+                    None
                 }
-                Some(transactions.settle_funded_checkpoint(settlements, state.coordinates.offset)?)
             } else {
-                transactions.require_portable_checkpoint()?;
                 None
             };
-            let transactions = settled.as_ref().unwrap_or(transactions);
-            let cut = transactions.index().head();
-            let checkpoint = transactions.encode_binary_checkpoint()?;
+            let checkpoint = if proof.is_some() {
+                transactions.encode_authenticated_portable_checkpoint()?
+            } else {
+                transactions.require_portable_checkpoint()?;
+                transactions.encode_binary_checkpoint()?
+            };
+            let header_len = HEADER_BYTES + proof.as_ref().map_or(0, |proof| 4 + proof.len());
+            let body_limit = PortableBackup::MAX_BYTES.checked_sub(header_len).ok_or_else(backup_too_large)?;
             let prior_index = if let Some((index, relocations)) = read_relocation_index(
                 &self.stream, self.store.as_ref(), state.coordinates.origin,
             ).await? {
@@ -234,8 +323,7 @@ impl MultiDatabase {
             let body = if with_files {
                 let mut body = files::archive_prefix(&checkpoint, source_files.len())?;
                 for id in source_files {
-                    let remaining = (PortableBackup::MAX_BYTES - HEADER_BYTES)
-                        .checked_sub(body.len()).ok_or_else(backup_too_large)?;
+                    let remaining = body_limit.checked_sub(body.len()).ok_or_else(backup_too_large)?;
                     let file = read_file_bounded(self.store.as_ref(), self.stream.kms.as_ref(), id, remaining).await?;
                     if file.generation != generation {
                         return Err(backup_dependencies());
@@ -246,16 +334,26 @@ impl MultiDatabase {
             } else {
                 checkpoint
             };
-            if body.len() > PortableBackup::MAX_BYTES - HEADER_BYTES {
+            if body.len() > body_limit {
                 return Err(backup_too_large());
             }
-            let mut header = Vec::with_capacity(HEADER_BYTES);
-            header.extend_from_slice(if with_files { BACKUP_FILES_HEADER } else { BACKUP_HEADER });
+            let mut header = Vec::with_capacity(header_len);
+            header.extend_from_slice(match (with_files, proof.is_some()) {
+                (false, false) => BACKUP_HEADER,
+                (true, false) => BACKUP_FILES_HEADER,
+                (false, true) => AUTHENTICATED_BACKUP_HEADER,
+                (true, true) => AUTHENTICATED_BACKUP_FILES_HEADER,
+            });
             header.extend_from_slice(&cut.basis.to_bytes());
             header.extend_from_slice(&cut.system_time.0.to_be_bytes());
             header.extend_from_slice(&through_lsn.0.to_be_bytes());
+            if let Some(proof) = proof {
+                let length = u32::try_from(proof.len()).map_err(|_| backup_too_large())?;
+                header.extend_from_slice(&length.to_be_bytes());
+                header.extend_from_slice(&proof);
+            }
             let ciphertext = rtdb_crypt::seal(self.stream.kms.as_ref(), generation, backup_context(&header), &body).await?;
-            if ciphertext.len() > PortableBackup::MAX_BYTES - HEADER_BYTES {
+            if ciphertext.len() > body_limit {
                 return Err(backup_too_large());
             }
             self.stream.kms.check_readable(generation).await?;
@@ -284,16 +382,16 @@ impl MultiDatabase {
         &mut self, backup: VerifiedBackup, hold: Option<RecoveryKeyHold>,
     ) -> Result<InstalledBackup> {
         Box::pin(async move {
-            let funded_inventory_sha256 = backup.funded_inventory_sha256()?;
-            let VerifiedBackup { source, manifest_sha256, mut transactions, files, source_kms, source_generation } = backup;
+            let VerifiedBackup { mut source, manifest_sha256, mut transactions, files, source_kms, source_generation } = backup;
             if source.cut.basis.incarnation() == self.incarnation() {
                 return Err(Anomaly::incorrect("rtdb/restore-same-deployment", "Restore needs a fresh deployment identity"));
             }
             self.refresh().await?;
             self.require_active()?;
             if let Some(installed) = self.applied_backup()? {
-                if installed.manifest_sha256 == manifest_sha256 && installed.source == source
-                    && installed.funded_inventory_sha256 == funded_inventory_sha256
+                if installed.manifest_sha256 == manifest_sha256 && installed.source.cut == source.cut
+                    && installed.source.through_lsn == source.through_lsn
+                    && installed.authenticated_cut() == source.authentication.source
                 {
                     self.verify_installed_files().await?;
                     if let Some(hold) = hold {
@@ -336,6 +434,18 @@ impl MultiDatabase {
                 }
                 None => (None, Vec::new()),
             };
+            if let Some(journal) = &self.stream.authenticated_journal
+                && has_authentication(journal, self.journal_stream()).await?
+            {
+                let history = journal.catalog_history().await.map_err(journal_error)?;
+                let anchor = InstallationAnchor {
+                    catalog: history.genesis.catalog,
+                    catalog_root: history.genesis.root(),
+                    position: next(self.state().head)?,
+                };
+                if !anchor.valid() { return Err(invalid_backup()); }
+                source.authentication.installation = Some(anchor);
+            }
             let origin = RestoreOrigin {
                 digest: manifest_sha256,
                 through: source.cut.basis.position(),
@@ -351,7 +461,6 @@ impl MultiDatabase {
                 destination_basis: cut.basis,
                 manifest_sha256,
                 activation_scope: self.stream.activation_scope,
-                funded_inventory_sha256,
             })
         }).await
     }
@@ -504,7 +613,6 @@ impl MultiDatabase {
             destination_basis: Basis::new(self.incarnation(), origin.through),
             manifest_sha256: origin.digest,
             activation_scope: self.stream.activation_scope,
-            funded_inventory_sha256: state.transactions.funded_inventory_digest(source.cut.basis.incarnation())?,
         }))
     }
 
@@ -542,6 +650,14 @@ impl MultiDatabase {
             recovery_epoch: self.state().checkpoint_recovery_epoch(through),
         }, lease.until, 0).await?;
         Ok(cut)
+    }
+}
+
+async fn has_authentication(journal: &ConsensusJournal, stream: StreamId) -> Result<bool> {
+    match journal.require_authenticated(stream).await {
+        Ok(()) => Ok(true),
+        Err(JournalError::Unsupported) => Ok(false),
+        Err(error) => Err(journal_error(error)),
     }
 }
 

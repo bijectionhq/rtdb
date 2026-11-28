@@ -295,15 +295,15 @@ surface StatelessDatabase {
         -- RTDB v1 admits ordinary transactions under their existing requirements.
         -- A live funded call requires a reachable Bijection Kernel for a booking from its sys.slots ledger.
         -- Stock RTDB listeners refuse OfferDecisionClock, PrepareFundedAppointment and ActivateFundedAppointment as Unavailable with rtdb/funding-kernel-unavailable.
-        -- Transact with a legacy funding instrument or funded capability requirement is refused before entering the write queue, except for exact retired ordinary receipt readback.
+        -- Transact with a legacy funding instrument or funded capability requirement is refused before entering the write queue.
         -- RTDB v1 capabilities omit the legacy funded feature names.
         -- Standalone ordinary Store reads, writes, recovery and ordered clock slots operate independently of live funding.
 
-    @guarantee RetiredFundedReceipt
-        -- An authenticated matching owner may use original Transact field 8 for exact retired DecisionClock receipt readback.
-        -- Readback matches the retained caller, key, original booking and canonical request without ordering a write or asking the receiver for a fresh observation.
-        -- Receipt field 9 preserves the authorized original offer. Scoped responses use the projected predecessor and omit the clock numbers.
-        -- Keyed status returns historical terminal receipts under the original authorized owner or receipt namespace.
+    @guarantee RetainedFundedStatus
+        -- The issuer handles booking retries by original call identity.
+        -- Keyed status reads committed receipts through the current binding and the caller's admitted scope.
+        -- When the current receipt retains authorized DecisionClock metadata, Receipt field 9 carries it for the matching owner.
+        -- Scoped responses use the projected predecessor and omit the clock numbers.
         -- A managed funded-appointment credential can read its original keyed status for the exact current scope.
         -- Managed status carries no appointment while pending and returns the retained terminal with Receipt field 10 after publication.
 

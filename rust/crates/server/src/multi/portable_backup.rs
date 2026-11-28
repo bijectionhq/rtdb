@@ -1,6 +1,7 @@
 use std::io::Read;
 
 use rtdb_db::{PortableBackup, VerifiedBackup};
+use rtdb_stream_journal::authenticated::CatalogRoot;
 use serde_json::{Value, json};
 
 use super::*;
@@ -18,10 +19,10 @@ pub const MULTI_BACKUP_HELP: &str = "\
 Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
                                  [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
+       rtdb multi-backup lineage-inclusion --archive FILE --catalog-root HEX --position N
        rtdb multi-backup export-hosted --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
                     [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
-                    [--funded-authority-url URL --funded-authority-tls-dir DIR --predecessor-revision N]
        rtdb multi-backup stage --archive FILE --source-key-vault DIR --operation-id UUID
                     --expected-incarnation UUID --expected-revision REVISION [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
@@ -79,6 +80,11 @@ pub struct MultiBackupOptions(BackupCommand);
 #[derive(Clone, Debug)]
 enum BackupCommand {
     Local(LocalBackupOptions),
+    LineageInclusion {
+        archive: PathBuf,
+        catalog_root: CatalogRoot,
+        position: journal_contract::Lsn,
+    },
     #[cfg(feature = "backup-object-holds")]
     HostedExport(hosted_export::Export),
     #[cfg(feature = "backup-object-holds")]
@@ -109,6 +115,21 @@ impl MultiBackupOptions {
             if name == "--immutable-streams" || !name.starts_with("--") || value.starts_with("--") || fields.insert(name, value).is_some() {
                 return Err(arguments_error());
             }
+        }
+        if operation == "lineage-inclusion" {
+            let archive = fields.remove("--archive").ok_or_else(arguments_error)?.into();
+            let catalog_root = fields.remove("--catalog-root").ok_or_else(arguments_error)?;
+            let catalog_root = CatalogRoot(activation::operator::hex_digest(catalog_root)?);
+            let position = fields.remove("--position").and_then(|value| value.parse::<u64>().ok())
+                .filter(|position| *position > 0).ok_or_else(arguments_error)?;
+            if immutable_streams || !fields.is_empty() {
+                return Err(arguments_error());
+            }
+            return Ok(Self(BackupCommand::LineageInclusion {
+                archive,
+                catalog_root,
+                position: journal_contract::Lsn(position),
+            }));
         }
         if matches!(operation.as_str(), "export-hosted" | "stage" | "verify-object-holds"
             | "acquire-object-holds" | "attest" | "release-object-holds" | "abandon-object-acquisition")
@@ -174,6 +195,19 @@ impl MultiBackupOptions {
     pub async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
         match self.0 {
             BackupCommand::Local(options) => options.run(apple_sync).await,
+            BackupCommand::LineageInclusion { archive, catalog_root, position } => {
+                let bytes = read_archive(&archive)?;
+                let archive = PortableBackup::lineage_archive(&bytes, catalog_root)?
+                    .ok_or_else(|| Anomaly::incorrect(
+                        "rtdb/lineage-proof", "The backup carries no authenticated lineage cut",
+                    ))?;
+                let proof = archive.inclusion(position).map_err(|_| Anomaly::incorrect(
+                    "rtdb/lineage-proof", "The backup does not contain this lineage position",
+                ))?;
+                serde_json::to_value(proof).map_err(|_| Anomaly::incorrect(
+                    "rtdb/lineage-proof", "The lineage proof could not be encoded",
+                ))
+            }
             #[cfg(feature = "backup-object-holds")]
             BackupCommand::HostedExport(export) => export.run(apple_sync).await,
             #[cfg(feature = "backup-object-holds")]
@@ -268,6 +302,10 @@ impl LocalBackupOptions {
         let journal = self.journal.as_ref()
             .map(|(url, directory)| crate::cli::development_stream_journal(url, directory))
             .transpose()?;
+        let offline_scope = self.activation_scope.map(|scope| {
+            let lineage = backup.as_ref().and_then(|backup| backup.authenticated_cut()).is_some();
+            (scope, lineage)
+        });
         let runtime = MultiRuntime::development_with_access(
             &self.data,
             &mut configuration,
@@ -275,7 +313,7 @@ impl LocalBackupOptions {
             incarnation,
             journal,
             None,
-            self.activation_scope,
+            offline_scope,
         ).await?;
         let result = self.transfer(&runtime, backup).await;
         runtime.close().await;
@@ -303,7 +341,7 @@ impl LocalBackupOptions {
             return Err(backup_source());
         }
         let keys = Arc::new(FileKms::open(&self.data.join("keys"), || SystemClock.now().0)?);
-        let JournalBackend { journal, batch, .. } =
+        let JournalBackend { journal, batch, placement } =
             connect_stream_journal(&connection.url, &connection.credentials).await?;
         let stream = StreamId(incarnation.as_u128());
         if journal.head(stream).await.map_err(|error| match error {
@@ -331,6 +369,9 @@ impl LocalBackupOptions {
             .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));
         if let Some(scope) = self.activation_scope {
             database = database.with_activation_scope(scope)?;
+            if let Some(placement) = placement {
+                database = database.with_authenticated_journal(placement.journal, false);
+            }
         }
         let backup = database.portable_backup().await;
         io.close_and_wait().await;

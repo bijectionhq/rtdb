@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use self::attestation::{Attestation, Attestors, Intent};
 use super::journal_custody::KeeperJournal;
-use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor, funded, recovery};
+use super::{Access, ActivationAuthority, ActivationStatus, Binding, VerifiedSuccessor, recovery};
 use crate::{
     config::NodeConfiguration,
     multi::{CONSENSUS_SCHEME, DEVELOPMENT_DATABASE, MultiRuntime},
@@ -18,6 +18,8 @@ pub(in crate::multi) mod attestation;
 mod broker;
 
 pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
+       rtdb multi-activation lineage-proof DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
+                 --expected-incarnation UUID --expected-revision N
        rtdb multi-activation bootstrap DATABASE AUTHORITY --incarnation UUID
        rtdb multi-activation upgrade-grants DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
        rtdb multi-activation freeze DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
@@ -34,20 +36,6 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
                  --expected-incarnation UUID --expected-revision N
        rtdb multi-activation ranked-outcomes DATABASE --authority-socket PATH [--after N]
                  --expected-incarnation UUID --expected-revision N [--operation-id UUID]
-       rtdb multi-activation commission-funded DATABASE --authority-socket PATH
-                 --expected-incarnation UUID --expected-revision N --issuer-id UUID
-                 --issuer-key HEX --receiver-certificate-sha256 HEX [--journal-trust FILE]
-                 (for an existing historical enrollment)
-       rtdb multi-activation funded-scopes DATABASE --authority-socket PATH [--offset N]
-                 --expected-incarnation UUID --expected-revision N
-       rtdb multi-activation reconcile-funded DATABASE --authority-socket PATH [--offset N]
-                 --expected-incarnation UUID --expected-revision N
-       rtdb multi-activation record-funded-closure DATABASE --authority-socket PATH --closure FILE
-                 --expected-incarnation UUID --expected-revision N
-       rtdb multi-activation record-funded-outcome DATABASE --authority-socket PATH --outcome FILE
-                 --expected-incarnation UUID --expected-revision N
-       rtdb multi-activation funded-outcome DATABASE --authority-socket PATH --scope-sha256 HEX --index N
-                 --expected-incarnation UUID --expected-revision N
        rtdb multi-activation seal-source DATABASE --authority-socket PATH
                  --expected-incarnation UUID --expected-revision N --operation-id UUID
        rtdb multi-activation record-install DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
@@ -120,33 +108,6 @@ enum Action {
     RankedOutcomes {
         predecessor: Binding,
         after: u64,
-    },
-    CommissionFunded {
-        expected: Binding,
-        enrollment: funded::Enrollment,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        journal: Option<funded::settlement::JournalTrust>,
-    },
-    FundedScopes {
-        predecessor: Binding,
-        offset: usize,
-    },
-    ReconcileFunded {
-        predecessor: Binding,
-        offset: usize,
-    },
-    RecordFundedClosure {
-        predecessor: Binding,
-        closure: funded::Closure,
-    },
-    RecordFundedOutcome {
-        predecessor: Binding,
-        resolution: funded::settlement::Resolution,
-    },
-    FundedOutcome {
-        predecessor: Binding,
-        scope_sha256: [u8; 32],
-        index: u64,
     },
     Freeze {
         expected: Binding,
@@ -293,6 +254,13 @@ struct ProofFile {
 
 #[derive(Clone, Debug)]
 enum Command {
+    LineageProof {
+        database: String,
+        identity: Uuid,
+        url: String,
+        tls: PathBuf,
+        predecessor: Binding,
+    },
     Direct {
         authority: Authority,
         request: Request,
@@ -411,6 +379,17 @@ impl Options {
             return Ok(Self(release));
         }
 
+        if operation == "lineage-proof" {
+            let predecessor = binding(&mut fields)?;
+            let identity = id(take(&mut fields, "--authority-id")?)?;
+            let url = take(&mut fields, "--authority-url")?;
+            let tls = take(&mut fields, "--authority-tls-dir")?.into();
+            if immutable_streams || !fields.is_empty() {
+                return Err(arguments_error());
+            }
+            return Ok(Self(Command::LineageProof { database, identity, url, tls, predecessor }));
+        }
+
         let action = match operation.as_str() {
             "status" => Action::Status,
             "bootstrap" => Action::Bootstrap {
@@ -431,43 +410,6 @@ impl Options {
                     },
                     None => Action::RankedOutcomes { predecessor, after },
                 }
-            },
-            #[cfg(unix)]
-            "commission-funded" => Action::CommissionFunded {
-                expected: binding(&mut fields)?,
-                enrollment: funded::Enrollment {
-                    issuer: id(take(&mut fields, "--issuer-id")?)?,
-                    receiver_certificate_sha256: hex_digest(take(&mut fields, "--receiver-certificate-sha256")?)?,
-                    verification_key: hex_digest(take(&mut fields, "--issuer-key")?)?,
-                },
-                journal: fields.remove("--journal-trust").as_deref().map(read_funded_document).transpose()?,
-            },
-            "funded-scopes" => Action::FundedScopes {
-                predecessor: binding(&mut fields)?,
-                offset: fields.remove("--offset").map(|offset| offset.parse()).transpose()
-                    .map_err(|_| arguments_error())?.unwrap_or(0),
-            },
-            #[cfg(unix)]
-            "reconcile-funded" => Action::ReconcileFunded {
-                predecessor: binding(&mut fields)?,
-                offset: fields.remove("--offset").map(|offset| offset.parse()).transpose()
-                    .map_err(|_| arguments_error())?.unwrap_or(0),
-            },
-            #[cfg(unix)]
-            "record-funded-closure" => Action::RecordFundedClosure {
-                predecessor: binding(&mut fields)?,
-                closure: read_funded_document(&take(&mut fields, "--closure")?)?,
-            },
-            #[cfg(unix)]
-            "record-funded-outcome" => Action::RecordFundedOutcome {
-                predecessor: binding(&mut fields)?,
-                resolution: read_funded_document(&take(&mut fields, "--outcome")?)?,
-            },
-            #[cfg(unix)]
-            "funded-outcome" => Action::FundedOutcome {
-                predecessor: binding(&mut fields)?,
-                scope_sha256: hex_digest(take(&mut fields, "--scope-sha256")?)?,
-                index: take(&mut fields, "--index")?.parse().map_err(|_| arguments_error())?,
             },
             "freeze" => Action::Freeze {
                 expected: binding(&mut fields)?,
@@ -545,8 +487,6 @@ impl Options {
         }
 
         if matches!(request.action, Action::CommissionRanked { .. } | Action::RankedOutcomes { .. }
-            | Action::CommissionFunded { .. } | Action::FundedScopes { .. } | Action::ReconcileFunded { .. } | Action::RecordFundedClosure { .. }
-            | Action::RecordFundedOutcome { .. } | Action::FundedOutcome { .. }
             | Action::Recovery { action: RecoveryAction::SealSource | RecoveryAction::RankedOutcomes { .. }, .. })
         {
             return Err(arguments_error());
@@ -588,6 +528,13 @@ impl Options {
 
     pub async fn run(self, apple_sync: rtdb_storage::AppleSync) -> Result<Value> {
         match self.0 {
+            Command::LineageProof { database, identity, url, tls, predecessor } => {
+                let authority = ActivationAuthority::connect(
+                    &url, crate::cli::journal_credentials(&tls)?, identity, Access::ConsensusReader,
+                ).await?;
+                let proof = authority.lineage_publication_proof(&database, predecessor).await?;
+                serde_json::to_value(proof).map_err(|_| super::corrupt())
+            }
             Command::Direct {
                 authority,
                 request,
@@ -627,7 +574,6 @@ impl Options {
                         &Attestors::new(),
                         &JournalReaders::new(),
                         &super::ranked::Providers::default(),
-                        &funded::issuer::Providers::default(),
                         apple_sync,
                     )
                     .await
@@ -733,7 +679,6 @@ impl Request {
         attestors: &Attestors,
         journals: &JournalReaders,
         ranked: &super::ranked::Providers,
-        funded_issuers: &funded::issuer::Providers,
         apple_sync: rtdb_storage::AppleSync,
     ) -> Result<Value> {
         let database = self.database;
@@ -744,24 +689,6 @@ impl Request {
             }
             Action::RankedOutcomes { predecessor, after } => {
                 return ranked.outcomes(authority, &database, predecessor, None, after).await;
-            }
-            Action::CommissionFunded { expected, enrollment, journal } => {
-                return Ok(json!(authority.readmit_funded_enrollment(&database, expected, enrollment, journal).await?));
-            }
-            Action::FundedScopes { predecessor, offset } => {
-                return Ok(json!(authority.funded_scope_page(&database, predecessor, offset).await?));
-            }
-            Action::ReconcileFunded { predecessor, offset } => {
-                return Ok(json!(funded_issuers.reconcile(authority, &database, predecessor, offset).await?));
-            }
-            Action::RecordFundedClosure { predecessor, closure } => {
-                return Ok(json!(authority.record_funded_closure(&database, predecessor, closure).await?));
-            }
-            Action::RecordFundedOutcome { predecessor, resolution } => {
-                return Ok(json!(authority.record_funded_outcome(&database, predecessor, resolution).await?));
-            }
-            Action::FundedOutcome { predecessor, scope_sha256, index } => {
-                return Ok(json!(authority.funded_outcome(&database, predecessor, scope_sha256, index).await?));
             }
             #[cfg(all(unix, feature = "backup-object-holds"))]
             Action::AuthorizeAbandonedAcquisition { intent, hold, head, anchor, object_namespace } => {
@@ -1019,7 +946,7 @@ async fn seal_source(
     let status = authority.recovery_status(database, operation).await?;
     match status {
         recovery::Status::Published { .. }
-        | recovery::Status::Pending { final_source_lsn: Some(_), funded_source_fence_needed: false, .. } => {
+        | recovery::Status::Pending { sealed_segment_end: Some(_), .. } => {
             return Ok(status);
         }
         recovery::Status::Pending { grants_closed: true, intent, .. }
@@ -1045,7 +972,7 @@ async fn seal_source(
             return Err(super::conflict());
         }
         stopped.database.check_activation_scope(head).await?;
-        authority.seal_recovery_source(database, operation, &*stopped.journal, source.cell, Some(stopped.journal_catalog)).await
+        authority.seal_recovery_source(database, operation, &*stopped.journal, source.cell, Some(&stopped.journal)).await
     }.await;
     stopped.io.close_and_wait().await;
     result
@@ -1136,7 +1063,7 @@ fn destination(fields: &mut BTreeMap<String, String>) -> Result<Destination> {
 }
 
 #[cfg(unix)]
-fn hex_digest(input: String) -> Result<[u8; 32]> {
+pub(in crate::multi) fn hex_digest(input: String) -> Result<[u8; 32]> {
     let bytes = input.as_bytes();
     if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
         return Err(arguments_error());
@@ -1147,20 +1074,6 @@ fn hex_digest(input: String) -> Result<[u8; 32]> {
         *byte = u8::from_str_radix(digits, 16).map_err(|_| arguments_error())?;
     }
     Ok(digest)
-}
-
-#[cfg(unix)]
-fn read_funded_document<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
-    use std::io::Read;
-
-    let mut bytes = Vec::new();
-    std::fs::File::open(path).map_err(|_| arguments_error())?
-        .take((super::BROKER_FRAME_BYTES + 1) as u64).read_to_end(&mut bytes)
-        .map_err(|_| arguments_error())?;
-    if bytes.len() > super::BROKER_FRAME_BYTES {
-        return Err(arguments_error());
-    }
-    serde_json::from_slice(&bytes).map_err(|_| arguments_error())
 }
 
 async fn read_installation(
@@ -1186,7 +1099,7 @@ async fn read_installation(
         Some(intent.candidate()?),
         Some(journal),
         None,
-        Some(intent.scope()?),
+        Some((intent.scope()?, false)),
     )
     .await?;
     let result = async {
@@ -1309,8 +1222,7 @@ async fn require_hold_release(
 #[cfg(unix)]
 struct StoppedDatabase {
     _lock: std::fs::File,
-    journal: std::sync::Arc<dyn journal_contract::Journal>,
-    journal_catalog: Uuid,
+    journal: std::sync::Arc<rtdb_stream_journal::ConsensusJournal>,
     keys: std::sync::Arc<rtdb_crypt::FileKms>,
     database: rtdb_db::MultiDatabase,
     io: std::sync::Arc<rtdb_storage::IoRegion>,
@@ -1360,9 +1272,8 @@ impl StoppedDatabase {
         )?;
         let journal_path = connection.url.strip_prefix(CONSENSUS_SCHEME).ok_or_else(missing_installation)?;
         let journal_config = crate::multi::JournalConfig::read(std::path::Path::new(journal_path)).map_err(io_error)?;
-        let journal_catalog = journal_config.catalog;
         let journal = rtdb_stream_journal::ConsensusJournal::new(&connection.credentials, &journal_config).map_err(io_error)?;
-        let journal: Arc<dyn journal_contract::Journal> = Arc::new(journal);
+        let journal = Arc::new(journal);
         let keys = Arc::new(FileKms::open(&data.join("keys"), || SystemClock.now().0)?);
         let objects = data.join("objects");
         if !objects.is_dir() {
@@ -1384,8 +1295,9 @@ impl StoppedDatabase {
             Arc::new(|| SystemClock.now()),
         )?
         .with_immutable_journal()
+        .with_authenticated_journal(journal.clone(), false)
         .with_activation_scope(scope)?;
-        Ok(Self { _lock: lock, journal, journal_catalog, keys, database, io })
+        Ok(Self { _lock: lock, journal, keys, database, io })
     }
 }
 
@@ -1485,19 +1397,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn funded_reconciliation_arguments_select_a_frozen_scope_without_a_recovery_id() {
-        let incarnation = Uuid::new_v4();
-        let arguments = format!(
-            "reconcile-funded xtdb --authority-socket /tmp/authority.sock --expected-incarnation {incarnation} --expected-revision 7 --offset 2"
-        );
-        let options = Options::parse(arguments.split_whitespace().map(str::to_owned)).unwrap();
-        assert!(matches!(options.0, Command::CallBroker { request: Request {
-            action: Action::ReconcileFunded { predecessor: Binding { incarnation: expected, revision: 7 }, offset: 2 }, ..
-        }, .. } if expected == incarnation));
-    }
-
-    #[test]
     fn publication_requires_exact_predecessor_and_destination() {
         let authority = Uuid::new_v4();
         let predecessor = Uuid::new_v4();
@@ -1574,7 +1473,8 @@ mod tests {
                     key_hold: None,
                     journal_hold: None,
                     objects_sha256: None,
-                    funded_inventory_sha256: None,
+                    source_head: None,
+                    installation_anchor: None,
                     source_cut: recovery::SourceCut::default(),
                     activation_scope: Some(
                         rtdb_db::ActivationScope::new(authority.identity(), &database).unwrap(),
@@ -1602,7 +1502,6 @@ mod tests {
                 &Attestors::new(),
                 &JournalReaders::new(),
                 &super::super::ranked::Providers::default(),
-                &funded::issuer::Providers::default(),
                 rtdb_storage::AppleSync::default(),
             )
             .await
@@ -1633,7 +1532,6 @@ mod tests {
                     &Attestors::new(),
                     &JournalReaders::new(),
                     &super::super::ranked::Providers::default(),
-                    &funded::issuer::Providers::default(),
                     rtdb_storage::AppleSync::default()
                 )
                 .await

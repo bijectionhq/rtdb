@@ -485,7 +485,8 @@ The stock RTDB deployment check for a standalone listener is a legacy `OfferDeci
 It returns the typed missing-Kernel refusal before using the request body.
 A listener serving RTDB v1 also omits the legacy funded feature names from `Capabilities`.
 A deployment serving live funded calls admits them through the Bijection Kernel and uses RTDB's ordered store interface for the append.
-The lineage protocol refuses prior signed-import funded state at its upgrade boundary.
+The activation authority refuses the former signed-import protocols 9 through 11.
+Portable restore refuses version 11 transaction checkpoints from that import path.
 
 ### Lineage and funded settlement
 
@@ -508,18 +509,23 @@ For `accept-unknown-tail`, use the verified cut installed from the selected arch
 An authenticated archive binds the original catalog and its signed head to the cut and preserves access to the proof material independently of the source cell.
 A successor's binding anchors its committed installation so a later recovery cut includes the previously selected history.
 Recovery publishes the segment without calling the issuer and carries the committed receipts in the selected cut to the successor.
+An authenticated control binding requires an authenticated source cut and a committed installation on an authenticated destination journal for every recovery.
+Existing legacy control bindings continue to use ordinary recovery and their legacy archives.
 
-The issuer verifies the publication's inclusion in the control catalog and the application's inclusion against the head identified by the segment.
+Use `rtdb multi-activation lineage-proof` with direct control-catalog reader credentials and the predecessor incarnation and revision to export the publication and its control inclusion.
+The issuer verifies the publication's inclusion in the control catalog and the application's inclusion against the head root identified by the segment.
 Pin the root of each catalog and verify its signed history to resolve the quorum keys for the head.
+Use `rtdb multi-backup lineage-inclusion --archive FILE --catalog-root HEX --position N` to export an application inclusion from a saved portable cut without the source keepers.
 For capture, verify a timed leaf at the authorized position that matches the authorization in full and binds a quorum durability bound strictly before the cutoff.
 For release, verify that the published segment of the authorized stream ends before the position, or that a different leaf occupies the position within that segment.
 For example, a replacement writer can fill an abandoned position, and an authorized leaf above the selected cut can exist in the old stream while remaining outside the published lineage.
 Until publication, even a verified timed leaf leaves the authorization pending.
 Checkpoint replacement and trim preserve proofs, and retirement preserves a proof archive that can be checked offline.
 
-RTDB retains committed receipts by their original retry identity as part of the portable cut.
-For label-scoped `TxStatus`, use a current credential with the same issuer, subject, database name, and read and write labels.
-For an unscoped recovered appointment, `TxStatus` requires the original authenticated booking owner.
+RTDB retains committed ordinary receipts by their original retry identity as part of the portable cut, including effects the Kernel orders through the ordinary Store interface.
+An authenticated cut carries terminal ordinary DecisionClock receipts and clears reusable offers.
+Legacy appointment receipts, scoped receipts and protected custody require their own portable transfer.
+Use `TxStatus` with the current binding and admitted receipt scope to read a retained receipt.
 The issuer retains the booking and the decision to capture or release even if the authorized transaction has no committed RTDB receipt.
 
 A hosted qualification requires a named non-production allocation with scoped object and key provider credentials, an independent activation quorum, and separate reader, operator and custodian identities.
@@ -617,7 +623,8 @@ Withdraw access to the uncommissioned predecessor's endpoints before publishing 
 
 Existing inline archives remain readable.
 Archives with files cover ordinary checkpoint attachments within the archive size limit and the current source key generation.
-Active pins, files retained only through pin history, transaction object inventories, protected custody, and scoped or funded receipts require a separate portable transfer.
+Active pins, files retained only through pin history, transaction object inventories, protected custody, scoped receipts and legacy appointment receipts require a separate portable transfer.
+Legacy archives require ordinary receipt state, while authenticated archives also carry terminal ordinary DecisionClock receipts without reusable offers.
 Ranked catalogues are rebuilt in the successor from the transferred database state.
 Recovery reconciles their admissions at the original ranked provider.
 The export refuses incomplete erasure and key rotation.

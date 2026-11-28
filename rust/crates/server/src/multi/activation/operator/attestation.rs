@@ -12,7 +12,7 @@ use std::{
 use ring::signature::Ed25519KeyPair;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use rtdb_crypt::{Generation, RecoveryKeyHold};
-use rtdb_db::ActivationScope;
+use rtdb_db::{ActivationScope, AuthenticatedCut, InstallationAnchor};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -51,7 +51,10 @@ impl Intent {
         )
     }
 
-    fn evidence(&self, cut: SourceCut, manifest_sha256: [u8; 32], key: Option<KeyEvidence>, funded_inventory_sha256: Option<[u8; 32]>) -> Result<Evidence> {
+    fn evidence(
+        &self, cut: SourceCut, manifest_sha256: [u8; 32], key: Option<KeyEvidence>,
+        source_head: Option<AuthenticatedCut>, installation_anchor: Option<InstallationAnchor>,
+    ) -> Result<Evidence> {
         Ok(Evidence {
             version: if key.is_some() { HELD_KEY_VERSION } else { VERSION },
             intent: self.clone(),
@@ -62,7 +65,8 @@ impl Intent {
             manifest_sha256,
             key,
             objects_sha256: None,
-            funded_inventory_sha256,
+            source_head,
+            installation_anchor,
         })
     }
 
@@ -76,7 +80,8 @@ impl Intent {
             position: archive.source_basis().position(),
             system_time: archive.source_system_time().0,
         };
-        self.evidence(cut, archive.manifest_sha256(), Some(key), archive.funded_inventory_sha256()?)?.key_hold()?.ok_or_else(invalid)
+        self.evidence(cut, archive.manifest_sha256(), Some(key), archive.authenticated_cut(), None)?
+            .key_hold()?.ok_or_else(invalid)
     }
 
     #[cfg(feature = "backup-object-holds")]
@@ -102,7 +107,7 @@ impl Intent {
             position: installed.source_basis().position(),
             system_time: installed.source_system_time().0,
         };
-        self.evidence(cut, manifest_sha256, key, installed.funded_inventory_sha256())
+        self.evidence(cut, manifest_sha256, key, installed.authenticated_cut(), installed.installation_anchor())
     }
 }
 
@@ -123,7 +128,9 @@ struct Evidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     objects_sha256: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    funded_inventory_sha256: Option<[u8; 32]>,
+    source_head: Option<AuthenticatedCut>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installation_anchor: Option<InstallationAnchor>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -163,12 +170,20 @@ impl Evidence {
             }
             _ => return Err(invalid()),
         }
-        if let Some(inventory) = self.funded_inventory_sha256 {
-            if inventory == [0; 32] {
+        if let Some(source) = self.source_head {
+            if !source.matches(*self.intent.expected.incarnation.as_bytes(), journal_contract::Lsn(self.source_lsn)) {
                 return Err(invalid());
             }
-            bytes.extend_from_slice(b"funded-inventory\0");
-            bytes.extend_from_slice(&inventory);
+            bytes.extend_from_slice(b"source-head\0");
+            bytes.extend_from_slice(&source.catalog_root.0);
+            bytes.extend_from_slice(&source.head.statement());
+        }
+        if let Some(anchor) = self.installation_anchor {
+            if !anchor.valid() { return Err(invalid()); }
+            bytes.extend_from_slice(b"installation-anchor\0");
+            bytes.extend_from_slice(anchor.catalog.as_bytes());
+            bytes.extend_from_slice(&anchor.catalog_root.0);
+            bytes.extend_from_slice(&anchor.position.0.to_be_bytes());
         }
         Ok(bytes)
     }
@@ -176,9 +191,13 @@ impl Evidence {
     fn key_hold(&self) -> Result<Option<RecoveryKeyHold>> {
         let Some(key) = self.key else { return Ok(None); };
         let message = self.message()?;
-        let key_message = if self.version == HOSTED_CUSTODY_VERSION {
-            Self { version: HELD_KEY_VERSION, objects_sha256: None, ..self.clone() }.message()?
-        } else { message };
+        let key_message = if self.version == HELD_KEY_VERSION && self.installation_anchor.is_none() {
+            message
+        } else {
+            Self {
+                version: HELD_KEY_VERSION, objects_sha256: None, installation_anchor: None, ..self.clone()
+            }.message()?
+        };
         let digest = ring::digest::digest(&ring::digest::SHA256, &key_message);
         Ok(Some(RecoveryKeyHold {
             authority: self.intent.authority_id,
@@ -243,12 +262,13 @@ impl Attestation {
         }
         let operation = Operation { predecessor: intent.expected, operation_id: intent.operation_id };
         match authority.recovery_status(&intent.database, operation).await? {
-            Status::Pending { intent: selected, candidate, installation, final_source_lsn, .. }
+            Status::Pending { intent: selected, candidate, installation, sealed_segment_end, .. }
                 if selected.destination_cell == intent.cell && candidate == evidence.candidate
-                    && (selected.loss_policy != LossPolicy::Lossless || final_source_lsn == Some(Lsn(evidence.source_lsn)))
+                    && (selected.loss_policy != LossPolicy::Lossless || sealed_segment_end == Some(Lsn(evidence.source_lsn)))
                     && installation.is_none_or(|prior| {
                         prior.manifest_digest == evidence.manifest_sha256 && prior.key_hold == Some(hold)
-                            && prior.funded_inventory_sha256 == evidence.funded_inventory_sha256
+                            && prior.source_head == evidence.source_head
+                            && prior.installation_anchor == evidence.installation_anchor
                             && prior.source_cut == SourceCut {
                                 lsn: evidence.source_lsn,
                                 position: evidence.source_position,
@@ -348,7 +368,8 @@ impl Attestation {
             key_hold,
             journal_hold,
             objects_sha256: evidence.objects_sha256,
-            funded_inventory_sha256: evidence.funded_inventory_sha256,
+            source_head: evidence.source_head,
+            installation_anchor: evidence.installation_anchor,
             source_cut: SourceCut {
                 lsn: evidence.source_lsn,
                 position: evidence.source_position,
@@ -464,7 +485,8 @@ mod tests {
                 manifest_sha256: [5; 32],
                 key: Some(KeyEvidence { generation: 1, authority_sha256: fingerprint }),
                 objects_sha256: None,
-                funded_inventory_sha256: None,
+                source_head: None,
+                installation_anchor: None,
             }, &signer).unwrap()
         };
         let recovery = |operation_id| RecoveryIntent {
@@ -527,7 +549,8 @@ mod tests {
                 manifest_sha256,
                 key: None,
                 objects_sha256: None,
-                funded_inventory_sha256: None,
+                source_head: None,
+                installation_anchor: None,
             },
             &key,
         )
@@ -542,16 +565,9 @@ mod tests {
                 .successor,
             intent.candidate().unwrap(),
         );
-        let mut funded = transported.evidence.clone();
-        funded.funded_inventory_sha256 = Some([17; 32]);
-        let funded = Attestation::signed(funded, &key).unwrap();
-        assert_eq!(
-            funded.verify(&intent, manifest_sha256, &trusted).unwrap().funded_inventory_sha256,
-            Some([17; 32])
-        );
-        let mut changed = funded;
-        changed.evidence.funded_inventory_sha256 = Some([18; 32]);
-        assert!(changed.verify(&intent, manifest_sha256, &trusted).is_err());
+        let mut legacy_funded = serde_json::to_value(&proof).unwrap();
+        legacy_funded["evidence"]["funded_inventory_sha256"] = serde_json::json!(vec![17_u8; 32]);
+        assert!(serde_json::from_value::<Attestation>(legacy_funded).is_err());
         assert!(proof.verify(&intent, [2; 32], &trusted).is_err());
         assert!(
             proof

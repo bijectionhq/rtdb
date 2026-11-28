@@ -490,7 +490,7 @@ contract KernelFundedAdmission {
         -- A refused call never enters the write queue and cannot fall through to an ordinary transaction.
         -- A clock certificate and a managed workload grant authenticate clock evidence and workload scope respectively.
         -- The standalone deployment probe returns the typed refusal and the RTDB v1 capabilities omit the legacy funded actions.
-        -- The authenticated historical receipt route can read back the exact original retired DecisionClock request and keyed status.
+        -- A booking retry uses the original call identity at the Kernel.
 
     @invariant RecoveryUsesKernelFates
         -- Recovery retains the original Kernel scope and ordered store cut through custody and readmission.
@@ -1279,7 +1279,9 @@ contract PortableApplicationBackup {
         -- The writer captures one settled applied cut and binds its source incarnation, basis, system time and journal position to the encrypted checkpoint.
         -- An immutable stream can capture its settled application state at a quorum-confirmed head with read authority and without provisioning any source streams.
         -- The checkpoint contains its inline application state and exact retained receipt index.
-        -- A portable cut carries committed receipts, requires ordinary row custody state, and closes its export-pin inventory.
+        -- A portable cut carries committed ordinary receipts, requires ordinary row custody state, and closes its export-pin inventory.
+        -- An authenticated portable cut carries terminal ordinary DecisionClock receipts and clears reusable offers.
+        -- A cut with legacy appointment receipts, scoped receipts or protected custody requires its own portable transfer.
         -- An authenticated portable cut binds its source catalog and signed head and preserves independent access to the proof material for that head.
         -- The archive authenticates each ordinary checkpoint file under its exact source object identity.
         -- The writer reads each file from the current generation's custody and verifies its stored identity before capture.

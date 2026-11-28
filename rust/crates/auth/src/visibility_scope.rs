@@ -19,8 +19,6 @@ struct ScopeClaim {
 
 pub struct VerifiedLabelScope {
     database: String,
-    issuer: String,
-    subject: String,
     incarnation: [u8; 16],
     labels: LabelScope,
     receipt_namespace: [u8; 32],
@@ -56,8 +54,6 @@ impl VerifiedLabelScope {
         let receipt_namespace = receipt_namespace(claim.incarnation, issuer, subject, &claim.database, &labels);
         Ok(Self {
             database: claim.database,
-            issuer: issuer.to_owned(),
-            subject: subject.to_owned(),
             incarnation: claim.incarnation,
             labels,
             receipt_namespace,
@@ -74,12 +70,6 @@ impl VerifiedLabelScope {
 
     pub fn receipt_namespace(&self) -> [u8; 32] {
         self.receipt_namespace
-    }
-
-    /// Reconstructs this identity's namespace for a retained funded receipt.
-    /// The call must separately admit this credential at the current incarnation.
-    pub fn funded_receipt_namespace_at(&self, incarnation: [u8; 16]) -> [u8; 32] {
-        receipt_namespace(incarnation, &self.issuer, &self.subject, &self.database, &self.labels)
     }
 
     pub fn admit(&self, database: &str, incarnation: [u8; 16]) -> Result<()> {
@@ -104,8 +94,6 @@ impl VerifiedLabelScope {
 
     pub(super) fn memory_bytes(&self) -> usize {
         self.database.capacity()
-            + self.issuer.capacity()
-            + self.subject.capacity()
             + [&self.labels.read, &self.labels.write]
                 .into_iter()
                 .flatten()
@@ -147,7 +135,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn funded_receipt_namespace_reconstructs_only_the_same_verified_scope() {
+    fn receipt_namespace_binds_the_verified_scope() {
         let original = [7; 16];
         let successor = [8; 16];
         let credential = |incarnation, issuer, subject, database, read| {
@@ -166,14 +154,13 @@ mod tests {
         assert!(retired.admit("database", successor).is_err());
         assert!(active.admit("database", successor).is_ok());
         assert_ne!(active.receipt_namespace(), retired.receipt_namespace());
-        assert_eq!(active.funded_receipt_namespace_at(original), retired.receipt_namespace());
         for different in [
             credential(successor, "different", "subject", "database", 2),
             credential(successor, "issuer", "different", "database", 2),
             credential(successor, "issuer", "subject", "different", 2),
             credential(successor, "issuer", "subject", "database", 4),
         ] {
-            assert_ne!(different.funded_receipt_namespace_at(original), retired.receipt_namespace());
+            assert_ne!(different.receipt_namespace(), active.receipt_namespace());
         }
     }
 }

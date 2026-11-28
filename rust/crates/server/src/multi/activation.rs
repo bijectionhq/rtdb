@@ -19,10 +19,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod clock;
-mod funded;
-#[cfg(all(test, unix, feature = "backup-object-holds"))]
-pub(super) use funded::settlement::tests::BookedRefusal;
 mod history;
+pub mod lineage;
 pub(super) mod journal_custody;
 pub(crate) mod operator;
 pub(super) mod recovery;
@@ -39,9 +37,7 @@ const RECOVERY_KEY_CUSTODY_PROTOCOL: u8 = 5;
 const RECOVERY_JOURNAL_CUSTODY_PROTOCOL: u8 = 6;
 const RECOVERY_HOSTED_CUSTODY_PROTOCOL: u8 = 7;
 const RANKED_RECOVERY_PROTOCOL: u8 = 8;
-const FUNDED_RECOVERY_PROTOCOL: u8 = 9;
-const FUNDED_SETTLEMENT_PROTOCOL: u8 = 10;
-const FUNDED_PORTABLE_PROTOCOL: u8 = 11;
+pub(super) const LINEAGE_PROTOCOL: u8 = 12;
 #[cfg(any(unix, feature = "backup-object-holds"))]
 const BROKER_FRAME_BYTES: usize = 16 * 1024;
 const RENEW_AHEAD: Duration = Duration::from_secs(1);
@@ -49,6 +45,7 @@ const ATTEMPTS: usize = 8;
 
 pub struct ActivationAuthority {
     journal: Arc<dyn Journal>,
+    authenticated_journal: Option<Arc<rtdb_stream_journal::ConsensusJournal>>,
     identity: Uuid,
     connection_sha256: Option<[u8; 32]>,
     serving_cell: Option<Uuid>,
@@ -109,6 +106,7 @@ impl ActivationStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Publication {
     operation: Uuid,
     predecessor: Binding,
@@ -117,6 +115,8 @@ struct Publication {
     destination_cell: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<recovery::Completed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segment: Option<lineage::LineageSegment>,
 }
 
 /// Produced by the destination installer after its reconstruction is committed.
@@ -130,7 +130,8 @@ pub struct VerifiedSuccessor {
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     journal_hold: Option<journal_custody::RetainedJournal>,
     objects_sha256: Option<[u8; 32]>,
-    funded_inventory_sha256: Option<[u8; 32]>,
+    source_head: Option<rtdb_db::AuthenticatedCut>,
+    installation_anchor: Option<rtdb_db::InstallationAnchor>,
     source_cut: recovery::SourceCut,
 }
 
@@ -145,7 +146,8 @@ impl VerifiedSuccessor {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
-            funded_inventory_sha256: installed.funded_inventory_sha256(),
+            source_head: installed.authenticated_cut(),
+            installation_anchor: installed.installation_anchor(),
             source_cut: recovery::SourceCut {
                 lsn: installed.source_lsn().0,
                 position: installed.source_basis().position(),
@@ -156,16 +158,17 @@ impl VerifiedSuccessor {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct State {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage_base_version: Option<u8>,
     binding: Binding,
     grants_closed: bool,
     grants_end: Option<i64>,
     retired: BTreeSet<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ranked: Option<ranked::RankedState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    funded: Option<funded::FundedState>,
     publication: Option<Publication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<recovery::Pending>,
@@ -177,6 +180,7 @@ impl State {
     fn initial(incarnation: Uuid) -> Self {
         Self {
             version: ELAPSED_GRANT_PROTOCOL,
+            lineage_base_version: None,
             binding: Binding {
                 incarnation,
                 revision: 1,
@@ -185,11 +189,31 @@ impl State {
             grants_end: None,
             retired: BTreeSet::new(),
             ranked: None,
-            funded: None,
             publication: None,
             recovery: None,
             superseded_recoveries: BTreeSet::new(),
         }
+    }
+
+    fn base_version(&self) -> u8 {
+        self.lineage_base_version.unwrap_or(self.version)
+    }
+
+    fn set_base_version(&mut self, version: u8) {
+        if let Some(base) = &mut self.lineage_base_version {
+            *base = version;
+        } else {
+            self.version = version;
+        }
+    }
+
+    fn enable_lineage(&mut self) {
+        self.lineage_base_version = Some(self.base_version());
+        self.version = LINEAGE_PROTOCOL;
+    }
+
+    fn uses_lineage(&self) -> bool {
+        self.version == LINEAGE_PROTOCOL
     }
 
     fn destination_cell(&self) -> Option<Uuid> {
@@ -226,13 +250,6 @@ impl State {
 }
 
 impl ActivationAuthority {
-    pub(super) async fn funded_export_reader(
-        url: &str, credentials: super::Credentials, identity: Uuid, source_journal_url: &str,
-    ) -> Result<Arc<Self>> {
-        require_independent_journals(url, source_journal_url)?;
-        Self::connect(url, credentials, identity, Access::ConsensusReader).await
-    }
-
     async fn connect(
         url: &str,
         credentials: super::Credentials,
@@ -240,8 +257,10 @@ impl ActivationAuthority {
         access: Access,
     ) -> Result<Arc<Self>> {
         let journal_custody::KeeperJournal { journal, connection_sha256 } = journal_custody::KeeperJournal::connect(url, &credentials)?;
-        let mut authority = Self::with_access(journal, identity, access)?;
-        Arc::get_mut(&mut authority).expect("just connected").connection_sha256 = Some(connection_sha256);
+        let mut authority = Self::with_access(journal.clone(), identity, access)?;
+        let connected = Arc::get_mut(&mut authority).expect("just connected");
+        connected.connection_sha256 = Some(connection_sha256);
+        connected.authenticated_journal = Some(journal);
         Ok(authority)
     }
 
@@ -273,6 +292,7 @@ impl ActivationAuthority {
         clock().ok_or_else(clock::unavailable)?;
         Ok(Arc::new(Self {
             journal,
+            authenticated_journal: None,
             identity,
             connection_sha256: None,
             serving_cell: None,
@@ -336,14 +356,28 @@ impl ActivationAuthority {
         let stream = self.stream_id(name)?;
         if self.access.is_local() {
             self.journal.create(stream).await
+        } else if let Some(journal) = &self.authenticated_journal {
+            match journal.require_authenticated(stream).await {
+                Ok(()) => Ok(()),
+                Err(JournalError::NotFound) => match journal.create_authenticated(stream).await {
+                    Err(JournalError::Unsupported) => self.journal.create_immutable(stream).await,
+                    result => result,
+                },
+                Err(JournalError::Unsupported) => self.journal.create_immutable(stream).await,
+                Err(error) => Err(error),
+            }
         } else {
             self.journal.create_immutable(stream).await
         }
         .map_err(journal_error)?;
+        let mut initial = State::initial(incarnation);
+        if self.supports_lineage(stream).await? {
+            initial.enable_lineage();
+        }
         let state = self
             .change(stream, |state| match state {
-                None => Ok(Some(State::initial(incarnation))),
-                Some(state) if state.binding == State::initial(incarnation).binding => Ok(None),
+                None => Ok(Some(initial.clone())),
+                Some(state) if state.binding == initial.binding && state.uses_lineage() == initial.uses_lineage() => Ok(None),
                 Some(_) => Err(conflict()),
             })
             .await?;
@@ -450,7 +484,7 @@ impl ActivationAuthority {
         if successor.predecessor != expected.incarnation
             || successor.successor != successor_incarnation(self.identity, name, expected, operation, successor.destination_cell)?
             || successor.successor == expected.incarnation
-            || successor.funded_inventory_sha256.is_some()
+            || successor.source_head.is_some() || successor.installation_anchor.is_some()
             || successor.activation_scope != Some(rtdb_db::ActivationScope::for_cell(self.identity, name, successor.destination_cell)?)
         {
             return Err(conflict());
@@ -461,8 +495,10 @@ impl ActivationAuthority {
             manifest_digest: successor.manifest_digest,
             destination_cell: successor.destination_cell,
             recovery: None,
+            segment: None,
         };
         let stream = self.stream_id(name)?;
+        if self.supports_lineage(stream).await? { return Err(conflict()); }
         let (_, frozen) = self.read(stream).await?;
         let frozen = frozen.ok_or_else(unavailable)?;
         if frozen.already_published(&publication, successor.successor)? {
@@ -513,9 +549,6 @@ impl ActivationAuthority {
             ranked.provider = None;
             ranked.closure = None;
         }
-        if let Some(funded) = &mut next.funded {
-            funded.scopes.clear();
-        }
         Ok(next)
     }
 
@@ -563,7 +596,25 @@ impl ActivationAuthority {
         activation_stream_id(self.identity, name)
     }
 
+    async fn supports_lineage(&self, stream: StreamId) -> Result<bool> {
+        let Some(journal) = &self.authenticated_journal else { return Ok(false); };
+        match journal.require_authenticated(stream).await {
+            Ok(()) => Ok(true),
+            Err(JournalError::Unsupported | JournalError::NotFound) => Ok(false),
+            Err(error) => Err(journal_error(error)),
+        }
+    }
+
+    pub(super) async fn supports_lineage_for(&self, name: &str) -> Result<bool> {
+        self.supports_lineage(self.stream_id(name)?).await
+    }
+
     async fn read(&self, stream: StreamId) -> Result<(Lsn, Option<State>)> {
+        let (head, record) = self.read_record(stream).await?;
+        Ok((head, record.map(|(state, _)| state)))
+    }
+
+    async fn read_record(&self, stream: StreamId) -> Result<(Lsn, Option<(State, Bytes)>)> {
         if !self.access.is_local() {
             self.journal
                 .require_immutable(stream)
@@ -595,17 +646,20 @@ impl ActivationAuthority {
             }
             let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
             if !matches!(state.base_version(), ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL | RANKED_RECOVERY_PROTOCOL)
+                || (state.version == LINEAGE_PROTOCOL) != state.lineage_base_version.is_some()
+                || state.publication.as_ref().and_then(|publication| publication.segment.as_ref())
+                    .is_some_and(|segment| state.version != LINEAGE_PROTOCOL || !segment.valid()
+                        || segment.authority != self.identity || self.stream_id(&segment.database).ok() != Some(stream))
                 || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
                 || state.retired.contains(&state.binding.incarnation)
                 || !state.valid_ranked()
-                || !state.valid_funded(stream)
                 || !state.valid_recovery()
             {
                 return Err(corrupt());
             }
-            return Ok((head, Some(state)));
+            return Ok((head, Some((state, bytes.clone()))));
         }
         Err(unavailable())
     }
@@ -619,10 +673,15 @@ impl ActivationAuthority {
         let local = self.access.is_local();
         let mut epoch = Epoch(u64::from(local));
         for _ in 0..ATTEMPTS {
-            let (head, observed) = self.read(stream).await?;
-            let Some(state) = next(observed.as_ref())? else {
-                return observed.ok_or_else(corrupt);
+            let (head, observed) = self.read_record(stream).await?;
+            let Some(state) = next(observed.as_ref().map(|(state, _)| state))? else {
+                return observed.map(|(state, _)| state).ok_or_else(corrupt);
             };
+            if let Some((observed, record)) = observed
+                && let Some(segment) = observed.publication.as_ref().and_then(|publication| publication.segment.as_ref())
+            {
+                self.preserve_publication(&segment.database, &observed, head, record).await?;
+            }
             let fence = match self.seal_fence(stream, epoch).await {
                 Ok((sealed_head, fence)) if sealed_head == head => fence,
                 Ok(_) => continue,
@@ -991,7 +1050,8 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
-            funded_inventory_sha256: None,
+            source_head: None,
+            installation_anchor: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(authority.identity(), "xtdb").unwrap()),
         };
@@ -1048,7 +1108,8 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
-            funded_inventory_sha256: None,
+            source_head: None,
+            installation_anchor: None,
             source_cut: recovery::SourceCut::default(),
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
         };
@@ -1146,6 +1207,25 @@ mod tests {
         });
         assert_eq!(authority.grant(stream, incarnation, None).await.unwrap_err().code, "rtdb/activation-fenced");
         assert_eq!(authority.journal.head(stream).await.unwrap(), Lsn(1));
+    }
+
+    #[tokio::test]
+    async fn activation_refuses_signed_import_protocols() {
+        let directory = tempfile::tempdir().unwrap();
+        let authority = ActivationAuthority::open_local(
+            &directory.path().join("activation"), Uuid::new_v4(),
+        ).unwrap();
+        for version in 9..=11 {
+            let name = format!("signed-import-{version}");
+            authority.bootstrap(&name, Uuid::new_v4()).await.unwrap();
+            let stream = authority.stream_id(&name).unwrap();
+            authority.change(stream, |state| {
+                let mut state = state.unwrap().clone();
+                state.version = version;
+                Ok(Some(state))
+            }).await.unwrap();
+            assert_eq!(authority.status(&name).await.unwrap_err().code, "rtdb/activation-state");
+        }
     }
 
     #[tokio::test]

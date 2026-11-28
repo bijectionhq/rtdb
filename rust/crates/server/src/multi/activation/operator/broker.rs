@@ -20,7 +20,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, JournalReaders, Request, Source, funded};
+use super::{Access, ActivationAuthority, Attestors, Destination, DestinationReader, JournalReaders, Request, Source};
 
 use super::super::{BROKER_FRAME_BYTES, ranked::Providers};
 
@@ -42,8 +42,6 @@ struct Config {
     destination_journal_readers: JournalReaders,
     #[serde(default)]
     ranked_providers: Providers,
-    #[serde(default)]
-    funded_issuers: funded::issuer::Settings,
 }
 
 impl Config {
@@ -105,9 +103,7 @@ pub(super) async fn serve(
     configuration: &Path,
     apple_sync: rtdb_storage::AppleSync,
 ) -> Result<()> {
-    let mut config = Config::read(configuration)?;
-    let funded_issuers = Arc::new(std::mem::take(&mut config.funded_issuers).connect(open_funded_key)?);
-    let config = Arc::new(config);
+    let config = Arc::new(Config::read(configuration)?);
     require_directory(&config.authority_tls_dir, 0o022)?;
     if let Some(destination) = &config.destination {
         super::super::require_independent_journals(
@@ -145,9 +141,8 @@ pub(super) async fn serve(
                 let (stream, _) = accepted.map_err(io_error)?;
                 let authority = authority.clone();
                 let config = config.clone();
-                let funded_issuers = funded_issuers.clone();
                 requests.spawn(async move {
-                    handle_peer(stream, &authority, &config, &funded_issuers, apple_sync).await;
+                    handle_peer(stream, &authority, &config, apple_sync).await;
                 });
             }
         }
@@ -160,7 +155,6 @@ async fn handle_peer(
     mut stream: UnixStream,
     authority: &ActivationAuthority,
     config: &Config,
-    funded_issuers: &funded::issuer::Providers,
     apple_sync: rtdb_storage::AppleSync,
 ) {
     let result: Result<Value> = if stream
@@ -177,7 +171,6 @@ async fn handle_peer(
                         &config.destination_attestors,
                         &config.destination_journal_readers,
                         &config.ranked_providers,
-                        funded_issuers,
                         apple_sync,
                     )
                     .await
@@ -308,15 +301,6 @@ fn require_private_file(file: &File) -> Result<()> {
     }
 }
 
-fn open_funded_key(path: &Path) -> Result<File> {
-    let parent = path.parent().filter(|_| path.is_absolute()).ok_or_else(configuration)?;
-    require_directory(parent, 0o022)?;
-    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path).map_err(io_error)?;
-    require_private_file(&file)?;
-    Ok(file)
-}
-
 fn configuration() -> Anomaly {
     Anomaly::incorrect(
         "rtdb/activation-broker-configuration",
@@ -370,7 +354,6 @@ mod tests {
                     server,
                     &authority,
                     &config,
-                    &funded::issuer::Providers::default(),
                     rtdb_storage::AppleSync::default(),
                 )
                 .await;
@@ -436,13 +419,11 @@ pub(super) async fn call_test_peer(
 ) -> Result<Value> {
     let (mut client, server) = UnixStream::pair().unwrap();
     let config = test_config(authority, BTreeSet::from([effective_uid()]), attestors.clone());
-    let funded_issuers = funded::issuer::Providers::default();
     let (_, result) = tokio::join!(
         handle_peer(
             server,
             authority,
             &config,
-            &funded_issuers,
             rtdb_storage::AppleSync::default(),
         ),
         async {
@@ -465,6 +446,5 @@ fn test_config(authority: &ActivationAuthority, operator_uids: BTreeSet<u32>, de
         destination_attestors,
         destination_journal_readers: JournalReaders::new(),
         ranked_providers: Providers::default(),
-        funded_issuers: funded::issuer::Settings::default(),
     }
 }

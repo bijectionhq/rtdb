@@ -44,7 +44,7 @@ impl RankedClosure {
 
 impl State {
     pub(super) fn recovery_protocol(&self) -> u8 {
-        self.ranked.map_or_else(|| self.base_version(), |ranked| ranked.protocol)
+        self.ranked.map_or(self.base_version(), |ranked| ranked.protocol)
     }
 
     pub(super) fn advance_protocol(&mut self, protocol: u8) {
@@ -817,7 +817,8 @@ mod tests {
                 key_hold: None,
                 journal_hold: None,
                 objects_sha256: None,
-                funded_inventory_sha256: None,
+                source_head: None,
+                installation_anchor: None,
                 activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
                 source_cut: SourceCut { lsn: 3, position: 3, system_time: 4 },
             }).await.unwrap();
@@ -910,7 +911,8 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
-            funded_inventory_sha256: None,
+            source_head: None,
+            installation_anchor: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
             source_cut: SourceCut {
                 lsn: 3,

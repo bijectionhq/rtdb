@@ -200,7 +200,7 @@ impl MultiRuntime {
         expected: Option<Uuid>,
         stream_journal: Option<DevelopmentStreamJournal>,
         activation: Option<Arc<ActivationAuthority>>,
-        offline_scope: Option<ActivationScope>,
+        offline_scope: Option<(ActivationScope, bool)>,
     ) -> Result<Self> {
         if expected.is_some_and(|id| id.is_nil()) {
             return Err(invalid("Multi development requires a nonzero incarnation"));
@@ -1483,7 +1483,7 @@ struct Backends {
     activation: Option<Arc<ActivationAuthority>>,
     #[cfg(all(feature = "s3", feature = "backup-object-holds"))]
     ranked_provider: Option<rtdb_s3::S3Config>,
-    offline_scope: Option<ActivationScope>,
+    offline_scope: Option<(ActivationScope, bool)>,
     _journal_lock: Option<Arc<File>>,
 }
 
@@ -1504,7 +1504,7 @@ impl Backends {
                 Ok(database)
             }
             None => match self.offline_scope {
-                Some(scope) => database.with_activation_scope(scope),
+                Some((scope, _)) => database.with_activation_scope(scope),
                 None => Ok(database),
             },
         }
@@ -1585,6 +1585,13 @@ async fn open_database_for_name(
         .with_hold_writes_after_recovery(backends.journal_settings.hold_writes_after_recovery);
     if backends.journal_settings.immutable_streams {
         database = database.with_immutable_journal();
+        if let Some(placement) = &backends.placement {
+            let create = match (application_name, &backends.activation) {
+                (Some(name), Some(authority)) => authority.supports_lineage_for(name).await?,
+                _ => backends.offline_scope.is_some_and(|(_, lineage)| lineage),
+            };
+            database = database.with_authenticated_journal(Arc::clone(&placement.journal), create);
+        }
     }
     if let Some(name) = application_name {
         database = backends.bound_database(database, name, id).await?;

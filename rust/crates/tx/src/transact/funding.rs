@@ -413,65 +413,52 @@ mod tests {
     }
 
     #[test]
-    fn reconciled_funded_receipts_survive_checkpoint_rebase_without_live_offers() {
+    fn signed_import_checkpoint_version_is_refused() {
+        let original = TransactState::new(INCARNATION);
+        let cut = original.index().head();
+        let mut checkpoint: serde_json::Value = serde_json::from_slice(&original.encode_checkpoint().unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
+        assert!(TransactState::decode_checkpoint(&bytes, cut).is_ok());
+        checkpoint[0] = 11.into();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
+        assert_eq!(TransactState::decode_checkpoint(&bytes, cut).err().unwrap().code, "rtdb/transaction-checkpoint");
+        let encoded = original.encode_binary_checkpoint().unwrap();
+        assert!(TransactState::decode_binary_checkpoint(&encoded, cut).is_ok());
+        let mut binary: ciborium::Value = ciborium::from_reader(encoded.as_ref()).unwrap();
+        binary.as_array_mut().unwrap()[0] = ciborium::Value::Integer(11_u8.into());
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&binary, &mut bytes).unwrap();
+        assert_eq!(TransactState::decode_binary_checkpoint(&bytes, cut).err().unwrap().code, "rtdb/transaction-checkpoint");
+    }
+
+    #[test]
+    fn authenticated_cut_preserves_terminal_receipts_and_vacates_live_bookings() {
         let mut pipeline = TransactPipeline::new(TransactState::new(INCARNATION), 1, 4).unwrap();
         let mut accepted = request(1, vec![put(TableRef::new("public", "items"), Interval::ALL.into(),
             StructFields::from([("reading".into(), Cell::TxTime)]))]);
+        accepted.require.push(DECISION_CLOCK_OFFER.into());
         let mut pending = accepted.clone();
         pending.key = vec![2; 16];
-        accepted.require.push(DECISION_CLOCK_OFFER.into());
-        pending.require.push(DECISION_CLOCK_OFFER.into());
         let predecessor = pipeline.durable().index().head().basis;
         let booked = funded(&mut pipeline, &accepted, None, book(predecessor, BOOKING)).unwrap();
         append(&mut pipeline, booked);
         let terminal = funded(&mut pipeline, &accepted, None, consume(1_200_000)).unwrap();
-        let (receipt, _) = append(&mut pipeline, terminal);
-        let pending_booking = [5; 16];
-        let booked = funded(&mut pipeline, &pending, None, book(predecessor, pending_booking)).unwrap();
+        let (terminal, _) = append(&mut pipeline, terminal);
+        let booked = funded(&mut pipeline, &pending, None, book(predecessor, [5; 16])).unwrap();
         append(&mut pipeline, booked);
-        let orphan_key = vec![3; 16];
-        let settled = |key, booking, intent_sha256, consumption_lsn| FundedSettlement {
-            namespace: None, key,
-            outcome: FundedOutcome {
-                booking, owner: OWNER, predecessor, intent_sha256, appointment: false,
-                activation_lsn: None, consumption_lsn, evidence_sha256: [7; 32],
-            },
-        };
-        let settlements = [
-            settled(accepted.key.clone(), BOOKING, accepted.logical_sha256().unwrap(), Some(2)),
-            settled(pending.key.clone(), pending_booking, pending.logical_sha256().unwrap(), None),
-            settled(orphan_key.clone(), [6; 16], [8; 32], None),
-        ];
-        let original = pipeline.durable();
-        assert!(original.require_portable_checkpoint().is_err());
-        assert!(original.settle_funded_checkpoint(&settlements[..1], 0).is_err());
-        let mut wrong = settlements.clone();
-        wrong[0].outcome.consumption_lsn = Some(1);
-        assert!(original.settle_funded_checkpoint(&wrong, 0).is_err());
-        let mut portable = original.settle_funded_checkpoint(&settlements, 0).unwrap();
-        let digest = funded_settlement_digest(INCARNATION, &settlements).unwrap();
-        assert_eq!(portable.funded_inventory_digest(INCARNATION).unwrap(), digest);
-        assert_eq!(original.tx_status(&pending.key).unwrap_err().code, "rtdb/transaction-pending");
+
+        let source = pipeline.durable();
+        assert!(source.require_portable_checkpoint().is_err());
+        let encoded = source.encode_authenticated_portable_checkpoint().unwrap();
+        let mut cut = TransactState::decode_binary_checkpoint(&encoded, source.index().head()).unwrap();
         let successor = [27; 16];
-        portable.restore_in(successor).unwrap();
-        let cut = portable.index().head();
-        let bytes = portable.encode_binary_checkpoint().unwrap();
-        let restored = TransactState::decode_binary_checkpoint(&bytes, cut).unwrap();
-        let (terminal, history) = restored.historical_funding(&accepted.key, None).unwrap().unwrap();
-        assert_eq!(terminal.outcome, receipt.outcome);
-        assert_eq!(terminal.basis, Basis::new(successor, receipt.basis.position()));
-        assert!(terminal.replayed && terminal.decision_clock.is_none());
-        assert_eq!(history.original_receipt_basis, Some(receipt.basis));
-        assert_eq!(history.outcome.booking, BOOKING);
-        for (key, booking) in [(&pending.key, pending_booking), (&orphan_key, [6; 16])] {
-            let (terminal, history) = restored.historical_funding(key, None).unwrap().unwrap();
-            assert!(matches!(&terminal.outcome, Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
-            assert_eq!(history.outcome.booking, booking);
-        }
-        assert!(restored.historical_funding(&accepted.key, Some(OWNER)).unwrap().is_none());
-        assert_eq!(restored.funded_inventory_digest(INCARNATION).unwrap(), digest);
-        let mut reopened = TransactPipeline::new(restored, cut.basis.position() + 1, 4).unwrap();
-        assert!(funded(&mut reopened, &accepted, None, consume(1_200_000)).is_err());
+        cut.restore_in(successor).unwrap();
+
+        let retained = cut.tx_status(&accepted.key).unwrap();
+        assert_eq!(retained.basis, Basis::new(successor, terminal.basis.position()));
+        assert_eq!(retained.outcome, terminal.outcome);
+        assert!(retained.replayed && retained.decision_clock.is_none());
+        assert_eq!(cut.tx_status(&pending.key).unwrap_err().code, "rtdb/unknown-transaction");
     }
 
     #[test]

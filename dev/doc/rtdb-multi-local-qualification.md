@@ -428,7 +428,8 @@ Qualify the installed profile and the standalone deployment with these cases.
 - With the certified receiver and timed journal installed, verify that the legacy funded features are absent from RTDB v1 capabilities and a fresh `OfferDecisionClock` returns `Unavailable` with `rtdb/funding-kernel-unavailable`.
 - Send a legacy funded transaction and verify that the receiver sample sequence and journal head stay at their previous positions.
 - Confirm that literal `Window` and ordinary Store reads and writes remain available. Exercise the Store's ordered clock slot independently of live funded admission.
-- For a retained original receipt, verify exact keyed `TxStatus` and ordinary DecisionClock readback before and after takeover and checkpoint recovery. A different owner, key, request or booking cannot return that receipt.
+- Verify keyed `TxStatus` for a retained committed receipt before and after takeover and checkpoint recovery.
+  Verify that a legacy DecisionClock consume returns `rtdb/funding-kernel-unavailable`.
 - Replay an earlier receiver challenge reply, stall an exchange, and regress the receiver's durable lineage after authority replacement. The verifier requires a fresh signed observation that advances the installed lineage.
 - Recover proof after keeper restart and successor sealing with a distinct writer. Compare the exact original proof before and after takeover and verify that a current-quorum copy cannot satisfy it.
 

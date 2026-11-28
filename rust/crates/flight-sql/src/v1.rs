@@ -6,7 +6,7 @@ use prost::{Message, Name};
 use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
-use rtdb_tx::transact::{DECISION_CLOCK_OFFER, FUNDED_APPOINTMENT, FundedStatus, PHYSICAL_ERASURE, REVIEWED_CUSTODY_PLACEMENT, ROW_CUSTODY, TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{DECISION_CLOCK_OFFER, FUNDED_APPOINTMENT, PHYSICAL_ERASURE, REVIEWED_CUSTODY_PLACEMENT, ROW_CUSTODY, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::{Timestamp, rtdb_v1::{CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS, RANKED_IVF}};
 use tonic::{Response, Status, metadata::MetadataMap};
 
@@ -362,7 +362,7 @@ impl Service {
     }
 
     async fn v1_transact(&self, call: &Call, source: Bytes) -> Result<Vec<u8>, Status> {
-        let mut request: proto::TransactRequest = decode(source)?;
+        let request: proto::TransactRequest = decode(source)?;
         if self.0.config.store_only {
             return Err(if requests_funding(&request) {
                 error::funding_kernel_unavailable()
@@ -377,11 +377,10 @@ impl Service {
             }
             return Err(error::funding_kernel_unavailable());
         }
-        if let Some(booking) = request.decision_clock_offer.take() {
+        if let Some(booking) = &request.decision_clock_offer {
             if appointment::is_managed(call) { return Err(appointment::denied()); }
-            let booking = booking.as_slice().try_into().map_err(|_| error::incorrect("Invalid DecisionClock booking"))?;
-            let receipt = self.retry_funded_transact(call, request, booking).await?;
-            return Ok(self.funded_wire_receipt(call, receipt).encode_to_vec());
+            <[u8; 16]>::try_from(booking.as_slice()).map_err(|_| error::incorrect("Invalid DecisionClock booking"))?;
+            return Err(error::funding_kernel_unavailable());
         }
         if requires_live_funding(&request) { return Err(error::funding_kernel_unavailable()); }
         if appointment::is_managed(call) { return Err(appointment::denied()); }
@@ -408,24 +407,6 @@ impl Service {
         }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         Ok(transact::receipt(receipt).encode_to_vec())
-    }
-
-    async fn retry_funded_transact(
-        &self, call: &Call, request: proto::TransactRequest, booking: [u8; 16],
-    ) -> Result<rtdb_tx::transact::Receipt, Status> {
-        let owner = funding_owner(call).ok_or_else(error::funding_kernel_unavailable)?;
-        let database = self.wire_attachment(call, DatabaseAccess::Write).await?;
-        let driver = database.serving_driver().ok_or_else(error::funding_kernel_unavailable)?;
-        let scope = self.serving_scope(call, driver)?;
-        let request = transact::request(request, call.memory())?;
-        request.check_funded_shape(scope.is_some()).map_err(error::anomaly)?;
-        let credential = call.session.caller.principal.label_scope();
-        let namespace_at = |incarnation| credential.expect("admitted label scope").funded_receipt_namespace_at(incarnation);
-        let funding = if credential.is_some() { FundedStatus::Scoped(&namespace_at) } else { FundedStatus::Owner(owner) };
-        let receipt = driver.retry_retired_funding(&request, booking, scope.as_ref(), funding, &call.cancellation)
-            .await.map_err(error::anomaly)?.ok_or_else(error::funding_kernel_unavailable)?;
-        self.check_attachment(call, &database)?;
-        Ok(receipt)
     }
 
     fn funded_wire_receipt(&self, call: &Call, receipt: rtdb_tx::transact::Receipt) -> proto::Receipt {
@@ -456,15 +437,8 @@ impl Service {
             .serving_driver()
             .ok_or_else(|| error::unsupported("tx-status"))?;
         let receipt = match self.serving_scope(call, driver)? {
-            Some(scope) => {
-                let credential = call.session.caller.principal.label_scope().expect("admitted label scope");
-                let namespace_at = |incarnation| credential.funded_receipt_namespace_at(incarnation);
-                driver.tx_status_with_funded_history(&request.key, Some(&scope), FundedStatus::Scoped(&namespace_at), &call.cancellation).await
-            }
-            None => match appointment::owner(call) {
-                Some(owner) => driver.tx_status_with_funded_history(&request.key, None, FundedStatus::Owner(owner), &call.cancellation).await,
-                None => driver.tx_status(&request.key, &call.cancellation).await,
-            }
+            Some(scope) => driver.tx_status_scoped(&request.key, &scope, &call.cancellation).await,
+            None => driver.tx_status(&request.key, &call.cancellation).await,
         }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         if receipt.decision_clock.is_some_and(rtdb_tx::transact::FundedReceipt::is_appointment) {

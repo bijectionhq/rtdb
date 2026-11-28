@@ -292,13 +292,14 @@ mod tests {
     use super::*;
     use rtdb_storage::ObjectKey;
     use crate::multi::activation::{
-        ActivationAuthority, ActivationOptions, BookedRefusal, journal_custody::KeeperJournal, operator::attestation::Attestation,
+        ActivationAuthority, ActivationOptions, journal_custody::KeeperJournal, operator::attestation::Attestation,
         recovery::{Intent, LossPolicy, Operation, Status},
     };
     use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
     use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, Config, JournalConfig, testing::LocalCluster};
 
     const DATABASE: &str = "hosted-documents";
+    const TRANSACTION_KEY: [u8; 16] = [1; 16];
 
     struct RestartedKeepers {
         stop: CancellationToken,
@@ -363,28 +364,19 @@ mod tests {
         export_arguments: Vec<String>,
     }
 
-    struct FundedExport<'a> {
-        authority_url: &'a str,
-        authority_tls: &'a Path,
-        predecessor_revision: u64,
-    }
-
     impl CommissionedSource {
-        async fn export(&self, archive: &Path, funded: Option<&FundedExport<'_>>) -> Result<Option<[u8; 32]>> {
+        async fn export(&self, archive: &Path) -> Result<()> {
             let options = MultiBackupOptions::parse([
                 "export-hosted".into(), "--archive".into(), archive.display().to_string(),
-            ].into_iter().chain(self.export_arguments.iter().cloned()).chain(funded.into_iter().flat_map(|funded| [
-                "--funded-authority-url".into(), funded.authority_url.into(),
-                "--funded-authority-tls-dir".into(), funded.authority_tls.display().to_string(),
-                "--predecessor-revision".into(), funded.predecessor_revision.to_string(),
-            ])))?;
+            ].into_iter().chain(self.export_arguments.iter().cloned()))?;
             let exported = options.run(rtdb_storage::AppleSync::Full).await?;
             let verified = PortableBackup::verify(&fs::read(archive).unwrap(), self.keys.clone()).await.unwrap();
             assert_eq!(exported["manifest_sha256"], digest_hex(&verified.manifest_sha256()));
             assert_eq!(verified.source_basis().incarnation(), self.stream.0.to_be_bytes());
             assert_eq!(verified.source_lsn(), self.head);
             assert_eq!(self.journal.head(self.stream).await.unwrap(), self.head);
-            verified.funded_inventory_sha256()
+            assert_eq!(verified.source_receipt(&TRANSACTION_KEY).await?.outcome, rtdb_tx::transact::Outcome::Then);
+            Ok(())
         }
     }
 
@@ -414,6 +406,32 @@ mod tests {
             .with_serving_authority(authority.serving_authority(DATABASE, source).unwrap());
         database.create().await.unwrap();
         assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        use rtdb_tx::transact::{Cell, Op, Row, Transact};
+        use rtdb_types::{EntityId, StructFields, TableRef, Value, rtdb_v1::MAIN_BRANCH};
+
+        database.transact(&Transact {
+            key: TRANSACTION_KEY.to_vec(),
+            require: Vec::new(),
+            window: Default::default(),
+            guards: Vec::new(),
+            requires: Vec::new(),
+            otherwise: Vec::new(),
+            custody_request_digest: None,
+            request_memory: None,
+            ops: vec![Op::Put {
+                branch: MAIN_BRANCH.into(),
+                table: TableRef::new("public", "documents"),
+                if_absent: false,
+                rows: vec![Row {
+                    id: EntityId::Integer(1),
+                    valid: None,
+                    cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("portable".into())))]),
+                    custody_group: None,
+                    protected_columns: Vec::new(),
+                    custody_payload: None,
+                }],
+            }],
+        }).await.unwrap();
         let attachment = database.write_file(b"portable object").await.unwrap();
         database.checkpoint(vec![attachment]).await.unwrap();
         database.shutdown_writer().await.unwrap();
@@ -509,9 +527,7 @@ mod tests {
         let source_id = Uuid::new_v4();
         let predecessor = activation.bootstrap(DATABASE, source_id).await.unwrap();
         let source = commissioned_source(home.path(), &authority_reader, source_id, &source, &source_vault).await;
-        let ordinary_archive = home.path().join("ordinary-archive");
-        assert_eq!(source.export(&ordinary_archive, None).await.unwrap(), None);
-        let issuer = BookedRefusal::commission(&activation, DATABASE, predecessor).await;
+        source.export(&archive_path).await.unwrap();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         let signing_key = home.path().join("attestor.pkcs8");
         fs::write(&signing_key, pkcs8.as_ref()).unwrap();
@@ -523,7 +539,6 @@ mod tests {
         fs::write(&broker_config, serde_json::to_vec(&json!({
             "authority_id": authority, "authority_url": authority_url, "authority_tls_dir": authority_tls,
             "operator_uids": [fs::metadata(home.path()).unwrap().uid()],
-            "funded_issuers": [issuer.broker_profile()],
             "destination_attestors": {(cell.to_string()): attestor_public_key},
             "destination_journal_readers": {(cell.to_string()): {
                 "journal_url": journal_url, "journal_tls_dir": reader_tls, "require_object_custody": true,
@@ -582,45 +597,14 @@ mod tests {
         let Status::Pending { candidate: unsealed_candidate, .. } =
             activation.begin_recovery(DATABASE, unsealed, None).await.unwrap()
         else { panic!("expected a pending lossless recovery"); };
-        assert_eq!(stage_archive(&ordinary_archive, lossless_id, &tls).await.unwrap_err().code,
+        assert_eq!(stage_archive(&archive_path, lossless_id, &tls).await.unwrap_err().code,
             "rtdb/backup-stage-source");
         assert!(matches!(journal.head(StreamId(unsealed_candidate.as_u128())).await, Err(JournalError::NotFound)));
         let Status::Pending { candidate: incarnation, .. } =
             activation.begin_recovery(DATABASE, intent, Some(lossless_id)).await.unwrap()
         else { panic!("expected a pending recovery"); };
-        assert!(recover("reconcile-funded", Vec::new()).await.is_err());
-        assert_eq!(issuer.requests(), 0);
         recover("freeze-recovery", vec!["--operation-id".into(), operation_id.to_string()]).await.unwrap();
-        let funded = FundedExport { authority_url: &authority_url, authority_tls: &authority_reader_tls,
-            predecessor_revision: predecessor.revision };
-        assert_eq!(source.export(&archive_path, Some(&funded)).await.unwrap_err().code,
-            "rtdb/activation-funded-closure-required");
-        assert!(!archive_path.exists());
-        let closure = recover("reconcile-funded", Vec::new()).await.unwrap();
-        assert_eq!(closure["scope_sha256"], json!(issuer.scope_sha256));
-        assert_eq!(closure["bookings"], 1);
-        assert_eq!(closure["next_index"], 1);
-        assert_eq!(source.export(&archive_path, Some(&funded)).await.unwrap_err().code,
-            "rtdb/activation-funded-reconciliation-required");
-        let reconciled = recover("reconcile-funded", Vec::new()).await.unwrap();
-        assert!(reconciled["next_index"].is_null());
-        assert_eq!(issuer.requests(), 2);
-        let (_, settlements) = authority_reader.funded_backup_settlements(DATABASE, predecessor).await.unwrap();
-        let funded_inventory = rtdb_tx::transact::funded_settlement_digest(*source_id.as_bytes(), &settlements).unwrap().unwrap();
-        assert_eq!(source.export(&archive_path, Some(&funded)).await.unwrap(), Some(funded_inventory));
-        let funded_key = issuer.key.clone();
-        let funded_booking = issuer.booking;
-        let funded_scope = issuer.scope_sha256;
         source.keepers.shutdown().await;
-        drop(issuer);
-        assert_eq!(recover("reconcile-funded", Vec::new()).await.unwrap(), reconciled);
-        let outcome = || recover("funded-outcome", vec![
-            "--scope-sha256".into(), digest_hex(&funded_scope), "--index".into(), "1".into(),
-        ]);
-        let funded_outcome = outcome().await.unwrap();
-        assert_eq!(funded_outcome["resolution"]["booking"]["id"], funded_booking.to_string());
-        assert_eq!(funded_outcome["resolution"]["booking"]["receipt"]["key"], json!(funded_key));
-        assert_eq!(funded_outcome["resolution"]["disposition"], "refused");
         let archive = fs::read(&archive_path).unwrap();
         let stream = StreamId(incarnation.as_u128());
         let activation_stream = activation.commissioning_stream_id(DATABASE).unwrap();
@@ -772,7 +756,6 @@ mod tests {
         );
         let verified_readback: Readback = serde_json::from_value(result.clone()).unwrap();
         assert_eq!(proof_json["evidence"]["objects_sha256"], json!(verified_readback.digest().unwrap()));
-        assert_eq!(proof_json["evidence"]["funded_inventory_sha256"], json!(funded_inventory));
         fs::write(&proof_path, serde_json::to_vec(&proof_json).unwrap()).unwrap();
         assert!(release().await.is_err());
 
@@ -793,7 +776,6 @@ mod tests {
         assert!(record(operation_id, &altered_proof).await.is_err());
         let recorded = record(operation_id, &proof_path).await.unwrap();
         assert_eq!(recorded["installation"]["objects_sha256"], json!(verified_readback.digest().unwrap()));
-        assert_eq!(recorded["installation"]["funded_inventory_sha256"], json!(funded_inventory));
         assert_eq!(record(operation_id, &proof_path).await.unwrap(), recorded);
         assert_eq!(attest(&readback).await.unwrap(), proof_json);
         let release_objects = |readback: &Path, proof: &Path| MultiBackupOptions::parse([
@@ -854,7 +836,6 @@ mod tests {
             ..intent
         };
         activation.begin_recovery(DATABASE, replacement_intent, Some(operation_id)).await.unwrap();
-        assert_eq!(outcome().await.unwrap(), funded_outcome);
         assert!(stage(operation_id).await.is_err());
         assert!(acquire(incarnation, &receipt_path).await.is_err());
         assert!(attest(&new_readback).await.is_err());
@@ -1026,13 +1007,11 @@ mod tests {
         let recorded = record(operation.operation_id, &serving_proof).await.unwrap();
         let serving_report: Readback = serde_json::from_value(report).unwrap();
         assert_eq!(recorded["installation"]["objects_sha256"], json!(serving_report.digest().unwrap()));
-        assert_eq!(recorded["installation"]["funded_inventory_sha256"], json!(funded_inventory));
         let serving_authority = authority_reader.serving_authority_for_cell(DATABASE, candidate, Some(cell)).unwrap();
         assert_eq!(serving_authority.acquire().await.unwrap_err().code, "rtdb/activation-fenced");
 
         let published = recover("publish-recovery", vec!["--operation-id".into(), operation.operation_id.to_string()]).await.unwrap();
-        assert_eq!(published["installation"]["funded_inventory_sha256"], json!(funded_inventory));
-        assert_eq!(outcome().await.unwrap(), funded_outcome);
+        assert_eq!(published["binding"]["incarnation"], candidate.to_string());
         serving_authority.acquire().await.unwrap().check().unwrap();
         let serving_keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
         let mut serving = MultiDatabase::new(
@@ -1040,12 +1019,11 @@ mod tests {
         ).unwrap().with_immutable_journal().with_activation_scope(scope).unwrap()
             .with_serving_authority(serving_authority);
         let installed = serving.installed_backup().await.unwrap().unwrap();
-        assert_eq!(installed.funded_inventory_sha256(), Some(funded_inventory));
         let serving_stream = serving.journal_stream();
         let installed_head = journal.head(serving_stream).await.unwrap();
-        let terminal = serving.tx_status(&funded_key).await.unwrap();
+        let terminal = serving.tx_status(&TRANSACTION_KEY).await.unwrap();
         assert!(terminal.replayed && terminal.decision_clock.is_none());
-        assert!(matches!(&terminal.outcome, rtdb_tx::transact::Outcome::Refused { error } if error.code == "rtdb/funded-booking-closed"));
+        assert_eq!(terminal.outcome, rtdb_tx::transact::Outcome::Then);
         assert_eq!(journal.head(serving_stream).await.unwrap(), installed_head);
         let proof: Attestation = serde_json::from_value(document).unwrap();
         let (installed_intent, held) = proof.held_key().unwrap();
@@ -1110,7 +1088,7 @@ mod tests {
         assert_eq!(serving.installed_backup().await.unwrap().unwrap().manifest_sha256(), archive_digest);
         let replacement_head = journal.head(serving_stream).await.unwrap();
         assert!(replacement_head > installed_head);
-        assert_eq!(serving.tx_status(&funded_key).await.unwrap(), terminal);
+        assert_eq!(serving.tx_status(&TRANSACTION_KEY).await.unwrap(), terminal);
         assert_eq!(journal.head(serving_stream).await.unwrap(), replacement_head);
         assert_eq!(discover(abandoned, &vault).await.unwrap(), abandoned_result);
         broker.abort();

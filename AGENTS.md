@@ -81,7 +81,7 @@ Put that commentary in the commit body.
 | `dev/doc/compaction.allium` | Coordination-free compaction — deterministic job selection and the merge algorithm. The message flow around it lives in `db.allium`. |
 | `dev/doc/gc.allium` | Trie garbage collection — leader-only, signalled at block boundaries, deleting superseded data/meta files and publishing those deletions atomically to the replica log. |
 | `dev/doc/block-gc.allium` | Garbage collection of superseded block-catalog and per-table block files — leader-only, and needs no replica-log coordination because block files are read only at startup/catch-up. |
-| `allium/rtdb-multi.allium` | Target design, ahead of the implementation: many deployments on shared, autoscaling cells — the directory and writer epochs, loglets and their seal, the storage fence and reaper, residency, read tiers, affinity, gateways, forks and deletion. Staged by `dev/doc/rtdb-multi-plan.md`. |
+| `allium/rtdb-multi.allium` | Target design for deployments on shared autoscaling cells, including directory and writer epochs, loglet seals, the storage fence and reaper, residency, read tiers, affinity, gateways, forks, deletion, and lineage-authenticated funded settlement (see `dev/doc/rtdb-multi-plan.md` and `dev/doc/rtdb-multi-consensus-keeper.md`). |
 | `dev/doc/fts.allium` | Full-text search — per-trie search files over events, the index lane that builds them, and how MATCH combines with bitemporal resolution so that the index only ever narrows the candidates. The core side, derived artefacts on tries, lives in `trie-cat`, `db` and `gc`. |
 
 ## Definition of Done (Session Completion)

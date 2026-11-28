@@ -1,10 +1,12 @@
 use super::{
-    ActivationAuthority, Binding, FUNDED_PORTABLE_PROTOCOL, Publication, RECOVERY_HOSTED_CUSTODY_PROTOCOL, RECOVERY_INTENT_PROTOCOL, RECOVERY_JOURNAL_CUSTODY_PROTOCOL,
+    ActivationAuthority, Binding, Publication, RECOVERY_HOSTED_CUSTODY_PROTOCOL, RECOVERY_INTENT_PROTOCOL, RECOVERY_JOURNAL_CUSTODY_PROTOCOL,
     RECOVERY_KEY_CUSTODY_PROTOCOL, State, VerifiedSuccessor,
     clock, conflict, journal_custody::RetainedJournal, journal_error, unavailable,
 };
 
 use journal_contract::{Epoch, Journal, JournalError, Lsn, SealReceipt, StreamId, WriterSessionId};
+use rtdb_db::{AuthenticatedCut, InstallationAnchor};
+use rtdb_stream_journal::ConsensusJournal;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,7 +54,9 @@ pub(crate) struct Installation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) objects_sha256: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) funded_inventory_sha256: Option<[u8; 32]>,
+    pub(super) source_head: Option<AuthenticatedCut>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) installation_anchor: Option<InstallationAnchor>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -60,9 +64,10 @@ pub(crate) struct Installation {
 pub(super) struct Pending {
     intent: Intent,
     installation: Option<Installation>,
-    final_source_lsn: Option<Lsn>,
+    #[serde(rename = "final_source_lsn")]
+    sealed_segment_end: Option<Lsn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    final_source_epoch: Option<Epoch>,
+    sealed_head: Option<AuthenticatedCut>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,13 +75,10 @@ pub(super) struct Pending {
 pub(super) struct Completed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) ranked_closure: Option<super::ranked::RankedClosure>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) funded_scopes: Vec<super::funded::Scope>,
     loss_policy: LossPolicy,
     source_cut: SourceCut,
-    final_source_lsn: Option<Lsn>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    final_source_epoch: Option<Epoch>,
+    #[serde(rename = "final_source_lsn")]
+    sealed_segment_end: Option<Lsn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_hold: Option<rtdb_crypt::RecoveryKeyHold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,7 +86,9 @@ pub(super) struct Completed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     objects_sha256: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    funded_inventory_sha256: Option<[u8; 32]>,
+    source_head: Option<AuthenticatedCut>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installation_anchor: Option<InstallationAnchor>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -95,9 +99,8 @@ pub(crate) enum Status {
         candidate: Uuid,
         grants_closed: bool,
         installation: Option<Installation>,
-        final_source_lsn: Option<Lsn>,
-        #[serde(skip)]
-        funded_source_fence_needed: bool,
+        #[serde(rename = "final_source_lsn")]
+        sealed_segment_end: Option<Lsn>,
         #[serde(skip_serializing_if = "Option::is_none")]
         ranked_closure: Option<super::ranked::RankedClosure>,
     },
@@ -105,7 +108,8 @@ pub(crate) enum Status {
         intent: Intent,
         binding: Binding,
         installation: Installation,
-        final_source_lsn: Option<Lsn>,
+        #[serde(rename = "final_source_lsn")]
+        sealed_segment_end: Option<Lsn>,
         #[serde(skip_serializing_if = "Option::is_none")]
         ranked_closure: Option<super::ranked::RankedClosure>,
     },
@@ -133,6 +137,10 @@ fn custody_protocol(
 }
 
 impl State {
+    fn installation_anchor(&self) -> Option<InstallationAnchor> {
+        self.publication.as_ref()?.recovery.as_ref()?.installation_anchor
+    }
+
     pub(super) fn valid_recovery(&self) -> bool {
         if self.recovery_protocol() < RECOVERY_INTENT_PROTOCOL {
             return self.recovery.is_none()
@@ -152,23 +160,37 @@ impl State {
                     .intent
                     .destination_cell
                     .is_none_or(|cell| !cell.is_nil())
-                && (pending.final_source_lsn.is_none() || self.grants_closed)
-                && pending.final_source_epoch.is_none_or(|epoch| epoch != Epoch(0) && pending.final_source_lsn.is_some())
+                && (pending.sealed_segment_end.is_none() || self.grants_closed)
+                && pending.sealed_head.is_some() == (self.uses_lineage() && pending.sealed_segment_end.is_some())
+                && pending.sealed_head.is_none_or(|source| pending.sealed_segment_end.is_some_and(|end| {
+                    source.matches(*self.binding.incarnation.as_bytes(), end)
+                }))
                 && pending.installation.is_none_or(|installation| {
                     installation.source_cut.lsn != 0
+                        && installation.valid_authentication(self.uses_lineage(), self.binding, self.installation_anchor())
                         && custody_protocol(installation.key_hold, installation.journal_hold, installation.objects_sha256)
                             .is_some_and(|protocol| self.recovery_protocol() >= protocol)
                         && match pending.intent.loss_policy {
                             LossPolicy::Lossless => {
-                                pending.final_source_lsn == Some(Lsn(installation.source_cut.lsn))
+                                pending.sealed_segment_end == Some(Lsn(installation.source_cut.lsn))
                             }
-                            LossPolicy::AcceptUnknownTail => pending.final_source_lsn.is_none(),
+                            LossPolicy::AcceptUnknownTail => pending.sealed_segment_end.is_none(),
                         }
                 })
         });
         let publication_valid = self.publication.as_ref().is_some_and(|publication| {
             if let Some(completed) = &publication.recovery {
                 completed.source_cut.lsn != 0
+                    && completed.installation(publication.manifest_digest)
+                        .valid_authentication(self.uses_lineage(), publication.predecessor, None)
+                    && publication.segment.is_some() == self.uses_lineage()
+                    && publication.segment.as_ref().is_none_or(|segment| {
+                        segment.predecessor == publication.predecessor && segment.successor == self.binding
+                            && segment.end == Lsn(completed.source_cut.lsn)
+                            && completed.source_head.is_some_and(|source| {
+                                segment.source_head == source.head && segment.source_root == source.catalog_root
+                            })
+                    })
                     && custody_protocol(completed.key_hold, completed.journal_hold, completed.objects_sha256)
                         .is_some_and(|protocol| self.recovery_protocol() >= protocol)
                     && completed.ranked_closure.is_none_or(|closure| {
@@ -176,12 +198,11 @@ impl State {
                     })
                     && publication.predecessor.revision.checked_add(1)
                         == Some(self.binding.revision)
-                    && completed.final_source_epoch.is_none_or(|epoch| epoch != Epoch(0) && completed.final_source_lsn.is_some())
                     && match completed.loss_policy {
                         LossPolicy::Lossless => {
-                            completed.final_source_lsn == Some(Lsn(completed.source_cut.lsn))
+                            completed.sealed_segment_end == Some(Lsn(completed.source_cut.lsn))
                         }
-                        LossPolicy::AcceptUnknownTail => completed.final_source_lsn.is_none(),
+                        LossPolicy::AcceptUnknownTail => completed.sealed_segment_end.is_none(),
                     }
             } else {
                 pending_valid
@@ -226,17 +247,13 @@ impl Publication {
             },
             binding,
             installation: completed.installation(self.manifest_digest),
-            final_source_lsn: completed.final_source_lsn,
+            sealed_segment_end: completed.sealed_segment_end,
             ranked_closure: completed.ranked_closure,
         })
     }
 }
 
 impl Completed {
-    pub(super) fn source_fence(&self) -> Option<(Epoch, Lsn)> {
-        self.final_source_epoch.zip(self.final_source_lsn)
-    }
-
     fn installation(&self, manifest_digest: [u8; 32]) -> Installation {
         Installation {
             manifest_digest,
@@ -244,25 +261,27 @@ impl Completed {
             key_hold: self.key_hold,
             journal_hold: self.journal_hold,
             objects_sha256: self.objects_sha256,
-            funded_inventory_sha256: self.funded_inventory_sha256,
+            source_head: self.source_head,
+            installation_anchor: self.installation_anchor,
         }
     }
 }
 
-impl Pending {
-    pub(super) fn source_lsn_for_backup(self) -> Result<Option<Lsn>> {
-        if self.intent.loss_policy == LossPolicy::Lossless && self.final_source_lsn.is_none() {
-            return Err(Anomaly::incorrect(
-                "rtdb/activation-final-source-cut",
-                "Lossless recovery requires the sealed predecessor's final position",
-            ));
+impl Installation {
+    fn valid_authentication(self, lineage: bool, predecessor: Binding, inherited: Option<InstallationAnchor>) -> bool {
+        match (lineage, self.source_head, self.installation_anchor) {
+            (true, Some(source), Some(anchor)) => anchor.valid()
+                && source.matches(*predecessor.incarnation.as_bytes(), Lsn(self.source_cut.lsn))
+                && inherited.is_none_or(|anchor| anchor.is_in(source)),
+            (false, None, None) => inherited.is_none(),
+            _ => false,
         }
-        Ok(self.final_source_lsn)
     }
+}
 
-    pub(super) fn source_fence(self) -> Option<(Epoch, Lsn)> {
-        self.final_source_epoch.zip(self.final_source_lsn)
-    }
+fn same_source_tree(left: AuthenticatedCut, right: AuthenticatedCut) -> bool {
+    left.catalog_root == right.catalog_root && left.head.catalog == right.head.catalog
+        && left.head.stream == right.head.stream && left.head.size == right.head.size && left.head.root == right.head.root
 }
 
 impl ActivationAuthority {
@@ -294,15 +313,15 @@ impl ActivationAuthority {
                     return Err(conflict());
                 }
                 let mut next = state.clone();
-                let mut final_source_lsn = None;
-                let mut final_source_epoch = None;
+                let mut sealed_segment_end = None;
+                let mut sealed_head = None;
                 if let Some(pending) = state.recovery {
                     if pending.intent == intent {
                         return Ok(None);
                     }
                     if supersedes != Some(pending.intent.operation.operation_id)
                         || operation.operation_id == pending.intent.operation.operation_id
-                        || (pending.final_source_lsn.is_some()
+                        || (pending.sealed_segment_end.is_some()
                             && intent.loss_policy != LossPolicy::Lossless)
                     {
                         return Err(conflict());
@@ -310,8 +329,8 @@ impl ActivationAuthority {
                     next.superseded_recoveries
                         .insert(pending.intent.operation.operation_id);
                     if intent.loss_policy == LossPolicy::Lossless {
-                        final_source_lsn = pending.final_source_lsn;
-                        final_source_epoch = pending.final_source_epoch;
+                        sealed_segment_end = pending.sealed_segment_end;
+                        sealed_head = pending.sealed_head;
                     }
                 } else if supersedes.is_some() {
                     return Err(conflict());
@@ -320,8 +339,8 @@ impl ActivationAuthority {
                 next.recovery = Some(Pending {
                     intent,
                     installation: None,
-                    final_source_lsn,
-                    final_source_epoch,
+                    sealed_segment_end,
+                    sealed_head,
                 });
                 Ok(Some(next))
             })
@@ -437,8 +456,7 @@ impl ActivationAuthority {
             candidate: self.candidate(name, pending.intent)?,
             grants_closed: state.grants_closed,
             installation: pending.installation,
-            final_source_lsn: pending.final_source_lsn,
-            funded_source_fence_needed: state.funded_catalog().is_some() && pending.final_source_epoch.is_none(),
+            sealed_segment_end: pending.sealed_segment_end,
             ranked_closure: state.ranked.and_then(|ranked| ranked.closure),
         })
     }
@@ -451,15 +469,11 @@ impl ActivationAuthority {
                     return Ok(None);
                 }
                 state.pending(operation)?;
-                let upgrade = state.version < FUNDED_PORTABLE_PROTOCOL && !state.funded_scopes().is_empty();
-                if state.grants_closed && !upgrade {
+                if state.grants_closed {
                     return Ok(None);
                 }
                 let mut next = state.clone();
                 next.grants_closed = true;
-                if upgrade {
-                    next.version = FUNDED_PORTABLE_PROTOCOL;
-                }
                 Ok(Some(next))
             })
             .await?;
@@ -478,14 +492,17 @@ impl ActivationAuthority {
             key_hold: installed.key_hold,
             journal_hold: installed.journal_hold,
             objects_sha256: installed.objects_sha256,
-            funded_inventory_sha256: installed.funded_inventory_sha256,
+            source_head: installed.source_head,
+            installation_anchor: installed.installation_anchor,
         };
-        if installation.source_cut.lsn == 0 {
+        let stream = self.stream_id(name)?;
+        let lineage = self.supports_lineage(stream).await?;
+        if installation.source_cut.lsn == 0 || !installation.valid_authentication(lineage, operation.predecessor, None) {
             return Err(conflict());
         }
         let protocol = custody_protocol(installation.key_hold, installation.journal_hold, installation.objects_sha256)
             .ok_or_else(conflict)?;
-        let state = self.change(self.stream_id(name)?, |state| {
+        let state = self.change(stream, |state| {
             let state = state.ok_or_else(unavailable)?;
             let published = state.publication_status(operation)?;
             let intent = if let Some(Status::Published { intent, .. }) = published {
@@ -520,11 +537,21 @@ impl ActivationAuthority {
                 return Err(conflict());
             }
             let mut pending = state.pending(operation)?;
+            if lineage != state.uses_lineage()
+                || !installation.valid_authentication(lineage, operation.predecessor, state.installation_anchor())
+                || pending.sealed_head.is_some_and(|sealed| {
+                    installation.source_head.is_none_or(|source| !same_source_tree(sealed, source))
+                })
+                || pending.intent.loss_policy == LossPolicy::Lossless
+                    && (installation.source_head.is_some() != pending.sealed_head.is_some())
+            {
+                return Err(conflict());
+            }
             if let Some(prior) = pending.installation {
                 return same_installation(prior, installation);
             }
             if intent.loss_policy == LossPolicy::Lossless
-                && pending.final_source_lsn != Some(Lsn(installation.source_cut.lsn))
+                && pending.sealed_segment_end != Some(Lsn(installation.source_cut.lsn))
             {
                 return Err(Anomaly::incorrect(
                     "rtdb/activation-final-source-cut",
@@ -546,7 +573,7 @@ impl ActivationAuthority {
         operation: Operation,
         source: &dyn Journal,
         source_cell: Option<Uuid>,
-        source_catalog: Option<Uuid>,
+        authenticated: Option<&ConsensusJournal>,
     ) -> Result<Status> {
         self.access.require_operator()?;
         let stream = self.stream_id(name)?;
@@ -559,15 +586,21 @@ impl ActivationAuthority {
         if !state.grants_closed
             || pending.intent.loss_policy != LossPolicy::Lossless
             || state.destination_cell() != source_cell
-            || state.funded_catalog().is_some_and(|original| Some(original) != source_catalog)
         {
             return Err(conflict());
         }
-        if pending.final_source_lsn.is_some()
-            && (state.funded_catalog().is_none() || pending.final_source_epoch.is_some())
-        {
+        if pending.sealed_segment_end.is_some() {
             return self.recovery_status_at(name, &state, operation);
         }
+        let lineage = self.supports_lineage(stream).await?;
+        if lineage != state.uses_lineage() { return Err(conflict()); }
+        let authenticated = if lineage {
+            let journal = authenticated.ok_or_else(conflict)?;
+            journal.require_authenticated(StreamId(operation.predecessor.incarnation.as_u128())).await.map_err(journal_error)?;
+            Some(journal)
+        } else {
+            None
+        };
         clock::wait_out(
             self.clock.as_ref(),
             clock::drain_window(state.grants_end.is_some()),
@@ -576,16 +609,27 @@ impl ActivationAuthority {
         // The source verifier has opened this commissioned predecessor. A new quorum
         // writer fence orders all still in-flight writer requests before this cut.
         let seal = seal_predecessor(source, operation).await?;
-        let final_source_lsn = seal.sealed_head_lsn;
+        let sealed_segment_end = seal.sealed_head_lsn;
+        let sealed_head = match authenticated {
+            Some(journal) => {
+                let (head, history) = journal.authenticated_head(seal.fence.stream, Some(sealed_segment_end.0)).await.map_err(journal_error)?;
+                let catalog_root = history.genesis.root();
+                head.verify(catalog_root, &history).map_err(|_| conflict())?;
+                let cut = AuthenticatedCut { head: head.head, catalog_root };
+                if !cut.matches(*operation.predecessor.incarnation.as_bytes(), sealed_segment_end) { return Err(conflict()); }
+                Some(cut)
+            }
+            None => None,
+        };
         let state = self
             .change(stream, |state| {
                 let state = state.ok_or_else(unavailable)?;
                 if let Some(Status::Published {
-                    final_source_lsn: prior,
+                    sealed_segment_end: prior,
                     ..
                 }) = state.publication_status(operation)?
                 {
-                    return if prior == Some(final_source_lsn) {
+                    return if prior == Some(sealed_segment_end) {
                         Ok(None)
                     } else {
                         Err(conflict())
@@ -595,22 +639,14 @@ impl ActivationAuthority {
                 if !state.grants_closed
                     || pending.intent.loss_policy != LossPolicy::Lossless
                     || state.destination_cell() != source_cell
-                    || state.funded_catalog().is_some_and(|original| Some(original) != source_catalog)
                 {
                     return Err(conflict());
                 }
-                if pending.final_source_lsn.is_some_and(|prior| prior != final_source_lsn)
-                    || pending.final_source_epoch.is_some_and(|prior| prior != seal.fence.writer_epoch)
-                {
-                    return Err(conflict());
+                if let Some(prior) = pending.sealed_segment_end {
+                    return if prior == sealed_segment_end { Ok(None) } else { Err(conflict()) };
                 }
-                if pending.final_source_epoch.is_some() {
-                    return Ok(None);
-                }
-                pending.final_source_lsn = Some(final_source_lsn);
-                if state.funded_catalog().is_some() {
-                    pending.final_source_epoch = Some(seal.fence.writer_epoch);
-                }
+                pending.sealed_segment_end = Some(sealed_segment_end);
+                pending.sealed_head = sealed_head;
                 let mut next = state.clone();
                 next.recovery = Some(pending);
                 Ok(Some(next))
@@ -626,8 +662,8 @@ impl ActivationAuthority {
     ) -> Result<Status> {
         self.access.require_operator()?;
         let stream = self.stream_id(name)?;
-        let (_, frozen) = self.read(stream).await?;
-        let frozen = frozen.ok_or_else(unavailable)?;
+        let (frozen_at, frozen) = self.read_record(stream).await?;
+        let (frozen, frozen_record) = frozen.ok_or_else(unavailable)?;
         if let Some(status) = frozen.publication_status(operation)? {
             return Ok(status);
         }
@@ -641,18 +677,31 @@ impl ActivationAuthority {
                 "Recovery requires a verified installation recorded by the authority",
             )
         })?;
-        let ranked_closure = frozen.require_ranked_closure()?;
-        let funded_scopes = frozen.require_funded_closures()?;
-        let settlements = self.funded_settlements(&frozen, Lsn(installation.source_cut.lsn)).await?;
-        if rtdb_tx::transact::funded_settlement_digest(*operation.predecessor.incarnation.as_bytes(), &settlements)?
-            != installation.funded_inventory_sha256
+        let lineage = self.supports_lineage(stream).await?;
+        if lineage != frozen.uses_lineage()
+            || !installation.valid_authentication(lineage, operation.predecessor, frozen.installation_anchor())
         {
-            return Err(Anomaly::incorrect(
-                "rtdb/activation-funded-installation",
-                "The installed backup does not retain the reconciled funded receipt inventory",
-            ));
+            return Err(conflict());
         }
+        let ranked_closure = frozen.require_ranked_closure()?;
         let successor = self.candidate(name, pending.intent)?;
+        let successor_binding = Binding {
+            incarnation: successor,
+            revision: operation.predecessor.revision.checked_add(1).ok_or_else(conflict)?,
+        };
+        let segment = installation.source_head.map(|source| super::lineage::LineageSegment {
+            authority: self.identity,
+            database: name.to_owned(),
+            predecessor: operation.predecessor,
+            successor: successor_binding,
+            source_catalog: source.head.catalog,
+            source_root: source.catalog_root,
+            source_stream: source.head.stream,
+            source_head: source.head,
+            end: Lsn(installation.source_cut.lsn),
+            previous: frozen.publication.as_ref().and_then(|prior| prior.segment.as_ref()).map(|segment| segment.digest()),
+        });
+        if segment.as_ref().is_some_and(|segment| !segment.valid()) { return Err(conflict()); }
         let publication = Publication {
             operation: operation.operation_id,
             predecessor: operation.predecessor,
@@ -660,18 +709,18 @@ impl ActivationAuthority {
             destination_cell: pending.intent.destination_cell,
             recovery: Some(Completed {
                 ranked_closure,
-                funded_scopes: funded_scopes.to_vec(),
                 loss_policy: pending.intent.loss_policy,
                 source_cut: installation.source_cut,
-                final_source_lsn: pending.final_source_lsn,
-                final_source_epoch: pending.final_source_epoch,
+                sealed_segment_end: pending.sealed_segment_end,
                 key_hold: installation.key_hold,
                 journal_hold: installation.journal_hold,
                 objects_sha256: installation.objects_sha256,
-                funded_inventory_sha256: installation.funded_inventory_sha256,
+                source_head: installation.source_head,
+                installation_anchor: installation.installation_anchor,
             }),
+            segment,
         };
-        self.preserve_publication(name, &frozen).await?;
+        self.preserve_publication(name, &frozen, frozen_at, frozen_record).await?;
         clock::wait_out(
             self.clock.as_ref(),
             clock::drain_window(frozen.grants_end.is_some()),
@@ -685,15 +734,10 @@ impl ActivationAuthority {
                 }
                 if state.pending(operation)? != pending
                     || state.require_ranked_closure()? != ranked_closure
-                    || state.require_funded_closures()? != funded_scopes
                 {
                     return Err(conflict());
                 }
-                let mut next = self.install_binding(name, state, &publication, successor)?;
-                if !funded_scopes.is_empty() {
-                    next.version = FUNDED_PORTABLE_PROTOCOL;
-                }
-                Ok(Some(next))
+                Ok(Some(self.install_binding(name, state, &publication, successor)?))
             })
             .await?;
         self.recovery_status_at(name, &state, operation)
@@ -773,6 +817,121 @@ mod tests {
     };
     use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lineage_recovery_publishes_a_cut_after_source_loss_and_proves_it_after_trim() {
+        use std::{collections::BTreeSet, net::Ipv4Addr};
+        use rtdb_crypt::FileKms;
+        use rtdb_db::{ActivationScope, MultiDatabase, MultiOptions, PortableBackup, Role};
+        use rtdb_node::{Clock, SystemClock};
+        use rtdb_storage::MemoryStore;
+
+        const NAME: &str = "lineage";
+        const PRINCIPAL: &str = "urn:logkeeper:client:lineage-recovery";
+        let mut control = LocalCluster::start_authenticated(&[PRINCIPAL]).await.unwrap();
+        let mut source = LocalCluster::start_authenticated(&[PRINCIPAL]).await.unwrap();
+        let mut destination = LocalCluster::start_authenticated(&[PRINCIPAL]).await.unwrap();
+        let open = |cluster: &LocalCluster| {
+            Arc::new(cluster.journal(PRINCIPAL, &cluster.journal_config(64 << 20, 4 << 20)).unwrap())
+        };
+        let control_journal = open(&control);
+        let source_journal = open(&source);
+        let destination_journal = open(&destination);
+        for journal in [&control_journal, &source_journal, &destination_journal] {
+            journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+        }
+        let control_root = control_journal.catalog_history().await.unwrap().genesis.root();
+        let source_root = source_journal.catalog_history().await.unwrap().genesis.root();
+        let identity = Uuid::new_v4();
+        let mut authority = ActivationAuthority::new(control_journal.clone(), identity).unwrap();
+        let ticks = AtomicU64::new(0);
+        let owner = Arc::get_mut(&mut authority).unwrap();
+        owner.authenticated_journal = Some(control_journal.clone());
+        owner.clock = Arc::new(move || Some(Duration::from_secs(ticks.fetch_add(6, Ordering::SeqCst))));
+
+        let directory = tempfile::tempdir().unwrap();
+        let vault = |name| {
+            let path = directory.path().join(name);
+            FileKms::create_directory(&path).unwrap();
+            Arc::new(FileKms::open(&path, || SystemClock.now().0).unwrap())
+        };
+        let source_vault = vault("source");
+        let destination_vault = vault("destination");
+        let node = Ipv4Addr::LOCALHOST.into();
+        let scope = ActivationScope::new(identity, NAME).unwrap();
+        let database = |incarnation, journal: Arc<ConsensusJournal>, keys: Arc<FileKms>| {
+            MultiDatabase::new(
+                MultiOptions { database: incarnation, node, lease_micros: 60_000_000, drift_micros: 0 },
+                journal.clone(), Arc::new(MemoryStore::default()), keys, Arc::new(|| SystemClock.now()),
+            ).unwrap().with_immutable_journal().with_authenticated_journal(journal, true)
+                .with_activation_scope(scope).unwrap()
+        };
+        let predecessor = authority.bootstrap(NAME, Uuid::new_v4()).await.unwrap();
+        let mut original = database(predecessor.incarnation, source_journal, source_vault.clone());
+        original.create().await.unwrap();
+        assert!(matches!(original.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        let backup = original.portable_backup().await.unwrap().into_bytes();
+        drop(original);
+        source.shutdown().await.unwrap();
+
+        let operation = Operation { predecessor, operation_id: Uuid::new_v4() };
+        let intent = Intent { operation, destination_cell: None, loss_policy: LossPolicy::AcceptUnknownTail };
+        let Status::Pending { candidate, .. } = authority.begin_recovery(NAME, intent, None).await.unwrap()
+            else { panic!("expected a pending recovery") };
+        let mut successor = database(candidate, destination_journal, destination_vault.clone());
+        successor.create().await.unwrap();
+        assert!(matches!(successor.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        let before_restore = successor.portable_backup().await.unwrap().into_bytes();
+        let verified = PortableBackup::verify(&backup, source_vault).await.unwrap();
+        let installed = successor.install_portable_backup(verified).await.unwrap();
+        let ready = VerifiedSuccessor::from_installation(&installed);
+        assert_eq!(authority.status(NAME).await.unwrap().grant_protocol_version, super::super::LINEAGE_PROTOCOL);
+        for incomplete in [
+            VerifiedSuccessor { source_head: None, ..ready },
+            VerifiedSuccessor { installation_anchor: None, ..ready },
+        ] {
+            assert_eq!(authority.record_recovery_installation(NAME, operation, incomplete).await.unwrap_err().code,
+                "rtdb/activation-conflict");
+        }
+        authority.record_recovery_installation(NAME, operation, ready).await.unwrap();
+        authority.freeze_recovery(NAME, operation).await.unwrap();
+        let Status::Published { binding, .. } = authority.publish_recovery(NAME, operation).await.unwrap()
+            else { panic!("expected a published recovery") };
+        let proof = authority.lineage_publication_proof(NAME, predecessor).await.unwrap();
+
+        let next = Operation { predecessor: binding, operation_id: Uuid::new_v4() };
+        let Status::Pending { candidate, .. } = authority.begin_recovery(NAME, Intent { operation: next, ..intent }, None).await.unwrap()
+            else { panic!("expected a second pending recovery") };
+        let before_restore = PortableBackup::verify(&before_restore, destination_vault).await.unwrap();
+        assert_eq!(authority.record_recovery_installation(NAME, next, VerifiedSuccessor {
+            predecessor: binding.incarnation,
+            successor: candidate,
+            manifest_digest: before_restore.manifest_sha256(),
+            source_head: before_restore.authenticated_cut(),
+            source_cut: SourceCut {
+                lsn: before_restore.source_lsn().0,
+                position: before_restore.source_basis().position(),
+                system_time: before_restore.source_system_time().0,
+            },
+            ..ready
+        }).await.unwrap_err().code, "rtdb/activation-conflict");
+
+        let at = proof.control_inclusion.leaf.at;
+        let stream = authority.stream_id(NAME).unwrap();
+        assert!(matches!(control_journal.read_page(stream, at, at, 1, Duration::ZERO).await,
+            Err(JournalError::Trimmed { .. })));
+        let archived = authority.lineage_publication_proof(NAME, predecessor).await.unwrap();
+        assert_eq!(proof.control_record, archived.control_record);
+        assert_eq!(at, archived.control_inclusion.leaf.at);
+        destination.shutdown().await.unwrap();
+        control.shutdown().await.unwrap();
+
+        let segment = archived.verify(identity, NAME, control_root).unwrap();
+        assert_eq!(segment.successor, binding);
+        let application = PortableBackup::lineage_archive(&backup, source_root).unwrap().unwrap();
+        assert_eq!(application.signed_head.head, segment.source_head);
+        assert_eq!(application.inclusion(segment.end).unwrap().verify(source_root).unwrap().at, segment.end);
+    }
+
     #[tokio::test]
     async fn lossless_recovery_seals_source_before_accepting_cut() {
         const PRINCIPAL: &str = "urn:logkeeper:client:lossless-recovery";
@@ -833,7 +992,8 @@ mod tests {
             key_hold: None,
             journal_hold: None,
             objects_sha256: None,
-            funded_inventory_sha256: None,
+            source_head: None,
+            installation_anchor: None,
             activation_scope: Some(rtdb_db::ActivationScope::new(identity, "xtdb").unwrap()),
             source_cut: SourceCut {
                 lsn,
@@ -878,7 +1038,7 @@ mod tests {
         assert!(matches!(
             sealed,
             Status::Pending {
-                final_source_lsn: Some(Lsn(2)),
+                sealed_segment_end: Some(Lsn(2)),
                 ..
             }
         ));
@@ -913,7 +1073,7 @@ mod tests {
             Status::Pending {
                 candidate,
                 grants_closed: true,
-                final_source_lsn: Some(Lsn(2)),
+                sealed_segment_end: Some(Lsn(2)),
                 ..
             } => candidate,
             other => panic!("expected the sealed cut to survive supersession, got {other:?}"),
@@ -944,7 +1104,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             published,
-            Status::Published { binding, final_source_lsn: Some(Lsn(2)), .. }
+            Status::Published { binding, sealed_segment_end: Some(Lsn(2)), .. }
                 if binding.incarnation == replacement_candidate
         ));
         assert!(matches!(
@@ -953,7 +1113,7 @@ mod tests {
                 .await
                 .unwrap(),
             Status::Published {
-                final_source_lsn: Some(Lsn(2)),
+                sealed_segment_end: Some(Lsn(2)),
                 ..
             }
         ));

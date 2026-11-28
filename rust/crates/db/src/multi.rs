@@ -9,7 +9,7 @@ use rtdb_store::{
     ObjectKey, ObjectStore, Reachability, StoredTokenKeys, VerifiedManifest, WriterObjects, read_manifest,
 };
 use rtdb_tx::transact::{
-    Erasure, FundedStatus, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState,
+    Erasure, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState,
     TransactionRecord,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
@@ -50,7 +50,7 @@ mod retirement;
 mod store_floor;
 mod store_hold;
 mod timing;
-pub use backup::{BackupFileRelocation, BackupObjectReadback, InstalledBackup, PortableBackup, VerifiedBackup};
+pub use backup::{AuthenticatedCut, BackupFileRelocation, BackupObjectReadback, InstallationAnchor, InstalledBackup, PortableBackup, VerifiedBackup};
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
 pub use pin::{NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport};
 pub use pipeline::WritePipeline;
@@ -281,6 +281,13 @@ impl MultiDatabase {
 
     pub fn with_immutable_journal(mut self) -> Self {
         self.stream = self.stream.with_immutable_history();
+        self
+    }
+
+    pub fn with_authenticated_journal(
+        mut self, journal: Arc<stream_logkeeper::stream::consensus::ConsensusJournal>, create: bool,
+    ) -> Self {
+        self.stream = self.stream.with_authenticated_journal(journal, create);
         self
     }
 
@@ -655,7 +662,7 @@ impl MultiDatabase {
     }
 
     pub async fn tx_status(&mut self, key: &[u8]) -> Result<Receipt> {
-        self.tx_status_in(key, None, None).await
+        self.tx_status_in(key, None).await
     }
 
     pub async fn tx_status_scoped(
@@ -663,51 +670,17 @@ impl MultiDatabase {
         key: &[u8],
         scope: ScopedTransact<'_>,
     ) -> Result<Receipt> {
-        self.tx_status_in(key, Some(scope), None).await
-    }
-
-    pub async fn tx_status_with_funded_history(
-        &mut self,
-        key: &[u8],
-        scope: Option<ScopedTransact<'_>>,
-        funding: FundedStatus<'_>,
-    ) -> Result<Receipt> {
-        self.tx_status_in(key, scope, Some(funding)).await
-    }
-
-    pub async fn retry_retired_funding(
-        &mut self, request: &Transact, booking: [u8; 16], scope: Option<ScopedTransact<'_>>,
-        funding: FundedStatus<'_>,
-    ) -> Result<Option<Receipt>> {
-        self.refresh().await?;
-        self.require_active()?;
-        match (self.current_tx_status(&request.key, scope), scope, &funding) {
-            (Ok(_), None, FundedStatus::Owner(_)) => (),
-            (Err(error), Some(_), FundedStatus::Scoped(_)) if error.code == "rtdb/unknown-transaction" => (),
-            _ => return Ok(None),
-        }
-        self.durable_transactions().retry_retired_funding(request, booking, funding)?
-            .map(|receipt| self.project_receipt(receipt, scope)).transpose()
+        self.tx_status_in(key, Some(scope)).await
     }
 
     async fn tx_status_in(
         &mut self,
         key: &[u8],
         scope: Option<ScopedTransact<'_>>,
-        funding: Option<FundedStatus<'_>>,
     ) -> Result<Receipt> {
         self.refresh().await?;
         self.require_active()?;
-        let receipt = self.current_tx_status(key, scope);
-        let receipt = match (receipt, scope, funding) {
-            (Err(error), None, Some(funding @ FundedStatus::Owner(_)))
-            | (Err(error), Some(_), Some(funding @ FundedStatus::Scoped(_)))
-                if error.code == "rtdb/unknown-transaction" =>
-            {
-                self.durable_transactions().historical_funding_status(key, funding)?
-            }
-            (receipt, _, _) => receipt?,
-        };
+        let receipt = self.current_tx_status(key, scope)?;
         if receipt.erasure == Some(Erasure::Pending) {
             return Err(erasure_pending());
         }

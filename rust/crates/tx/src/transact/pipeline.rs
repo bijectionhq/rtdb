@@ -241,7 +241,7 @@ impl TransactPipeline {
             let TransactionRecord::Tx(tx) = prepared.record else { unreachable!("checked above") };
             Entry::Untimed { after: after.clone(), receipt: StoredReceipt {
                 receipt: tx.receipt, fingerprint: tx.fingerprint, receipt_namespace: tx.receipt_namespace,
-                installed: None, workload: tx.workload, workload_digest: tx.workload_digest, retired_funding: None,
+                installed: None, workload: tx.workload, workload_digest: tx.workload_digest,
             } }
         };
         // A timed write's overlay assumes it settles at `position + 1`.

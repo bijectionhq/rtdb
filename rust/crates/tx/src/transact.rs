@@ -553,11 +553,6 @@ const FUNDED_RECORD_VERSION: u8 = 7;
 const APPOINTMENT_RECORD_VERSION: u8 = 8;
 const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 9;
 const PRUNED_STORE_CHECKPOINT_VERSION: u8 = 10;
-const RETIRED_FUNDING_CHECKPOINT_VERSION: u8 = 11;
-
-mod funded_transfer;
-pub use funded_transfer::{FundedOutcome, FundedSettlement, FundedStatus, HistoricalFunding, funded_settlement_digest};
-use funded_transfer::RetiredFunding;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -706,6 +701,7 @@ struct Pending {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StoredReceipt {
     receipt: Receipt,
     fingerprint: [u8; 32],
@@ -717,8 +713,6 @@ pub(crate) struct StoredReceipt {
     workload: Option<WorkloadFamily>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workload_digest: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    retired_funding: Option<RetiredFunding>,
 }
 
 impl StoredReceipt {
@@ -756,7 +750,6 @@ pub struct TransactState {
     index: BranchIndex,
     receipts: Receipts,
     appointment_addresses: BTreeSet<[u8; 32]>,
-    scoped_funding_origins: BTreeSet<[u8; 16]>,
     pending: Option<Pending>,
     pending_erasure: Option<TxKey>,
 }
@@ -765,7 +758,6 @@ impl TransactState {
     pub fn new(incarnation: [u8; 16]) -> Self {
         Self {
             index: BranchIndex::new(incarnation), receipts: BTreeMap::new(), appointment_addresses: BTreeSet::new(),
-            scoped_funding_origins: BTreeSet::new(),
             pending: None, pending_erasure: None,
         }
     }
@@ -860,7 +852,6 @@ impl TransactState {
                 let actual = actual.get(key).ok_or_else(invalid_record)?;
                 if actual.fingerprint != expected.fingerprint || actual.receipt != expected.receipt
                     || actual.workload != expected.workload || actual.workload_digest != expected.workload_digest
-                    || actual.retired_funding != expected.retired_funding
                     || expected.installed.is_some_and(|position| actual.installed != Some(position))
                 {
                     return Err(invalid_record());
@@ -902,7 +893,7 @@ impl TransactState {
         if self.pending.is_some() { return Err(pending_error()); }
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }
         let unsupported_receipt = self.receipts.values().flat_map(|scope| scope.values()).any(|stored| {
-            (stored.receipt_namespace.is_some() && stored.retired_funding.is_none()) || stored.receipt.decision_clock.is_some()
+            stored.receipt_namespace.is_some() || stored.receipt.decision_clock.is_some()
                 || stored.installed.is_some() || stored.workload.is_some()
         });
         if unsupported_receipt || self.index.has_custody_groups() || self.index.inherited_custody().is_some()
@@ -914,6 +905,25 @@ impl TransactState {
             return Err(Anomaly::unsupported("rtdb/backup-custody", "The checkpoint needs an independent custody transfer"));
         }
         Ok(())
+    }
+
+    pub fn encode_authenticated_portable_checkpoint(&self) -> Result<Bytes> {
+        let mut cut = self.clone();
+        for receipts in cut.receipts.values_mut() {
+            *receipts = receipts.iter().filter_map(|(key, stored)| {
+                let mut stored = stored.clone();
+                if let Some(offer) = stored.receipt.decision_clock.filter(|offer| !offer.is_appointment())
+                    && stored.receipt_namespace.is_none() && stored.installed.is_none() && stored.workload.is_none()
+                {
+                    if offer.booked() { return None; }
+                    stored.receipt.decision_clock = None;
+                }
+                Some((key.clone(), stored))
+            }).collect();
+        }
+        cut.receipts.retain(|_, receipts| !receipts.is_empty());
+        cut.require_portable_checkpoint()?;
+        cut.encode_binary_checkpoint()
     }
 
     pub fn encode_native_checkpoint_at(&self, basis: Basis) -> Result<Bytes> {
@@ -975,7 +985,6 @@ impl TransactState {
         let mut matches = receipts.iter().filter_map(|(namespace, receipts)| {
             let stored = receipts.get(key)?;
             (stored.receipt.basis == basis
-                && stored.retired_funding.is_none()
                 && (namespace.is_none() || stored.workload.is_some_and(&allows_family))
                 && !stored.receipt.decision_clock.is_some_and(|offer| offer.booked())
                 && stored.receipt.erasure != Some(Erasure::Pending)
@@ -994,7 +1003,6 @@ impl TransactState {
         self.index.restore_native_checkpoint(custody)?;
         self.receipts.clear();
         self.appointment_addresses.clear();
-        self.scoped_funding_origins.clear();
         Ok(())
     }
 
@@ -1017,8 +1025,6 @@ impl TransactState {
                 .collect();
         }
         self.receipts.retain(|_, receipts| !receipts.is_empty());
-        self.appointment_addresses.extend(self.receipts.values().flat_map(|receipts| receipts.values())
-            .filter_map(|stored| stored.retired_funding.as_ref()?.appointment_address));
         Ok(())
     }
 
@@ -1041,10 +1047,7 @@ impl TransactState {
 
     fn checkpoint_version<'a>(index: &BranchIndex, receipts: impl Iterator<Item = &'a StoredReceipt>) -> u8 {
         let floor_version = if index.store_history_floor() == 0 { RECORD_VERSION } else { PRUNED_STORE_CHECKPOINT_VERSION };
-        receipts.map(|stored| {
-            if stored.retired_funding.is_some() { RETIRED_FUNDING_CHECKPOINT_VERSION }
-            else { stored.receipt.record_version(stored.receipt_namespace) }
-        }).fold(floor_version, u8::max)
+        receipts.map(|stored| stored.receipt.record_version(stored.receipt_namespace)).fold(floor_version, u8::max)
     }
 
     /// The checkpoint of [`Self::encode_checkpoint`] in CBOR instead of JSON:
@@ -1080,14 +1083,13 @@ impl TransactState {
         }
         let mut state = Self {
             index, receipts: BTreeMap::new(), appointment_addresses: BTreeSet::new(),
-            scoped_funding_origins: BTreeSet::new(), pending: None, pending_erasure: None,
+            pending: None, pending_erasure: None,
         };
         for stored in receipts {
             let receipt = &stored.receipt;
             validate_key(&receipt.key).map_err(|_| invalid())?;
             if receipt.replayed || state.index.exact(receipt.basis)?.system_time != receipt.system_time
                 || stored.workload_digest.is_some() && stored.workload.is_none()
-                || stored.retired_funding.as_ref().is_some_and(|retired| !retired.valid(&stored))
             {
                 return Err(invalid());
             }
@@ -1106,28 +1108,14 @@ impl TransactState {
             {
                 return Err(invalid());
             }
-            if stored.retired_funding.as_ref().and_then(|retired| retired.appointment_address)
-                .is_some_and(|address| state.appointment_addresses.contains(&address))
-            {
-                return Err(invalid());
-            }
             if state.store_receipt(stored).is_some() { return Err(invalid()); }
         }
         Ok(state)
     }
 
     fn store_receipt(&mut self, stored: StoredReceipt) -> Option<StoredReceipt> {
-        if stored.receipt_namespace.is_some()
-            && let Some(retired) = &stored.retired_funding
-            && !retired.history.outcome.appointment
-        {
-            self.scoped_funding_origins.insert(retired.history.source);
-        }
         let key = stored.receipt.key.clone();
         if let Some(address) = stored.receipt.decision_clock.and_then(FundedReceipt::appointment_address) {
-            self.appointment_addresses.insert(address);
-        }
-        if let Some(address) = stored.retired_funding.as_ref().and_then(|retired| retired.appointment_address) {
             self.appointment_addresses.insert(address);
         }
         if stored.receipt.erasure == Some(Erasure::Pending) {
@@ -1170,7 +1158,7 @@ impl TransactState {
     /// Compare a retry to an already applied admission without resolving it or recording a new write.
     pub fn recover_exact(&self, key: &[u8], namespace: Option<[u8; 32]>, fingerprint: [u8; 32]) -> Result<Receipt> {
         let stored = self.lookup_receipt(key, namespace)?;
-        if stored.fingerprint != fingerprint || stored.retired_funding.is_some() {
+        if stored.fingerprint != fingerprint {
             return Err(conflicting_key());
         }
         Ok(replay(&stored.receipt))
@@ -1178,9 +1166,6 @@ impl TransactState {
 
     fn tx_status_with_namespace(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<Receipt> {
         let stored = self.lookup_receipt(key, namespace)?;
-        if stored.retired_funding.as_ref().is_some_and(|retired| retired.history.outcome.appointment) {
-            return Err(unknown_receipt());
-        }
         Ok(replay(&stored.receipt))
     }
 
@@ -1283,9 +1268,6 @@ impl TransactState {
         let fingerprint = request.custody_request_digest
             .unwrap_or_else(|| Sha256::digest(canonical_request.as_bytes()).into());
         let stored = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key));
-        if stored.is_some_and(|stored| stored.retired_funding.is_some()) {
-            return Err(conflicting_key());
-        }
         if let Some(stored) = stored && appointment.is_none() {
             let same_request = match workload_digest {
                 Some(digest) => stored.matches_workload_digest(digest)
@@ -1896,7 +1878,7 @@ impl TransactState {
             candidate.apply(effect)?;
         }
         self.index = candidate;
-        self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload, workload_digest, retired_funding: None });
+        self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload, workload_digest });
         Ok(receipt)
     }
 }
