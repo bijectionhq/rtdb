@@ -197,6 +197,14 @@ impl State {
         }
     }
 
+    /// Signed-import recoveries stamped their successor 9 to 11 even after
+    /// vacating its funding, and the record is otherwise the protocol beneath.
+    fn unstamp_signed_import(&mut self) {
+        if matches!(self.version, 9..=11) {
+            self.version = if self.ranked.is_some() { RANKED_RECOVERY_PROTOCOL } else { RECOVERY_HOSTED_CUSTODY_PROTOCOL };
+        }
+    }
+
     fn base_version(&self) -> u8 {
         self.lineage_base_version.unwrap_or(self.version)
     }
@@ -646,7 +654,8 @@ impl ActivationAuthority {
             if *at != head {
                 return Err(corrupt());
             }
-            let state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
+            let mut state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
+            state.unstamp_signed_import();
             if !matches!(state.base_version(), ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL | RANKED_RECOVERY_PROTOCOL)
                 || (state.version == LINEAGE_PROTOCOL) != state.lineage_base_version.is_some()
                 || state.publication.as_ref().and_then(|publication| publication.segment.as_ref())
@@ -1211,23 +1220,18 @@ mod tests {
         assert_eq!(authority.journal.head(stream).await.unwrap(), Lsn(1));
     }
 
-    #[tokio::test]
-    async fn activation_refuses_signed_import_protocols() {
-        let directory = tempfile::tempdir().unwrap();
-        let authority = ActivationAuthority::open_local(
-            &directory.path().join("activation"), Uuid::new_v4(),
-        ).unwrap();
+    #[test]
+    fn funding_free_signed_import_records_read_as_the_protocol_beneath() {
         for version in 9..=11 {
-            let name = format!("signed-import-{version}");
-            authority.bootstrap(&name, Uuid::new_v4()).await.unwrap();
-            let stream = authority.stream_id(&name).unwrap();
-            authority.change(stream, |state| {
-                let mut state = state.unwrap().clone();
-                state.version = version;
-                Ok(Some(state))
-            }).await.unwrap();
-            assert_eq!(authority.status(&name).await.unwrap_err().code, "rtdb/activation-state");
+            let mut state = State::initial(Uuid::new_v4());
+            state.version = version;
+            state.unstamp_signed_import();
+            assert_eq!(state.version, RECOVERY_HOSTED_CUSTODY_PROTOCOL);
         }
+        let mut funded = serde_json::to_value(State::initial(Uuid::new_v4())).unwrap();
+        funded["version"] = 11.into();
+        funded["funded"] = serde_json::json!({"scopes": []});
+        assert!(serde_json::from_value::<State>(funded).is_err());
     }
 
     #[tokio::test]
