@@ -144,6 +144,8 @@ impl RetainedBytes {
     pub fn as_slice(&self) -> &[u8] { &self.bytes }
     pub fn len(&self) -> usize { self.bytes.len() }
     pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
+    /// Another handle on the same bytes, which keeps their charge while either lives.
+    pub(crate) fn share(&self) -> Self { Self { bytes: self.bytes.clone(), _retention: Arc::clone(&self._retention) } }
     pub(crate) fn discard_prefix(mut self, bytes: usize) -> Self {
         self.bytes = self.bytes.slice(bytes..);
         self

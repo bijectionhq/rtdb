@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{Read, Seek, SeekFrom, Write}, ops::Range, path::{Path, PathBuf}, sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}}, time::SystemTime};
+use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{Read, Seek, SeekFrom, Write}, ops::{Bound, Range}, path::{Path, PathBuf}, sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}}, time::SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs2::FileExt;
@@ -8,9 +8,47 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 
+/// The top-level directory of cached byte ranges, each an entry of its own at `.ranges/<cache key>/<start>-<end>`.
+/// Zero-padded offsets order a key's ranges by start, then end.
+const RANGES: &str = ".ranges";
+/// Kept ranges are many and small, so the metadata they hold is bounded by a share of the cache's memory budget as well as by disk capacity.
+const RANGE_METADATA_SHARE: usize = 16;
+
+fn range_key(cache_key: &ObjectKey, range: &Range<u64>) -> Result<ObjectKey> {
+    ObjectKey::new(format!("{RANGES}/{cache_key}/{:020}-{:020}", range.start, range.end))
+}
+
+/// The keys from the first to the last possible range of `cache_key` that starts at or before `start`.
+fn range_bounds(cache_key: &ObjectKey, start: u64) -> Result<(ObjectKey, ObjectKey)> {
+    Ok((ObjectKey::new(format!("{RANGES}/{cache_key}/0"))?, ObjectKey::new(format!("{RANGES}/{cache_key}/{start:020}-~"))?))
+}
+
+/// An entry under the range directory: a kept range of an object, or the object's size, held as an empty file `size-<size>`.
+enum Reserved { Range(Range<u64>), Size(u64) }
+
+fn size_key(cache_key: &ObjectKey, size: u64) -> Result<ObjectKey> { ObjectKey::new(format!("{RANGES}/{cache_key}/size-{size:020}")) }
+
+/// The cache key a range directory entry belongs to, and what it holds.
+fn reserved(key: &ObjectKey) -> Option<(&str, Reserved)> {
+    let rest = key.as_str().strip_prefix(RANGES)?.strip_prefix('/')?;
+    let (owner, name) = rest.rsplit_once('/')?;
+    let offset = |offset: &str| (offset.len() == 20 && offset.bytes().all(|byte| byte.is_ascii_digit())).then(|| offset.parse().ok()).flatten();
+    if let Some(size) = name.strip_prefix("size-") { return Some((owner, Reserved::Size(offset(size)?))); }
+    let (start, end) = name.split_once('-')?;
+    let range = offset(start)?..offset(end)?;
+    (range.start < range.end).then_some((owner, Reserved::Range(range)))
+}
+
+fn cached_range(key: &ObjectKey) -> Option<(&str, Range<u64>)> {
+    match reserved(key)? { (owner, Reserved::Range(range)) => Some((owner, range)), _ => None }
+}
+
+fn is_reserved(key: &ObjectKey) -> bool { key.as_str().split('/').next() == Some(RANGES) }
+
 /// The path moves when a leased file is invalidated; readers hold the lock while they open it.
 struct CachedFile { path: parking_lot::RwLock<PathBuf>, size: u64 }
 struct Entry {
+    key: ObjectKey,
     file: OnceLock<CachedFile>,
     loading: Arc<tokio::sync::Mutex<()>>,
     accessed: AtomicU64,
@@ -23,7 +61,28 @@ impl Drop for Entry {
         if self.retired.load(Ordering::Acquire) { if let Some(file) = self.file.get() { let _ = fs::remove_file(&*file.path.read()); } }
     }
 }
-struct State { entries: BTreeMap<ObjectKey, Arc<Entry>>, clock: u64 }
+/// `bytes` and `range_metadata` total the entries with files: their sizes, and the reservations of kept ranges.
+struct State { entries: BTreeMap<ObjectKey, Arc<Entry>>, clock: u64, bytes: u64, range_metadata: usize }
+impl State {
+    fn counted(&mut self, entry: &Entry, add: bool) {
+        let Some(file) = entry.file.get() else { return };
+        let metadata = if is_reserved(&entry.key) { entry._reservation.bytes() } else { 0 };
+        if add {
+            self.bytes = self.bytes.saturating_add(file.size);
+            self.range_metadata = self.range_metadata.saturating_add(metadata);
+        } else {
+            self.bytes = self.bytes.saturating_sub(file.size);
+            self.range_metadata = self.range_metadata.saturating_sub(metadata);
+        }
+    }
+    /// The range directory entries of `cache_key`.
+    fn range_keys(&self, cache_key: &ObjectKey) -> Result<Vec<ObjectKey>> {
+        let first = ObjectKey::new(format!("{RANGES}/{cache_key}/0"))?;
+        let last = ObjectKey::new(format!("{RANGES}/{cache_key}/~"))?;
+        Ok(self.entries.range(first..=last).filter(|(key, _)| reserved(key).is_some_and(|(owner, _)| owner == cache_key.as_str()))
+            .map(|(key, _)| key.clone()).collect())
+    }
+}
 
 pub struct DiskCache {
     root: PathBuf,
@@ -45,13 +104,19 @@ struct Traffic { misses: AtomicU64, read: AtomicU64, written: AtomicU64 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiskCacheTraffic { pub misses: u64, pub network_read_bytes: u64, pub network_write_bytes: u64 }
 
-pub struct DiskLease { cache: Arc<DiskCache>, entry: Arc<Entry> }
+/// The entry is taken on drop so that its reference is released under the cache's lock.
+pub struct DiskLease { cache: Arc<DiskCache>, entry: Option<Arc<Entry>> }
+struct RangeClaim { lease: DiskLease, _guard: tokio::sync::OwnedMutexGuard<()> }
 impl DiskLease {
-    pub fn path(&self) -> PathBuf { self.entry.file.get().expect("published disk lease").path.read().clone() }
-    fn open(&self) -> std::io::Result<File> { File::open(&*self.entry.file.get().expect("published disk lease").path.read()) }
-    pub fn size(&self) -> u64 { self.entry.file.get().expect("published disk lease").size }
+    fn new(cache: &Arc<DiskCache>, entry: Arc<Entry>) -> Self { Self { cache: Arc::clone(cache), entry: Some(entry) } }
+    fn entry(&self) -> &Arc<Entry> { self.entry.as_ref().expect("a live disk lease holds its entry") }
+    pub fn path(&self) -> PathBuf { self.entry().file.get().expect("published disk lease").path.read().clone() }
+    fn open(&self) -> std::io::Result<File> { File::open(&*self.entry().file.get().expect("published disk lease").path.read()) }
+    pub fn size(&self) -> u64 { self.entry().file.get().expect("published disk lease").size }
 }
-impl Drop for DiskLease { fn drop(&mut self) { self.cache.trim(Some(&self.entry)); } }
+impl Drop for DiskLease {
+    fn drop(&mut self) { if let Some(entry) = self.entry.take() { self.cache.release(entry); } }
+}
 
 impl DiskCache {
     /// Reuses complete files and evicts the oldest idle entries to fit the configured cache capacity.
@@ -88,10 +153,14 @@ impl DiskCache {
             let path = item.path();
             if item.file_type().map_err(|error| Error::io(&path, error))?.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }.map_err(|error| Error::io(&path, error))?;
         }
-        let cache = Arc::new(Self { root, maximum_bytes, memory, state: Mutex::new(State { entries: BTreeMap::new(), clock: 0 }),
+        let cache = Arc::new(Self { root, maximum_bytes, memory, state: Mutex::new(State { entries: BTreeMap::new(), clock: 0, bytes: 0, range_metadata: 0 }),
             operations, cancellation: CancellationToken::new(), _directory_lock: directory_lock, traffic: Traffic::default() });
-        cache.discover(&cache.root)?;
-        cache.trim(None);
+        cache.discover(&cache.root, None)?;
+        let ranges = cache.root.join(RANGES);
+        if fs::symlink_metadata(&ranges).is_ok_and(|metadata| metadata.is_dir()) {
+            cache.discover(&ranges, Some(&mut (cache.memory.limit_bytes() / RANGE_METADATA_SHARE)))?;
+        }
+        cache.trim();
         Ok(cache)
     }
     fn begin_operation(&self) -> Result<crate::io_region::IoAdmission> {
@@ -113,24 +182,42 @@ impl DiskCache {
         self.cancellation.cancel();
         self.operations.wait().await;
     }
-    fn discover(&self, directory: &Path) -> Result<()> {
+    /// Whole files are discovered before kept ranges, which are funded only from `range_budget`, so ranges cannot crowd a whole file out of the memory budget.
+    fn discover(&self, directory: &Path, mut range_budget: Option<&mut usize>) -> Result<()> {
         for item in fs::read_dir(directory).map_err(|error| Error::io(directory, error))? {
             let item = item.map_err(|error| Error::io(directory, error))?;
             let path = item.path();
             let metadata = fs::symlink_metadata(&path).map_err(|error| Error::io(&path, error))?;
             if metadata.file_type().is_symlink() { continue; }
             if item.file_name() == ".tmp" { continue; }
-            if metadata.is_dir() { self.discover(&path)?; continue; }
+            if range_budget.is_none() && directory == self.root && item.file_name() == RANGES { continue; }
+            if metadata.is_dir() { self.discover(&path, range_budget.as_deref_mut())?; continue; }
             if !metadata.is_file() { continue; }
             let relative = path.strip_prefix(&self.root).map_err(|error| Error::Task(error.to_string()))?;
             let key = ObjectKey::new(relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))?;
-            let entry = self.new_entry(&key)?;
+            let entry = match range_budget.as_deref_mut() {
+                None => self.new_entry(&key)?,
+                Some(budget) => {
+                    let funded = reserved(&key)
+                        .filter(|(owner, held)| match held { Reserved::Range(range) => range.end - range.start, Reserved::Size(_) => 0 } == metadata.len()
+                            && ObjectKey::new(*owner).is_ok_and(|owner| self.cached_size(&owner).is_none()))
+                        .and_then(|_| self.new_entry(&key).ok())
+                        .filter(|entry| entry._reservation.bytes() <= *budget);
+                    let Some(entry) = funded else {
+                        fs::remove_file(&path).map_err(|error| Error::io(&path, error))?;
+                        continue;
+                    };
+                    *budget -= entry._reservation.bytes();
+                    entry
+                }
+            };
             let accessed = metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH).max(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH))
                 .duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_micros().min(u64::MAX as u128) as u64;
             entry.accessed.store(accessed, Ordering::Relaxed);
             let _ = entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size: metadata.len() });
             let mut state = self.state.lock();
             state.clock = state.clock.max(accessed);
+            state.counted(&entry, true);
             state.entries.insert(key, Arc::new(entry));
         }
         Ok(())
@@ -140,7 +227,7 @@ impl DiskCache {
     }
     fn new_entry(&self, key: &ObjectKey) -> Result<Entry> {
         let bytes = key.as_str().len().checked_mul(3).and_then(|bytes| bytes.checked_add(self.root.as_os_str().len())).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| Error::Task("Disk cache metadata allocation exceeds range".into()))?;
-        Ok(Entry { file: OnceLock::new(), loading: Arc::new(tokio::sync::Mutex::new(())), accessed: AtomicU64::new(0), retired: Default::default(), _reservation: self.reserve(bytes)? })
+        Ok(Entry { key: key.clone(), file: OnceLock::new(), loading: Arc::new(tokio::sync::Mutex::new(())), accessed: AtomicU64::new(0), retired: Default::default(), _reservation: self.reserve(bytes)? })
     }
     fn entry(&self, key: &ObjectKey) -> Result<Arc<Entry>> {
         let mut state = self.state.lock();
@@ -158,24 +245,25 @@ impl DiskCache {
         }
         result
     }
-    fn trim(&self, releasing: Option<&Arc<Entry>>) {
+    /// Removes a lease's entry if it never got a file and nobody else holds it.
+    fn release(&self, entry: Arc<Entry>) {
         let mut state = self.state.lock();
-        state.entries.retain(|_, entry| entry.file.get().is_some() || !idle(entry, releasing));
-        let mut bytes = state.entries.values().filter_map(|entry| entry.file.get()).fold(0u64, |bytes, file| bytes.saturating_add(file.size));
-        while bytes > self.maximum_bytes {
-            let candidate = state.entries.iter().filter(|(_, entry)| {
-                entry.file.get().is_some() && idle(entry, releasing)
-            }).min_by_key(|(_, entry)| entry.accessed.load(Ordering::Relaxed)).map(|(key, _)| key.clone());
-            let Some(key) = candidate else { break; };
-            let Some(entry) = state.entries.remove(&key) else { break; };
-            if let Some(file) = entry.file.get() {
-                let path = file.path.read().clone();
-                match fs::remove_file(&path) {
-                    Ok(()) => bytes = bytes.saturating_sub(file.size),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => bytes = bytes.saturating_sub(file.size),
-                    Err(error) => { tracing::warn!("Disk cache eviction failed at {}: {error}", path.display()); state.entries.insert(key, entry); break; }
-                }
-            }
+        if entry.file.get().is_none() && Arc::strong_count(&entry) == 2
+            && state.entries.get(&entry.key).is_some_and(|current| Arc::ptr_eq(current, &entry))
+        {
+            state.entries.remove(&entry.key);
+        }
+        drop(entry);
+        self.trim_locked(&mut state);
+    }
+    fn trim(&self) { self.trim_locked(&mut self.state.lock()); }
+    fn trim_locked(&self, state: &mut State) {
+        while state.bytes > self.maximum_bytes {
+            if !self.evict_oldest(state, |_| true) { break; }
+        }
+        let limit = self.memory.limit_bytes() / RANGE_METADATA_SHARE;
+        while state.range_metadata > limit {
+            if !self.evict_oldest(state, is_reserved) { break; }
         }
     }
     fn cached_file(self: &Arc<Self>, key: &ObjectKey) -> Option<DiskLease> {
@@ -183,17 +271,73 @@ impl DiskCache {
         let entry = state.entries.get(key).filter(|entry| entry.file.get().is_some()).cloned()?;
         state.clock = state.clock.saturating_add(1);
         entry.accessed.store(state.clock, Ordering::Relaxed);
-        Some(DiskLease { cache: Arc::clone(self), entry })
+        Some(DiskLease::new(self, entry))
     }
     fn cached_size(&self, key: &ObjectKey) -> Option<u64> { self.state.lock().entries.get(key).and_then(|entry| entry.file.get()).map(|file| file.size) }
 
+    /// The size of a whole cached file, or else the size recorded for the object.
+    fn known_size(&self, cache_key: &ObjectKey) -> Option<u64> {
+        let state = self.state.lock();
+        if let Some(file) = state.entries.get(cache_key).and_then(|entry| entry.file.get()) { return Some(file.size); }
+        let first = ObjectKey::new(format!("{RANGES}/{cache_key}/size-0")).ok()?;
+        let last = ObjectKey::new(format!("{RANGES}/{cache_key}/size-~")).ok()?;
+        state.entries.range(first..=last).filter(|(_, entry)| entry.file.get().is_some()).find_map(|(key, _)| match reserved(key)? {
+            (owner, Reserved::Size(size)) if owner == cache_key.as_str() => Some(size),
+            _ => None,
+        })
+    }
+
+    /// Records the size of an immutable object for its range copies, unless another reader is recording it.
+    /// The record is an empty file, published inline as `publish` already is, so a metadata read never waits for a blocking thread.
+    fn keep_size(self: &Arc<Self>, cache_key: &ObjectKey, size: u64) -> Result<()> {
+        let lease = DiskLease::new(self, self.entry(&size_key(cache_key, size)?)?);
+        let Ok(_guard) = lease.entry().loading.try_lock() else { return Ok(()) };
+        if lease.entry().file.get().is_some() { return Ok(()); }
+        let temporary = tempfile::NamedTempFile::new_in(self.root.join(".tmp")).map_err(|error| Error::io(&self.root, error))?;
+        self.publish(&lease.entry().key, lease.entry(), temporary, 0)
+    }
+
+    /// A cached range of `cache_key` holding all of `range`, with the object offset its file starts at.
+    /// Only the range starting last at or before `range.start` is consulted, so another range that also covers it may be missed.
+    fn cached_range(self: &Arc<Self>, cache_key: &ObjectKey, range: &Range<u64>) -> Option<(DiskLease, u64)> {
+        let (first, last) = range_bounds(cache_key, range.start).ok()?;
+        let mut state = self.state.lock();
+        let (key, entry) = state.entries.range((Bound::Included(first), Bound::Included(last))).next_back()?;
+        let (owner, cached) = cached_range(key)?;
+        if owner != cache_key.as_str() || entry.file.get().is_none() || cached.end < range.end { return None; }
+        let entry = Arc::clone(entry);
+        state.clock = state.clock.saturating_add(1);
+        entry.accessed.store(state.clock, Ordering::Relaxed);
+        Some((DiskLease::new(self, entry), cached.start))
+    }
+
+    /// Claims the entry of a range before it is fetched, so that invalidating the object during the fetch retires the copy.
+    /// `None` where another reader is keeping the range, or its entry cannot be funded.
+    fn claim_range(self: &Arc<Self>, cache_key: &ObjectKey, range: &Range<u64>) -> Option<RangeClaim> {
+        let lease = DiskLease::new(self, self.entry(&range_key(cache_key, range).ok()?).ok()?);
+        let guard = Arc::clone(&lease.entry().loading).try_lock_owned().ok()?;
+        lease.entry().file.get().is_none().then_some(RangeClaim { lease, _guard: guard })
+    }
+
+    async fn keep_range(self: &Arc<Self>, claim: RangeClaim, bytes: RetainedBytes, operation: crate::io_region::IoAdmission) -> Result<()> {
+        let cache = Arc::clone(self);
+        IoRegion::run_admitted(operation, move || {
+            let (cache, claim, bytes) = (cache, claim, bytes);
+            let mut temporary = tempfile::NamedTempFile::new_in(cache.root.join(".tmp")).map_err(|error| Error::io(&cache.root, error))?;
+            temporary.write_all(bytes.as_slice()).map_err(|error| Error::io(temporary.path(), error))?;
+            if cache.cancellation.is_cancelled() { return Err(cache_closed()); }
+            cache.publish(&claim.lease.entry().key, claim.lease.entry(), temporary, bytes.len() as u64)
+        }).await
+    }
+
     /// Concurrent readers share a load; cancellation discards its temporary file and leaves the next caller able to retry.
     pub async fn get(self: &Arc<Self>, cache_key: &ObjectKey, store: &dyn ObjectStore, remote_key: &ObjectKey) -> Result<DiskLease> {
+        if is_reserved(cache_key) { return Err(Error::InvalidKey(cache_key.to_string())); }
         let _operation = self.begin_operation()?;
         let entry = self.entry(cache_key)?;
-        let lease = DiskLease { cache: Arc::clone(self), entry };
-        let guard = self.cancellation.run_until_cancelled(lease.entry.loading.lock()).await.ok_or_else(cache_closed)?;
-        if lease.entry.file.get().is_none() {
+        let lease = DiskLease::new(self, entry);
+        let guard = self.cancellation.run_until_cancelled(lease.entry().loading.lock()).await.ok_or_else(cache_closed)?;
+        if lease.entry().file.get().is_none() {
             let mut temporary = tempfile::NamedTempFile::new_in(self.root.join(".tmp")).map_err(|error| Error::io(&self.root, error))?;
             let streamed = self.cancellation.run_until_cancelled(store.try_fill_disk_cache(remote_key, &mut temporary, &self.memory))
                 .await.ok_or_else(cache_closed)??;
@@ -202,11 +346,11 @@ impl DiskCache {
                 None => self.fill_with_reserved_reads(store, remote_key, &mut temporary).await?,
             };
             if self.cancellation.is_cancelled() { return Err(cache_closed()); }
-            self.publish(cache_key, &lease.entry, temporary, size)?;
+            self.publish(cache_key, &lease.entry(), temporary, size)?;
             self.missed(size);
         }
         drop(guard);
-        self.trim(None);
+        self.trim();
         Ok(lease)
     }
 
@@ -242,8 +386,9 @@ impl DiskCache {
     }
 
     fn publish(&self, key: &ObjectKey, entry: &Arc<Entry>, temporary: tempfile::NamedTempFile, size: u64) -> Result<()> {
-        let state = self.state.lock();
-        let path = if state.entries.get(key).is_some_and(|current| Arc::ptr_eq(current, entry)) {
+        let mut state = self.state.lock();
+        let current = state.entries.get(key).is_some_and(|current| Arc::ptr_eq(current, entry));
+        let path = if current {
             let path = self.root.join(key.as_str());
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
@@ -254,13 +399,33 @@ impl DiskCache {
             temporary.keep().map_err(|error| Error::io(error.file.path(), error.error))?.1
         };
         entry.file.set(CachedFile { path: parking_lot::RwLock::new(path), size })
-            .map_err(|_| Error::Task("Disk cache entry published twice".into()))
+            .map_err(|_| Error::Task("Disk cache entry published twice".into()))?;
+        if current {
+            state.counted(entry, true);
+            if !is_reserved(key) {
+                for range in state.range_keys(key)? {
+                    if let Err(error) = self.retire(&mut state, &range) {
+                        tracing::warn!("Disk cache kept a range of {key} after caching the whole object: {error}");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drops the cached copy of a key, so the next read goes to the remote store.
     /// An idle file is removed now. A leased one moves into the staging directory, where its readers keep it until the last lease ends and a restart clears it.
     pub fn invalidate(&self, cache_key: &ObjectKey) -> Result<()> {
         let mut state = self.state.lock();
+        let ranges = state.range_keys(cache_key)?;
+        let mut result = Ok(());
+        for key in std::iter::once(cache_key).chain(&ranges) {
+            if let Err(error) = self.retire(&mut state, key) && result.is_ok() { result = Err(error); }
+        }
+        result
+    }
+
+    fn retire(&self, state: &mut State, cache_key: &ObjectKey) -> Result<()> {
         let Some(entry) = state.entries.get(cache_key) else { return Ok(()) };
         if let Some(file) = entry.file.get() {
             let staging = self.root.join(".tmp");
@@ -277,8 +442,35 @@ impl DiskCache {
             }
         }
         entry.retired.store(true, Ordering::Release);
-        state.entries.remove(cache_key);
+        if let Some(entry) = state.entries.remove(cache_key) {
+            state.counted(&entry, false);
+            self.remove_empty_range_directory(cache_key);
+        }
         Ok(())
+    }
+
+    fn remove_empty_range_directory(&self, key: &ObjectKey) {
+        if is_reserved(key) && let Some(directory) = self.root.join(key.as_str()).parent() { let _ = fs::remove_dir(directory); }
+    }
+
+    fn evict_oldest(&self, state: &mut State, eligible: impl Fn(&ObjectKey) -> bool) -> bool {
+        let Some(key) = state.entries.iter()
+            .filter(|(key, entry)| eligible(key) && entry.file.get().is_some() && Arc::strong_count(entry) == 1)
+            .min_by_key(|(_, entry)| entry.accessed.load(Ordering::Relaxed)).map(|(key, _)| key.clone()) else { return false };
+        let Some(entry) = state.entries.remove(&key) else { return false };
+        let path = entry.file.get().expect("an evicted entry has a file").path.read().clone();
+        match fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("Disk cache eviction failed at {}: {error}", path.display());
+                state.entries.insert(key, entry);
+                false
+            }
+            _ => {
+                state.counted(&entry, false);
+                self.remove_empty_range_directory(&key);
+                true
+            }
+        }
     }
     pub fn scope(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
         self.scope_in(namespace, remote, Arc::clone(&self.operations))
@@ -290,20 +482,22 @@ impl DiskCache {
         if !remote.permits_shared_read_cache() {
             return Err(Error::Closed("The object owner requires a fresh read for each use".into()));
         }
+        if is_reserved(&namespace) { return Err(Error::InvalidKey(namespace.to_string())); }
         Ok(Arc::new(DiskCachedStore { cache: Arc::clone(self), namespace, remote, io }))
     }
 
     /// Caches a completed immutable upload; the caller keeps `source` unchanged until this returns.
     /// The source file remains at its original path.
     pub async fn put_file(self: &Arc<Self>, key: &ObjectKey, source: &Path) -> Result<()> {
+        if is_reserved(key) { return Err(Error::InvalidKey(key.to_string())); }
         self.put_file_admitted(key, source, None).await
     }
     async fn put_file_admitted(self: &Arc<Self>, key: &ObjectKey, source: &Path, scope: Option<crate::io_region::IoAdmission>) -> Result<()> {
         let operation = self.begin_operation()?;
         let operation = match scope { Some(scope) => operation.and(scope), None => operation };
-        let lease = DiskLease { cache: Arc::clone(self), entry: self.entry(key)? };
-        let guard = self.cancellation.run_until_cancelled(Arc::clone(&lease.entry.loading).lock_owned()).await.ok_or_else(cache_closed)?;
-        if lease.entry.file.get().is_some() { return Ok(()); }
+        let lease = DiskLease::new(self, self.entry(key)?);
+        let guard = self.cancellation.run_until_cancelled(Arc::clone(&lease.entry().loading).lock_owned()).await.ok_or_else(cache_closed)?;
+        if lease.entry().file.get().is_some() { return Ok(()); }
         let input = File::open(source).map_err(|error| Error::io(source, error))?;
         let paths = self.reserve(source.as_os_str().len().checked_add(key.as_str().len()).and_then(|size| size.checked_add(1024)).ok_or_else(|| Error::Task("Cache copy path allocation exceeds range".into()))?)?;
         let (cache, source, key) = (Arc::clone(self), source.to_owned(), key.clone());
@@ -322,15 +516,11 @@ impl DiskCache {
                 temporary.write_all(&chunk[..length]).map_err(|error| Error::io(temporary.path(), error))?;
                 remaining -= length as u64;
             }
-            cache.publish(&key, &lease.entry, temporary, size)
+            cache.publish(&key, &lease.entry(), temporary, size)
         }).await
     }
 }
 
-fn idle(entry: &Arc<Entry>, releasing: Option<&Arc<Entry>>) -> bool {
-    let count = Arc::strong_count(entry);
-    count == 1 || count == 2 && releasing.is_some_and(|released| Arc::ptr_eq(released, entry))
-}
 fn cache_closed() -> Error { Error::Closed("disk cache is closed".into()) }
 
 struct DiskCachedStore { cache: Arc<DiskCache>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>, io: Arc<IoRegion> }
@@ -424,7 +614,15 @@ impl ObjectStore for DiskCachedStore {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?)?;
         let _operation = self.cache.begin_operation()?;
-        match self.cache.cached_size(&self.key(key)?) { Some(size) => Ok(StoredObject { key: key.clone(), size }), None => self.cache.cancellation.run_until_cancelled(self.remote.head(key)).await.ok_or_else(cache_closed)? }
+        let cache_key = self.key(key)?;
+        if let Some(size) = self.cache.known_size(&cache_key) { return Ok(StoredObject { key: key.clone(), size }); }
+        let object = self.cache.cancellation.run_until_cancelled(self.remote.head(key)).await.ok_or_else(cache_closed)??;
+        if self.remote.supports_scan_ranges(key)
+            && let Err(error) = self.cache.keep_size(&cache_key, object.size)
+        {
+            tracing::debug!("Disk cache recorded no size for {key}: {error}");
+        }
+        Ok(object)
     }
     async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> {
         let _scope = self.io.admit_read(self.cache.clone(), self.key(key)?)?;
@@ -492,17 +690,30 @@ impl ObjectStore for DiskCachedStore {
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         let scope = self.io.admit_read(self.cache.clone(), self.key(key)?)?;
         let operation = self.cache.begin_operation()?.and(scope);
-        let Some(lease) = self.cache.cached_file(&self.key(key)?) else {
-            let length = reservation.length() as u64;
-            let bytes = self.cache.cancellation.run_until_cancelled(self.remote.get_reserved_scan_range(key, range, reservation))
-                .await.ok_or_else(cache_closed)??;
-            self.cache.missed(length);
-            return Ok(bytes);
+        let cache_key = self.key(key)?;
+        let (lease, offset) = match self.cache.cached_file(&cache_key) {
+            Some(lease) => (lease, 0),
+            None => match self.cache.cached_range(&cache_key, &range) {
+                Some(cached) => cached,
+                None => {
+                    let claim = self.cache.claim_range(&cache_key, &range);
+                    let length = reservation.length() as u64;
+                    let bytes = self.cache.cancellation.run_until_cancelled(self.remote.get_reserved_scan_range(key, range, reservation))
+                        .await.ok_or_else(cache_closed)??;
+                    self.cache.missed(length);
+                    if let Some(claim) = claim
+                        && let Err(error) = self.cache.keep_range(claim, bytes.share(), operation).await
+                    {
+                        tracing::debug!("Disk cache kept no copy of a range of {key}: {error}");
+                    }
+                    return Ok(bytes);
+                }
+            },
         };
         let key = key.clone();
         IoRegion::run_admitted(operation, move || {
             let file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
-            crate::object_store::map_range(crate::LocalFile::new(file, Some(lease)), &key, range, reservation)
+            crate::object_store::map_range(crate::LocalFile::new(file, Some(lease)), &key, range.start - offset..range.end - offset, reservation)
         }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {

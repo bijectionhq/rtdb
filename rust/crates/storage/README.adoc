@@ -42,6 +42,12 @@ An evicted payload remains charged until its last lease or slice drops.
 
 A scan maps requested byte ranges on local object files and on existing disk-cache files.
 A cold remote range read can fetch those bytes directly.
+The disk cache keeps a copy of each fetched scan range as its own entry under `.ranges/<cache key>/<start>-<end>`, so a later read inside that range, including after a restart, is served from disk without fetching the whole object.
+Range copies share the cache capacity and recency order with whole files, and their entry metadata, drawn from the node's memory budget, is held to a sixteenth of it.
+A range entry is claimed before its bytes are fetched, so deleting or forgetting the object during the fetch leaves no copy, and afterwards drops every copy.
+Caching the whole object replaces its range copies.
+A metadata read answered by the provider also records the object's size beside its range copies, as an empty `size-<size>` entry, so that a restart can open the object's footer without asking the provider again.
+A restart funds whole files before range copies, and discards a range file whose name does not parse, whose length differs from its range, whose object is cached whole, or that its share cannot fund.
 Whole-object transforms such as authenticated encryption load the object once before reading its selected pages.
 A retained mapping keeps any disk-cache lease alive until the last Arrow buffer referencing it is released.
 

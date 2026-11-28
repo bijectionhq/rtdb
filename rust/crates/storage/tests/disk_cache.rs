@@ -645,7 +645,7 @@ async fn a_local_file_of_a_cached_object_is_pinned_while_held() {
 }
 
 #[tokio::test]
-async fn a_cold_scan_range_does_not_fill_the_disk_cache() {
+async fn a_cold_scan_range_keeps_only_its_own_bytes_in_the_disk_cache() {
     let directory = tempfile::tempdir().unwrap();
     let memory = MemoryBudget::new(8 << 20);
     let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
@@ -660,7 +660,7 @@ async fn a_cold_scan_range_does_not_fill_the_disk_cache() {
     let page = pool.scan_range(&key, 123..127, &memory).await.unwrap();
     assert_eq!(page.as_slice(), b"page");
     assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
-    assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 0);
+    assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 4);
 
     drop(store.local_file(&key).await.unwrap());
     let previously_read = remote.reads.load(Ordering::SeqCst);
@@ -669,6 +669,241 @@ async fn a_cold_scan_range_does_not_fill_the_disk_cache() {
     assert_eq!(cache.stats().pinned_bytes, 2 << 20);
     store.forget(&key).await.unwrap();
     assert_eq!(page.as_slice(), b"page");
+}
+
+fn range_fixture() -> (Vec<u8>, ObjectKey) {
+    ((0..=255u8).cycle().take(4096).collect(), ObjectKey::new("tables/docs/data/file.arrow").unwrap())
+}
+
+async fn scan(store: &Arc<dyn ObjectStore>, key: &ObjectKey, range: Range<u64>) -> Vec<u8> {
+    let length = (range.end - range.start) as usize;
+    store.get_reserved_scan_range(key, range, ReadReservation::new(length, ())).await.unwrap().as_slice().to_vec()
+}
+
+#[tokio::test]
+async fn kept_scan_ranges_serve_themselves_and_their_subranges_after_reopen_without_remote_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(8 << 20);
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    remote.put(&key, bytes.clone().into()).await.unwrap();
+    {
+        let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+        let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+        assert_eq!(scan(&store, &key, 100..900).await, bytes[100..900]);
+        assert_eq!(scan(&store, &key, 100..900).await, bytes[100..900]);
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.stats().evictable_bytes, 800);
+        cache.close_and_wait().await;
+    }
+    assert_eq!(memory.used_bytes(), 0);
+
+    let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    assert_eq!(scan(&store, &key, 100..900).await, bytes[100..900]);
+    assert_eq!(scan(&store, &key, 100..110).await, bytes[100..110]);
+    assert_eq!(scan(&store, &key, 400..900).await, bytes[400..900]);
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 1, "every read lies inside the kept range");
+
+    assert_eq!(scan(&store, &key, 50..150).await, bytes[50..150]);
+    assert_eq!(scan(&store, &key, 850..1000).await, bytes[850..1000]);
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 3, "a range reaching outside every kept range reads the provider");
+    assert_eq!(scan(&store, &key, 850..1000).await, bytes[850..1000]);
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn deleting_or_forgetting_an_object_drops_its_kept_ranges_and_only_its_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 8 << 20, MemoryBudget::new(8 << 20)).unwrap();
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    let sibling = ObjectKey::new("tables/docs/data/file.arrow2").unwrap();
+    remote.put(&key, bytes.clone().into()).await.unwrap();
+    remote.put(&sibling, bytes.clone().into()).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    scan(&store, &key, 0..10).await;
+    scan(&store, &key, 20..30).await;
+    scan(&store, &sibling, 0..10).await;
+
+    store.forget(&key).await.unwrap();
+    assert_eq!(cache.stats().evictable_bytes, 10);
+    scan(&store, &key, 0..10).await;
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 4, "a forgotten range is read again");
+    scan(&store, &sibling, 0..10).await;
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 4, "another object keeps its ranges");
+
+    store.delete(&key).await.unwrap();
+    assert_eq!(cache.stats().evictable_bytes, 10);
+    assert!(store.get_reserved_scan_range(&key, 0..10, ReadReservation::new(10, ())).await.is_err());
+}
+
+#[tokio::test]
+async fn reopening_discards_a_kept_range_whose_file_does_not_match_its_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(8 << 20);
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    remote.put(&key, bytes.clone().into()).await.unwrap();
+    {
+        let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+        let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+        scan(&store, &key, 100..200).await;
+        cache.close_and_wait().await;
+    }
+    let ranges = directory.path().join(".ranges/db/tables/docs/data/file.arrow");
+    let kept = std::fs::read_dir(&ranges).unwrap().next().unwrap().unwrap().path();
+    std::fs::write(&kept, &bytes[100..150]).unwrap();
+    std::fs::write(ranges.join("not-a-range"), b"stray").unwrap();
+
+    let cache = DiskCache::open(directory.path(), 8 << 20, memory).unwrap();
+    assert!(!kept.exists());
+    assert!(!ranges.join("not-a-range").exists());
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    assert_eq!(scan(&store, &key, 100..200).await, bytes[100..200]);
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn kept_ranges_count_against_capacity_and_the_oldest_is_evicted_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 250, MemoryBudget::new(8 << 20)).unwrap();
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    remote.put(&key, bytes.into()).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    scan(&store, &key, 0..100).await;
+    scan(&store, &key, 100..200).await;
+    scan(&store, &key, 0..100).await;
+    scan(&store, &key, 200..300).await;
+    assert_eq!(cache.stats().evictable_bytes, 200);
+    let reads = remote.reads.load(Ordering::SeqCst);
+    scan(&store, &key, 0..100).await;
+    assert_eq!(remote.reads.load(Ordering::SeqCst), reads, "the most recently used range survives");
+    scan(&store, &key, 100..200).await;
+    assert_eq!(remote.reads.load(Ordering::SeqCst), reads + 1, "the least recently used range was evicted");
+}
+
+#[tokio::test]
+async fn kept_ranges_hold_at_most_a_sixteenth_of_the_cache_memory_and_reopen_within_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(48 << 10);
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    remote.put(&key, bytes.into()).await.unwrap();
+    {
+        let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+        let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+        for start in [0, 100, 200] { scan(&store, &key, start..start + 100).await; }
+        assert_eq!(cache.stats().evictable_bytes, 200);
+        assert!(memory.used_bytes() <= memory.limit_bytes() / 16);
+        scan(&store, &key, 200..300).await;
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 3);
+        scan(&store, &key, 0..100).await;
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 4, "the least recently used range made room");
+        cache.close_and_wait().await;
+    }
+    let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+    assert_eq!(cache.stats().evictable_bytes, 200);
+    assert!(memory.used_bytes() <= memory.limit_bytes() / 16);
+}
+
+#[tokio::test]
+async fn forgetting_an_object_while_its_range_is_fetched_keeps_no_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 8 << 20, MemoryBudget::new(8 << 20)).unwrap();
+    let remote = Arc::new(ObservedStore::new(true));
+    let (bytes, key) = range_fixture();
+    remote.put(&key, bytes.clone().into()).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    let mut read = Box::pin(scan(&store, &key, 0..10));
+    assert_pending(read.as_mut()).await;
+    remote.entered.acquire().await.unwrap().forget();
+    store.forget(&key).await.unwrap();
+    remote.release.add_permits(1);
+    assert_eq!(read.await, bytes[0..10]);
+    assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 0);
+    scan(&store, &key, 0..10).await;
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_cached_whole_file_replaces_its_kept_ranges() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 8 << 20, MemoryBudget::new(8 << 20)).unwrap();
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    remote.put(&key, bytes.clone().into()).await.unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    scan(&store, &key, 0..10).await;
+    scan(&store, &key, 20..30).await;
+    drop(store.local_file(&key).await.unwrap());
+    assert_eq!(cache.stats().evictable_bytes, 4096);
+    assert!(!directory.path().join(".ranges/db/tables/docs/data/file.arrow").exists());
+    assert_eq!(scan(&store, &key, 0..10).await, bytes[0..10]);
+}
+
+#[tokio::test]
+async fn reopening_funds_whole_files_before_kept_ranges() {
+    let directory = tempfile::tempdir().unwrap();
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    let whole = ObjectKey::new("tables/docs/data/whole.arrow").unwrap();
+    remote.put(&key, bytes.clone().into()).await.unwrap();
+    remote.put(&whole, Bytes::from_static(b"whole file")).await.unwrap();
+    {
+        let cache = DiskCache::open(directory.path(), 8 << 20, MemoryBudget::new(8 << 20)).unwrap();
+        let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+        for start in (0..2000).step_by(100) { scan(&store, &key, start..start + 100).await; }
+        drop(store.local_file(&whole).await.unwrap());
+        cache.close_and_wait().await;
+    }
+    let memory = MemoryBudget::new(48 << 10);
+    let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+    assert_eq!(cache.stats().evictable_bytes, 10 + 200, "the whole file and the two ranges its share funds");
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    let reads = remote.reads.load(Ordering::SeqCst);
+    assert_eq!(store.get(&whole).await.unwrap().as_ref(), b"whole file");
+    assert_eq!(remote.reads.load(Ordering::SeqCst), reads);
+}
+
+#[tokio::test]
+async fn an_object_with_kept_ranges_answers_its_size_after_reopen_until_it_is_forgotten() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(8 << 20);
+    let remote = Arc::new(ObservedStore::new(false));
+    let (bytes, key) = range_fixture();
+    remote.put(&key, bytes.clone().into()).await.unwrap();
+    {
+        let cache = DiskCache::open(directory.path(), 8 << 20, Arc::clone(&memory)).unwrap();
+        let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+        assert_eq!(store.head(&key).await.unwrap().size, 4096);
+        assert_eq!(store.head(&key).await.unwrap().size, 4096);
+        assert_eq!(remote.heads.load(Ordering::SeqCst), 1);
+        scan(&store, &key, 4086..4096).await;
+        cache.close_and_wait().await;
+    }
+    let cache = DiskCache::open(directory.path(), 8 << 20, memory).unwrap();
+    let store = cache.scope(ObjectKey::new("db").unwrap(), remote.clone()).unwrap();
+    assert_eq!(store.head(&key).await.unwrap().size, 4096);
+    assert_eq!(scan(&store, &key, 4086..4096).await, bytes[4086..4096]);
+    assert_eq!((remote.heads.load(Ordering::SeqCst), remote.reads.load(Ordering::SeqCst)), (1, 1));
+
+    store.forget(&key).await.unwrap();
+    assert_eq!(cache.stats().pinned_bytes + cache.stats().evictable_bytes, 0);
+    assert_eq!(store.head(&key).await.unwrap().size, 4096);
+    assert_eq!(remote.heads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn the_kept_range_directory_is_not_a_cache_namespace() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(8 << 20)).unwrap();
+    let remote = Arc::new(MemoryStore::default());
+    assert!(matches!(cache.scope(ObjectKey::new(".ranges").unwrap(), remote.clone()), Err(Error::InvalidKey(_))));
+    assert!(matches!(cache.scope(ObjectKey::new(".ranges/db").unwrap(), remote.clone()), Err(Error::InvalidKey(_))));
+    let key = ObjectKey::new(".ranges/db/file").unwrap();
+    assert!(matches!(cache.get(&key, remote.as_ref(), &key).await, Err(Error::InvalidKey(_))));
 }
 
 #[tokio::test]
