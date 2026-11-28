@@ -2719,6 +2719,8 @@ surface QueryAccess {
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
+        -- An ENTITY_SORT_KEY projection over compatible Arrow columns writes the complete tagged handles of ordinary entity IDs into Binary output in row order.
+        -- The output uses observed nullability and emits Arrow Null when every selected result is null.
         -- Scalar COALESCE can pass the selected Arrow string through to concatenation or regular expression replacement as borrowed text.
         -- Scalar character and octet length calls can also measure the selected text without copying it into an owned argument.
         -- POSITION and OCTET_POSITION can read reached UTF-8 arguments in place and write their counts directly into an Arrow integer column.

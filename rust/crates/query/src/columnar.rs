@@ -5567,6 +5567,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entity_sort_key_projects_exact_handle_bytes_from_arrow_ids() {
+        use arrow_array::BinaryArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let ids = [
+            Value::Utf8("東京".into()), Value::Keyword(rtdb_types::Keyword::from_name(":ns/東京")),
+            Value::I8(i8::MIN), Value::I16(-1), Value::I32(0), Value::I64(i64::MAX),
+            Value::U8(u8::MAX), Value::Uuid([0xa5; 16]), Value::Null,
+        ];
+        let ty = LogicalType::from_legs(ids.iter().map(Value::logical_type));
+        let mut input = field(0, ScalarType::Utf8);
+        input.data_type = ty.clone();
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let array = rtdb_columnar::build_array(&ty, &ids).unwrap();
+        let field = Arc::new(rtdb_columnar::to_field(&input.name, &ty).unwrap());
+        let args = vec![input.expression()];
+        let name = "entity_sort_key";
+        let expression = Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args };
+        let null_row = ids.len() - 1;
+        let binary = LogicalType::Scalar(ScalarType::Binary);
+        let cases = [(0..ids.len(), binary.clone().maybe()), (0..null_row, binary), (null_row..ids.len(), LogicalType::Null)];
+        for (range, expected) in cases {
+            let column = Column::Arrow {
+                array: array.slice(range.start, range.len()), field: Arc::clone(&field), logical: Some(ty.clone()),
+            };
+            let batch = ColumnBatch::settled(vec![column], range.len(), memory.reserve(4096).unwrap()).unwrap();
+            let mut cursor = record_projection_cursor(batch, schema.clone(), vec![expression.clone()], &memory);
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            let Column::Arrow { array, field, .. } = &page.columns[0] else { panic!("Expected an Arrow result column"); };
+            assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", &expected).unwrap());
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            if expected == LogicalType::Null {
+                assert_eq!(array.data_type(), &DataType::Null);
+                continue;
+            }
+            let handles = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            for (row, value) in ids[range].iter().enumerate() {
+                match value {
+                    Value::Null => assert!(handles.is_null(row)),
+                    Value::U8(_) => assert_eq!(handles.value(row), rtdb_types::EntityId::Integer(-1).handle_bytes().as_slice()),
+                    id => assert_eq!(handles.value(row), id.entity_id().unwrap().handle_bytes().as_slice()),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_sort_key_defers_invalid_id_and_uri_errors_in_row_order() {
+        use arrow_array::BinaryArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut input = field(0, ScalarType::Binary);
+        input.data_type = input.data_type.join(&LogicalType::Scalar(ScalarType::Uri));
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let args = vec![input.expression()];
+        let name = "entity_sort_key";
+        let expression = Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args };
+        let ty = LogicalType::Scalar(ScalarType::Uri);
+        let uri_field = Arc::new(rtdb_columnar::to_field("value", &ty).unwrap());
+        let uri_array = Arc::new(StringArray::from(vec!["bad uri"]));
+        let binary_field = Arc::new(ArrowField::new("value", DataType::Binary, true));
+        let binary_array = Arc::new(BinaryArray::from_iter([None, Some(&[4u8][..])]));
+        let uri_error = rtdb_columnar::read_value(&uri_field, uri_array.as_ref(), 0).unwrap_err();
+        let id_error = Value::Binary(vec![4]).entity_id().unwrap_err();
+        for (tail, expected) in [([(1, 0), (0, 1)], uri_error), ([(0, 1), (1, 0)], id_error)] {
+            let sources = vec![
+                Some((Arc::clone(&binary_array) as ArrayRef, Arc::clone(&binary_field), None, None)),
+                Some((Arc::clone(&uri_array) as ArrayRef, Arc::clone(&uri_field), None, None)),
+            ];
+            let column = Column::Selected(SelectedColumn::new(sources, Arc::new(vec![(0, 0), tail[0], tail[1]])));
+            let batch = ColumnBatch::settled(vec![column], 3, memory.reserve(4096).unwrap()).unwrap();
+            let mut cursor = record_projection_cursor(batch, schema.clone(), vec![expression.clone()], &memory);
+            let error = cursor.next_batch().await.err().unwrap();
+            assert_eq!(error.code, expected.code);
+            assert_eq!(error.message, expected.message);
+        }
+    }
+
+    #[tokio::test]
     async fn binary_projections_write_reached_spans_and_observed_nulls() {
         use arrow_array::BinaryArray;
 

@@ -192,6 +192,11 @@ pub(super) fn column(
         {
             extremum(args, Ordering::Greater, schema, batch, execution)
         }
+        (Some(ScalarType::Binary), Expr::Call { name, args, .. })
+            if name.eq_ignore_ascii_case("entity_sort_key") =>
+        {
+            entity_sort_key(args, schema, batch, execution)
+        }
         (Some(ScalarType::Binary), Expr::Call { name, args, .. }) => {
             trim(name, args, schema, batch, execution)
         }
@@ -204,6 +209,102 @@ pub(super) fn column(
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
         result => result,
     }
+}
+
+fn entity_sort_key(
+    args: &[Expr],
+    schema: &Schema,
+    batch: &ColumnBatch,
+    execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let [Expr::Column { id, .. }] = args else {
+        return Ok(None);
+    };
+    let Some(position) = schema.position(*id) else {
+        return Ok(None);
+    };
+    let input = &batch.columns[position];
+    let read = |row| {
+        if input.arrow_cell(row)?.is_none() {
+            return Some(None);
+        }
+        let cell = input.expression_cell(row)?.physical().ok()?;
+        if cell.is_null().ok()? {
+            return Some(None);
+        }
+        let storage = cell.field.data_type();
+        if !storage.is_integer() && !matches!(storage, DataType::Utf8 | DataType::FixedSizeBinary(16)) {
+            return None;
+        }
+        let logical = rtdb_columnar::from_field(cell.field).ok()?;
+        use ScalarType as S;
+        if !matches!(
+            plain_scalar(&logical),
+            Some(
+                S::Utf8
+                    | S::Keyword
+                    | S::Uuid
+                    | S::I8
+                    | S::I16
+                    | S::I32
+                    | S::I64
+                    | S::U8
+                    | S::U16
+                    | S::U32
+                    | S::U64
+            )
+        ) {
+            return None;
+        }
+        rtdb_columnar::read_execution_entity_id_as(Some(&logical), cell.field, cell.array, cell.row)
+            .ok()
+    };
+    let len = batch.len;
+    let context = &execution.context;
+    let mut payload = 0usize;
+    for row in 0..len {
+        context.check_cancelled_at(row)?;
+        let Some(id) = read(row) else {
+            return Ok(None);
+        };
+        if let Some(id) = id {
+            let mut integer = [0; 8];
+            let (_, bytes) = id.handle_parts(&mut integer);
+            let Some(total) = payload
+                .checked_add(1)
+                .and_then(|total| total.checked_add(bytes.len()))
+                .filter(|total| i32::try_from(*total).is_ok())
+            else {
+                return Ok(None);
+            };
+            payload = total;
+        }
+    }
+    let bound = len
+        .checked_add(1)
+        .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
+        .and_then(|bytes| bytes.checked_add(payload))
+        .and_then(|bytes| bytes.checked_add(len.div_ceil(8) + 1024))
+        .ok_or_else(size_error)?;
+    let charge = context.memory.reserve(bound)?;
+    let mut builder = BinaryBuilder::with_capacity(len, payload);
+    for row in 0..len {
+        context.check_cancelled_at(row)?;
+        let Some(id) = read(row) else {
+            return Ok(None);
+        };
+        if let Some(id) = id {
+            let mut integer = [0; 8];
+            let (tag, bytes) = id.handle_parts(&mut integer);
+            builder
+                .write_all(&[tag])
+                .expect("Writing into a BinaryBuilder only appends bytes");
+            builder.append_value(bytes);
+        } else {
+            builder.append_null();
+        }
+    }
+    finish(builder.finish(), charge).map(Some)
 }
 
 fn concat(
