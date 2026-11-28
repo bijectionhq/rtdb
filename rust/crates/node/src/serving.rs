@@ -451,6 +451,13 @@ pub trait ServingDriver: Send + Sync {
         Ok(None)
     }
 
+    #[cfg(feature = "multi")]
+    async fn enter_held_store_watch(
+        &self, _after: Basis, _reader: [u8; 32], _hold: StoreVersionHoldKey, _cancellation: &CancellationToken,
+    ) -> Result<StoreReadTurn> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.store/hold-unsupported", "This route cannot admit an exact retained Store watch"))
+    }
+
     async fn store_sizes(&self, _epoch: Option<u64>, _now: Timestamp, _cancellation: &CancellationToken) -> Result<StorageSizes> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/unsupported", "This route does not serve the ordered-bytes store"))
     }

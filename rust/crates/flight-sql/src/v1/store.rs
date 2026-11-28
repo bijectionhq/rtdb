@@ -601,11 +601,24 @@ impl Service {
         let mut after = Basis::new(incarnation, request.after);
         let original = after;
         #[cfg(feature = "multi")]
-        let hold = if self.follower().is_none() {
-            driver.enter_local_store_read(At::Exactly(original), &call.cancellation).await.map_err(error::anomaly)?
-        } else {
-            None
+        let hold = match request.retention {
+            Some(retention) => {
+                if self.follower_only() || call.session.fresh_replica {
+                    return Err(error::unsupported("rtdb.store.v1.Watch with exact retention"));
+                }
+                let account = hold_version::reader_account(call)?;
+                let reader = hold_version::reader_identity(incarnation, account);
+                let key = hold_version::hold_key(incarnation, retention)?;
+                Some(driver.enter_held_store_watch(original, reader, key, &call.cancellation).await.map_err(error::anomaly)?)
+            },
+            None if self.follower().is_none() =>
+                driver.enter_local_store_read(At::Exactly(original), &call.cancellation).await.map_err(error::anomaly)?,
+            None => None,
         };
+        #[cfg(not(feature = "multi"))]
+        if request.retention.is_some() {
+            return Err(error::unsupported("rtdb.store.v1.Watch with exact retention"));
+        }
         #[cfg(feature = "multi")]
         let mut delivery = None;
         let touched = loop {

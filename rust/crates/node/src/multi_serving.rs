@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeOrder, ChangePage, Changes, FamilyReviewSelection, QuerySource, QueryView, ROW_VISIBILITY,
-    ServingDriver, ServingScope, StoreReadTurn, StoreVersionHoldReply, StoreVersionHoldRequest, TimedStoreAppend, TimedStoreReceipt,
+    ServingDriver, ServingScope, StoreReadTurn, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest, TimedStoreAppend, TimedStoreReceipt,
     WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
@@ -1020,6 +1020,19 @@ impl ServingDriver for MultiServing {
         self.serve(async {
             cancellation.run_until_cancelled(async {
                 self.database.lock().await.enter_local_store_read(at).await.map(Some)
+            }).await.ok_or_else(interrupted)?
+        }).await
+    }
+
+    async fn enter_held_store_watch(
+        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey, cancellation: &CancellationToken,
+    ) -> Result<StoreReadTurn> {
+        if self.classic_workload_fence.is_some() {
+            return Err(workload::denied());
+        }
+        self.serve(async {
+            cancellation.run_until_cancelled(async {
+                self.database.lock().await.enter_held_store_watch(after, reader, hold).await
             }).await.ok_or_else(interrupted)?
         }).await
     }

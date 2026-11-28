@@ -312,6 +312,10 @@ message WatchRequest {
   bytes incarnation = 3;
   // Maximum wait; the server caps it.
   uint64 wait_millis = 4;
+  // Exact resume on the ordinary Multi writer. This live receipt belongs
+  // to the authenticated reader and retains a Version at or before after.
+  // An unknown, expired or released receipt reports cursor-expired.
+  HeldVersionKey retention = 5;
 }
 
 message WatchReply {
@@ -392,7 +396,7 @@ message PurgeFloorReply {
 }
 
 // rtdb.store.v1.HoldVersion orders exact byte retention on the current Multi writer.
-// A fresh Store handshake advertises x-rtdb-store-hold-version: 1 when available.
+// A fresh Store handshake advertises x-rtdb-store-hold-version: 2 for holds and retained watches.
 // Reopen and release require database read access for the same authenticated account
 // and issuer in this incarnation. The receipt carries no data authority.
 message HoldVersionRequest {

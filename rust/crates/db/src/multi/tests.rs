@@ -645,7 +645,8 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
     writer.create().await.unwrap();
     writer.tick(&live(1)).await.unwrap();
-    let writes = WritePipeline::start(Arc::new(Mutex::new(writer)));
+    let database = Arc::new(Mutex::new(writer));
+    let writes = WritePipeline::start(database.clone());
     let old = writes.transact(store_write(1, b"a", Some(b"old"))).await.unwrap().basis;
     let current = writes.transact(store_write(2, b"a", Some(b"new"))).await.unwrap().basis;
     let reader = [1; 32];
@@ -671,11 +672,16 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
 
     let StoreVersionHoldReply::Held(second) = writes.store_version_hold(reader, retain).await.unwrap() else { panic!("expected a hold"); };
     assert_ne!(first.key.id, second.key.id);
+    let turn = database.lock().await.enter_held_store_watch(current, reader, second.key).await.unwrap();
     cluster.at(35);
+    assert_eq!(database.lock().await.check_local_store_basis(current, Some(&turn)).await.unwrap_err().code,
+        "rtdb/cursor-expired");
     assert_eq!(writes.store_version_hold(reader, StoreVersionHoldRequest::Reopen(second.key)).await.unwrap_err().code,
         "rtdb.store/hold-unavailable");
     assert_eq!(purge().await.unwrap_err().code, "rtdb.store/purge-retention");
     cluster.at(40 + DRIFT);
+    assert_eq!(purge().await.unwrap_err().code, "rtdb.store/purge-retention");
+    drop(turn);
     purge().await.unwrap();
     assert_eq!(writes.store_version_hold(reader, StoreVersionHoldRequest::Reopen(second.key)).await.unwrap_err().code,
         "rtdb/cursor-expired");
@@ -713,8 +719,17 @@ async fn store_version_hold_survives_checkpoint_and_replacement_writer() {
     assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap(), StoreVersionHoldReply::Held(hold));
     assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
         "rtdb.store/purge-retention");
+    assert_eq!(successor.enter_held_store_watch(current, [2; 32], hold.key).await.err().unwrap().code,
+        "rtdb/cursor-expired");
+    let turn = successor.enter_held_store_watch(current, reader, hold.key).await.unwrap();
     let release = StoreVersionHoldRequest::Release(hold.key);
     assert_eq!(successor.store_version_hold(reader, release).await.unwrap(), StoreVersionHoldReply::Released(hold.key));
+    assert_eq!(successor.enter_held_store_watch(current, reader, hold.key).await.err().unwrap().code,
+        "rtdb/cursor-expired");
+    successor.check_local_store_basis(current, Some(&turn)).await.unwrap();
+    assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
+        "rtdb.store/purge-retention");
+    drop(turn);
     successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap();
     assert_eq!(successor.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
 }

@@ -20,6 +20,8 @@ pub(super) fn stale_read_turn() -> Anomaly {
 /// The original attachment still needs its final delivery check.
 pub struct StoreReadTurn {
     basis: Basis,
+    retained_from: Basis,
+    expires_at: Option<Timestamp>,
     epoch: u64,
     generation: u64,
     writer_fence_position: Option<u64>,
@@ -28,6 +30,13 @@ pub struct StoreReadTurn {
 
 impl StoreReadTurn {
     pub fn basis(&self) -> Basis { self.basis }
+
+    pub(super) fn require_unexpired(&self, upper: i64) -> Result<()> {
+        if self.expires_at.is_some_and(|expires_at| upper >= expires_at.0) {
+            return Err(watch_gap());
+        }
+        Ok(())
+    }
 
     pub fn same_writer(&self, other: &Self) -> bool {
         self.basis.incarnation() == other.basis.incarnation()
@@ -42,7 +51,7 @@ pub(super) struct StoreReads(Vec<(Basis, Weak<()>)>);
 impl StoreReads {
     fn add(&mut self, turn: &StoreReadTurn) {
         self.reap();
-        self.0.push((turn.basis, Arc::downgrade(&turn.owner)));
+        self.0.push((turn.retained_from, Arc::downgrade(&turn.owner)));
     }
 
     fn reap(&mut self) {
@@ -200,9 +209,32 @@ fn invalid_hold(message: &str) -> Anomaly {
     Anomaly::fault("rtdb.store/hold-record", message)
 }
 
+fn watch_gap() -> Anomaly {
+    Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
+        "The exact Store watch has no current retention receipt")
+}
+
 impl MultiDatabase {
     pub async fn enter_local_store_read(&mut self, at: At) -> Result<StoreReadTurn> {
         self.refresh().await?;
+        self.admit_local_store_read(at, None)
+    }
+
+    /// The receipt lookup and the in-flight byte turn share the writer lock
+    /// with hold release and floor publication.
+    pub async fn enter_held_store_watch(
+        &mut self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey,
+    ) -> Result<StoreReadTurn> {
+        if hold.basis.incarnation() != after.incarnation() || hold.basis.position() > after.position() {
+            return Err(watch_gap());
+        }
+        self.refresh().await?;
+        self.settled_store_writer()?;
+        let retained = self.state().store_holds.find(hold, reader, self.upper()).map_err(|_| watch_gap())?;
+        self.admit_local_store_read(At::Exactly(after), Some(retained))
+    }
+
+    fn admit_local_store_read(&mut self, at: At, retained: Option<OrderedStoreHold>) -> Result<StoreReadTurn> {
         self.require_active()?;
         let writer = self.authority()?;
         let state = self.state();
@@ -221,8 +253,14 @@ impl MultiDatabase {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
                 "The requested basis precedes the admitted Store floor"));
         }
+        let retained_from = retained.map_or(basis, |hold| hold.basis);
+        if retained_from.position() < floor {
+            return Err(watch_gap());
+        }
         let turn = StoreReadTurn {
             basis,
+            retained_from,
+            expires_at: retained.map(|hold| Timestamp(hold.expires_at_micros)),
             epoch: writer.epoch.0,
             generation: state.generation,
             writer_fence_position: index.store_writer_fence_position(),
@@ -237,7 +275,7 @@ impl MultiDatabase {
         let owner = Arc::downgrade(&turn.owner);
         if basis != turn.basis || writer.epoch.0 != turn.epoch || self.state().generation != turn.generation
             || self.durable_transactions().index().store_writer_fence_position() != turn.writer_fence_position
-            || !self.store_reads.0.iter().any(|(at, active)| *at == basis && active.ptr_eq(&owner))
+            || !self.store_reads.0.iter().any(|(at, active)| *at == turn.retained_from && active.ptr_eq(&owner))
         {
             return Err(stale_read_turn());
         }

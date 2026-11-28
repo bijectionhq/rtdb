@@ -4398,6 +4398,8 @@ actor Gateway {
     -- Store Version hold acquisition and release order with purge under the same writer. Checkpoints carry the settled hold inventory for that incarnation. A fresh restore does not inherit source receipt ownership.
     -- A Store release handshake advertises Version hold support to a verified unscoped account with database read access when the ordinary Multi writer is serving.
     -- Reconnecting can reopen or release an exact receipt under the same authenticated issuer, account and physical incarnation. Receipt ownership does not authorize a read.
+    -- An exact retained Store watch proves its same-owner receipt and opens a read turn under the Multi writer lock. The original receipt basis remains protected until the turn's reply buffer drains, even if release wins after admission.
+    -- Final exact watch delivery checks its admitted deadline. An expired or released receipt cannot begin another exact resume.
     identified_by: MemberRecord where role = gateway
 }
 

@@ -758,7 +758,8 @@ impl MultiDatabase {
         self.require_local_store_turn(basis, turn).await?;
         let state = self.state();
         state.require_retained_store_delivery(&self.stream, basis).await?;
-        self.check_generation(state.generation).await
+        self.check_generation(state.generation).await?;
+        turn.require_unexpired(self.upper())
     }
 
     fn follower_state(&self, owner: &Arc<()>) -> Result<&Committed> {

@@ -11,7 +11,7 @@ use tonic::Status;
 use super::{Call, HOLD_VERSION, Service, error, incarnation, proto::{self, hold_version_reply::Outcome, hold_version_request::Operation}};
 use crate::store_release::StoreRelease;
 
-fn reader_account(call: &Call) -> Result<(Option<&str>, &str), Status> {
+pub(super) fn reader_account(call: &Call) -> Result<(Option<&str>, &str), Status> {
     let caller = &call.session.caller;
     if caller.verified_credential && let Some(account) = caller.principal.unscoped_account() {
         return Ok(account);
@@ -19,7 +19,7 @@ fn reader_account(call: &Call) -> Result<(Option<&str>, &str), Status> {
     Err(Status::permission_denied("Store Version holds require verified database reader authority"))
 }
 
-fn reader_identity(incarnation: [u8; 16], (issuer, subject): (Option<&str>, &str)) -> [u8; 32] {
+pub(super) fn reader_identity(incarnation: [u8; 16], (issuer, subject): (Option<&str>, &str)) -> [u8; 32] {
     let mut reader = Sha256::new();
     reader.update(b"rtdb.store.v1.HoldVersion.reader");
     reader.update(incarnation);
@@ -39,7 +39,7 @@ fn exact(incarnation: [u8; 16], at: Option<u64>) -> Result<Basis, Status> {
     Ok(Basis::new(incarnation, at.ok_or_else(|| error::incorrect("A Store hold states its exact Version"))?))
 }
 
-fn hold_key(incarnation: [u8; 16], key: proto::HeldVersionKey) -> Result<StoreVersionHoldKey, Status> {
+pub(super) fn hold_key(incarnation: [u8; 16], key: proto::HeldVersionKey) -> Result<StoreVersionHoldKey, Status> {
     let id = key.hold_id.try_into().map_err(|_| error::incorrect("A Store hold identity has 16 bytes"))?;
     Ok(StoreVersionHoldKey { basis: exact(incarnation, key.at)?, id })
 }
