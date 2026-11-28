@@ -1459,14 +1459,11 @@ impl TransactState {
         }
     }
 
-    /// `rtdb.store.v1.Append`, resolved at the ordering point. Its time is the
-    /// writer's clock sample `now` smoothed past the head's as XTDB's `TxResolver`
-    /// smooths every transaction, `max(now, head + 1 µs)`, so a classic head stamped
-    /// one tick past its predecessor or at a supplied time ahead of the clock is
-    /// followed, never refused. Its reads are judged first, then that time by
-    /// [`store_clock::judge_store_clock`], the vendored `store_judge::admit`
-    /// (Bijection's `fact_store::persistence::judge::admit`, V9′); a time outside
-    /// the window decides and records nothing so a retry is judged again.
+    /// `rtdb.store.v1.Append`, resolved at the ordering point. Reads and the
+    /// append window are judged against the writer's unmodified sample, the
+    /// value recorded as `source_log_time`. SQL system time still follows
+    /// XTDB's strictly increasing projection. A time outside the window
+    /// records nothing, so a retry gets a fresh clock judgement.
     ///
     /// Every other outcome is a receipt under the request's key, so a retry returns
     /// the first one: a commit with its stamp `{ micros: time, version: position }`,
@@ -1510,7 +1507,7 @@ impl TransactState {
         let sample = now;
         let now = crate::system_time::automatic_time(last, sample.0).map(Timestamp)
             .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))?;
-        let guard_time = now;
+        let guard_time = sample;
         if let Some(basis) = retained_basis {
             view.index.check_retained_store_basis(basis)?;
         }
@@ -1522,8 +1519,8 @@ impl TransactState {
         if failed.is_empty() {
             match store_clock::judge_store_clock(
                 head.basis.position(),
-                last,
-                now.0,
+                None,
+                sample.0,
                 not_before.map(|t| t.0),
                 before.map(|t| t.0),
                 !mutates,
@@ -1535,7 +1532,7 @@ impl TransactState {
                         STORE_OUTSIDE_EARLY,
                         "The store append's window has not opened",
                     )
-                    .with_context("retry_after_micros", not_before.unwrap_or(now).0.saturating_sub(now.0).into()));
+                    .with_context("retry_after_micros", not_before.unwrap_or(sample).0.saturating_sub(sample.0).into()));
                 }
                 store_judge::Admitted::Outside(store_judge::Side::Late) => {
                     return Err(Anomaly::new(

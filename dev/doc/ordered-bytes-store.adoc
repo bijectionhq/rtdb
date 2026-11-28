@@ -118,6 +118,7 @@ It always reports how far it inspected, so a caller resumes from there.
 == Invariants
 
 * Keys are compared bytewise and ranges are half-open.
+* Append windows judge the writer's raw `source_log_time` observation, independent of the strictly increasing SQL `system_time`.
 * A version is a commit position within one incarnation of the database.
   A restore or reset starts a new incarnation, and a request naming another one is refused.
 * The conflict condition is range intersection only.

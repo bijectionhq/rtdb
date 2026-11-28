@@ -117,7 +117,7 @@ fn a_store_writer_close_orders_against_appends_and_survives_checkpoint_restore()
 }
 
 #[test]
-fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
+fn a_store_append_judges_the_sample_independently_of_system_time() {
     use rtdb_index::branches::store::{Projection, StoreRead};
     let mut state = TransactState::new(INCARNATION);
     let partition = vec![0u8, 1, b'p'];
@@ -144,7 +144,9 @@ fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
         let TransactionRecord::Tx(resolved) = smoothed.record() else { panic!("expected a transaction record") };
         assert_eq!((resolved.receipt.basis, resolved.receipt.system_time), (basis(2), Timestamp(101)), "{sample}");
     }
-    let smoothed = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], Window::default()), 2, 100, DEFAULT);
+    // The raw sample is inside this window even though system time is not.
+    let window = Window { not_before: Some(Timestamp(100)), before: Some(Timestamp(101)) };
+    let smoothed = plan(&state, &store_append(2, 1, Vec::new(), vec![other.clone()], window), 2, 100, DEFAULT);
     let smoothed_receipt = apply(&mut state, 2, smoothed.record()).unwrap();
     assert_eq!((smoothed_receipt.basis, smoothed_receipt.system_time, smoothed_receipt.outcome), (basis(2), Timestamp(101), Outcome::Then));
     // Outside the window nothing is decided.
