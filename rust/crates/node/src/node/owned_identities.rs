@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use rtdb_columnar::{EntityIdRef, MemoryReservation, estimate_read_value_bytes, read_owned_entity_id};
+use arrow_array::{ArrayRef, builder::{BinaryBuilder, StringBuilder}};
+use rtdb_columnar::{EntityIdRef, MemoryReservation, estimate_read_value_bytes, read_owned_entity_id, retain_array};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedIdentityScan, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result,
     SEALED_SEARCH_UNIT_ROWS, SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp, sealed_search_inventory_row};
 
@@ -15,6 +16,92 @@ pub struct OwnedIdentityPage {
     pub keys: Vec<EntityId>,
     pub more: bool,
     _charges: Vec<Arc<MemoryReservation>>,
+}
+
+/// A validated Root key page for a consumer that can render Arrow identities.
+pub enum OwnedIdentityPageOutput {
+    Rows(OwnedIdentityPage),
+    Arrow(OwnedIdentityArrowPage),
+}
+
+/// The page keeps the reservations for its compact identity column alive.
+pub struct OwnedIdentityArrowPage {
+    ids: ArrayRef,
+    pub more: bool,
+}
+
+impl OwnedIdentityArrowPage {
+    pub fn ids(&self) -> &ArrayRef { &self.ids }
+}
+
+enum PageKeys {
+    Rows(Vec<EntityId>),
+    Text(StringBuilder),
+    Binary(BinaryBuilder),
+}
+
+impl PageKeys {
+    fn new(scan: Option<&OwnedIdentityScan<'_>>, count: usize) -> Self {
+        match scan {
+            Some(OwnedIdentityScan::Text(_)) => Self::Text(StringBuilder::with_capacity(count, 0)),
+            Some(OwnedIdentityScan::Binary(_)) => Self::Binary(BinaryBuilder::with_capacity(count, 0)),
+            _ => Self::Rows(Vec::with_capacity(count)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Rows(keys) => keys.len(),
+            Self::Text(keys) => keys.offsets_slice().len() - 1,
+            Self::Binary(keys) => keys.offsets_slice().len() - 1,
+        }
+    }
+
+    fn follows_last(&self, key: EntityIdRef<'_>, bound: Option<EntityIdRef<'_>>) -> bool {
+        fn tail<'a>(bytes: &'a [u8], offsets: &[i32]) -> Option<&'a [u8]> {
+            let [.., start, end] = offsets else { return None; };
+            Some(&bytes[*start as usize..*end as usize])
+        }
+        let mut integer = [0; 8];
+        let current = key.handle_parts(&mut integer);
+        let after = match self {
+            Self::Rows(keys) => return keys.last().map(EntityIdRef::from).or(bound).is_none_or(|previous| previous < key),
+            Self::Text(keys) => tail(keys.values_slice(), keys.offsets_slice()).map(|previous| (0, previous)),
+            Self::Binary(keys) => tail(keys.values_slice(), keys.offsets_slice()).map(|previous| (4, previous)),
+        };
+        match after {
+            Some(previous) => previous < current,
+            None => bound.is_none_or(|previous| previous < key),
+        }
+    }
+
+    fn push(&mut self, key: EntityIdRef<'_>, capacity: usize) {
+        match (self, key) {
+            (Self::Rows(keys), key) => keys.push(key.into_owned()),
+            (Self::Text(keys), EntityIdRef::String(key)) => keys.append_value(key),
+            (Self::Binary(keys), EntityIdRef::Binary(key)) => keys.append_value(key),
+            (output, key) => {
+                let mut rows = Vec::with_capacity(capacity);
+                match output {
+                    Self::Text(keys) => rows.extend(keys.finish().iter().flatten().map(|key| EntityIdRef::String(key).into_owned())),
+                    Self::Binary(keys) => rows.extend(keys.finish().iter().flatten().map(|key| EntityIdRef::Binary(key).into_owned())),
+                    Self::Rows(_) => unreachable!(),
+                }
+                rows.push(key.into_owned());
+                *output = Self::Rows(rows);
+            }
+        }
+    }
+
+    fn finish(self, more: bool, charge: Arc<MemoryReservation>) -> Result<OwnedIdentityPageOutput> {
+        let ids: ArrayRef = match self {
+            Self::Rows(keys) => return Ok(OwnedIdentityPageOutput::Rows(OwnedIdentityPage { keys, more, _charges: vec![charge] })),
+            Self::Text(mut keys) => Arc::new(keys.finish()),
+            Self::Binary(mut keys) => Arc::new(keys.finish()),
+        };
+        let ids = retain_array(ids, &charge)?;
+        Ok(OwnedIdentityPageOutput::Arrow(OwnedIdentityArrowPage { ids, more }))
+    }
 }
 
 impl OwnedReadSession {
@@ -197,6 +284,14 @@ impl OwnedReadSession {
         self.identity_page_in_prefix(relation, system, valid, after, limit, None).await
     }
 
+    /// Reads a typed Root page, using compact funded Arrow keys at the held head.
+    pub async fn identity_page_output(
+        &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: &OwnedIdentityScan<'_>,
+        limit: usize,
+    ) -> Result<OwnedIdentityPageOutput> {
+        self.read_identity_page(relation, system, valid, after, limit, None, true).await
+    }
+
     /// Root identities with any assertion current at `system`, across all
     /// valid time, in key order, each once. Repeated valid slices of one key
     /// are skipped by fetching again after the last distinct key, until the
@@ -281,6 +376,16 @@ impl OwnedReadSession {
         &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: &OwnedIdentityScan<'_>,
         limit: usize, prefix: Option<EntityIdRef<'_>>,
     ) -> Result<OwnedIdentityPage> {
+        match self.read_identity_page(relation, system, valid, after, limit, prefix, false).await? {
+            OwnedIdentityPageOutput::Rows(page) => Ok(page),
+            OwnedIdentityPageOutput::Arrow(_) => unreachable!("Requested owned keys"),
+        }
+    }
+
+    async fn read_identity_page(
+        &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: &OwnedIdentityScan<'_>,
+        limit: usize, prefix: Option<EntityIdRef<'_>>, arrow: bool,
+    ) -> Result<OwnedIdentityPageOutput> {
         if !(1..=MAX_PAGE_ROWS).contains(&limit) {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/identity-page",
@@ -290,11 +395,15 @@ impl OwnedReadSession {
         let at_head = self.admit_root_system(relation, system).await?;
         let context = self.relation_context(relation)?;
         let count = limit + 1;
-        let mut charges = vec![self.context.memory.reserve(count * 128)?];
-        let mut keys: Vec<EntityId> = Vec::with_capacity(count);
+        let mut charge = self.context.memory.reserve(count * 128)?;
+        let mut keys = PageKeys::new((at_head && arrow).then_some(after), count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
-        let bound = after.bound().map(|key| key.owned_entity_id()).transpose()?;
+        let bound = match after {
+            OwnedIdentityScan::Text(bound) => bound.as_deref().map(EntityIdRef::String),
+            OwnedIdentityScan::Binary(bound) => bound.as_deref().map(EntityIdRef::Binary),
+            OwnedIdentityScan::Unbounded => None,
+        };
         let cursor = match prefix {
             Some(prefix) if at_head && valid == system => rtdb_query::open_owned_identity_prefix(
                 Arc::clone(&context), &self.owner, relation, system, after, prefix, count as i64,
@@ -318,42 +427,37 @@ impl OwnedReadSession {
                         break 'page;
                     }
                     let bytes = estimate_read_value_bytes(field, array, row)?;
-                    let Some(rest) = remaining.checked_sub(bytes) else {
-                        if keys.is_empty() {
-                            return Err(Anomaly::new(
-                                AnomalyCategory::Busy,
-                                "rtdb.owned/identity-size",
-                                "An identity exceeds the page's retained byte bound",
-                            ));
-                        }
+                    let Some(rest) = remaining_page_bytes(remaining, bytes, keys.len())? else {
                         more = true;
                         break 'page;
                     };
                     remaining = rest;
-                    charges.push(self.context.memory.reserve(bytes)?);
-                    let key = read_owned_entity_id(field, array, row).map_err(|_| invalid_page())?.into_owned();
-                    let previous = keys.last().or(bound.as_ref());
-                    if previous.is_some_and(|previous| previous >= &key) {
+                    Arc::get_mut(&mut charge).expect("Identity page owns its reservation")
+                        .grow_to(count * 128 + MAX_PAGE_BYTES - remaining)?;
+                    let key = read_owned_entity_id(field, array, row).map_err(|_| invalid_page())?;
+                    if !keys.follows_last(key, bound) {
                         return Err(invalid_page());
                     }
                     if !at_head {
-                        self.check_point_purge_floor(
-                            relation,
-                            &key,
-                            system,
-                        )
-                        .await?;
+                        self.point_purge_guard(relation, key, system, false).await?;
                     }
-                    keys.push(key);
+                    keys.push(key, count);
                 }
             }
         }
         context.check_cancelled()?;
-        Ok(OwnedIdentityPage {
-            keys,
-            more,
-            _charges: charges,
-        })
+        keys.finish(more, charge)
+    }
+}
+
+fn remaining_page_bytes(remaining: usize, bytes: usize, rows: usize) -> Result<Option<usize>> {
+    match remaining.checked_sub(bytes) {
+        None if rows == 0 => Err(Anomaly::new(
+            AnomalyCategory::Busy,
+            "rtdb.owned/identity-size",
+            "An identity exceeds the page's retained byte bound",
+        )),
+        rest => Ok(rest),
     }
 }
 
@@ -411,4 +515,21 @@ fn protected_page_unavailable() -> Anomaly {
         "rtdb.owned/protected-equality",
         "The installed protected equality partition is unavailable",
     )
+}
+
+#[cfg(test)]
+#[test]
+fn held_identity_page_refuses_its_first_oversize_key_and_truncates_later_keys() {
+    use arrow_array::StringArray;
+
+    let values = StringArray::from(vec!["a".repeat(MAX_PAGE_BYTES / 2), "b".into()]);
+    let field = arrow_schema::Field::new("_id", arrow_schema::DataType::Utf8, false);
+    let large = estimate_read_value_bytes(&field, &values, 0).unwrap();
+    let small = estimate_read_value_bytes(&field, &values, 1).unwrap();
+    let error = remaining_page_bytes(MAX_PAGE_BYTES, large, 0).unwrap_err();
+    assert_eq!(error.category, AnomalyCategory::Busy);
+    assert_eq!(error.code, "rtdb.owned/identity-size");
+    let remaining = remaining_page_bytes(MAX_PAGE_BYTES, small, 0).unwrap().unwrap();
+    assert_eq!(remaining_page_bytes(remaining, large, 1).unwrap(), None);
+    assert_eq!(remaining_page_bytes(remaining, remaining, 1).unwrap(), Some(0));
 }

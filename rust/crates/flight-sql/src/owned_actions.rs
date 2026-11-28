@@ -24,7 +24,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_owned_entity_id, selected_cell, try_entity_id_array};
 use rtdb_format::ipc::OwnedStream;
-use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
+use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedIdentityPageOutput, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
 use rtdb_types::{Anomaly, OwnedIdentityScan, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation,
@@ -2775,13 +2775,23 @@ impl Service {
         let limit = usize::try_from(history_request_integer(batch, "limit")?)
             .map_err(|_| invalid("Owned identity limit is out of range"))?;
         let after = identity_scan_request(batch)?;
-        let page = held.snapshot.identity_page(&relation, system, valid, &after, limit).await.map_err(status)?;
-        let (rows, _copy) = identity_scan_reply(call, &after, &page.keys)?;
+        let page = held.snapshot.identity_page_output(&relation, system, valid, &after, limit).await.map_err(status)?;
+        let (rows, charge, more) = match &page {
+            OwnedIdentityPageOutput::Rows(page) => {
+                let (rows, charge) = identity_scan_reply(call, &after, &page.keys)?;
+                (rows, charge, page.more)
+            }
+            OwnedIdentityPageOutput::Arrow(page) => {
+                let (rows, charge) = positioned_identity_scan_reply(call.memory(), page.ids())?;
+                (rows, charge, page.more)
+            }
+        };
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
-            [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
+            [(OWNED_IDENTITY_MORE.into(), u8::from(more).to_string())].into()
         );
         let reply = self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), system, valid, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
+        drop((charge, page));
         Ok(reply)
     }
 
@@ -6451,6 +6461,69 @@ fn identity_scan_reply(
     };
     let rows = RecordBatch::try_from_iter([("_id", ids)]).map_err(arrow)?;
     Ok((rows, charge))
+}
+
+fn positioned_identity_scan_reply(
+    memory: &Arc<MemoryBudget>, ids: &ArrayRef,
+) -> Result<(RecordBatch, Arc<MemoryReservation>), Status> {
+    let bytes = if let Some(ids) = ids.as_any().downcast_ref::<StringArray>() {
+        ids.value_data().len()
+    } else if let Some(ids) = ids.as_any().downcast_ref::<BinaryArray>() {
+        ids.value_data().len()
+    } else {
+        return Err(invalid("Owned identity page has a different identity type"));
+    };
+    let charge = memory.reserve(wire::add(4096, bytes)?).map_err(status)?;
+    let rows = RecordBatch::try_from_iter([("_id", Arc::clone(ids))]).map_err(arrow)?;
+    Ok((rows, charge))
+}
+
+#[cfg(test)]
+#[test]
+fn held_identity_reply_preserves_typed_ipc_and_the_original_reply_reservation() {
+    use arrow_array::builder::{BinaryBuilder, StringBuilder};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    let text = ["a", "a\0", "é"];
+    let binary = [&[0_u8, 255][..], &[0_u8, 255, 0][..]];
+    for rows in [0, 2] {
+        let mut utf8 = StringBuilder::with_capacity(rows, text[..rows].iter().map(|key| key.len()).sum());
+        let mut bytes = BinaryBuilder::with_capacity(rows, binary[..rows].iter().map(|key| key.len()).sum());
+        for key in &text[..rows] { utf8.append_value(key); }
+        for key in &binary[..rows] { bytes.append_value(key); }
+        let cases = [
+            (Arc::new(StringArray::from_iter_values(text[..rows].iter().copied())) as ArrayRef, Arc::new(utf8.finish()) as ArrayRef),
+            (Arc::new(BinaryArray::from_iter_values(binary[..rows].iter().copied())) as ArrayRef, Arc::new(bytes.finish()) as ArrayRef),
+        ];
+        for (array, old) in cases {
+            let memory = MemoryBudget::new(1 << 20);
+            let source = rtdb_columnar::retain_array(array, &memory.reserve(4096).unwrap()).unwrap();
+            let (actual, charge) = positioned_identity_scan_reply(&memory, &source).unwrap();
+            let old = RecordBatch::try_from_iter([("_id", old)]).unwrap();
+            assert_eq!(actual, old);
+            assert_eq!(actual.get_array_memory_size(), old.get_array_memory_size());
+            assert!(Arc::ptr_eq(actual.column(0), &source));
+            assert_eq!(charge.bytes(), 4096 + source.to_data().buffers()[1].len());
+            let encode = |batch: &RecordBatch| {
+                let schema = batch.schema_ref().as_ref().clone().with_metadata(
+                    [(OWNED_IDENTITY_MORE.into(), u8::from(rows != 0).to_string())].into(),
+                );
+                Service::with_owned_point_page(&memory, &schema, Some(batch), Timestamp(5), Timestamp(3), None, None,
+                    |schema, batch| {
+                        assert_eq!(schema.metadata().len(), 3);
+                        write_arrow_stream(schema, std::slice::from_ref(batch.unwrap()), IpcWriteOptions::default()).map_err(status)
+                    }).unwrap()
+            };
+            assert_eq!(encode(&actual), encode(&old));
+            let short = MemoryBudget::new(charge.bytes() - 1);
+            assert_eq!(positioned_identity_scan_reply(&short, &source).unwrap_err().code(), tonic::Code::ResourceExhausted);
+            drop((charge, actual));
+            assert_eq!(memory.used_bytes(), 4096);
+            drop(source);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
 }
 
 fn absent_keys_valid(batch: &RecordBatch) -> Result<Timestamp, Status> {

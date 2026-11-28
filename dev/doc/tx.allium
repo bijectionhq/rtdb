@@ -354,6 +354,10 @@
 -- An ordinary Flight caller can opt into Arrow IPC message framing for a raw owned reply.
 -- A historical point uses the held catalog and the same identity registry within the admitted cut and its requested system-time cap.
 -- The relation journal certifies historical point coverage, and incomplete coverage refuses the read.
+-- A held Root identity page selects complete Utf8 or Binary keys visible at its valid instant and system cut in ascending order after its exclusive bound.
+-- A page that stops at its row or byte limit reports more when another key is available, and refuses a first key that exceeds the byte bound.
+-- At the held head the Flight reply can gather the admitted positions into a funded typed identity column.
+-- A historical identity page checks live purge floors before returning keys.
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
 -- An owned-read witness expires at the read's own 60-second lifetime clamped to the configured `garbage_lifetime`, and is further bounded by a provider lease where the store grants one.
 -- A declared ordered path on an empty relation validates bounds against the held schema and has exact zero cardinality before the first fact.

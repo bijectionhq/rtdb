@@ -6681,6 +6681,90 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
 }
 
 #[tokio::test]
+async fn root_identity_output_pages_keep_the_typed_order_and_hold_fences() {
+    use rtdb_columnar::read_owned_entity_id;
+    use rtdb_types::OwnedRelation;
+
+    struct HeldClock { wall: TickClock, monotonic: AtomicI64 }
+    impl Clock for HeldClock {
+        fn now(&self) -> Timestamp { self.wall.now() }
+        fn monotonic_micros(&self) -> i64 { self.monotonic.load(Ordering::Relaxed) }
+    }
+
+    let clock = Arc::new(HeldClock { wall: TickClock(AtomicI64::new(1_000_000)), monotonic: AtomicI64::new(0) });
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, NodeServices {
+        resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)),
+        clock: clock.clone(),
+        ..services()
+    }).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let text = OwnedRelation::new("text-identities").unwrap();
+    let binary = OwnedRelation::new("binary-identities").unwrap();
+    let text_keys = [EntityId::String("é".into()), EntityId::String("é\0".into())];
+    let binary_keys = [EntityId::Binary(vec![0, 255]), EntityId::Binary(vec![0, 255, 0])];
+    let put = |relation: &OwnedRelation, keys: &[EntityId]| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(keys.iter().rev().map(|key| StructFields::from([("_id".into(), key.as_value())]))
+            .collect(), node.memory()).unwrap(),
+        valid_from: None,
+        valid_to: None,
+    };
+    let initial = session.state_mut().execute_tx(vec![put(&text, &text_keys), put(&binary, &binary_keys)],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert!(initial.committed(), "{:?}", initial.error());
+    let held = session.open_owned_read().await.unwrap();
+    let cut = held.system_time();
+    for (relation, keys, after, ty) in [
+        (&text, &text_keys, OwnedIdentityScan::text(None), arrow_schema::DataType::Utf8),
+        (&binary, &binary_keys, OwnedIdentityScan::binary(None), arrow_schema::DataType::Binary),
+    ] {
+        for (bound, expected, more) in [
+            (after.clone(), &keys[..1], true),
+            (OwnedIdentityScan::seek(&keys[0]).unwrap(), &keys[1..], false),
+            (OwnedIdentityScan::seek(&keys[1]).unwrap(), &keys[2..], false),
+        ] {
+            let output = held.identity_page_output(relation, cut, cut, &bound, 1).await.unwrap();
+            let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
+            assert_eq!(page.more, more);
+            assert_eq!(page.ids().data_type(), &ty);
+            let field = arrow_schema::Field::new("_id", ty.clone(), false);
+            let actual = (0..page.ids().len()).map(|row| read_owned_entity_id(&field, page.ids().as_ref(), row).unwrap().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            let owned = held.identity_page(relation, cut, cut, &bound, 1).await.unwrap();
+            assert_eq!((owned.keys.as_slice(), owned.more), (expected, more));
+        }
+        for limit in [0, 129] {
+            let error = held.identity_page_output(relation, cut, cut, &after, limit).await.err().unwrap();
+            assert_eq!(error.code, "rtdb.owned/identity-page");
+        }
+    }
+
+    let update = session.state_mut().execute_tx(vec![put(&text, &[EntityId::String("z".into())])],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert!(update.committed(), "{:?}", update.error());
+    let current = session.open_owned_read().await.unwrap();
+    let historical = current.identity_page_output(&text, cut, cut, &OwnedIdentityScan::text(None), 2).await.unwrap();
+    let OwnedIdentityPageOutput::Rows(historical) = historical else { panic!("Expected historical owned keys"); };
+    assert_eq!(historical.keys, text_keys);
+    assert!(!historical.more);
+    let erase = session.state_mut().execute_tx(vec![TxOp::OwnedErase { relation: binary.clone(), id: binary_keys[0].clone() }],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert!(erase.committed(), "{:?}", erase.error());
+    assert_eq!(held.check_relation(&binary).unwrap_err().code, "rtdb.owned/read-purged");
+    let after_erase = session.open_owned_read().await.unwrap();
+    let error = after_erase.identity_page_output(&binary, cut, cut, &OwnedIdentityScan::binary(None), 2).await.err().unwrap();
+    assert_eq!(error.code, "rtdb.owned/read-purged");
+    clock.monotonic.store(60_000_000, Ordering::Relaxed);
+    let error = held.identity_page_output(&text, cut, cut, &OwnedIdentityScan::text(None), 1).await.err().unwrap();
+    assert_eq!(error.code, "rtdb.owned/read-expired");
+    drop((current, after_erase, held, session));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn binary_owned_history_keeps_original_positions_and_refuses_duplicate_creates() {
     use rtdb_types::{Interval, OwnedChangeKind, OwnedRelation};
 

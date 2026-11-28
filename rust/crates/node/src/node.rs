@@ -14,7 +14,7 @@ mod owned_usage;
 pub use owned_usage::OwnedStorageUsage;
 mod owned_identities;
 mod owned_unique;
-pub use owned_identities::OwnedIdentityPage;
+pub use owned_identities::{OwnedIdentityArrowPage, OwnedIdentityPage, OwnedIdentityPageOutput};
 pub use owned_changes::{ChangeEdgeOrder, OwnedChangeEdge, archived_changes_at_cut, archived_path_touch_at_cut, archived_versions_at_cut, ExpiryCandidate, ExpiryCandidatePage, OwnedChangeCommit, OwnedMergedChanges, OwnedPublicationLookup, OwnedRelationChanges, OwnedWorldVersionRead, OWNED_MERGED_CHANGE_RELATIONS};
 
 use rtdb_types::StructFields;
