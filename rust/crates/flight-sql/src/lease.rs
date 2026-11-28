@@ -31,6 +31,9 @@ impl<K: Ord + Clone, V: Leased> Registry<K, V> {
     pub fn lookup(&self, key: &K, acquire: bool) -> Lookup<V> {
         self.lookup_at(key, acquire, false)
     }
+    pub fn contains(&self, key: &K) -> bool {
+        self.entries.lock().expect("lease lock").contains_key(key)
+    }
     pub fn lookup_for_close(&self, key: &K) -> Lookup<V> {
         self.lookup_at(key, true, true)
     }
@@ -208,12 +211,14 @@ mod tests {
             assert!(original.closed.load(Ordering::Acquire));
             assert!(matches!(registry.lookup(&1, true), Lookup::Expired(_)));
             assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(value) if Arc::ptr_eq(&value, &original)));
+            assert!(registry.contains(&1));
             original.pending.store(false, Ordering::Release);
             registry.sweep();
             assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(_)));
             clock.0.store(4_000_000, Ordering::Relaxed);
             registry.sweep();
             assert!(matches!(registry.lookup_for_close(&1), Lookup::Unknown));
+            assert!(!registry.contains(&1));
         }
     }
 

@@ -9,7 +9,7 @@ use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExe
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
-use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER, LINKED_STORE_RELEASE, STORE_RELEASE_HEADER};
+use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER, LINKED_STORE_RELEASE, REQUEST_STORE_DRAIN_HEADER, STORE_DRAIN_PROOF_HEADER, STORE_RELEASE_HEADER};
 use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
@@ -24,8 +24,7 @@ use crate::{admin, capability::CellSecret, cipher::Cipher, classic_flight, contr
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
 const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v6";
-const DRAIN_CONTEXT: &str = "rtdb.multi/flight-store-drain/v1";
-const REQUEST_DRAIN_HEADER: &str = "x-rtdb-request-store-drain";
+const DRAIN_CONTEXT: &str = "rtdb.multi/flight-store-drain/v2";
 const DRAIN_HEADER: &str = "x-rtdb-store-drain-ticket";
 const CLOSE_SESSION_FRAME: &[u8] = b"\x00\x00\x00\x00\x0e\x0a\x0cCloseSession";
 const FRESH_HEADER: &str = "x-rtdb-fresh-read";
@@ -72,6 +71,12 @@ struct FreshReplica {
 struct SessionRoute {
     target: Target,
     session: Uuid,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DrainRoute {
+    session: SessionRoute,
+    proof: String,
 }
 
 struct Router {
@@ -203,7 +208,7 @@ async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, r
 }
 
 impl Router {
-    fn decode(&self, context: &str, token: &str) -> std::result::Result<SessionRoute, Status> {
+    fn decode<T: serde::de::DeserializeOwned>(&self, context: &str, token: &str) -> std::result::Result<T, Status> {
         let invalid = || Status::unauthenticated("Invalid Flight SQL session route");
         if token.len() > MAXIMUM_ROUTE_BYTES { return Err(invalid()); }
         let bytes = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
@@ -211,7 +216,7 @@ impl Router {
         serde_json::from_slice(&opened).map_err(|_| invalid())
     }
 
-    fn encode(&self, context: &str, route: &SessionRoute) -> std::result::Result<String, Status> {
+    fn encode(&self, context: &str, route: &impl Serialize) -> std::result::Result<String, Status> {
         let bytes = serde_json::to_vec(route).map_err(|_| Status::internal("Invalid Flight SQL route"))?;
         let sealed = self.routes.seal(context, &bytes).map_err(|_| Status::internal("Could not seal the Flight SQL route"))?;
         let token = URL_SAFE_NO_PAD.encode(sealed);
@@ -411,14 +416,15 @@ impl Router {
         let selector = single_header(request.headers(), DATABASE_HEADER)?;
         let drain = single_header(request.headers(), DRAIN_HEADER)?;
         let draining = drain.is_some();
-        let route = match drain {
+        let (route, drain_proof) = match drain {
             Some(token) if authorization.is_none() && cookie.is_none() && request.uri().path() == DO_ACTION => {
-                Some(self.decode(DRAIN_CONTEXT, token)?)
+                let DrainRoute { session, proof } = self.decode(DRAIN_CONTEXT, token)?;
+                (Some(session), Some(proof))
             }
             Some(_) => return Err(Status::permission_denied("A drain ticket only closes its original session")),
-            None => bearer.or(cookie).map(|token| self.decode(ROUTE_CONTEXT, token)).transpose()?,
+            None => (bearer.or(cookie).map(|token| self.decode(ROUTE_CONTEXT, token)).transpose()?, None),
         };
-        let issue_drain = match single_header(request.headers(), REQUEST_DRAIN_HEADER)? {
+        let issue_drain = match single_header(request.headers(), REQUEST_STORE_DRAIN_HEADER)? {
             Some("1") if route.is_none() && request.uri().path() == HANDSHAKE => true,
             Some(_) => return Err(Status::invalid_argument("Request a drain ticket at the Flight handshake")),
             None => false,
@@ -469,8 +475,17 @@ impl Router {
         headers.remove(header::COOKIE);
         headers.remove(FORWARDED_PEER_HEADER);
         headers.remove(FRESH_HEADER);
-        headers.remove(REQUEST_DRAIN_HEADER);
+        headers.remove(REQUEST_STORE_DRAIN_HEADER);
         headers.remove(DRAIN_HEADER);
+        headers.remove(STORE_DRAIN_PROOF_HEADER);
+        if let Some(proof) = drain_proof {
+            let mut proof = header_value(&proof)?;
+            proof.set_sensitive(true);
+            headers.insert(STORE_DRAIN_PROOF_HEADER, proof);
+        }
+        if issue_drain {
+            headers.insert(REQUEST_STORE_DRAIN_HEADER, HeaderValue::from_static("1"));
+        }
         headers.insert(GATEWAY_ANSWER_DEADLINE_HEADER, HeaderValue::from_static("forward"));
         headers.insert(DATABASE_HEADER, header_value(&target.name)?);
         if let Some(session) = session {
@@ -564,6 +579,7 @@ impl Router {
 
     fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, issue_drain: bool) -> std::result::Result<(), Status> {
         headers.remove(DRAIN_HEADER);
+        let drain_proof = headers.remove(STORE_DRAIN_PROOF_HEADER);
         let Some(cookie) = headers.remove(header::SET_COOKIE) else { return Ok(()); };
         let cookie = cookie.to_str().map_err(|_| Status::internal("Invalid private Flight SQL cookie"))?;
         if cookie.contains("Max-Age=0") {
@@ -578,8 +594,11 @@ impl Router {
         let route = self.encode(ROUTE_CONTEXT, &session)?;
         if issue_drain && headers.contains_key(header::AUTHORIZATION)
             && single_header(headers, STORE_RELEASE_HEADER)? == Some(LINKED_STORE_RELEASE)
+            && let Some(proof) = drain_proof
         {
-            let mut ticket = header_value(&self.encode(DRAIN_CONTEXT, &session)?)?;
+            let proof = proof.to_str().ok().filter(|proof| proof.len() == 43)
+                .ok_or_else(|| Status::internal("Invalid private Flight Store drain proof"))?;
+            let mut ticket = header_value(&self.encode(DRAIN_CONTEXT, &DrainRoute { session, proof: proof.into() })?)?;
             ticket.set_sensitive(true);
             headers.insert(DRAIN_HEADER, ticket);
         }
@@ -595,6 +614,7 @@ fn strip_session_credentials(headers: &mut HeaderMap) {
     headers.remove(header::SET_COOKIE);
     headers.remove(header::AUTHORIZATION);
     headers.remove(DRAIN_HEADER);
+    headers.remove(STORE_DRAIN_PROOF_HEADER);
 }
 
 async fn inspect_drain_action(mut body: impl Body<Data = Bytes> + Unpin) -> std::result::Result<RequestBody, Status> {

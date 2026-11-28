@@ -15,6 +15,9 @@ use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
 use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::{Binding, ServerStatus}, state::{ConnectionResource, Prepared, PreparedScope, Session, StoreReadLease, Transaction}, wire};
 use crate::store_release::{self, StoreRelease};
 
+pub(crate) mod store_drain;
+use store_drain::{REQUEST_STORE_DRAIN_HEADER, STORE_DRAIN_PROOF_HEADER};
+
 pub(crate) const CLOSE_SESSION: &str = "CloseSession";
 const CLASSIC_RETAINED_PROOF: &str = "x-rtdb-classic-retained-proof";
 const MAX_CLASSIC_RETAINED_PROOF: usize = 4608;
@@ -330,6 +333,7 @@ impl Service {
         self.publish();
     }
     pub fn close(&self) {
+        self.0.cancellation.cancel();
         self.0.exact_reads.close();
         self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
         self.publish();
@@ -709,6 +713,20 @@ impl FlightService for Service {
             self.check_family_readback_handshake(&call).await.map_err(|status| call.error(status))?;
         }
         let release = if call.minted { call.session.store_release } else { None };
+        let drain_proof = if release.is_some() && call.session.caller.verified_credential {
+            let offered = request.metadata().get_all(REQUEST_STORE_DRAIN_HEADER);
+            let mut offered = offered.iter();
+            match offered.next() {
+                Some(value) if value == "1" && offered.next().is_none() => {
+                    let session = Uuid::parse_str(&call.session.id).map_err(arrow)?;
+                    let mut proof: tonic::metadata::MetadataValue<_> =
+                        self.0.auth.issue_store_drain(session, &call.database).parse().map_err(arrow)?;
+                    proof.set_sensitive(true);
+                    Some(proof)
+                }
+                _ => None,
+            }
+        } else { None };
         let retained_basis_append = call.minted && call.session.caller.verified_credential
             && call.session.caller.principal.label_scope().is_none()
             && call.session.caller.principal.workload_grant().is_none()
@@ -747,6 +765,9 @@ impl FlightService for Service {
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());
+        }
+        if let Some(proof) = drain_proof {
+            reply.metadata_mut().insert(STORE_DRAIN_PROOF_HEADER, proof);
         }
         Ok(reply)
     }
@@ -886,6 +907,7 @@ impl FlightService for Service {
     }
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let name = request.get_ref().r#type.as_str();
+        let drain_proof = self.store_drain_proof(&request)?;
         if crate::v1::requests_funded_offer(name) {
             return Err(crate::v1::error::funding_kernel_unavailable());
         }
@@ -914,7 +936,18 @@ impl FlightService for Service {
             return rtdb_types::boxed(|| self.v1_action(call, request.into_inner())).await;
         }
         let kind = CallKind::action(name);
-        let mut call = rtdb_types::boxed(|| self.call_with_kind(&request, request.get_ref().encoded_len(), kind)).await?;
+        let admitted = rtdb_types::boxed(|| self.call_with_kind(&request, request.get_ref().encoded_len(), kind)).await;
+        let mut call = match admitted {
+            Ok(call) => call,
+            Err(error) => {
+                if let Some(proof) = drain_proof
+                    && let Some(reply) = self.confirm_forgotten_store_drain(&proof)?
+                {
+                    return Ok(reply);
+                }
+                return Err(error);
+            }
+        };
         let proof_headers = request.metadata().get_all(CLASSIC_RETAINED_PROOF);
         let mut proofs = proof_headers.iter();
         if let Some(proof) = proofs.next() {

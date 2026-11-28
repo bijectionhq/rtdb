@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rtdb_auth::{Authenticator, Method};
 use rtdb_node::SessionIdentity;
@@ -53,11 +53,26 @@ pub(crate) fn cookie<T>(request: &Request<T>) -> Option<&str> {
 }
 fn random_key() -> Zeroizing<[u8; 32]> { let mut key = [0; 32]; key[..16].copy_from_slice(Uuid::new_v4().as_bytes()); key[16..].copy_from_slice(Uuid::new_v4().as_bytes()); Zeroizing::new(key) }
 pub(crate) fn equal(left: &[u8], right: &[u8]) -> bool { bool::from(left.ct_eq(right)) }
-pub(crate) struct Authentication { authenticator: Arc<Authenticator>, key: Zeroizing<[u8; 32]>, ticket_key: Zeroizing<[u8; 32]> }
+pub(crate) struct Authentication { authenticator: Arc<Authenticator>, key: Zeroizing<[u8; 32]>, ticket_key: Zeroizing<[u8; 32]>, store_drain_key: Zeroizing<[u8; 32]> }
 impl Authentication {
-    pub fn new(authenticator: Arc<Authenticator>) -> Self { Self { authenticator, key: random_key(), ticket_key: random_key() } }
+    pub fn new(authenticator: Arc<Authenticator>) -> Self { Self { authenticator, key: random_key(), ticket_key: random_key(), store_drain_key: random_key() } }
     pub fn mac(&self, raw: &str) -> [u8; 32] { let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_ref()).expect("HMAC key"); mac.update(raw.as_bytes()); mac.finalize().into_bytes().into() }
     pub fn ticket_mac(&self) -> Hmac<Sha256> { Hmac::<Sha256>::new_from_slice(self.ticket_key.as_ref()).expect("HMAC key") }
+    fn store_drain_mac(&self, session: Uuid, database: &str) -> Hmac<Sha256> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.store_drain_key.as_ref()).expect("HMAC key");
+        mac.update(b"rtdb.flight.store-drain.receiver.v1\0");
+        mac.update(session.as_bytes());
+        mac.update(database.as_bytes());
+        mac
+    }
+    pub fn issue_store_drain(&self, session: Uuid, database: &str) -> String {
+        URL_SAFE_NO_PAD.encode(self.store_drain_mac(session, database).finalize().into_bytes())
+    }
+    pub fn verify_store_drain(&self, session: Uuid, database: &str, proof: &[u8]) -> bool {
+        proof.len() == 43 && URL_SAFE_NO_PAD.decode(proof).ok().is_some_and(|proof| {
+            self.store_drain_mac(session, database).verify_slice(&proof).is_ok()
+        })
+    }
     pub async fn authenticate(&self, credentials: &Credentials<'_>, peer: Option<&str>) -> Result<Arc<Caller>, Status> {
         let (principal, verified_credential) = match credentials {
             Credentials::None => { if self.authenticator.method_for(None, peer) != Some(Method::Trust) { return Err(unauthenticated("authentication required")); } (self.authenticator.unauthenticated().map_err(auth_error)?, false) }
@@ -149,6 +164,28 @@ mod tests {
             assert_eq!(caller.principal.user_id(), Some("xtdb"));
             assert_eq!(caller.verified_credential, verified);
         }
+    }
+
+    #[tokio::test]
+    async fn the_store_drain_proof_is_bound_to_its_receiver_session_and_database() {
+        use rtdb_auth::{AuthConfig, NativeHttp};
+        use rtdb_columnar::MemoryBudget;
+        use std::time::Duration;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let http = Arc::new(NativeHttp::new(memory.clone(), Duration::from_secs(1), 1024).unwrap());
+        let authenticator = Authenticator::open(
+            AuthConfig::SingleRootUser { password: None }, memory, Arc::new(rtdb_node::SystemClock), http,
+        ).await.unwrap();
+        let receiver = Authentication::new(authenticator.clone());
+        let replacement = Authentication::new(authenticator);
+        let session = Uuid::from_u128(1);
+        let proof = receiver.issue_store_drain(session, "original");
+        assert!(receiver.verify_store_drain(session, "original", proof.as_bytes()));
+        assert!(!receiver.verify_store_drain(session, "replacement", proof.as_bytes()));
+        assert!(!receiver.verify_store_drain(Uuid::from_u128(2), "original", proof.as_bytes()));
+        assert!(!replacement.verify_store_drain(session, "original", proof.as_bytes()));
+        assert!(!receiver.verify_store_drain(session, "original", b"malformed"));
     }
 
     #[test]

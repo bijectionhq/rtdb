@@ -4386,7 +4386,8 @@ actor Gateway {
     -- The gateway accepts that ticket only for a single uncompressed CloseSession action and routes it to the ticket's original placement.
     -- A drain ticket carries no data request authority.
     -- Completion requires the original receiver's explicit Store read drain acknowledgement.
-    -- An original receiver with a registered closed session can retry the close acknowledgement at the same placement.
+    -- An enrolled receiver signs a close-only proof naming the exact session and database. The gateway carries the private proof in the sealed original-placement ticket.
+    -- The original receiver can replay a close acknowledgement after its session registry sweeps a fenced and drained session. Its signing key belongs to the receiver process.
     -- An expired Store session keeps its close identity while its reads or reply buffers are pending. Only CloseSession can resolve it.
     -- An enrolled Store bearer retains the close operation at its exact original attachment after its startup credential loses access.
     -- The original Store receiver can acknowledge close after local detachment. A same-named replacement cannot acknowledge the old session.

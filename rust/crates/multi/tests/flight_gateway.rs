@@ -165,6 +165,7 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     assert!(!ordinary.metadata().contains_key("x-rtdb-store-drain-ticket"));
     let _: Vec<_> = ordinary.into_inner().try_collect().await.unwrap();
     let enrolled = raw.handshake(startup(true)).await.unwrap();
+    assert!(!enrolled.metadata().contains_key(rtdb_flight_sql::STORE_DRAIN_PROOF_HEADER));
     let drain = enrolled.metadata().get("x-rtdb-store-drain-ticket").unwrap().clone();
     let _: Vec<_> = enrolled.into_inner().try_collect().await.unwrap();
 
@@ -185,6 +186,7 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     let confirmation = raw.do_action(close).await.unwrap();
     assert!(!confirmation.metadata().contains_key("authorization"));
     assert!(!confirmation.metadata().contains_key("set-cookie"));
+    assert!(!confirmation.metadata().contains_key(rtdb_flight_sql::STORE_DRAIN_PROOF_HEADER));
     let mut results = confirmation.into_inner();
     let result = results.message().await.unwrap().unwrap();
     assert_eq!(result.body.as_ref(), &[8, 1, 16, 1]);

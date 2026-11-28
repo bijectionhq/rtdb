@@ -21,6 +21,7 @@ pub use follower::NativeFollowerAssignment;
 pub use config::{FORWARDED_PEER_HEADER, ClassicFlightExclusion, ClassicRetainedAdmission, ClassicRetainedRead, FlightConfig, FlightPeerVerifier, HostedControlConfig};
 pub use actions::classic_retained_action;
 pub use server::{FlightEgress, FlightEgressIo, ServerDriver, ServerHandle, ServerStatus};
+pub use service::store_drain::{REQUEST_STORE_DRAIN_HEADER, STORE_DRAIN_PROOF_HEADER};
 pub use store_release::{HEADER as STORE_RELEASE_HEADER, LINKED_RELEASE as LINKED_STORE_RELEASE};
 
 mod owned_actions;
