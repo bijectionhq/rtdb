@@ -5307,7 +5307,9 @@ mod tests {
         ]).unwrap();
         let source = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![array]).unwrap();
         let backing = memory.reserve(source.get_array_memory_size()).unwrap();
-        let source = rtdb_columnar::OwnedBatch::with_reservation(source, backing).unwrap();
+        let schema_owner = memory.reserve(4096).unwrap();
+        let source_schema_charge = Arc::downgrade(&schema_owner);
+        let source = rtdb_columnar::OwnedBatch::with_reservation(source, backing).unwrap().with_schema_reservation(schema_owner);
         let child = source.batch().column(0).as_any().downcast_ref::<ListArray>().unwrap().values().clone();
         let charge = Arc::downgrade(source.reservation());
         let expression = Expr::Subscript {
@@ -5321,13 +5323,17 @@ mod tests {
         let page = cursor.next_batch().await.unwrap().unwrap();
         for row in 0..2 {
             assert_eq!(page.columns[0].value(row).unwrap(), second);
-            let (array, _, _, offset) = page.columns[0].arrow_cell(row).unwrap().unwrap();
-            assert!(std::ptr::eq(array, child.as_ref()));
-            assert_eq!(offset, 2);
+            let cell = page.columns[0].funded_arrow_cell(row, page.column_reservation(0)).unwrap().unwrap();
+            assert!(Arc::ptr_eq(cell.array, &child));
+            assert_eq!(cell.row, 2);
+            assert_eq!(cell.field.name(), "value");
+            assert!(cell.owner.bytes() >= cell.field.size());
+            assert!(cell.owner.backing().iter().any(|owner| Arc::downgrade(owner).ptr_eq(&charge)));
         }
         drop(cursor);
         drop(child);
         assert!(charge.upgrade().is_some());
+        assert!(source_schema_charge.upgrade().is_none());
         drop(page);
         assert!(charge.upgrade().is_none());
     }
@@ -7821,7 +7827,7 @@ pub(crate) mod projection {
     pub(super) fn list_subscript(
         expression: &Expr, output: &LogicalType, schema: &Schema, batch: &ColumnBatch, execution: &crate::context::Execution,
     ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, hash_map::Entry};
         use arrow_array::NullArray;
         use rtdb_columnar::ArrowCell;
         use rtdb_plan::{BinaryOp, UnaryOp};
@@ -7919,13 +7925,23 @@ pub(crate) mod projection {
                 continue;
             }
             let key = (Arc::as_ptr(child_array).cast::<()>(), Arc::as_ptr(child), Arc::as_ptr(owner));
-            let source = *source_positions.entry(key).or_insert_with(|| {
-                let id = sources.len();
-                let logical = LogicalType::Scalar(scalar.clone());
-                let logical = if child.is_nullable() { logical.maybe() } else { logical };
-                sources.push(Some((Arc::clone(child_array), Arc::clone(child), Some(logical), Some(Arc::clone(owner)))));
-                id
-            });
+            let source = match source_positions.entry(key) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    let field = ArrowField::new("value", result_type.clone(), child.is_nullable());
+                    let bytes = field.size().checked_add(256).ok_or_else(size_error)?;
+                    let charge = match context.memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(owner))) {
+                        Ok(charge) => charge,
+                        Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    let logical = LogicalType::Scalar(scalar.clone());
+                    let logical = if field.is_nullable() { logical.maybe() } else { logical };
+                    let id = sources.len();
+                    sources.push(Some((Arc::clone(child_array), Arc::new(field), Some(logical), Some(charge))));
+                    *entry.insert(id)
+                }
+            };
             picks.push((source, child_row));
         }
         drop(source_positions);
