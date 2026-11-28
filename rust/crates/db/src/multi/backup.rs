@@ -27,20 +27,7 @@ use files::ArchivedFiles;
 
 pub struct PortableBackup(Vec<u8>);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthenticatedCut {
-    pub head: Head,
-    pub catalog_root: CatalogRoot,
-}
-
-impl AuthenticatedCut {
-    pub fn matches(self, incarnation: [u8; 16], at: Lsn) -> bool {
-        self.catalog_root.0 != [0; 32] && self.head.valid()
-            && self.head.stream == StreamId(u128::from_be_bytes(incarnation))
-            && self.head.size == at.0
-    }
-}
+pub use rtdb_lineage::AuthenticatedCut;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

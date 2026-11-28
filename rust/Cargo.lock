@@ -5137,6 +5137,7 @@ dependencies = [
  "rtdb-crypt",
  "rtdb-format",
  "rtdb-index",
+ "rtdb-lineage",
  "rtdb-logkeeper",
  "rtdb-storage",
  "rtdb-store",

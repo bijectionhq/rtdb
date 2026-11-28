@@ -16,6 +16,7 @@ rtdb-storage.workspace = true
 rtdb-store = { path = "../store" }
 rtdb-tx.workspace = true
 rtdb-types.workspace = true
+rtdb-lineage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -115,7 +115,10 @@ impl ActivationAuthority {
             .authenticated_head(StreamId(expected.incarnation.as_u128()), Some(through.0))
             .await
             .map_err(journal_error)?;
-        let floor = rtdb_lineage::LineageFloor { binding: expected, source_root: history.genesis.root(), source_head: head.head };
+        let floor = rtdb_lineage::LineageFloor {
+            binding: expected,
+            source: rtdb_db::AuthenticatedCut { head: head.head, catalog_root: history.genesis.root() },
+        };
         if !floor.valid() {
             return Err(conflict());
         }

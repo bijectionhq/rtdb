@@ -35,19 +35,89 @@ pub fn activation_stream_id(authority: Uuid, name: &str) -> Result<StreamId> {
     Ok(StreamId(u128::from_be_bytes(digest[..16].try_into().unwrap())))
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// A signed head of one stream, with the root of the catalog that signed it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct AuthenticatedCut {
+    pub head: Head,
+    pub catalog_root: CatalogRoot,
+}
+
+impl AuthenticatedCut {
+    pub fn matches(self, incarnation: [u8; 16], at: Lsn) -> bool {
+        self.catalog_root.0 != [0; 32] && self.head.valid()
+            && self.head.stream == StreamId(u128::from_be_bytes(incarnation))
+            && self.head.size == at.0
+    }
+
+    pub fn end(self) -> Lsn {
+        Lsn(self.head.size)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "SegmentRecord", into = "SegmentRecord")]
 pub struct LineageSegment {
     pub authority: Uuid,
     pub database: String,
     pub predecessor: Binding,
     pub successor: Binding,
-    pub source_catalog: Uuid,
-    pub source_root: CatalogRoot,
-    pub source_stream: StreamId,
-    pub source_head: Head,
-    pub end: Lsn,
+    pub source: AuthenticatedCut,
     pub previous: Option<Hash>,
+}
+
+/// The published form of a segment. Every release reads and writes it, so
+/// it still repeats the source head's catalog, stream and size.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SegmentRecord {
+    authority: Uuid,
+    database: String,
+    predecessor: Binding,
+    successor: Binding,
+    source_catalog: Uuid,
+    source_root: CatalogRoot,
+    source_stream: StreamId,
+    source_head: Head,
+    end: Lsn,
+    previous: Option<Hash>,
+}
+
+impl TryFrom<SegmentRecord> for LineageSegment {
+    type Error = &'static str;
+
+    fn try_from(record: SegmentRecord) -> std::result::Result<Self, Self::Error> {
+        let head = record.source_head;
+        if head.catalog != record.source_catalog || head.stream != record.source_stream || head.size != record.end.0 {
+            return Err("the lineage segment disagrees with its source head");
+        }
+        Ok(Self {
+            authority: record.authority,
+            database: record.database,
+            predecessor: record.predecessor,
+            successor: record.successor,
+            source: AuthenticatedCut { head, catalog_root: record.source_root },
+            previous: record.previous,
+        })
+    }
+}
+
+impl From<LineageSegment> for SegmentRecord {
+    fn from(segment: LineageSegment) -> Self {
+        let head = segment.source.head;
+        Self {
+            authority: segment.authority,
+            database: segment.database,
+            predecessor: segment.predecessor,
+            successor: segment.successor,
+            source_catalog: head.catalog,
+            source_root: segment.source.catalog_root,
+            source_stream: head.stream,
+            source_head: head,
+            end: segment.source.end(),
+            previous: segment.previous,
+        }
+    }
 }
 
 impl LineageSegment {
@@ -58,14 +128,14 @@ impl LineageSegment {
             && self.predecessor.incarnation != self.successor.incarnation
             && self.predecessor.revision > 0
             && self.predecessor.revision.checked_add(1) == Some(self.successor.revision)
-            && self.source_stream == StreamId(self.predecessor.incarnation.as_u128())
-            && self.source_root.0 != [0; 32]
-            && self.source_head.valid()
-            && self.source_head.catalog == self.source_catalog
-            && self.source_head.stream == self.source_stream
-            && self.source_head.size == self.end.0
+            && self.source.matches(*self.predecessor.incarnation.as_bytes(), self.end())
             && self.previous != Some([0; 32])
             && activation_stream_id(self.authority, &self.database).is_ok()
+    }
+
+    /// The inclusive position the segment ends at.
+    pub fn end(&self) -> Lsn {
+        self.source.end()
     }
 
     pub fn digest(&self) -> Hash {
@@ -78,11 +148,12 @@ impl LineageSegment {
             digest.update(binding.incarnation.as_bytes());
             digest.update(binding.revision.to_be_bytes());
         }
-        digest.update(self.source_catalog.as_bytes());
-        digest.update(self.source_root.0);
-        digest.update(self.source_stream.0.to_be_bytes());
-        digest.update(self.source_head.statement());
-        digest.update(self.end.0.to_be_bytes());
+        let head = self.source.head;
+        digest.update(head.catalog.as_bytes());
+        digest.update(self.source.catalog_root.0);
+        digest.update(head.stream.0.to_be_bytes());
+        digest.update(head.statement());
+        digest.update(head.size.to_be_bytes());
         match self.previous {
             Some(previous) => {
                 digest.update([1]);
@@ -104,25 +175,42 @@ impl LineageSegment {
 /// The serving incarnation's published prefix. Every later cut of this
 /// incarnation keeps it, so an append inside it is part of the lineage.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "FloorRecord", into = "FloorRecord")]
 pub struct LineageFloor {
     pub binding: Binding,
-    pub source_root: CatalogRoot,
-    pub source_head: Head,
+    pub source: AuthenticatedCut,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FloorRecord {
+    binding: Binding,
+    source_root: CatalogRoot,
+    source_head: Head,
+}
+
+impl From<FloorRecord> for LineageFloor {
+    fn from(record: FloorRecord) -> Self {
+        Self { binding: record.binding, source: AuthenticatedCut { head: record.source_head, catalog_root: record.source_root } }
+    }
+}
+
+impl From<LineageFloor> for FloorRecord {
+    fn from(floor: LineageFloor) -> Self {
+        Self { binding: floor.binding, source_root: floor.source.catalog_root, source_head: floor.source.head }
+    }
 }
 
 impl LineageFloor {
     pub fn valid(&self) -> bool {
         !self.binding.incarnation.is_nil()
             && self.binding.revision > 0
-            && self.source_root.0 != [0; 32]
-            && self.source_head.valid()
-            && self.source_head.size > 0
-            && self.source_head.stream == StreamId(self.binding.incarnation.as_u128())
+            && self.end().0 > 0
+            && self.source.matches(*self.binding.incarnation.as_bytes(), self.end())
     }
 
     pub fn end(&self) -> Lsn {
-        Lsn(self.source_head.size)
+        self.source.end()
     }
 }
 
@@ -187,7 +275,7 @@ impl PublicationProof {
         if state.version != LINEAGE_PROTOCOL {
             return Err(invalid("The control record is not a lineage activation record"));
         }
-        if let Some(floor) = state.floor.filter(|floor| Some(floor.source_head.stream) == source) {
+        if let Some(floor) = state.floor.filter(|floor| Some(floor.source.head.stream) == source) {
             if !floor.valid() || floor.binding != state.binding {
                 return Err(invalid("The activation record does not publish this lineage floor"));
             }
@@ -277,7 +365,7 @@ impl SettlementCut {
     fn matches(self, segment: &LineageSegment) -> bool {
         self.predecessor == segment.predecessor
             && self.successor == segment.successor
-            && self.end == segment.end
+            && self.end == segment.end()
     }
 }
 
@@ -329,21 +417,22 @@ pub fn verify_settlement_at(
         return Ok(Settlement::Pending);
     };
     let control_catalog = publication.control_inclusion.signed_head.head.catalog;
-    let (source_root, source_head, end, closed) =
+    let (source, closed) =
         match publication.published(authority, database, control_root, Some(authorization.stream))? {
             Published::Closed(segment) => {
                 if selected.is_some_and(|cut| !cut.matches(&segment)) {
                     return Err(invalid("The publication differs from the selected predecessor, successor, or end"));
                 }
-                (segment.source_root, segment.source_head, segment.end, true)
+                (segment.source, true)
             }
             Published::Open(floor) => {
                 if selected.is_some() {
                     return Err(invalid("The publication is an open floor, not the selected cut"));
                 }
-                (floor.source_root, floor.source_head, floor.end(), false)
+                (floor.source, false)
             }
         };
+    let (source_root, source_head, end) = (source.catalog_root, source.head, source.end());
     if source_root == control_root || source_head.catalog == control_catalog {
         return Err(invalid(
             "Lineage requires independent control and application catalogs",

@@ -112,25 +112,28 @@ fn activation_record(binding: Binding) -> serde_json::Value {
     })
 }
 
+fn cut(source: &Archive) -> AuthenticatedCut {
+    AuthenticatedCut { head: source.signed_head.head, catalog_root: source.history.genesis.root() }
+}
+
+fn segment(source: &Archive) -> LineageSegment {
+    LineageSegment {
+        authority: AUTHORITY,
+        database: DATABASE.into(),
+        predecessor: PREDECESSOR,
+        successor: SUCCESSOR,
+        source: cut(source),
+        previous: Some([9; 32]),
+    }
+}
+
 fn publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
     publication_with(source, |_| ())
 }
 
 fn publication_with(source: &Archive, amend: impl FnOnce(&mut serde_json::Value)) -> (PublicationProof, CatalogRoot) {
     let control_stream = activation_stream_id(AUTHORITY, DATABASE).unwrap();
-    let source_head = source.signed_head.head;
-    let segment = LineageSegment {
-        authority: AUTHORITY,
-        database: DATABASE.into(),
-        predecessor: PREDECESSOR,
-        successor: SUCCESSOR,
-        source_catalog: source_head.catalog,
-        source_root: source.history.genesis.root(),
-        source_stream: source_head.stream,
-        source_head,
-        end: Lsn(source_head.size),
-        previous: None,
-    };
+    let segment = segment(source);
     let mut state = activation_record(SUCCESSOR);
     state["publication"] = serde_json::json!({
         "operation": Uuid::from_u128(8),
@@ -370,8 +373,7 @@ fn floor_publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
     let control_stream = activation_stream_id(AUTHORITY, DATABASE).unwrap();
     let floor = LineageFloor {
         binding: PREDECESSOR,
-        source_root: source.history.genesis.root(),
-        source_head: source.signed_head.head,
+        source: cut(source),
     };
     let mut state = activation_record(PREDECESSOR);
     state["floor"] = serde_json::to_value(floor).unwrap();
@@ -445,4 +447,76 @@ fn authorization_reads_a_full_width_stream_id() {
     let authorization = Authorization { stream: StreamId(1 << 100), ..authorization(1) };
     let json = serde_json::to_vec(&authorization).unwrap();
     assert_eq!(serde_json::from_slice::<Authorization>(&json).unwrap(), authorization);
+}
+
+fn published_segment(source: &Archive) -> serde_json::Value {
+    let head = source.signed_head.head;
+    serde_json::json!({
+        "authority": AUTHORITY,
+        "database": DATABASE,
+        "predecessor": PREDECESSOR,
+        "successor": SUCCESSOR,
+        "source_catalog": head.catalog,
+        "source_root": source.history.genesis.root(),
+        "source_stream": head.stream,
+        "source_head": head,
+        "end": head.size,
+        "previous": Some([9u8; 32]),
+    })
+}
+
+#[test]
+fn segment_keeps_its_published_form_and_digest() {
+    let source = archive(SOURCE, STREAM, [leaf(1), leaf(2)]);
+    let published = published_segment(&source);
+    let segment: LineageSegment = serde_json::from_value(published.clone()).unwrap();
+    assert_eq!(segment, self::segment(&source));
+    assert_eq!(segment.end(), Lsn(2));
+    assert_eq!(serde_json::to_value(&segment).unwrap(), published);
+
+    let head = source.signed_head.head;
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb/activation/lineage-segment/v1\0");
+    digest.update(AUTHORITY.as_bytes());
+    digest.update((DATABASE.len() as u64).to_be_bytes());
+    digest.update(DATABASE.as_bytes());
+    for binding in [PREDECESSOR, SUCCESSOR] {
+        digest.update(binding.incarnation.as_bytes());
+        digest.update(binding.revision.to_be_bytes());
+    }
+    digest.update(head.catalog.as_bytes());
+    digest.update(source.history.genesis.root().0);
+    digest.update(head.stream.0.to_be_bytes());
+    digest.update(head.statement());
+    digest.update(head.size.to_be_bytes());
+    digest.update([1]);
+    digest.update([9; 32]);
+    assert_eq!(segment.digest(), <Hash>::from(digest.finalize()));
+}
+
+#[test]
+fn segment_refuses_a_published_form_that_disagrees_with_its_head() {
+    let source = archive(SOURCE, STREAM, [leaf(1)]);
+    for (field, value) in [
+        ("end", serde_json::json!(2)),
+        ("source_stream", serde_json::json!(STREAM.0 + 1)),
+        ("source_catalog", serde_json::json!(CONTROL)),
+    ] {
+        let mut published = published_segment(&source);
+        published[field] = value;
+        assert!(serde_json::from_value::<LineageSegment>(published).is_err(), "{field}");
+    }
+}
+
+#[test]
+fn floor_keeps_its_published_form() {
+    let source = archive(SOURCE, STREAM, [leaf(1)]);
+    let published = serde_json::json!({
+        "binding": PREDECESSOR,
+        "source_root": source.history.genesis.root(),
+        "source_head": source.signed_head.head,
+    });
+    let floor: LineageFloor = serde_json::from_value(published.clone()).unwrap();
+    assert_eq!(floor, LineageFloor { binding: PREDECESSOR, source: cut(&source) });
+    assert_eq!(serde_json::to_value(&floor).unwrap(), published);
 }

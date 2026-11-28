@@ -192,10 +192,8 @@ impl State {
                     && publication.segment.is_some() == self.uses_lineage()
                     && publication.segment.as_ref().is_none_or(|segment| {
                         segment.predecessor == publication.predecessor && segment.successor == self.binding
-                            && segment.end == Lsn(completed.source_cut.lsn)
-                            && completed.source_head.is_some_and(|source| {
-                                segment.source_head == source.head && segment.source_root == source.catalog_root
-                            })
+                            && segment.end() == Lsn(completed.source_cut.lsn)
+                            && completed.source_head == Some(segment.source)
                     })
                     && custody_protocol(completed.key_hold, completed.journal_hold, completed.objects_sha256)
                         .is_some_and(|protocol| self.recovery_protocol() >= protocol)
@@ -709,11 +707,7 @@ impl ActivationAuthority {
             database: name.to_owned(),
             predecessor: operation.predecessor,
             successor: successor_binding,
-            source_catalog: source.head.catalog,
-            source_root: source.catalog_root,
-            source_stream: source.head.stream,
-            source_head: source.head,
-            end: Lsn(installation.source_cut.lsn),
+            source,
             previous: frozen.publication.as_ref().and_then(|prior| prior.segment.as_ref()).map(|segment| segment.digest()),
         });
         if segment.as_ref().is_some_and(|segment| !segment.valid()) { return Err(conflict()); }
@@ -900,7 +894,7 @@ mod tests {
         let inclusion = source_journal.inclusion(stream, at, Some(at.0)).await.unwrap();
         let committed = inclusion.verify(source_root).unwrap();
         let authorization = Authorization {
-            catalog: floor.source_head.catalog,
+            catalog: floor.source.head.catalog,
             stream,
             writer_epoch: committed.writer_epoch,
             at,
@@ -1063,8 +1057,8 @@ mod tests {
         let segment = archived.verify(identity, NAME, control_root).unwrap();
         assert_eq!(segment.successor, binding);
         let application = PortableBackup::lineage_archive(&backup, source_root).unwrap().unwrap();
-        assert_eq!(application.signed_head.head, segment.source_head);
-        assert_eq!(application.inclusion(segment.end).unwrap().verify(source_root).unwrap().at, segment.end);
+        assert_eq!(application.signed_head.head, segment.source.head);
+        assert_eq!(application.inclusion(segment.end()).unwrap().verify(source_root).unwrap().at, segment.end());
     }
 
     #[tokio::test]
