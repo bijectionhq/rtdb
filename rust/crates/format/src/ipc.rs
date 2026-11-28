@@ -116,7 +116,6 @@ impl<R: Read + Seek + Send> RetainedReader for StreamReader<R> {}
 struct RangeReader<R, F> {
     reader: StreamReader<R>,
     retain: F,
-    file_blocks: bool,
 }
 
 impl<R: Read, F> Read for RangeReader<R, F> {
@@ -137,12 +136,6 @@ where
         let bytes = (self.retain)(range.start as u64..range.end as u64)?;
         if bytes.len() != range.len() || bytes.as_ptr().align_offset(std::mem::align_of::<u128>()) != 0 {
             return None;
-        }
-        if self.file_blocks {
-            let message = arrow_ipc::root_as_message(&bytes[block_header(&bytes).ok()?]).ok()?;
-            let nodes = message.header_as_record_batch()?.nodes()?;
-            // File normalization edits the encoded block in place on the ordinary read path.
-            if nodes.iter().any(|node| node.null_count() < 0) { return None; }
         }
         Some(Buffer::from(bytes))
     }
@@ -211,7 +204,7 @@ impl ArrowFile {
         retain: impl FnMut(Range<u64>) -> Option<Bytes> + Send + 'static,
     ) -> Result<Self> {
         let layout = inspect_file(&mut reader)?;
-        Self::open_inspected(Box::new(RangeReader { reader: StreamReader(reader), retain, file_blocks: true }), projection, layout)
+        Self::open_inspected(Box::new(RangeReader { reader: StreamReader(reader), retain }), projection, layout)
     }
 
     /// The layout must describe this immutable reader, as returned by `inspect_file`.
@@ -858,7 +851,7 @@ impl ArrowStream<Cursor<Arc<[u8]>>> {
         reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>,
         retain: impl FnMut(Range<u64>) -> Option<Bytes> + Send + 'static,
     ) -> Result<Self> {
-        Self::from_input(StreamInput::Ranges(Box::new(RangeReader { reader: StreamReader(reader), retain, file_blocks: false })), projection)
+        Self::from_input(StreamInput::Ranges(Box::new(RangeReader { reader: StreamReader(reader), retain })), projection)
     }
 }
 impl<R: Read> ArrowStream<R> {
@@ -2446,6 +2439,65 @@ fn seekable_event_projection_funds_only_selected_decode_and_wire_with_unknown_nu
     assert!(!fields.contains_key("ignored"));
     drop((page, charge));
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn legacy_file_range_keeps_funded_backing_after_null_count_normalization() {
+    use arrow_array::Int64Array;
+    use arrow_ipc::{MetadataVersion, writer::FileWriter};
+
+    struct FundedFile {
+        bytes: Buffer,
+        _charge: Arc<MemoryReservation>,
+    }
+    impl AsRef<[u8]> for FundedFile {
+        fn as_ref(&self) -> &[u8] { self.bytes.as_slice() }
+    }
+
+    let expected = RecordBatch::try_from_iter([
+        ("n", Arc::new(Int64Array::from(vec![Some(3), None, Some(7)])) as ArrayRef),
+    ]).unwrap();
+    let options = IpcWriteOptions::try_new(64, false, MetadataVersion::V5).unwrap();
+    let mut writer = FileWriter::try_new_with_options(Vec::new(), expected.schema_ref(), options).unwrap();
+    writer.write(&expected).unwrap();
+    let mut file = writer.into_inner().unwrap();
+    let tail = file.len() - 10;
+    let footer = tail - arrow_ipc::reader::read_footer_length(file[tail..].try_into().unwrap()).unwrap();
+    let pages = PageDecoder::from_footer(&file[footer..tail], footer as u64, None).unwrap();
+    let range = pages.page_range(0).unwrap();
+    let block = &file[range.start as usize..range.end as usize];
+    let (header, body_start) = block_message(pages.block(0).unwrap(), block).unwrap();
+    let message = arrow_ipc::root_as_message(&block[header]).unwrap();
+    let nodes = message.header_as_record_batch().unwrap().nodes().unwrap();
+    let null_count = nodes.get(0).0.as_ptr() as usize - file.as_ptr() as usize + 8;
+    file[null_count..null_count + 8].copy_from_slice(&(-1_i64).to_le_bytes());
+    let memory = MemoryBudget::new(1 << 20);
+    for shift in [0, 1] {
+        let mut envelope = vec![0; shift];
+        envelope.extend_from_slice(&file);
+        let charge = memory.reserve(envelope.len()).unwrap();
+        let funded = charge.bytes();
+        let bytes = Bytes::from_owner(FundedFile {
+            bytes: Buffer::from_slice_ref(&envelope),
+            _charge: charge,
+        }).slice(shift..);
+        let body = bytes[range.start as usize + body_start..range.end as usize].as_ptr_range();
+        let input = bytes.clone();
+        // SAFETY: the cursor and retained slices read the same immutable bytes.
+        let mut reader = unsafe {
+            ArrowFile::from_reader_with_retained_ranges(Cursor::new(bytes), None, move |range| {
+                Some(input.slice(range.start as usize..range.end as usize))
+            })
+        }.unwrap();
+        let decoded = reader.read_page(0).unwrap();
+        let values = decoded.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values();
+        assert_eq!(body.contains(&values.as_ptr().cast()), shift == 0);
+        drop(reader);
+        assert_eq!(memory.used_bytes(), if shift == 0 { funded } else { 0 });
+        assert_eq!(decoded, expected);
+        drop(decoded);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }
 
 #[test]
