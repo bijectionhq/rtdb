@@ -195,7 +195,11 @@ pub async fn resolve_levels<S: RangeSource + ?Sized>(
                 reads.push(KeyRange::point(&keys::floor(&row)));
                 return Ok((index, None));
             },
-            Resolved::Redacted(_) => anyhow::bail!("rtdb.temporal/erased-assertion: the point is an erased assertion"),
+            Resolved::Redacted(_) if erased_absent => {
+                reads.push(KeyRange::point(&keys::floor(&row)));
+                return Ok((index, None));
+            },
+            Resolved::Redacted(_) => anyhow::bail!("rtdb.owned/read-purged: the row was erased after this cut"),
         }
     }
     Ok((levels.len(), None))

@@ -283,15 +283,13 @@ pub struct Slice<'a> {
 }
 
 /// The present regions of `window` at `cut`, sorted by valid start. Deleted
-/// regions are gaps. A redacted region is an error.
+/// and erased regions are gaps.
 pub fn slices<'a>(events: &'a [Event], cut: &Cut, window: Interval) -> anyhow::Result<Vec<Slice<'a>>> {
     Ok(claims(events, cut, window)?.into_iter().filter(|slice| slice.event.op == Op::Put).collect())
 }
 
-/// Every claimed region of `window` at `cut`, puts and deletes, sorted by
-/// valid start. A world level masks its parents inside these regions: a
-/// tombstone hides the parent as a put replaces it. A redacted region is an
-/// error.
+/// Every claimed region of `window` at `cut`, sorted by valid start. Puts,
+/// deletions and erased assertions all mask earlier assertions and parents.
 pub fn claims<'a>(events: &'a [Event], cut: &Cut, window: Interval) -> anyhow::Result<Vec<Slice<'a>>> {
     let mut ordered = events.iter().filter(|event| cut.applies(event)).collect::<Vec<_>>();
     ordered.sort_by_key(|event| std::cmp::Reverse(event.precedence));
@@ -301,10 +299,7 @@ pub fn claims<'a>(events: &'a [Event], cut: &Cut, window: Interval) -> anyhow::R
     for event in ordered {
         let Some(region) = event.valid.intersect(window) else { continue };
         for piece in unclaimed(&claimed, region) {
-            match event.op {
-                Op::Put | Op::Delete => out.push(Slice { valid: piece, event }),
-                Op::Redacted => anyhow::bail!("rtdb.temporal/erased-assertion: the history reaches an erased assertion"),
-            }
+            out.push(Slice { valid: piece, event });
         }
         claim(&mut claimed, region);
     }
@@ -412,9 +407,12 @@ mod tests {
     }
 
     #[test]
-    fn a_redacted_region_is_an_error_to_read() {
-        let events = [event(1, Op::Put, 0, VALID_MAX, b"a"), event(2, Op::Redacted, 0, VALID_MAX, b"")];
-        assert!(matches!(point(&events, &ALL, 0), Resolved::Redacted(_)));
-        assert!(slices(&events, &ALL, Interval::ALL).is_err());
+    fn a_redacted_region_masks_the_old_winner_and_leaves_survivors() -> anyhow::Result<()> {
+        let events = [event(1, Op::Put, 0, VALID_MAX, b"a"), event(2, Op::Redacted, 3, 7, b"")];
+        assert!(matches!(point(&events, &ALL, 4), Resolved::Redacted(_)));
+        let spans = slices(&events, &ALL, Interval::ALL)?.into_iter().map(|slice| slice.valid).collect::<Vec<_>>();
+        assert_eq!(spans, [Interval { from: 0, to: 3 }, Interval { from: 7, to: VALID_MAX }]);
+        assert_eq!(claims(&events, &ALL, Interval::ALL)?[1].event.op, Op::Redacted);
+        Ok(())
     }
 }
