@@ -583,6 +583,8 @@ variant TxMessage : SourceMessage {
     -- Canonical float vector arguments retain Arrow positions across nullable vectors, nullable components, and compatible dense unions.
     -- Canonical argument encoding uses the logical types of the selected float union legs.
     -- Canonical argument gathering applies the row writer's layouts when combining Arrow and row arguments.
+    -- The JVM source log table renders the first operation page as EDN when tx_ops is requested.
+    -- A truncated frame encountered while reading that page produces the diagnostic marker `<error decoding tx-ops>`.
     -- Source replay decodes each Arrow IPC message from its retained transaction bytes.
     -- SQL source replay decodes the argument stream from the selected Arrow binary cell.
     -- Native SQL source replay can retain an aligned plain Binary run value under the source allocation through nested IPC decoding.

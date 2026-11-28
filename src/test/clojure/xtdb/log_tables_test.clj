@@ -1,7 +1,11 @@
 (ns xtdb.log-tables-test
   (:require [clojure.test :as t :refer [deftest]]
             [xtdb.api :as xt]
-            [xtdb.test-util :as tu]))
+            [xtdb.log-tables :as log-tables]
+            [xtdb.test-util :as tu])
+  (:import (com.google.protobuf ByteString)
+           (java.nio ByteOrder)
+           (xtdb.arrow Relation)))
 
 (t/use-fixtures :each tu/with-mock-clock tu/with-allocator tu/with-node)
 
@@ -45,3 +49,20 @@
 
     (t/testing "tx_ops contains decoded operations"
       (t/is (re-find #"put-docs" (:tx-ops (first tx-rows)))))))
+
+(deftest test-source-log-msgs-tx-ops-framing
+  (let [value (apply str (repeat 4097 "a"))
+        ^ByteString ipc (with-open [rel (Relation/openFromCols tu/*allocator* {"value" [value]})]
+                          (.toArrowStream rel 0 1))
+        schema-end (+ 8 (-> (.substring ipc 4 8) (.asReadOnlyByteBuffer) (.order ByteOrder/LITTLE_ENDIAN) (.getInt)))
+        schema-only (.substring ipc 0 (int schema-end))
+        eos (ByteString/copyFrom (byte-array 4))
+        decode #(#'log-tables/decode-tx-ops tu/*allocator* %)]
+    (t/is (> (count (.asReadOnlyByteBufferList ipc)) 1))
+    (t/is (= (pr-str [{:value value}]) (decode ipc)))
+    (t/is (= (pr-str [{:value value}]) (decode (.substring ipc 0 (- (.size ipc) 4)))))
+    (t/is (= "[]" (decode (.concat schema-only eos))))
+    (t/is (nil? (decode nil)))
+    (doseq [truncated [ByteString/EMPTY schema-only (.concat schema-only (.substring eos 0 2))
+                       (.substring ipc 0 (- (.size ipc) 5))]]
+      (t/is (= "<error decoding tx-ops>" (decode truncated))))))

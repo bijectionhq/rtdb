@@ -7,7 +7,10 @@
             [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector.reader :as vr])
-  (:import (java.util Map)
+  (:import (com.google.protobuf ByteString)
+           (java.nio ByteBuffer)
+           (java.nio.channels ReadableByteChannel)
+           (java.util Map)
            (org.apache.arrow.memory BufferAllocator)
            (xtdb.api ICursor)
            (xtdb.api.log Log Log$Record SourceMessage SourceMessage$Tx
@@ -17,7 +20,7 @@
                          ReplicaMessage ReplicaMessage$ResolvedTx
                          ReplicaMessage$TriesAdded ReplicaMessage$BlockBoundary
                          ReplicaMessage$BlockUploaded ReplicaMessage$NoOp)
-           (xtdb.arrow Relation RelationReader VectorReader)
+           (xtdb.arrow Relation Relation$StreamLoader RelationReader VectorReader)
            (xtdb.database Database)
            (xtdb.log.proto TrieDetails)
            (xtdb.operator SelectionSpec SelectionSpec$Factory)
@@ -95,12 +98,30 @@
 
      {:type :unknown})))
 
+(defn- tx-ops-channel ^ReadableByteChannel [^ByteString bytes]
+  (let [offset (volatile! 0)]
+    (reify ReadableByteChannel
+      (^int read [_ ^ByteBuffer dst]
+        (let [start (int @offset)
+              len (.remaining dst)
+              end (+ (long start) (long len))]
+          ;; Arrow treats a short frame prefix after a complete schema as end-of-stream.
+          (when (> end (.size bytes))
+            (throw (err/incorrect :xtdb/truncated-source-tx-ops "Truncated source log tx-ops")))
+          (.copyTo (.substring bytes start (int end)) dst)
+          (vreset! offset (int end))
+          len))
+      (isOpen [_] true)
+      (close [_]))))
+
 (defn- decode-tx-ops
   "Decodes Arrow-encoded tx-ops bytes into an EDN string."
-  [^BufferAllocator allocator ^bytes tx-ops-bytes]
+  [^BufferAllocator allocator ^ByteString tx-ops-bytes]
   (when tx-ops-bytes
     (try
-      (with-open [rel (Relation/openFromArrowStream allocator tx-ops-bytes)]
+      (with-open [loader (Relation$StreamLoader. allocator (tx-ops-channel tx-ops-bytes))
+                  rel (Relation. allocator (.getSchema loader))]
+        (.loadNextPage loader rel)
         (pr-str (util/->clj (.getAsMaps rel))))
       (catch Exception e
         (log/warn e "Failed to decode tx-ops from source log message")
@@ -183,7 +204,7 @@
                "msg_type" (source-msg-type msg)
                "msg" (source-msg->edn msg)
                "tx_ops" (when (and decode-tx-ops? (instance? SourceMessage$Tx msg))
-                          (decode-tx-ops allocator (.toByteArray (.getTxOps ^SourceMessage$Tx msg))))}))
+                          (decode-tx-ops allocator (.getTxOps ^SourceMessage$Tx msg)))}))
           records)
     (mapv (fn [^Log$Record rec]
             (let [msg (.getMessage rec)]
