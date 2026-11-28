@@ -7,7 +7,7 @@
             [xtdb.time :as time])
   (:import (java.nio BufferUnderflowException ByteBuffer)
            (java.nio.charset StandardCharsets)
-           (java.time Duration LocalDate)
+           (java.time Duration LocalDate LocalDateTime LocalTime ZonedDateTime)
            (java.util.function Consumer)
            (xtdb.api ICursor)
            (xtdb.arrow FixedSizeBinaryVector Relation RelationReader UuidVector Vector VectorWriterKt)))
@@ -230,6 +230,44 @@
     (VectorWriterKt/writeScalarCell out wide-source 0)
     (t/is (= #uuid "00010203-0405-0607-0809-0a0b0c0d0e0f" (.getObject out 0)))
     (t/is (= (ByteBuffer/wrap (byte-array (range 16))) (.getBytes out 0)))))
+
+(t/deftest computed-values-preserve-uuid-and-date-day-layouts
+  (let [id #uuid "fedcba98-7654-3210-8123-456789abcdef"
+        first-day (LocalDate/ofEpochDay Integer/MIN_VALUE)
+        last-day (LocalDate/ofEpochDay Integer/MAX_VALUE)]
+    (t/is (= {:res [{:id id, :day first-day, :mixed-id id, :mixed-day last-day}
+                    {:day last-day, :mixed-id 7, :mixed-day "other"}]
+              :types '{id #xt/type [:? :uuid], day #xt/type [:date :day],
+                       mixed_id #xt/type #{:uuid :i64}, mixed_day #xt/type #{[:date :day] :utf8}}}
+             (tu/query-ra '[:table {:rows [{:id (cast ?id #xt/type :uuid),
+                                           :day (cast ?first_day #xt/type [:date :day]),
+                                           :mixed_id (cast ?id #xt/type :uuid),
+                                           :mixed_day (cast ?last_day #xt/type [:date :day])}
+                                          {:id (cast ?absent #xt/type :uuid),
+                                           :day (cast ?last_day #xt/type [:date :day]),
+                                           :mixed_id 7, :mixed_day "other"}]}]
+                          {:args {:id (str id), :absent nil,
+                                  :first_day (str first-day), :last_day (str last-day)}
+                           :with-types? true})))
+    (t/is (thrown-with-msg? RuntimeException #"Invalid UUID string"
+                            (tu/query-ra '[:table {:rows [{:id (cast ?id #xt/type :uuid)}]}]
+                                         {:args {:id "bad"}})))))
+
+(t/deftest values-and-records-preserve-bound-temporal-layouts
+  (let [ts (LocalDateTime/parse "1969-12-31T23:59:59.999999")
+        at (ZonedDateTime/parse "2025-11-02T01:30:00-05:00[America/New_York]")
+        duration (Duration/ofNanos -1000)
+        row {:ts ts, :at at, :duration duration, :clock LocalTime/MAX}]
+    (t/is (= {:res [row (assoc row :clock LocalTime/MIDNIGHT) {:at 7} {}]
+              :types '{ts #xt/type [:? [:timestamp-local :micro]],
+                       at #xt/type #{[:timestamp-tz :micro "America/New_York"] :i64 :null},
+                       duration #xt/type [:? [:duration :micro]], clock #xt/type [:? [:time-local :nano]]}}
+             (tu/query-ra '[:table {:rows [{:ts ?ts, :at ?at, :duration ?duration, :clock ?clock}
+                                          ?record
+                                          {:at 7}
+                                          {}]}]
+                          {:args (assoc row :record (assoc row :clock LocalTime/MIDNIGHT))
+                           :with-types? true})))))
 
 (t/deftest values-text-cells-preserve-java-utf8-replacement
   (let [^bytes malformed (byte-array (map unchecked-byte [0xed 0xa0 0x80 0x61 0xf0 0x9f]))

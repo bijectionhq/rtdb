@@ -296,6 +296,7 @@
 
 (defmethod codegen-cast [:utf8 :uuid] [_]
   {:return-type #xt/type :uuid
+   :canonical-uuid? true
    :->call-code #(do `(util/uuid->byte-buffer
                        (UUID/fromString (resolve-string ~@%))))})
 
@@ -840,6 +841,10 @@
        :valid-utf8? (every? (fn [{:keys [return-type valid-utf8?]}]
                              (or (= #xt/type :null return-type) valid-utf8?))
                            (vals emitted-calls))
+       :canonical-uuid? (and (= #xt.arrow/type :uuid (.getArrowType ^VectorType return-type))
+                             (every? (fn [{:keys [return-type canonical-uuid?]}]
+                                       (or (= #xt/type :null return-type) canonical-uuid?))
+                                     (vals emitted-calls)))
        :children (vals emitted-calls)
        :continue #(continue-call-expr % nil)
        :continue-projection (when (and (or projection-root?
@@ -2744,6 +2749,7 @@
                                    eval)))
 
            :return-type return-type
+           :canonical-uuid? (:canonical-uuid? emitted-expr)
            :valid-utf8? valid-utf8?}))
       (util/lru-memoize) ; <<no-commit>>
       wrap-zone-id-cache-buster))
@@ -2838,20 +2844,20 @@
         in-rel RelationReader/DUAL]
     {:return-type return-type
      :write-cell! (fn [{:keys [allocator args]} ^VectorWriter out]
-                    (let [{:keys [^VectorType return-type !projection-fn valid-utf8?]}
+                    (let [{:keys [^VectorType return-type !projection-fn valid-utf8? canonical-uuid?]}
                           (emit-batch (->param-types args) in-rel)
                           arrow-type (.getArrowType return-type)
                           utf8-output? (and (= #xt.arrow/type :utf8 arrow-type) (instance? Utf8Vector out))]
                       (if (or (and utf8-output? valid-utf8?)
-                              (and (instance? Vector out)
-                                   (= arrow-type (.getArrowType out))
-                                   (VectorWriterKt/hasScalarObjectIdentity arrow-type)))
+                              (VectorWriterKt/acceptsScalarProjection out return-type (boolean canonical-uuid?)))
                         (rethrowing-anomalies
                           (@!projection-fn in-rel schema args out))
                         (with-open [value (Vector/open allocator "_scalar" return-type)]
                           (rethrowing-anomalies
                             (@!projection-fn in-rel schema args value))
-                          (if utf8-output?
+                          (if (or utf8-output?
+                                  (= arrow-type #xt.arrow/type :uuid)
+                                  (= arrow-type #xt.arrow/type [:date :day]))
                             (VectorWriterKt/writeScalarCell out value 0)
                             (.writeObject out (.getObject value 0)))))))}))
 

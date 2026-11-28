@@ -1294,6 +1294,8 @@ rule ClientSubmitsTransaction {
     -- Each reuse evaluates the submitted argument rows and temporal bounds, and preserves the source encoding and retry digest of ordinary expansion.
     -- JVM static INSERT and PATCH copy compatible direct scalar parameters by Arrow position into source documents.
     -- Their source encoding follows inferred field types, field presence and the row order within each valid-time group.
+    -- Canonical microsecond timestamps and durations and in-range nanosecond times of day retain their ticks in matching static document fields.
+    -- Zoned timestamp fields retain the source zone, and valid-time controls retain their effective-zone interpretation.
     -- JVM static INSERT and PATCH copy compatible scalar cells from gathered bindings in binding order, including repeated source positions.
     -- JVM static expansion reaches bound arguments in row and parameter order before a statement falls through to SQL resolution.
     -- Volatile expressions and expressions requiring transaction time or a live catalog proceed to transaction resolution as SQL.
@@ -2467,8 +2469,12 @@ surface QueryAccess {
         -- JVM VALUES retains the order of rows and evaluates each reached cell in its existing expression order.
         -- Compatible scalar parameters and children of bound records are copied at their Arrow positions.
         -- JVM VALUES and RECORDS preserve canonical 16-byte UUIDs and signed DateDay ticks when copying bound cells into matching layouts, including existing union legs.
+        -- JVM VALUES and RECORDS preserve canonical microsecond timestamps and durations and in-range nanosecond times of day when copying bound cells into matching layouts.
+        -- Positioned zoned timestamps retain their source zone, and a null bound record field keeps its omission semantics.
         -- A nested bound record with matching child layouts and complete compatible reached fields can be copied as a record.
         -- Compatible computed scalar cells write to the result column as they are evaluated.
+        -- Computed DateDay cells and canonical text-to-UUID casts write directly into matching plain VALUES columns.
+        -- Computed DateDay and UUID cells can copy their reached position into a compatible existing union leg.
         -- VALUES writes computed text known to be valid UTF-8 directly into a matching text column.
         -- VALUES copies valid input text at its Arrow position and uses Java's UTF-8 replacement when the reached text bytes are malformed.
         -- Computed records with compatible scalar children evaluate all their fields before writing the record.

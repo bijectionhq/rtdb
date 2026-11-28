@@ -12,7 +12,7 @@
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
   (:import (com.github.benmanes.caffeine.cache Cache)
-           (java.time ZoneId)
+           (java.time DateTimeException Duration LocalDateTime LocalTime ZoneId ZonedDateTime)
            (org.antlr.v4.runtime ParserRuleContext)
            (xtdb.api.error Incorrect)
            (xtdb.arrow PositionedScalar Relation RelationReader VectorReader)
@@ -204,6 +204,42 @@
           (t/is (seq actual))
           (t/is (= (TxWriter/toArrowBytes expected al)
                    (TxWriter/toArrowBytes actual al))))))))
+
+(deftest static-temporal-dml-preserves-source-bytes-and-valid-time-groups
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (let [al (.getAllocator conn)
+          tz (ZoneId/of "America/New_York")
+          ts (LocalDateTime/parse "1969-12-31T23:59:59.999999")
+          ny (ZonedDateTime/parse "2025-11-02T01:30:00-05:00[America/New_York]")
+          utc (.withZoneSameInstant ny time/utc)
+          duration (Duration/ofNanos -1000)
+          rows [[1 ts ny duration LocalTime/MAX #xt/date-time "2020-01-01T12:00" 2 utc]
+                [3 nil ny nil LocalTime/MIDNIGHT #xt/date-time "2020-02-01T12:00" 4 utc]]]
+      (doseq [sql ["INSERT INTO docs (_id, ts, at, duration, clock, _valid_from)
+                    VALUES ($1, $2, $3, $4, $5, $6), ($7, $2, $8, NULL, NULL, $6)"
+                   "PATCH INTO docs FOR PORTION OF VALID_TIME FROM $6 TO NULL
+                    RECORDS {_id: $1, ts: $2, at: $3, duration: $4, clock: $5},
+                            {_id: $7, ts: $2, at: $8}"]]
+        (util/with-open [expected (with-open [args (apply vw/open-args al rows)]
+                                    (open-row-static-ops al sql args tz))
+                         actual (with-open [args (apply vw/open-args al rows)]
+                                  (doseq [param ["?_1" "?_2" "?_3" "?_4" "?_5" "?_7"]]
+                                    (t/is (instance? PositionedScalar (PositionedScalar/read (.vectorFor args param) 0))))
+                                  (sql/sql->tx-ops sql args al tz {}))]
+          (t/is (= 2 (count actual)))
+          (t/is (= (TxWriter/toArrowBytes expected al)
+                   (TxWriter/toArrowBytes actual al))))))))
+
+(deftest static-temporal-dml-validates-unused-time-ticks-before-declining
+  (with-open [conn (xt/open-adbc-conn *node*)
+              args (Relation. (.getAllocator conn))]
+    (.writeLong (.vectorFor args "?_0" #xt.arrow/type :i64 false) 1)
+    (let [clock (.vectorFor args "?_1" #xt.arrow/type [:time-local :nano] false)]
+      (.writeLong clock -1)
+      (.endRow args)
+      (t/is (thrown? DateTimeException (PositionedScalar/checkRead clock 0)))
+      (t/is (nil? (sql/sql->tx-ops "INSERT INTO docs (_id) VALUES (?)"
+                                  args (.getAllocator conn) time/utc {}))))))
 
 (deftest prepared-static-insert-missing-id-diagnostic
   (with-open [conn (xt/open-adbc-conn *node*)

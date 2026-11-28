@@ -15,6 +15,10 @@ class PositionedScalar private constructor(private val reader: Vector, private v
             is DenseUnionVector -> existing.vectorFor(type, false)
             else -> existing.takeIf { it.arrowType == type } ?: return false
         }
+        if (reader.hasCanonicalTemporalLayout()) {
+            val storage = if (target is DenseUnionVector.LegVector) target.inner else target
+            if (!storage.hasCanonicalTemporalLayout()) return false
+        }
         target.writeValue0(reader.valueReader().also { it.pos = index })
         return true
     }
@@ -53,7 +57,11 @@ class PositionedScalar private constructor(private val reader: Vector, private v
                     if (!source.hasCanonicalWidth) return reader.getObject(index, SNAKE_CASE_STRING)
                     source.getBytes(index)
                 }
-                else -> return reader.getObject(index, SNAKE_CASE_STRING)
+                else -> {
+                    if (!source.hasCanonicalTemporalLayout()) return reader.getObject(index, SNAKE_CASE_STRING)
+                    val ticks = source.getLong(index)
+                    if (source is Time64Vector && !ticks.isNanoTimeOfDay()) return reader.getObject(index, SNAKE_CASE_STRING)
+                }
             }
             return if (keepPosition) PositionedScalar(source, index) else null
         }

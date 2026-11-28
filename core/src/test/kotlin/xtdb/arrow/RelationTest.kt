@@ -2,6 +2,8 @@ package xtdb.arrow
 
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.RootAllocator
+import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
+import org.apache.arrow.vector.types.TimeUnit.NANOSECOND
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
@@ -19,7 +21,11 @@ import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.ClosedByInterruptException
 import java.nio.channels.SeekableByteChannel
+import java.time.DateTimeException
 import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZoneOffset
 import java.util.UUID
 
 class RelationTest {
@@ -102,6 +108,75 @@ class RelationTest {
                 assertEquals(1, dst["day"].valueCount)
                 dst.writeRow(src.getObject(0) as Map<*, *>)
                 assertEquals(listOf(7L, id), dst["id"].asList)
+            }
+        }
+    }
+
+    @Test
+    fun `bound temporal record preserves signed ticks and omits null children`() {
+        val types = linkedMapOf(
+            "timestamp" to VectorType.TIMESTAMP_MICRO,
+            "duration" to VectorType.DURATION_MICRO,
+            "clock" to maybe(VectorType.TIME_NANO),
+        )
+
+        Vector.open(allocator, "src", VectorType.structOf(types)).use { src ->
+            src["timestamp"].writeLong(Long.MIN_VALUE)
+            src["duration"].writeLong(Long.MAX_VALUE)
+            src["clock"].writeLong(LocalTime.MAX.toNanoOfDay())
+            src.endStruct()
+            src["timestamp"].writeLong(Long.MAX_VALUE)
+            src["duration"].writeLong(Long.MIN_VALUE)
+            src.endStruct()
+
+            Relation(allocator, types).use { dst ->
+                assertTrue(dst.tryCopyStructRow(src, 0))
+                assertTrue(dst.tryCopyStructRow(src, 1))
+                assertEquals(Long.MIN_VALUE, dst["timestamp"].getLong(0))
+                assertEquals(Long.MAX_VALUE, dst["timestamp"].getLong(1))
+                assertEquals(Long.MAX_VALUE, dst["duration"].getLong(0))
+                assertEquals(Long.MIN_VALUE, dst["duration"].getLong(1))
+                assertEquals(LocalTime.MAX.toNanoOfDay(), dst["clock"].getLong(0))
+                assertEquals(listOf(LocalTime.MAX, null), dst["clock"].asList)
+            }
+        }
+    }
+
+    @Test
+    fun `out of day time ticks retain the object read error`() {
+        val types = mapOf("clock" to VectorType.TIME_NANO)
+        Vector.open(allocator, "src", VectorType.structOf(types)).use { src ->
+            src["clock"].writeLong(-1L)
+            src.endStruct()
+            src["clock"].writeLong(LocalTime.MAX.toNanoOfDay() + 1)
+            src.endStruct()
+
+            Relation(allocator, types).use { dst ->
+                for (idx in 0..1) {
+                    assertFalse(dst.tryCopyStructRow(src, idx))
+                    assertThrows<DateTimeException> { dst["clock"].writeScalarCell(src["clock"], idx) }
+                    assertEquals(0, dst["clock"].valueCount)
+                    assertEquals(0, dst.rowCount)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `bound temporal cells use object conversion across different units or zones`() {
+        DurationVector(allocator, "src", false, MICROSECOND).use { src ->
+            DurationVector(allocator, "dst", false, NANOSECOND).use { dst ->
+                src.writeLong(-1L)
+                dst.writeScalarCell(src, 0)
+                assertEquals(-1_000L, dst.getLong(0))
+            }
+        }
+
+        TimestampTzVector(allocator, "src", false, MICROSECOND, ZoneId.of("America/New_York")).use { src ->
+            TimestampTzVector(allocator, "dst", false, MICROSECOND, ZoneOffset.UTC).use { dst ->
+                src.writeLong(0L)
+                assertThrows<InvalidWriteObjectException> { dst.writeScalarCell(src, 0) }
+                assertEquals(0, dst.valueCount)
             }
         }
     }

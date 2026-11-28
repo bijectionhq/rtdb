@@ -4,10 +4,13 @@ import clojure.lang.IExceptionInfo
 import clojure.lang.IPersistentMap
 import clojure.lang.PersistentArrayMap
 import com.google.protobuf.UnsafeByteOperations
+import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
 import org.apache.arrow.vector.types.pojo.ArrowType
+import xtdb.InternalApi
 import xtdb.arrow.extensions.UuidType
 import xtdb.kw
 import java.nio.ByteBuffer
+import java.time.LocalTime
 
 internal data class InvalidWriteObjectException(
     val vec: VectorWriter, val obj: Any?
@@ -83,7 +86,26 @@ internal fun ArrowType.hasScalarObjectIdentity() = when (this) {
     else -> false
 }
 
+/** @suppress */
+@InternalApi
+fun VectorWriter.acceptsScalarProjection(resultType: VectorType, canonicalUuid: Boolean): Boolean =
+    this is Vector && arrowType == resultType.arrowType && when (this) {
+        is DateDayVector -> resultType.encoding == Encoding.Plain
+        is UuidVector -> resultType.encoding == Encoding.Plain && canonicalUuid && hasCanonicalWidth
+        else -> arrowType.hasScalarObjectIdentity()
+    }
+
 internal fun ByteBuffer.isWellFormedUtf8() = UnsafeByteOperations.unsafeWrap(this).isValidUtf8
+
+internal fun VectorReader.hasCanonicalTemporalLayout() = when (this) {
+    is TimestampLocalVector -> unit == MICROSECOND
+    is TimestampTzVector -> unit == MICROSECOND
+    is DurationVector -> unit == MICROSECOND
+    is Time64Vector -> arrowType == VectorType.TIME_NANO.arrowType
+    else -> false
+}
+
+internal fun Long.isNanoTimeOfDay() = this in 0L..LocalTime.MAX.toNanoOfDay()
 
 private tailrec fun unwrapScalarSource(reader: VectorReader): VectorReader = when (val source = VectorReader.unwrapRenamed(reader)) {
     is IndirectVector -> unwrapScalarSource(source.inner)
@@ -97,15 +119,21 @@ internal fun VectorWriter.scalarObjectTarget(src: VectorReader, idx: Int): Vecto
         VectorType.DATE_DAY.arrowType -> unwrapScalarSource(src) is DateDayVector
         UuidType -> (unwrapScalarSource(src) as? UuidVector)?.hasCanonicalWidth == true
         UTF8_TYPE -> src.isNull(idx) || src.getBytes(idx).isWellFormedUtf8()
+        is ArrowType.Timestamp, is ArrowType.Duration, is ArrowType.Time -> unwrapScalarSource(src).let { source ->
+            source.hasCanonicalTemporalLayout() &&
+                (source !is Time64Vector || src.isNull(idx) || src.getLong(idx).isNanoTimeOfDay())
+        }
         else -> sourceType.hasScalarObjectIdentity()
     }
     if (!hasIdentity) return null
 
-    val target = if (this is DenseUnionVector) vectorForOrNull(sourceType.toLeg()) else this
-    if (target?.arrowType != sourceType) return null
-    if (sourceType == UuidType) {
-        val storage = if (target is DenseUnionVector.LegVector) target.inner else target
-        if (storage !is UuidVector || !storage.hasCanonicalWidth) return null
+    val target = (if (this is DenseUnionVector) vectorForOrNull(sourceType.toLeg()) else this) ?: return null
+    if (target.arrowType != sourceType) return null
+    val storage = if (target is DenseUnionVector.LegVector) target.inner else target
+    when (sourceType) {
+        UuidType -> if (storage !is UuidVector || !storage.hasCanonicalWidth) return null
+        is ArrowType.Timestamp, is ArrowType.Duration, is ArrowType.Time ->
+            if (!storage.hasCanonicalTemporalLayout()) return null
     }
     return target
 }
