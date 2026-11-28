@@ -10,6 +10,9 @@
 --
 -- Source and replica are separate ordered streams.
 -- Classic uses two durable logs.
+-- On an Apple volume shared by a Classic source and replica, each full-sync writer selects its ready batch after taking its turn to append.
+-- Each writer acknowledges its batch after its own durability fence succeeds.
+-- A source writer that waits for a replica fence gives additional arrivals a bounded interval to join a partially filled batch.
 -- Installed standalone keeps its source intake in process and uses the local replica journal for durability.
 -- The standalone replica carries resolved transactions and source coordinates for applied control messages.
 -- On reopen, the standalone source allocates new positions above the replica's durable frame byte offset.

@@ -31,6 +31,8 @@ pub(super) fn is_record_separator(byte: u8) -> bool {
 }
 const APPEND_BATCH_BYTES: usize = 256 * 1024;
 const APPEND_BATCH_RECORDS: usize = 10;
+#[cfg(target_vendor = "apple")]
+const SOURCE_HANDOFF_WINDOW: Duration = Duration::from_micros(600);
 const MAXIMUM_POLL_RECORDS: usize = 1024;
 const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 const RECENT_FRAMES: usize = 256;
@@ -67,6 +69,23 @@ pub struct LocalLogDriver {
     queue: mpsc::Receiver<Queued>,
     progress: Arc<Progress>,
     recent: Arc<RecentFrames>,
+    #[cfg(target_vendor = "apple")]
+    full_sync_turn: Option<FullSyncTurn>,
+}
+
+#[cfg(target_vendor = "apple")]
+enum FullSyncTurn {
+    Source(Arc<tokio::sync::Mutex<()>>),
+    Replica(Arc<tokio::sync::Mutex<()>>),
+}
+
+#[cfg(target_vendor = "apple")]
+impl FullSyncTurn {
+    fn gate(&self) -> &tokio::sync::Mutex<()> {
+        match self {
+            Self::Source(gate) | Self::Replica(gate) => gate,
+        }
+    }
 }
 
 struct Writer {
@@ -439,7 +458,11 @@ impl LocalLog {
         let (send, queue) = mpsc::channel(options.queue_capacity);
         let log = Arc::new(Self { path, lineage, queue: send, progress: progress.clone(),
             maximum_message_bytes: options.maximum_message_bytes, keys, reads, recent: recent.clone(), apple_sync });
-        Ok((log, LocalLogDriver { writer, queue, progress, recent }))
+        Ok((log, LocalLogDriver {
+            writer, queue, progress, recent,
+            #[cfg(target_vendor = "apple")]
+            full_sync_turn: None,
+        }))
     }
 
     /// Closes and drains reader I/O; the caller must cancel and join the writer driver first.
@@ -552,6 +575,20 @@ fn arrow_byte_path_vectored_record_keeps_the_payload_slice_and_wire_bytes_after_
 }
 
 impl LocalLogDriver {
+    /// Lets the source and replica on one Apple volume select their batches when the drive becomes available.
+    pub fn coordinate_full_sync(&mut self, replica: &mut Self) {
+        #[cfg(target_vendor = "apple")]
+        if let Some(device) = self.writer.file.full_sync_device()
+            && replica.writer.file.full_sync_device() == Some(device)
+        {
+            let turn = Arc::new(tokio::sync::Mutex::new(()));
+            self.full_sync_turn = Some(FullSyncTurn::Source(Arc::clone(&turn)));
+            replica.full_sync_turn = Some(FullSyncTurn::Replica(turn));
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = replica;
+    }
+
     pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
         let shutdown = shutdown.child_token();
         let _cancel_on_drop = shutdown.clone().drop_guard();
@@ -576,6 +613,8 @@ impl LocalLogDriver {
     }
 
     async fn write_batches(mut self, shutdown: CancellationToken) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        let full_sync_turn = self.full_sync_turn.take();
         let mut next = None;
         loop {
             let first = tokio::select! {
@@ -583,6 +622,35 @@ impl LocalLogDriver {
                 _ = shutdown.cancelled() => break,
                 record = async { match next.take() { Some(record) => Some(record), None => self.queue.recv().await } } =>
                     match record { Some(record) => record, None => break },
+            };
+            #[cfg(target_vendor = "apple")]
+            let turn = match &full_sync_turn {
+                Some(turn) => {
+                    let (guard, waited) = match turn.gate().try_lock() {
+                        Ok(guard) => (guard, false),
+                        Err(_) => {
+                            let guard = tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => {
+                                    next = Some(first);
+                                    break;
+                                }
+                                guard = turn.gate().lock() => guard,
+                            };
+                            (guard, true)
+                        }
+                    };
+                    if waited && matches!(turn, FullSyncTurn::Source(_)) && self.queue.len() < APPEND_BATCH_RECORDS - 1 {
+                        // Replica read-back can wake clients whose next writes can still share this source fence.
+                        thread::sleep(SOURCE_HANDOFF_WINDOW);
+                    }
+                    if shutdown.is_cancelled() {
+                        next = Some(first);
+                        break;
+                    }
+                    Some(guard)
+                }
+                None => None,
             };
             let (records, deferred) = self.ready_batch(first);
             next = deferred;
@@ -600,6 +668,8 @@ impl LocalLogDriver {
                     return Err(error);
                 }
             }
+            #[cfg(target_vendor = "apple")]
+            drop(turn);
         }
         self.reject_pending(next, "local log shutdown before append".into());
         self.progress.close();
@@ -1188,6 +1258,78 @@ mod tests {
         let (batch, deferred) = driver.ready_batch(first);
         assert_eq!(batch.len(), 1);
         assert!(deferred.is_none());
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn local_full_sync_batches_include_writes_queued_while_the_other_journal_owns_the_turn() -> Result<()> {
+        struct ObserveTip {
+            log: Arc<LocalLog>,
+            tips: parking_lot::Mutex<Vec<LogOffset>>,
+        }
+
+        impl AppendTimestampSource for ObserveTip {
+            fn timestamp(&self, _: &[u8], supplied: Timestamp) -> Result<Timestamp> {
+                self.tips.lock().push(self.log.latest()?);
+                Ok(supplied)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (log, mut source) = LocalLog::open(directory.path().join("LOG"), replica_options())?;
+        let (_, mut replica) = LocalLog::open(directory.path().join("REPLICA_LOG"), replica_options())?;
+        source.coordinate_full_sync(&mut replica);
+        let replica_turn = replica.full_sync_turn.as_ref().unwrap().gate().lock().await;
+        let observed = Arc::new(ObserveTip { log: Arc::clone(&log), tips: parking_lot::Mutex::new(Vec::new()) });
+        source.writer.timestamps = observed.clone();
+
+        let first = log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
+        let shutdown = CancellationToken::new();
+        let mut writes = std::pin::pin!(source.write_batches(shutdown.clone()));
+        tokio::select! {
+            biased;
+            result = &mut writes => panic!("writer exited while waiting for the other journal: {result:?}"),
+            _ = std::future::ready(()) => (),
+        }
+        assert!(observed.tips.lock().is_empty());
+        let second = log.enqueue(Bytes::from_static(b"second"), Timestamp(2)).await?;
+        drop(replica_turn);
+
+        let (result, (first, second)) = tokio::join!(&mut writes, async {
+            let first = first.durable().await;
+            let second = second.durable().await;
+            shutdown.cancel();
+            (first, second)
+        });
+        result?;
+        assert!(first?.offset.0 < second?.offset.0);
+        assert_eq!(*observed.tips.lock(), vec![LogOffset(-1); 2]);
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn local_full_sync_wait_rejects_the_batch_on_shutdown() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let (log, mut source) = LocalLog::open(directory.path().join("LOG"), replica_options())?;
+        let (_, mut replica) = LocalLog::open(directory.path().join("REPLICA_LOG"), replica_options())?;
+        source.coordinate_full_sync(&mut replica);
+        let _replica_turn = replica.full_sync_turn.as_ref().unwrap().gate().lock().await;
+        let first = log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await?;
+        let second = log.enqueue(Bytes::from_static(b"second"), Timestamp(2)).await?;
+        let shutdown = CancellationToken::new();
+        let mut writes = std::pin::pin!(source.write_batches(shutdown.clone()));
+        tokio::select! {
+            biased;
+            result = &mut writes => panic!("writer exited while waiting for the other journal: {result:?}"),
+            _ = std::future::ready(()) => (),
+        }
+        shutdown.cancel();
+        writes.await?;
+        assert!(matches!(first.durable().await, Err(Error::Closed(_))));
+        assert!(matches!(second.durable().await, Err(Error::Closed(_))));
+        assert_eq!(fs::metadata(directory.path().join("LOG")).unwrap().len(), 0);
         Ok(())
     }
 

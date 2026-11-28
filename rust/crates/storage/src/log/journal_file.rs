@@ -43,6 +43,17 @@ pub(crate) struct JournalFile {
 }
 
 impl JournalFile {
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn full_sync_device(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+
+        if self.apple_sync == AppleSync::Full {
+            self.file.metadata().ok().map(|metadata| metadata.dev())
+        } else {
+            None
+        }
+    }
+
     fn inspect_header(mut file: File, path: &Path, apple_sync: AppleSync) -> Result<Self> {
         let mut magic = [0; MAGIC.len()];
         let lineage = if file.read(&mut magic[..1]).map_err(|error| Error::io(path, error))? == 1 && magic[0] == MAGIC[0] {

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, StorageRoot}};
-use rtdb_storage::{AppleSync, IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, IntakeLog, LocalLog, LocalLogOptions, Log, LogOffset, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
+use rtdb_storage::{AppleSync, IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, IntakeLog, LocalLog, LocalLogDriver, LocalLogOptions, Log, LogOffset, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
 use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -339,8 +339,8 @@ impl NativeResources {
         if self.storage_factories.insert(name, factory).is_some() { return Err(invalid("A storage factory is already registered for this protobuf type")); }
         Ok(self)
     }
-    fn local_log(&self, path: PathBuf, source: bool, read_only: bool, cancellation: CancellationToken, io: Arc<IoRegion>, bind_lineage: bool)
-        -> Result<(Arc<dyn Log>, Option<ResourceDriver>)> {
+    fn local_log(&self, path: PathBuf, source: bool, read_only: bool, io: Arc<IoRegion>, bind_lineage: bool)
+        -> Result<(Arc<dyn Log>, Option<LocalLogDriver>)> {
         let keys = self.classic_vault.as_ref().map(|vault| vault.log_keys(&path, !read_only, Arc::clone(&io))).transpose()?;
         if read_only {
             let log = match keys {
@@ -356,7 +356,7 @@ impl NativeResources {
         } else {
             LocalLog::open_with_key_slots_and_sync(path, options, timestamps, io, keys, self.apple_sync)?
         };
-        Ok((log, Some(async move { driver.run(cancellation).await.map_err(Into::into) }.boxed())))
+        Ok((log, Some(driver)))
     }
 }
 
@@ -624,19 +624,23 @@ impl NativeResources {
             Some(database_config::Log::LocalLog(log)) => {
                 let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
                 let epoch = StorageEpoch(log.epoch.unwrap_or(0));
+                let run = |driver: LocalLogDriver| -> ResourceDriver {
+                    let cancellation = log_cancellation.clone();
+                    async move { driver.run(cancellation).await.map_err(Into::into) }.boxed()
+                };
                 if self.single_journal {
                     if access == LogAccess::SourceWriter {
                         return Err(invalid("A single local journal requires the local replica writer for submissions"));
                     }
                     let (replica, replica_driver) = self.local_log(
-                        path.join("REPLICA_LOG"), false, access.replica_read_only(),
-                        log_cancellation.clone(), Arc::clone(io), true,
+                        path.join("REPLICA_LOG"), false, access.replica_read_only(), Arc::clone(io), true,
                     )?;
                     // Each consumed source position needs a replica frame, whose byte offset advances by more than one.
                     // New intake therefore starts above all durable source positions without scanning the replica.
                     let start = replica.latest()?.0.checked_add(1).ok_or_else(|| invalid("The local journal has no remaining source positions"))?;
                     SourcePosition::from_epoch_offset(epoch, start)?;
                     let source = Arc::new(IntakeLog::for_local_replica(self.maximum_log_message_bytes, LogOffset(start)));
+                    let replica_driver = replica_driver.map(run);
                     let trimming = {
                         let source = Arc::clone(&source);
                         async move {
@@ -654,10 +658,13 @@ impl NativeResources {
                         drivers: replica_driver.into_iter().chain([trimming]).collect(),
                     });
                 }
-                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io), storage.store.local_erasure_custody().is_some())?;
-                let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation, Arc::clone(io), bind_lineage)?;
+                let (source, mut source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), Arc::clone(io), storage.store.local_erasure_custody().is_some())?;
+                let (replica, mut replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), Arc::clone(io), bind_lineage)?;
+                if let (Some(source), Some(replica)) = (&mut source_driver, &mut replica_driver) {
+                    source.coordinate_full_sync(replica);
+                }
                 Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition,
-                    drivers: source_driver.into_iter().chain(replica_driver).collect() })
+                    drivers: source_driver.into_iter().chain(replica_driver).map(run).collect() })
             }
             Some(database_config::Log::OtherLog(log)) => {
                 let factory = self.log_factories.get(type_name(log)?).ok_or_else(|| invalid("Native log factory is unavailable"))?;
