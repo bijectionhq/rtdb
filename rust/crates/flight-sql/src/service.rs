@@ -322,7 +322,7 @@ impl Service {
     }
     fn retire_session(&self, session: &Session) {
         self.fence_session(session);
-        let _ = self.0.sessions.take(&session.id);
+        self.0.sessions.retire(&session.id);
     }
     pub fn sweep(&self) {
         self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
@@ -450,7 +450,7 @@ impl Service {
         }
         if retained_proof && bearer.or(cookie).is_none() { return Err(classic_retained_refusal()); }
         if let (Some(cookie), Some(bearer)) = (cookie, bearer) { if !auth::equal(cookie.as_bytes(), bearer.as_bytes()) { return Err(auth::unauthenticated("the session cookie and bearer token name different sessions")); } }
-        let (session, minted, lease, mint_exclusion) = if let Some(id) = bearer.or(cookie) {
+        let (session, minted, lease, mint_exclusion, store_close) = if let Some(id) = bearer.or(cookie) {
             if forwarded_peer.is_some() {
                 return Err(auth::unauthenticated("Forwarded peer proof is for a new session"));
             }
@@ -484,14 +484,19 @@ impl Service {
             if let Some(raw) = credentials.raw() {
                 if session.caller.mac.is_none_or(|mac| !auth::equal(&mac, &self.0.auth.mac(raw))) { return Err(auth::unauthenticated("these credentials aren't the ones the session was authenticated with")); }
             }
-            let verified = self.0.cancellation.run_until_cancelled(session.caller.principal.revalidate(self.0.node.now())).await.ok_or_else(cancelled)?;
-            if let Err(error) = verified {
-                self.retire_session(&session);
-                return Err(auth::auth_error(error));
+            // An enrolled Store bearer retains only the right to close its
+            // own exact session after the original credential loses access.
+            let store_close = matches!(kind, CallKind::SessionClose) && bearer.is_some() && session.store_release.is_some();
+            if !store_close {
+                let verified = self.0.cancellation.run_until_cancelled(session.caller.principal.revalidate(self.0.node.now())).await.ok_or_else(cancelled)?;
+                if let Err(error) = verified {
+                    self.retire_session(&session);
+                    return Err(auth::auth_error(error));
+                }
+                admit_workload(&session.caller.principal, session.fresh_replica)?;
             }
-            admit_workload(&session.caller.principal, session.fresh_replica)?;
             if store_action { StoreRelease::require(session.store_release)?; }
-            (session, false, lease, None)
+            (session, false, lease, None, store_close)
         } else {
             let catalog = self.0.node.catalog();
             let placed_name = || requested_database.filter(|name| !name.is_empty())
@@ -574,7 +579,7 @@ impl Service {
             sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
                 self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            (session, true, lease, Some(excluded))
+            (session, true, lease, Some(excluded), false)
         };
         if session.caller.principal.label_scope().is_some() && !kind.allows_label_scope() {
             return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
@@ -606,7 +611,7 @@ impl Service {
             egress: transport.map(|transport| transport.egress.clone()),
             routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward"),
             classic_flight_excluded, classic_retained: None };
-        if self.0.node.catalog().is_managed()
+        if !store_close && self.0.node.catalog().is_managed()
             && let Ok(attached) = self.0.node.catalog().database(&call.database)
         {
             call.require_imported_workload(&attached)?;

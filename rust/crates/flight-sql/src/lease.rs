@@ -62,6 +62,19 @@ impl<K: Ord + Clone, V: Leased> Registry<K, V> {
             }
         }
     }
+    /// Retire a credential's live registration while preserving an enrolled
+    /// receiver's close-only identity.
+    pub fn retire(&self, key: &K) {
+        let mut entries = self.entries.lock().expect("lease lock");
+        let Some(entry) = entries.get_mut(key) else { return; };
+        let Entry::Live(live) = entry else { return; };
+        if live.value.retain_close_on_expiry() {
+            *entry = expired(live, self.clock.now());
+        } else if let Some(Entry::Live(live)) = entries.remove(key) {
+            live.value.close();
+        }
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
     pub fn sweep(&self) {
         let now = self.clock.now();
         self.entries.lock().expect("lease lock").retain(|_, entry| {
@@ -109,16 +122,20 @@ fn expire<V: Leased>(entry: &mut Entry<V>, now: Timestamp) -> bool {
     if let Entry::Live(live) = entry {
         let ceiling_elapsed = live.value.hard_deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
         if ceiling_elapsed || live.users == 0 && elapsed(live.since, now) >= live.limit {
-            live.value.close();
-            let close = live.value.retain_close_on_expiry().then(|| PendingClose {
-                value: Arc::clone(&live.value),
-                drained_at: (!live.value.closed_reads_pending()).then_some(now),
-            });
-            *entry = Entry::Expired { at: now, after: live.limit, close, _reservation: Arc::clone(&live._reservation) };
+            *entry = expired(live, now);
             return true;
         }
     }
     false
+}
+
+fn expired<V: Leased>(live: &Live<V>, now: Timestamp) -> Entry<V> {
+    live.value.close();
+    let close = live.value.retain_close_on_expiry().then(|| PendingClose {
+        value: Arc::clone(&live.value),
+        drained_at: (!live.value.closed_reads_pending()).then_some(now),
+    });
+    Entry::Expired { at: now, after: live.limit, close, _reservation: Arc::clone(&live._reservation) }
 }
 
 pub(crate) fn duration(value: Duration) -> String {
@@ -169,32 +186,35 @@ mod tests {
         clock.0.store(7_000_000, Ordering::Relaxed); registry.sweep(); assert_eq!(memory.used_bytes(), 0); assert!(matches!(registry.lookup(&1, false), Lookup::Unknown));
     }
     #[test]
-    fn expired_store_session_remains_close_only_until_after_its_last_reply_buffer() {
+    fn expired_or_retired_store_session_remains_close_only_after_its_last_reply_buffer() {
         struct StoreSession { closed: AtomicBool, pending: AtomicBool }
         impl Leased for StoreSession {
             fn close(&self) { self.closed.store(true, Ordering::Release); }
             fn retain_close_on_expiry(&self) -> bool { true }
             fn closed_reads_pending(&self) -> bool { self.pending.load(Ordering::Acquire) }
         }
-        let clock = Arc::new(TestClock(AtomicI64::new(0)));
-        let registry = Registry::new(clock.clone(), MemoryBudget::new(4096));
-        let original = Arc::new(StoreSession { closed: AtomicBool::new(false), pending: AtomicBool::new(true) });
-        let idle = Duration::from_secs(1);
-        registry.insert(1, original.clone(), idle, idle, false, 8).unwrap();
-        clock.0.store(1_000_000, Ordering::Relaxed);
-        registry.sweep();
-        clock.0.store(3_000_000, Ordering::Relaxed);
-        registry.sweep();
-        assert_eq!(registry.len(), 0);
-        assert!(original.closed.load(Ordering::Acquire));
-        assert!(matches!(registry.lookup(&1, true), Lookup::Expired(_)));
-        assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(value) if Arc::ptr_eq(&value, &original)));
-        original.pending.store(false, Ordering::Release);
-        registry.sweep();
-        assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(_)));
-        clock.0.store(4_000_000, Ordering::Relaxed);
-        registry.sweep();
-        assert!(matches!(registry.lookup_for_close(&1), Lookup::Unknown));
+        for retire in [false, true] {
+            let clock = Arc::new(TestClock(AtomicI64::new(0)));
+            let registry = Registry::new(clock.clone(), MemoryBudget::new(4096));
+            let original = Arc::new(StoreSession { closed: AtomicBool::new(false), pending: AtomicBool::new(true) });
+            let idle = Duration::from_secs(1);
+            registry.insert(1, original.clone(), idle, idle, retire, 8).unwrap();
+            if retire { registry.retire(&1); }
+            clock.0.store(1_000_000, Ordering::Relaxed);
+            registry.sweep();
+            clock.0.store(3_000_000, Ordering::Relaxed);
+            registry.sweep();
+            assert_eq!(registry.len(), 0);
+            assert!(original.closed.load(Ordering::Acquire));
+            assert!(matches!(registry.lookup(&1, true), Lookup::Expired(_)));
+            assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(value) if Arc::ptr_eq(&value, &original)));
+            original.pending.store(false, Ordering::Release);
+            registry.sweep();
+            assert!(matches!(registry.lookup_for_close(&1), Lookup::Found(_)));
+            clock.0.store(4_000_000, Ordering::Relaxed);
+            registry.sweep();
+            assert!(matches!(registry.lookup_for_close(&1), Lookup::Unknown));
+        }
     }
 
     #[test]
