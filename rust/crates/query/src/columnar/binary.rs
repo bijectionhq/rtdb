@@ -507,14 +507,12 @@ fn trim(
         return Ok(None);
     };
     project(batch, execution, |row| {
-        let Some(source) = source.binary(row)? else {
-            return Some(Ok(None));
-        };
+        let source = source.binary(row)?;
         let retained = match &token {
-            TrimToken::Binary(token) => token
-                .binary(row)?
-                .map(|token| rtdb_expr::kernels::binary_trim(source, token, leading, trailing)),
-            TrimToken::Signed(token) => token.signed(row)?.map(|token| {
+            TrimToken::Binary(token) => source.zip(token.binary(row)?).map(|(source, token)| {
+                rtdb_expr::kernels::binary_trim(source, token, leading, trailing)
+            }),
+            TrimToken::Signed(token) => source.zip(token.signed(row)?).map(|(source, token)| {
                 rtdb_expr::kernels::binary_trim_signed(source, token, leading, trailing)
             }),
         };

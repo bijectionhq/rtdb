@@ -5880,6 +5880,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_trim_preserves_reached_token_layout_errors_with_a_null_source() {
+        use arrow_array::{BinaryArray, Int16Array};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let source = field(0, ScalarType::Binary);
+        let token = field(1, ScalarType::I16);
+        let schema = Schema::new(vec![source.clone(), token.clone()]).unwrap();
+        let source_field = rtdb_columnar::to_field(&source.name, &source.data_type).unwrap();
+        let token_field = ArrowField::new(&token.name, DataType::Int16, true).with_metadata(
+            [(rtdb_columnar::EXTENSION_NAME_KEY.into(), "unknown-token".into())].into(),
+        );
+        let columns = vec![
+            Column::Arrow {
+                array: Arc::new(BinaryArray::from_iter([None::<&[u8]>])),
+                field: Arc::new(source_field),
+                logical: Some(source.data_type.clone()),
+            },
+            Column::Arrow {
+                array: Arc::new(Int16Array::from(vec![1])),
+                field: Arc::new(token_field),
+                logical: None,
+            },
+        ];
+        let expected = columns[1].value(0).unwrap_err();
+        let batch = ColumnBatch::settled(columns, 1, memory.reserve(4096).unwrap()).unwrap();
+        let args = vec![source.expression(), token.expression()];
+        let expression = Expr::Call {
+            name: "trim".into(),
+            return_type: rtdb_plan::function_type_with_args("trim", &args).unwrap(),
+            args,
+        };
+        let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
+        let error = cursor.next_batch().await.err().unwrap();
+        assert_eq!(error.code, expected.code);
+        assert_eq!(error.message, expected.message);
+    }
+
+    #[tokio::test]
     async fn binary_substring_with_a_bound_signed_length_copies_only_the_reached_slice() {
         use arrow_array::{BinaryArray, Int16Array, RecordBatch};
 

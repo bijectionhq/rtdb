@@ -144,6 +144,7 @@
 -- Native Binary concatenation and OVERLAY can write reached byte spans directly into a funded Binary result.
 -- Binary TRIM with a Binary token uses its first octet and reports an empty token when both operands are present.
 -- Binary TRIM can read exact plain Arrow signed operands and checks the signed octet range when both operands are present.
+-- Binary TRIM preserves operand decoding order before applying null propagation.
 -- Native Binary TRIM and SUBSTRING can write reached byte slices into a funded Binary result.
 -- SUBSTRING accepts signed literals and exact plain Arrow signed controls on this path.
 -- Its byte slicing retains the scalar index narrowing, null behavior, and errors.
