@@ -1964,9 +1964,7 @@ impl HeldCheckpointWorld {
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
         }
-        let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
-            .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
-        self.require_overlay_coverage(relation, &witness).await?;
+        self.require_overlay_identity_coverage(relation).await?;
         if !self.clock_mode().is_writable() {
             self.check_relation(relation)?;
             return Ok(WorldIdentityPage { keys: Vec::new(), more: false, reservations: Vec::new() });
@@ -1975,6 +1973,26 @@ impl HeldCheckpointWorld {
             self.open.record.id, relation, valid, after, limit + 1,
         ).await?;
         self.merge_overlay_identities(relation, valid, after, limit, candidates, None).await
+    }
+
+    pub(crate) async fn local_overlay_identity_page(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
+    ) -> Result<Option<rtdb_node::OwnedIdentityPageOutput>> {
+        if self.ancestor().is_some() || !self.clock_mode().is_writable() || matches!(after, OwnedIdentityScan::Unbounded) {
+            return Ok(None);
+        }
+        self.check_relation(relation)?;
+        if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
+        self.require_overlay_identity_coverage(relation).await?;
+        let page = self.open.snapshot.world_identity_page_output(self.open.record.id, relation, valid, after, limit).await?;
+        self.check_relation(relation)?;
+        Ok(Some(page))
+    }
+
+    async fn require_overlay_identity_coverage(&self, relation: &OwnedRelation) -> Result<()> {
+        let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [relation])
+            .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+        self.require_overlay_coverage(relation, &witness).await
     }
 
     pub async fn overlay_identities_at(

@@ -20,6 +20,72 @@ fn tx(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64, system: i64) 
 fn timestamp(value: i64) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 
 #[tokio::test]
+async fn local_overlay_candidate_collection_proves_and_funds_the_lookahead() {
+    use rtdb_columnar::EntityIdRef;
+    use rtdb_format::data::{StoredEvent, StoredOperation};
+    use rtdb_query::{collect_owned_identity_candidates, owned_identity_candidates};
+    use rtdb_types::{OwnedIdentityScan, OwnedRelation, WorldShadow};
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(1 << 24);
+    let world = Iid([7; 16]);
+    let overlay = OwnedRelation::new("overlay-page").unwrap().in_world(world).unwrap();
+    let table = overlay.table("alice");
+    let keys = [EntityId::Binary(vec![0, 255]), EntityId::Binary(vec![0, 255, 0])];
+    let system = Timestamp(100);
+    let valid = Timestamp(10);
+    let mut write = tx(&state, &memory, 0, system.0);
+    for id in keys.iter().rev() {
+        write.append(table.clone(), StoredEvent {
+            position: None, origin: None, commit_position: 0, entity_key: Some(id.handle_bytes().into()),
+            iid: id.iid(), system_from: system, valid_time: Interval::ALL,
+            operation: StoredOperation::Put(WorldShadow::Deleted.record(id).unwrap()), recency: None,
+        }).unwrap();
+    }
+    let broken = EntityId::Binary(vec![255]);
+    write.append(table, StoredEvent {
+        position: None, origin: None, commit_position: 0, entity_key: Some(broken.handle_bytes().into()),
+        iid: Iid::MIN, system_from: system, valid_time: Interval::from_micros(11, 12).unwrap(),
+        operation: StoredOperation::Put(WorldShadow::Deleted.record(&broken).unwrap()), recency: None,
+    }).unwrap();
+    state.apply(&write.stage().unwrap()).unwrap();
+    let snapshot = state.value().snapshot().with_system_time_cap(Some(system)).unwrap();
+    let context = query_context(snapshot, Arc::new(MemoryStore::default()), false);
+    let after = OwnedIdentityScan::binary(None);
+    let rows = owned_identity_candidates(Arc::clone(&context), "alice", &overlay, system, valid, &after, 2).await.unwrap();
+    let (rows, row_charges) = rows.into_parts();
+    assert_eq!(rows, keys);
+
+    let mut proved = 0;
+    let (first, charges) = collect_owned_identity_candidates(
+        Arc::clone(&context), "alice", &overlay, system, valid, &after, 2, None,
+        || None::<EntityId>,
+        |last, key| last.as_ref().map(|last| EntityIdRef::from(last).cmp(&key)),
+        |first, key| {
+            proved += 1;
+            first.get_or_insert_with(|| key.into_owned());
+        },
+    ).await.unwrap();
+    assert_eq!(first.as_ref(), rows.first());
+    assert_eq!(proved, 2);
+    assert_eq!(charges.iter().map(|charge| charge.bytes()).collect::<Vec<_>>(),
+        row_charges.iter().map(|charge| charge.bytes()).collect::<Vec<_>>());
+    assert_eq!(charges.len(), 3);
+
+    let after = OwnedIdentityScan::seek(&keys[0]).unwrap();
+    let lookahead = |fetch| collect_owned_identity_candidates(
+        Arc::clone(&context), "alice", &overlay, system, Timestamp(11), &after, fetch, None,
+        Vec::<EntityId>::new,
+        |keys, key| keys.last().map(|last| EntityIdRef::from(last).cmp(&key)),
+        |keys, key| keys.push(key.into_owned()),
+    );
+    let (first, _) = lookahead(1).await.unwrap();
+    assert_eq!(first.as_slice(), &keys[1..]);
+    let error = lookahead(2).await.err().expect("The second candidate has no matching point");
+    assert_eq!(error.code, "rtdb.owned/world-identities");
+}
+
+#[tokio::test]
 async fn delegated_scan_refuses_a_later_erase_horizon_and_falls_back() {
     use rtdb_query::{FragmentDepth, ScanFragment, ScanFragmenter, evaluate_fragment};
     use std::sync::atomic::{AtomicUsize, Ordering};

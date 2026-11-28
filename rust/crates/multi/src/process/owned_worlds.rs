@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
-use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldPointResult};
+use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldIdentityPageOutput, WorldPointResult};
 use rtdb_node::{OwnedChangeEdge, NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey, WorldClockMode};
 use uuid::Uuid;
@@ -384,6 +384,17 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         Box::pin(async move {
             let page = HeldCheckpointWorld::overlay_identities(self, relation, valid, after, limit).await?;
             Ok(WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations })
+        })
+    }
+
+    fn overlay_identities_output<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
+    ) -> BoxFuture<'a, Result<WorldIdentityPageOutput>> {
+        Box::pin(async move {
+            if let Some(page) = self.local_overlay_identity_page(relation, valid, after, limit).await? {
+                return Ok(WorldIdentityPageOutput::Local(page));
+            }
+            OwnedWorldRead::overlay_identities(self, relation, valid, after, limit).await.map(WorldIdentityPageOutput::Rows)
         })
     }
 

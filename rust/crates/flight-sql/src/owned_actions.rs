@@ -2778,16 +2778,7 @@ impl Service {
             .map_err(|_| invalid("Owned identity limit is out of range"))?;
         let after = identity_scan_request(batch)?;
         let page = held.snapshot.identity_page_output(&relation, system, valid, &after, limit).await.map_err(status)?;
-        let (rows, charge, more) = match &page {
-            OwnedIdentityPageOutput::Rows(page) => {
-                let (rows, charge) = identity_scan_reply(call, &after, &page.keys)?;
-                (rows, charge, page.more)
-            }
-            OwnedIdentityPageOutput::Arrow(page) => {
-                let (rows, charge) = positioned_identity_scan_reply(call.memory(), page.ids())?;
-                (rows, charge, page.more)
-            }
-        };
+        let (rows, charge, more) = identity_page_output_reply(call, &after, &page)?;
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(more).to_string())].into()
         );
@@ -2817,16 +2808,7 @@ impl Service {
             .map_err(|_| invalid("Owned identity limit is out of range"))?;
         let after = identity_scan_request(batch)?;
         let page = held.snapshot.identity_page_all_valid_output(&relation, system, &after, limit).await.map_err(status)?;
-        let (rows, charge, more) = match &page {
-            OwnedIdentityPageOutput::Rows(page) => {
-                let (rows, charge) = identity_scan_reply(call, &after, &page.keys)?;
-                (rows, charge, page.more)
-            }
-            OwnedIdentityPageOutput::Arrow(page) => {
-                let (rows, charge) = positioned_identity_scan_reply(call.memory(), page.ids())?;
-                (rows, charge, page.more)
-            }
-        };
+        let (rows, charge, more) = identity_page_output_reply(call, &after, &page)?;
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(more).to_string())].into()
         );
@@ -5088,6 +5070,8 @@ impl Service {
     pub(crate) async fn held_world_identities_action(
         &self, call: &Call, envelope: &Bytes, mode: WorldIdentityRead, reply_format: OwnedReplyFormat<'_>,
     ) -> Result<OwnedIpcReply, Status> {
+        use crate::owned_world::WorldIdentityPageOutput;
+
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = envelope.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -5116,21 +5100,27 @@ impl Service {
             .map_err(|_| invalid("Owned world identity limit is out of range"))?;
         let after = identity_scan_request(request)?;
         let page = match (mode, system) {
-            (WorldIdentityRead::ParentAt, Some(system)) =>
-                held.snapshot.parent_identity_page_at(&relation, valid, &after, limit, system).await,
-            (WorldIdentityRead::EffectiveAt, Some(system)) =>
-                held.snapshot.identity_page_at(&relation, valid, &after, limit, system, parent_only).await,
-            (WorldIdentityRead::OverlayAt, Some(system)) =>
-                held.snapshot.overlay_identities_at(&relation, valid, &after, limit, system).await,
             (WorldIdentityRead::Overlay, None) =>
-                held.snapshot.overlay_identities(&relation, valid, &after, limit).await,
+                held.snapshot.overlay_identities_output(&relation, valid, &after, limit).await,
+            (WorldIdentityRead::ParentAt, Some(system)) =>
+                held.snapshot.parent_identity_page_at(&relation, valid, &after, limit, system).await.map(WorldIdentityPageOutput::Rows),
+            (WorldIdentityRead::EffectiveAt, Some(system)) =>
+                held.snapshot.identity_page_at(&relation, valid, &after, limit, system, parent_only).await.map(WorldIdentityPageOutput::Rows),
+            (WorldIdentityRead::OverlayAt, Some(system)) =>
+                held.snapshot.overlay_identities_at(&relation, valid, &after, limit, system).await.map(WorldIdentityPageOutput::Rows),
             (WorldIdentityRead::Effective, None) =>
-                held.snapshot.identity_page(&relation, valid, &after, limit).await,
+                held.snapshot.identity_page(&relation, valid, &after, limit).await.map(WorldIdentityPageOutput::Rows),
             _ => return Err(invalid("Invalid held world identity coordinates")),
         }.map_err(status)?;
-        let (rows, _copy) = identity_scan_reply(call, &after, &page.keys)?;
+        let (rows, _copy, more) = match &page {
+            WorldIdentityPageOutput::Rows(page) => {
+                let (rows, charge) = identity_scan_reply(call, &after, &page.keys)?;
+                (rows, charge, page.more)
+            }
+            WorldIdentityPageOutput::Local(page) => identity_page_output_reply(call, &after, page)?,
+        };
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
-            [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
+            [(OWNED_IDENTITY_MORE.into(), u8::from(more).to_string())].into()
         );
         let reply = self.encode_owned_point_reply(
             self.memory(), &schema, Some(&rows), system.unwrap_or_else(|| held.snapshot.present()), valid,
@@ -6507,6 +6497,21 @@ fn shared_column_scopes(body: &[u8]) -> Result<(SharedColumnCarrierPrefix<'_>, &
 fn shared_column_census_rows(keys: &[EntityId]) -> Result<RecordBatch, Status> {
     let ids = rtdb_columnar::entity_id_array(keys.iter().map(EntityIdRef::from)).map_err(status)?;
     RecordBatch::try_from_iter([("_id", ids)]).map_err(arrow)
+}
+
+fn identity_page_output_reply(
+    call: &Call, scan: &OwnedIdentityScan<'_>, page: &OwnedIdentityPageOutput,
+) -> Result<(RecordBatch, Arc<MemoryReservation>, bool), Status> {
+    match page {
+        OwnedIdentityPageOutput::Rows(page) => {
+            let (rows, charge) = identity_scan_reply(call, scan, &page.keys)?;
+            Ok((rows, charge, page.more))
+        }
+        OwnedIdentityPageOutput::Arrow(page) => {
+            let (rows, charge) = positioned_identity_scan_reply(call.memory(), page.ids())?;
+            Ok((rows, charge, page.more))
+        }
+    }
 }
 
 fn identity_scan_reply(

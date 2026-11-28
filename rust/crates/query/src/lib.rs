@@ -93,6 +93,8 @@ mod owned_relation;
 mod owned_unique;
 mod owned_range;
 mod owned_range_order;
+#[doc(hidden)]
+pub use owned_relation::collect_owned_identity_candidates;
 pub use owned_range::{verify_owned_revealed_range, verify_owned_entity_region, verify_owned_fixed_range};
 pub use cursor::{SpatialProbeCells, SpatialProbeFallback};
 pub use owned_relation::{OwnedSpatialScan, open_native_spatial_builds, open_owned_spatial_refinement};

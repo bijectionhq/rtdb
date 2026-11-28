@@ -648,6 +648,25 @@ pub async fn owned_identity_candidates_in_prefix(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
     valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize, prefix: Option<EntityIdRef<'_>>,
 ) -> Result<OwnedIdentityCandidates> {
+    let (keys, charges) = collect_owned_identity_candidates(
+        context, owner, relation, system, valid, after, fetch, prefix,
+        || Vec::<EntityId>::with_capacity(fetch),
+        |keys, id| keys.last().map(|prior| EntityIdRef::from(prior).cmp(&id)),
+        |keys, key| keys.push(key.into_owned()),
+    ).await?;
+    Ok(OwnedIdentityCandidates { keys, _charges: charges })
+}
+
+/// Collects proved candidates in scan order, with their original grants.
+/// The collector compares against the last candidate it retained and receives each proved key while its source batch is live.
+#[doc(hidden)]
+pub async fn collect_owned_identity_candidates<T>(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
+    valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize, prefix: Option<EntityIdRef<'_>>,
+    init: impl FnOnce() -> T,
+    compare_last: impl Fn(&T, EntityIdRef<'_>) -> Option<std::cmp::Ordering>,
+    mut push: impl FnMut(&mut T, EntityIdRef<'_>),
+) -> Result<(T, Vec<Arc<rtdb_columnar::MemoryReservation>>)> {
     let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/world-identities",
         "The held world identity candidates exceed their exact coverage or byte bound");
     if !(1..=129).contains(&fetch) || relation.is_world_catalog()
@@ -657,7 +676,8 @@ pub async fn owned_identity_candidates_in_prefix(
     }
     let context = owned_context_at_system(context, system)?;
     let mut charges = vec![context.memory.reserve(fetch * 128)?];
-    let mut keys: Vec<EntityId> = Vec::with_capacity(fetch);
+    let mut keys = init();
+    let mut seen = 0;
     let mut remaining: usize = 8 << 20;
     let bound = match after {
         OwnedIdentityScan::Text(after) => after.as_deref().map(EntityIdRef::String),
@@ -675,33 +695,36 @@ pub async fn owned_identity_candidates_in_prefix(
                 let size = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
                 remaining = remaining.checked_sub(size).ok_or_else(unavailable)?;
                 charges.push(context.memory.reserve(size)?);
-                let id = rtdb_columnar::read_owned_entity_id(field, array, row)
+                let key = rtdb_columnar::read_owned_entity_id(field, array, row)
                     .map_err(|_| unavailable())?;
-                if keys.len() == fetch
-                    || prefix.is_some_and(|prefix| !identity_has_prefix(prefix, id))
-                    || keys.last().map(EntityIdRef::from).or(bound).is_some_and(|prior| prior >= id)
+                if seen == fetch
+                    || prefix.is_some_and(|prefix| !identity_has_prefix(prefix, key))
+                    || compare_last(&keys, key).or_else(|| bound.map(|prior| prior.cmp(&key)))
+                        .is_some_and(|order| !order.is_lt())
                 {
                     return Err(unavailable());
                 }
-                let id = id.into_owned();
-                let mut point = open_owned_point(
-                    Arc::clone(&context), owner, relation, &id,
-                    Some(Interval::at(valid)?), Some(&["_id"]),
+                let mut point = open_owned_table_selection(
+                    Arc::clone(&context), relation.table(owner), [key.iid()].into(),
+                    OwnedSelection::Point(key.into_owned()), Some(Interval::at(valid)?), Some(&["_id"]),
+                    false, false, false,
                 ).await?.ok_or_else(unavailable)?;
                 let mut found = false;
                 while let Some(hit) = point.next_batch().await? {
                     if hit.batch().num_rows() == 0 { continue; }
                     if found || hit.batch().num_rows() != 1 { return Err(unavailable()); }
-                    owned_row_revision(hit.batch(), 0, &id, &context.memory)?;
+                    owned_row_revision_for(hit.batch(), 0, key, &context.memory)?;
                     found = true;
                 }
                 if !found { return Err(unavailable()); }
-                keys.push(id);
+                drop(point);
+                push(&mut keys, key);
+                seen += 1;
             }
         }
     }
     context.check_cancelled()?;
-    Ok(OwnedIdentityCandidates { keys, _charges: charges })
+    Ok((keys, charges))
 }
 
 /// Project winning base facts, including when a decision suffix is hidden.

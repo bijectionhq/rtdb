@@ -28,7 +28,7 @@ mod owned_landing_wire;
 mod owned_world;
 mod owned_family;
 pub use owned_family::{FamilyReleaseInputWire, FamilyReleaseRegistrationWire, FamilyReleaseRequest, FamilyDerivedRow, FamilyFenceReply, FamilyOccurrenceWire, FamilyReply, FamilyRequest, FamilyReservationWire, FamilyStage, RetiredFamilyRequest, RetiredFamilyOperation, RetiredWorldRankRequest, WorldRowAuthoring};
-pub use owned_world::{FrozenWorldWinner, OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, PreparedWorldOverlay, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldParentVersion, WorldParentVersions, WorldPointResult, WorldPointRow};
+pub use owned_world::{FrozenWorldWinner, OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, PreparedWorldOverlay, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldIdentityPageOutput, WorldParentVersion, WorldParentVersions, WorldPointResult, WorldPointRow};
 
 /// Private Flight gateway request marker and response cutoff.
 pub const GATEWAY_ANSWER_DEADLINE_HEADER: &str = "x-rtdb-answer-deadline";

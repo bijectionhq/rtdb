@@ -18,7 +18,7 @@ pub struct OwnedIdentityPage {
     _charge: Arc<MemoryReservation>,
 }
 
-/// A validated Root key page for a consumer that can render Arrow identities.
+/// A validated held key page for a consumer that can render Arrow identities.
 pub enum OwnedIdentityPageOutput {
     Rows(OwnedIdentityPage),
     Arrow(OwnedIdentityArrowPage),
@@ -287,16 +287,53 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, system: Timestamp, valid: Timestamp,
         after: &OwnedIdentityScan<'_>, fetch: usize, prefix: Option<&str>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
-        let (admitted, _charge) = self.world_registration(world).await?
-            .filter(|(world, _)| !world.dropped && world.until > self.present.system_time)
-            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-        let context = self.relation_context(relation)?;
-        let relation = relation.in_world(admitted.id)?;
+        let (context, relation, _charge) = self.world_identity_context(world, relation).await?;
         let page = rtdb_query::owned_identity_candidates_in_prefix(
             Arc::clone(&context), &self.owner, &relation, system, valid, after, fetch, prefix.map(EntityIdRef::String),
         ).await?;
         context.check_cancelled()?;
         Ok(page)
+    }
+
+    /// Reads a local shadow page, including tombstones, with an additional proved key for lookahead.
+    pub async fn world_identity_page_output(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
+        after: &OwnedIdentityScan<'_>, limit: usize,
+    ) -> Result<OwnedIdentityPageOutput> {
+        if !(1..=MAX_PAGE_ROWS).contains(&limit) { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        let (context, relation, _registration) = self.world_identity_context(world, relation).await?;
+        let mut more = false;
+        let (keys, charges) = rtdb_query::collect_owned_identity_candidates(
+            Arc::clone(&context), &self.owner, &relation, self.present.system_time, valid, after, limit + 1, None,
+            || PageKeys::new(Some(after), limit),
+            PageKeys::compare_last,
+            |keys, key| {
+                if keys.len() == limit {
+                    more = true;
+                } else {
+                    keys.push(key, limit);
+                }
+            },
+        ).await?;
+        context.check_cancelled()?;
+        let mut charges = charges.into_iter();
+        let mut charge = charges.next().expect("Identity candidates own their initial reservation");
+        let grant = Arc::get_mut(&mut charge).expect("Identity candidates own their reservations");
+        for mut part in charges {
+            grant.absorb(Arc::get_mut(&mut part).expect("Identity candidates own their reservations"))?;
+        }
+        keys.finish(more, charge)
+    }
+
+    async fn world_identity_context(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation,
+    ) -> Result<(Arc<rtdb_query::QueryContext>, OwnedRelation, Arc<MemoryReservation>)> {
+        let (admitted, charge) = self.world_registration(world).await?
+            .filter(|(world, _)| !world.dropped && world.until > self.present.system_time)
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        let context = self.relation_context(relation)?;
+        let relation = relation.in_world(admitted.id)?;
+        Ok((context, relation, charge))
     }
 
     pub async fn identity_page(

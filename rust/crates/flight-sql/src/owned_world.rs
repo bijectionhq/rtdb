@@ -573,6 +573,12 @@ pub struct WorldIdentityPage {
     pub reservations: Vec<Arc<MemoryReservation>>,
 }
 
+/// A held overlay reply keeps its candidate grants through encoding.
+pub enum WorldIdentityPageOutput {
+    Rows(WorldIdentityPage),
+    Local(rtdb_node::OwnedIdentityPageOutput),
+}
+
 pub struct WorldParentVersion {
     pub sequence: u64,
     pub system: Timestamp,
@@ -686,6 +692,11 @@ pub trait OwnedWorldRead: Send + Sync {
     fn overlay_identities<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn overlay_identities_output<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
+    ) -> BoxFuture<'a, Result<WorldIdentityPageOutput>> {
+        Box::pin(async move { self.overlay_identities(relation, valid, after, limit).await.map(WorldIdentityPageOutput::Rows) })
+    }
     fn overlay_identities_at<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>,
         limit: usize, system: Timestamp,
