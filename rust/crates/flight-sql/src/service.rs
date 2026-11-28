@@ -243,6 +243,19 @@ impl Call {
         Ok((headers, cutoff))
     }
 
+    #[cfg(feature = "multi")]
+    pub(crate) fn fence_store_reply(
+        &self, headers: &mut tonic::metadata::MetadataMap, deadline: DeliveryDeadline,
+    ) -> Result<(), Status> {
+        let egress = self.egress.as_ref().ok_or_else(|| Status::unavailable("The retained Store watch has no socket fence"))?;
+        egress.restrict(deadline).map_err(|_| Status::unavailable("The retained Store watch expired before delivery"))?;
+        if self.routed_delivery {
+            let wire = deadline.wire_nanos().ok_or_else(|| Status::unavailable("The Store watch deadline cannot be routed"))?;
+            headers.insert(crate::GATEWAY_ANSWER_DEADLINE_HEADER, wire.to_string().parse().map_err(arrow)?);
+        }
+        Ok(())
+    }
+
     fn classic_deadline(&self, cutoff: Option<DeliveryDeadline>) -> Option<DeliveryDeadline> {
         match self.classic_retained {
             Some(retained) => Some(cutoff.map_or(retained.deadline, |cutoff| cutoff.earlier(retained.deadline))),

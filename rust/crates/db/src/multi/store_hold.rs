@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, sync::{Arc, Weak}};
+use std::{collections::BTreeMap, sync::{Arc, Weak}, time::{Duration, Instant, SystemTime}};
 
 use rtdb_crypt::store_watch_drain::Proof as WatchDrainProof;
 use rtdb_format::journal::{OrderedStoreHold, OrderedStoreWatchTurn, Record, StoreHoldChange, StoreWatchReceiver};
 use rtdb_index::branches::BranchIndex;
+use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
 };
@@ -23,13 +24,18 @@ pub(super) fn stale_read_turn() -> Anomaly {
 pub struct StoreReadTurn {
     basis: Basis,
     retained_from: Basis,
-    expires_at: Option<Timestamp>,
+    deadline: Option<StoreWatchDeadline>,
     epoch: u64,
     generation: u64,
     writer_fence_position: Option<u64>,
     owner: Arc<()>,
     watch: Option<(StoreVersionHoldKey, OrderedStoreWatchTurn)>,
     drain: Option<StoreWatchDrain>,
+}
+
+struct StoreWatchDeadline {
+    expires_at: Timestamp,
+    transport: DeliveryDeadline,
 }
 
 pub(super) struct StoreWatchDrain(Option<Box<dyn FnOnce() + Send + Sync>>);
@@ -55,8 +61,12 @@ impl StoreReadTurn {
         self.drain = Some(drain);
     }
 
+    pub fn delivery_deadline(&self) -> Option<DeliveryDeadline> {
+        self.deadline.as_ref().map(|deadline| deadline.transport)
+    }
+
     pub(super) fn require_unexpired(&self, upper: i64) -> Result<()> {
-        if self.expires_at.is_some_and(|expires_at| upper >= expires_at.0) {
+        if self.deadline.as_ref().is_some_and(|deadline| upper >= deadline.expires_at.0) {
             return Err(watch_gap());
         }
         Ok(())
@@ -84,7 +94,7 @@ impl StoreReads {
         self.0.push(InFlightStoreRead {
             retained_from: turn.retained_from,
             owner: Arc::downgrade(&turn.owner),
-            change_history: turn.expires_at.is_some(),
+            change_history: turn.deadline.is_some(),
         });
     }
 
@@ -421,10 +431,24 @@ impl MultiDatabase {
         if retained_from.position() < floor {
             return Err(watch_gap());
         }
+        let deadline = retained.map(|hold| -> Result<StoreWatchDeadline> {
+            // Time spent admitting and materializing the reply consumes
+            // this original writer-clock allowance.
+            let instant = Instant::now();
+            let wall = SystemTime::now();
+            let expires_at = Timestamp(hold.expires_at_micros);
+            let remaining = u64::try_from(expires_at.0.saturating_sub(self.upper())).map_err(|_| watch_gap())?;
+            if remaining == 0 {
+                return Err(watch_gap());
+            }
+            let transport = DeliveryDeadline::from_clock_sample(instant, wall, Duration::from_micros(remaining))
+                .ok_or_else(watch_gap)?;
+            Ok(StoreWatchDeadline { expires_at, transport })
+        }).transpose()?;
         let turn = StoreReadTurn {
             basis,
             retained_from,
-            expires_at: retained.map(|hold| Timestamp(hold.expires_at_micros)),
+            deadline,
             epoch: writer.epoch.0,
             generation: state.generation,
             writer_fence_position: index.store_writer_fence_position(),

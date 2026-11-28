@@ -44,6 +44,11 @@ impl DeliveryDeadline {
         Self { instant: until, wall: wall.checked_add(until.saturating_duration_since(now)).unwrap_or(wall) }
     }
 
+    /// Bound a transport by the allowance at one original clock sample.
+    pub fn from_clock_sample(instant: Instant, wall: SystemTime, allowance: Duration) -> Option<Self> {
+        Some(Self { instant: instant.checked_add(allowance)?, wall: wall.checked_add(allowance)? })
+    }
+
     pub fn answer_window() -> Self {
         let now = Instant::now();
         Self::sampled(now, SystemTime::now(), now + GRANT_WINDOW)

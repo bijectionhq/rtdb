@@ -343,7 +343,10 @@ impl Service {
     pub(super) fn store_reply_stream(
         &self, call: Call, guard: StoreReplyGuard, bytes: Bytes,
     ) -> Result<tonic::Response<crate::service::Output<arrow_flight::Result>>, Status> {
-        let headers = call.response(())?.metadata().clone();
+        let mut headers = call.response(())?.metadata().clone();
+        if let Some(deadline) = guard.hold.as_ref().and_then(|turn| turn.delivery_deadline()) {
+            call.fence_store_reply(&mut headers, deadline)?;
+        }
         let service = self.clone();
         let stream: crate::service::Output<_> = Box::pin(async_stream::try_stream! {
             service.check_store_reply_guard(&call, &guard).await.map_err(|status| call.error(status))?;
