@@ -98,7 +98,7 @@ impl<'a> BackupHeader<'a> {
 }
 
 fn archive_cut(archive: &Archive) -> AuthenticatedCut {
-    AuthenticatedCut { head: archive.signed_head.head, catalog_root: archive.history.genesis.root() }
+    AuthenticatedCut { head: archive.signed_head.head, catalog_root: archive.certification.history.genesis.root() }
 }
 
 impl PortableBackup {

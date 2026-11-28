@@ -90,7 +90,7 @@ impl ActivationAuthority {
             return Err(unavailable());
         };
         let inclusion = journal.inclusion(stream, position, Some(position.0)).await.map_err(journal_error)?;
-        let leaf = inclusion.verify(inclusion.history.genesis.root()).map_err(|_| corrupt())?;
+        let leaf = inclusion.verify(inclusion.certification.history.genesis.root()).map_err(|_| corrupt())?;
         if leaf.at != position || leaf.stream != stream || leaf.payload_sha256 != <[u8; 32]>::from(Sha256::digest(&record)) {
             return Err(corrupt());
         }
@@ -111,13 +111,13 @@ impl ActivationAuthority {
         self.access.require_operator()?;
         let control = self.authenticated_journal.as_ref().ok_or_else(unavailable)?;
         let stream = self.stream_id(name)?;
-        let (head, history) = application
+        let (head, certification) = application
             .authenticated_head(StreamId(expected.incarnation.as_u128()), Some(through.0))
             .await
             .map_err(journal_error)?;
         let floor = rtdb_lineage::LineageFloor {
             binding: expected,
-            source: rtdb_db::AuthenticatedCut { head: head.head, catalog_root: history.genesis.root() },
+            source: rtdb_db::AuthenticatedCut { head: head.head, catalog_root: certification.history.genesis.root() },
         };
         if !floor.valid() {
             return Err(conflict());

@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rtdb_stream_journal::authenticated::{
-    Archive, CatalogAuthority, CatalogHistory, QuorumSignature, SignedHead, Tree, VoterKeys,
+    Archive, CatalogAuthority, CatalogHistory, Certification, QuorumSignature, SignedHead,
+    SignedStreamAuthority, StreamAuthority, Tree, VoterKeys,
 };
 
 use super::*;
@@ -40,12 +41,25 @@ fn archive(catalog: Uuid, stream: StreamId, leaves: impl IntoIterator<Item = Lea
             })
             .collect::<BTreeMap<_, _>>(),
     );
-    let authority = CatalogAuthority {
+    let sign = |statement: &[u8]| {
+        Vec::from([1, 3].map(|seed| QuorumSignature {
+            keeper: keeper(seed),
+            signature: key(seed).sign(statement).as_ref().to_vec(),
+        }))
+    };
+    let genesis = CatalogAuthority {
         catalog,
         revision: 0,
         predecessor_sha256: None,
         catalog_voters: roster.clone(),
-        stream_voters: BTreeMap::from([(stream, roster)]),
+    };
+    let authority = StreamAuthority {
+        catalog,
+        stream,
+        revision: 0,
+        predecessor_sha256: None,
+        catalog_sha256: genesis.digest(),
+        voters: roster,
     };
     let mut tree = Tree::default();
     tree.extend(leaves).unwrap();
@@ -57,18 +71,20 @@ fn archive(catalog: Uuid, stream: StreamId, leaves: impl IntoIterator<Item = Lea
         timestamp_micros: 100,
         authority_sha256: authority.digest(),
     };
-    let signatures = [1, 3].map(|seed| QuorumSignature {
-        keeper: keeper(seed),
-        signature: key(seed).sign(&head.statement()).as_ref().to_vec(),
-    });
     Archive {
         signed_head: SignedHead {
             head,
-            signatures: Vec::from(signatures),
+            signatures: sign(&head.statement()),
         },
-        history: CatalogHistory {
-            genesis: authority,
-            transitions: Vec::new(),
+        certification: Certification {
+            history: CatalogHistory {
+                genesis,
+                transitions: Vec::new(),
+            },
+            stream: vec![SignedStreamAuthority {
+                signatures: sign(&authority.statement()),
+                authority,
+            }],
         },
         tree,
     }
@@ -113,7 +129,7 @@ fn activation_record(binding: Binding) -> serde_json::Value {
 }
 
 fn cut(source: &Archive) -> AuthenticatedCut {
-    AuthenticatedCut { head: source.signed_head.head, catalog_root: source.history.genesis.root() }
+    AuthenticatedCut { head: source.signed_head.head, catalog_root: source.certification.history.genesis.root() }
 }
 
 fn segment(source: &Archive) -> LineageSegment {
@@ -160,7 +176,7 @@ fn publication_with(source: &Archive, amend: impl FnOnce(&mut serde_json::Value)
             control_record,
             control_inclusion: control.inclusion(Lsn(1)).unwrap(),
         },
-        control.history.genesis.root(),
+        control.certification.history.genesis.root(),
     )
 }
 
@@ -174,7 +190,7 @@ fn lineage_capture_waits_for_publication() {
             AUTHORITY,
             DATABASE,
             control_root,
-            source.history.genesis.root(),
+            source.certification.history.genesis.root(),
             authorization(1),
             proof,
             Some(&inclusion),
@@ -190,7 +206,7 @@ fn selected_settlement_waits_for_evidence_and_refuses_a_substituted_cut() {
     let source = archive(SOURCE, STREAM, [leaf(1)]);
     let inclusion = source.inclusion(Lsn(1)).unwrap();
     let (publication, control_root) = publication(&source);
-    let application_root = source.history.genesis.root();
+    let application_root = source.certification.history.genesis.root();
     let cut = SettlementCut { predecessor: PREDECESSOR, successor: SUCCESSOR, end: Lsn(1) };
     let verify = |cut, proof, inclusion| {
         verify_settlement_at(
@@ -227,7 +243,7 @@ fn lineage_leaves_a_matching_untimed_record_pending() {
             AUTHORITY,
             DATABASE,
             control_root,
-            source.history.genesis.root(),
+            source.certification.history.genesis.root(),
             authorization(1),
             Some(&publication),
             Some(&inclusion),
@@ -256,7 +272,7 @@ fn lineage_rejects_conflicting_timing_for_a_matching_record() {
         AUTHORITY,
         DATABASE,
         control_root,
-        source.history.genesis.root(),
+        source.certification.history.genesis.root(),
         authorization(1),
         Some(&publication),
         Some(&inclusion),
@@ -280,7 +296,7 @@ fn lineage_releases_an_authorized_position_filled_by_a_replacement() {
             AUTHORITY,
             DATABASE,
             control_root,
-            source.history.genesis.root(),
+            source.certification.history.genesis.root(),
             authorization(1),
             Some(&publication),
             inclusion,
@@ -296,7 +312,7 @@ fn lineage_releases_a_committed_append_discarded_by_a_lossy_cut() {
     let old_source = archive(SOURCE, STREAM, [leaf(1), leaf(2)]);
     let cut = archive(SOURCE, STREAM, [leaf(1)]);
     let discarded = old_source.inclusion(Lsn(2)).unwrap();
-    let source_root = old_source.history.genesis.root();
+    let source_root = old_source.certification.history.genesis.root();
     assert_eq!(discarded.verify(source_root), Ok(&leaf(2)));
     let (publication, control_root) = publication(&cut);
     assert_eq!(
@@ -343,7 +359,7 @@ fn lineage_rejects_substituted_publication_and_application_head() {
             AUTHORITY,
             DATABASE,
             control_root,
-            source.history.genesis.root(),
+            source.certification.history.genesis.root(),
             authorization(1),
             Some(&publication),
             Some(&unselected),
@@ -395,7 +411,7 @@ fn floor_publication(source: &Archive) -> (PublicationProof, CatalogRoot) {
             control_record,
             control_inclusion: control.inclusion(Lsn(1)).unwrap(),
         },
-        control.history.genesis.root(),
+        control.certification.history.genesis.root(),
     )
 }
 
@@ -406,7 +422,7 @@ fn lineage_floor_captures_a_serving_incarnations_included_append() {
     let (floor, control_root) = floor_publication(&source);
     let verify = |authorization, inclusion| {
         verify_settlement(
-            AUTHORITY, DATABASE, control_root, source.history.genesis.root(), authorization, Some(&floor), inclusion,
+            AUTHORITY, DATABASE, control_root, source.certification.history.genesis.root(), authorization, Some(&floor), inclusion,
         )
         .unwrap()
     };
@@ -422,7 +438,7 @@ fn lineage_floor_releases_a_position_it_filled_with_another_append() {
     let source = archive(SOURCE, STREAM, [replacement]);
     let inclusion = source.inclusion(Lsn(1)).unwrap();
     let (floor, control_root) = floor_publication(&source);
-    let application_root = source.history.genesis.root();
+    let application_root = source.certification.history.genesis.root();
     assert_eq!(
         verify_settlement(
             AUTHORITY, DATABASE, control_root, application_root, authorization(1), Some(&floor), Some(&inclusion),
@@ -457,7 +473,7 @@ fn published_segment(source: &Archive) -> serde_json::Value {
         "predecessor": PREDECESSOR,
         "successor": SUCCESSOR,
         "source_catalog": head.catalog,
-        "source_root": source.history.genesis.root(),
+        "source_root": source.certification.history.genesis.root(),
         "source_stream": head.stream,
         "source_head": head,
         "end": head.size,
@@ -485,7 +501,7 @@ fn segment_keeps_its_published_form_and_digest() {
         digest.update(binding.revision.to_be_bytes());
     }
     digest.update(head.catalog.as_bytes());
-    digest.update(source.history.genesis.root().0);
+    digest.update(source.certification.history.genesis.root().0);
     digest.update(head.stream.0.to_be_bytes());
     digest.update(head.statement());
     digest.update(head.size.to_be_bytes());
@@ -513,7 +529,7 @@ fn floor_keeps_its_published_form() {
     let source = archive(SOURCE, STREAM, [leaf(1)]);
     let published = serde_json::json!({
         "binding": PREDECESSOR,
-        "source_root": source.history.genesis.root(),
+        "source_root": source.certification.history.genesis.root(),
         "source_head": source.signed_head.head,
     });
     let floor: LineageFloor = serde_json::from_value(published.clone()).unwrap();

@@ -831,9 +831,9 @@ impl ActivationAuthority {
         let sealed_segment_end = seal.sealed_head_lsn;
         let sealed = match authenticated {
             Some(journal) => {
-                let (head, history) = journal.authenticated_head(seal.fence.stream, Some(sealed_segment_end.0)).await.map_err(journal_error)?;
-                let catalog_root = history.genesis.root();
-                head.verify(catalog_root, &history).map_err(|_| conflict())?;
+                let (head, certification) = journal.authenticated_head(seal.fence.stream, Some(sealed_segment_end.0)).await.map_err(journal_error)?;
+                let catalog_root = certification.history.genesis.root();
+                head.verify(catalog_root, &certification).map_err(|_| conflict())?;
                 let cut = AuthenticatedCut { head: head.head, catalog_root };
                 if !cut.matches(*operation.predecessor.incarnation.as_bytes(), sealed_segment_end) { return Err(conflict()); }
                 SourceSeal::Cut(cut)
