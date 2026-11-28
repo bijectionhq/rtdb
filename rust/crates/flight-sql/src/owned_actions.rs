@@ -7264,6 +7264,68 @@ mod world_point_tests {
     }
 
     #[test]
+    fn world_point_all_null_numeric_lists_keep_reply_admission_and_reached_errors() {
+        let logical = LogicalType::list(LogicalType::Scalar(ScalarType::I64).maybe());
+        let field = to_field("items", &logical).unwrap();
+        let DataType::List(item) = field.data_type() else {
+            unreachable!()
+        };
+        let items = Arc::new(ListArray::new(
+            Arc::clone(item),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(Int64Array::from(vec![None, None])),
+            None,
+        )) as ArrayRef;
+        let decoded = rtdb_columnar::read_value(&field, items.as_ref(), 0).unwrap();
+        let bytes =
+            Value::document_retained_bytes(&StructFields::from([("items".into(), decoded)])).unwrap();
+        let bound = 4096 + 8 * bytes;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field.clone()])),
+            vec![Arc::clone(&items)],
+        )
+        .unwrap();
+        let memory = MemoryBudget::new(bound);
+        let (mut cells, charge) = prepare_world_point(&batch, &memory).unwrap();
+        assert_eq!(charge.bytes(), bound);
+        let (output_field, output) = cells.pop().unwrap().write("items").unwrap();
+        assert_eq!(
+            output_field,
+            to_field("items", &LogicalType::list(LogicalType::Null)).unwrap()
+        );
+        assert_eq!(output.as_list::<i32>().values().len(), 2);
+        drop((output, charge));
+        assert_eq!(memory.used_bytes(), 0);
+
+        let tight = MemoryBudget::new(bound - 1);
+        let expected = status(tight.reserve(bound).unwrap_err());
+        let refused = prepare_world_point(&batch, &tight).err().unwrap();
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (expected.code(), expected.message())
+        );
+        assert_eq!(tight.used_bytes(), 0);
+
+        let uri = Arc::new(to_field("uri", &LogicalType::Scalar(ScalarType::Uri)).unwrap());
+        let nested = Arc::new(StructArray::new(
+            vec![uri].into(),
+            vec![Arc::new(StringArray::from(vec!["not a URI"]))],
+            None,
+        ));
+        let payload = Field::new("payload", nested.data_type().clone(), false);
+        let expected = rtdb_columnar::read_value(&payload, nested.as_ref(), 0).unwrap_err();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field, payload])),
+            vec![items, nested],
+        )
+        .unwrap();
+        let memory = MemoryBudget::new(1);
+        let error = prepare_world_point(&batch, &memory).err().unwrap();
+        assert_eq!(error.message(), status(expected).message());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn world_point_budget_refusal_uses_the_complete_document_charge() {
         let first = Arc::new(StringArray::from(vec!["first"]));
         let long = "x".repeat(8192);

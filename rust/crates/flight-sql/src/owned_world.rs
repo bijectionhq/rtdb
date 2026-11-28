@@ -157,6 +157,7 @@ enum PointStorage<'a> {
     Slice(ArrowCell<'a>),
     Compact { cell: ArrowCell<'a>, validate_uri: bool },
     NumericList(ArrowCell<'a>),
+    NullList(usize),
     FloatList { values: &'a dyn Array, rows: Range<usize> },
     ByteList { values: &'a dyn Array, rows: Range<usize>, payload_bytes: usize },
     Struct(Vec<PointCell<'a>>),
@@ -271,6 +272,9 @@ impl<'a> PointCell<'a> {
             LogicalType::List { kind: kind @ (ListKind::List | ListKind::FixedSizeList(_)), element } => {
                 let Some((item, values, rows)) = selected.sequence_range() else { return Ok(None); };
                 if let Some((bytes, observed)) = rtdb_columnar::plain_numeric_list_layout(item, values, rows.clone(), element)? {
+                    if observed == LogicalType::Null {
+                        return Ok(Some(Self::null_list(kind, rows.len(), bytes)));
+                    }
                     return Ok(Some(Self {
                         logical: LogicalType::List { kind: kind.clone(), element: Box::new(observed) },
                         bytes,
@@ -281,14 +285,14 @@ impl<'a> PointCell<'a> {
                     return Ok(None);
                 }
                 let element = match element.as_ref() { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
-                let plain_list = *kind == ListKind::List && selected.field.metadata().is_empty();
+                let plain_list = selected.field.metadata().is_empty();
                 let (header, width) = match (element, item.data_type()) {
                     (LogicalType::Scalar(ScalarType::F32), DataType::Float32) => (size_of::<Float32Array>(), 4),
                     (LogicalType::Scalar(ScalarType::F64), DataType::Float64) => (size_of::<Float64Array>(), 8),
                     (LogicalType::Scalar(ScalarType::Utf8), DataType::Utf8) if plain_list =>
-                        return Ok(Self::try_byte_list::<Utf8Type>(values, rows, element)),
+                        return Ok(Self::try_byte_list::<Utf8Type>(values, rows, element, kind)),
                     (LogicalType::Scalar(ScalarType::Binary), DataType::Binary) if plain_list =>
-                        return Ok(Self::try_byte_list::<BinaryType>(values, rows, element)),
+                        return Ok(Self::try_byte_list::<BinaryType>(values, rows, element, kind)),
                     _ => return Ok(None),
                 };
                 let nulls = values.nulls().map_or(0, |nulls| nulls.slice(rows.start, rows.len()).null_count());
@@ -310,13 +314,26 @@ impl<'a> PointCell<'a> {
         Ok(Some(Self { logical, bytes, storage }))
     }
 
+    fn null_list(kind: &ListKind, length: usize, bytes: usize) -> Self {
+        Self {
+            logical: LogicalType::List { kind: kind.clone(), element: Box::new(LogicalType::Null) },
+            bytes,
+            storage: PointStorage::NullList(length),
+        }
+    }
+
     fn try_byte_list<T: ByteArrayType<Offset = i32>>(
-        values: &'a dyn Array, rows: Range<usize>, element: &LogicalType,
+        values: &'a dyn Array, rows: Range<usize>, element: &LogicalType, kind: &ListKind,
     ) -> Option<Self> {
         let values = values.as_bytes_opt::<T>()?;
         let nulls = values.nulls().map(|nulls| nulls.slice(rows.start, rows.len()));
         let null_count = nulls.as_ref().map_or(0, NullBuffer::null_count);
-        if null_count == rows.len() { return None; }
+        if null_count == rows.len() {
+            // The checked byte-list reader packs an all-null span with the numeric builder's "null" field.
+            let bytes = size_of::<NullArray>() + Field::new("null", DataType::Null, true).size();
+            return Some(Self::null_list(kind, rows.len(), bytes));
+        }
+        if *kind != ListKind::List { return None; }
         let offsets = &values.value_offsets()[rows.start..=rows.end];
         let (element, payload_bytes, validity_bytes) = match nulls.filter(|_| null_count != 0) {
             None => (element.clone(), (offsets[rows.len()] - offsets[0]) as usize, 0),
@@ -379,6 +396,20 @@ impl<'a> PointCell<'a> {
             PointStorage::NumericList(cell) => {
                 let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
                 rtdb_columnar::build_array(&self.logical, &[value])?
+            }
+            PointStorage::NullList(length) => {
+                let values: ArrayRef = Arc::new(NullArray::new(length));
+                match field.data_type() {
+                    DataType::List(item) => {
+                        let mut offsets = vec![0];
+                        offsets.push(i32::try_from(length).expect("An Arrow list has i32 offsets"));
+                        rtdb_columnar::build_list_array(Arc::clone(item), offsets.into(), &values, None)?
+                    }
+                    DataType::FixedSizeList(item, width) => {
+                        Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *width, values, None).map_err(point_arrow)?)
+                    }
+                    _ => unreachable!("Prepared point null list"),
+                }
             }
             PointStorage::FloatList { values, rows } => compact_float_list(field, values, rows)?,
             PointStorage::ByteList { values, rows, payload_bytes } => match values.data_type() {
@@ -535,17 +566,21 @@ fn held_history_numeric_list_sizing_borrows_the_child_and_keeps_the_legacy_charg
             Arc::clone(&values),
             None,
         );
-        let fixed = FixedSizeListArray::new(item, length as i32, values.slice(2, length), None);
+        let fixed = FixedSizeListArray::new(Arc::clone(&item), length as i32, values.slice(2, length), None);
+        let fixed_null = FixedSizeListArray::new(item, 2, values.slice(length + 2, 2), None);
         let list_field = Field::new("items", list.data_type().clone(), false);
         let fixed_field = Field::new("items", fixed.data_type().clone(), false);
+        let fixed_null_field = Field::new("items", fixed_null.data_type().clone(), false);
         let list = Arc::new(list) as ArrayRef;
         let fixed = Arc::new(fixed) as ArrayRef;
+        let fixed_null = Arc::new(fixed_null) as ArrayRef;
         for (field, array, row) in [
             (&list_field, &list, 0),
             (&list_field, &list, 1),
             (&list_field, &list, 2),
             (&list_field, &list, 3),
             (&fixed_field, &fixed, 0),
+            (&fixed_null_field, &fixed_null, 0),
         ] {
             let batch = RecordBatch::try_new(
                 Arc::new(Schema::new(vec![field.clone()])),
@@ -556,11 +591,15 @@ fn held_history_numeric_list_sizing_borrows_the_child_and_keeps_the_legacy_charg
             let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row).unwrap();
             let expected_heap = value.retained_bytes().unwrap() - size_of::<Value>();
             let logical = value.logical_type();
+            let all_null = matches!(&logical, LogicalType::List { element, .. } if **element == LogicalType::Null);
             let plan = PointCell::prepare(cell).unwrap();
-            let PointStorage::NumericList(borrowed) = &plan.storage else {
-                panic!("Expected a borrowed numeric list");
-            };
-            assert!(std::ptr::addr_eq(borrowed.array, cell.array));
+            match &plan.storage {
+                PointStorage::NullList(2) if all_null => {}
+                PointStorage::NumericList(borrowed) if !all_null => {
+                    assert!(std::ptr::addr_eq(borrowed.array, cell.array));
+                }
+                _ => panic!("Expected a borrowed numeric list or an all-null child"),
+            }
             assert_eq!(plan.heap_bytes(), expected_heap);
             assert_eq!(
                 WorldPointRow::document_bytes(&batch).unwrap(),
@@ -604,6 +643,65 @@ fn held_point_plain_byte_lists_prepare_borrowed_child_spans() {
         assert!(std::ptr::addr_eq(values, child.as_ref()));
         assert_eq!(rows, 1..2);
         assert_eq!(payload_bytes, 5);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn held_point_all_null_byte_lists_plan_only_a_null_child() {
+    let text = Arc::new(StringArray::from(vec![
+        Some("outside"),
+        Some("selected elsewhere"),
+        None,
+        None,
+    ])) as ArrayRef;
+    let binary = Arc::new(BinaryArray::from(vec![
+        Some(b"outside".as_slice()),
+        Some(b"selected elsewhere".as_slice()),
+        None,
+        None,
+    ])) as ArrayRef;
+    for child in [text, binary] {
+        let item = Arc::new(Field::new("source_child", child.data_type().clone(), true));
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Arc::clone(&child),
+            None,
+        );
+        let fixed = FixedSizeListArray::new(item, 2, child, None);
+        for array in [Arc::new(list) as ArrayRef, Arc::new(fixed) as ArrayRef] {
+            let field = Field::new("items", array.data_type().clone(), false);
+            let array = array.slice(1, 1);
+            let cell = ArrowCell {
+                field: &field,
+                array: array.as_ref(),
+                row: 0,
+            };
+            let checked = rtdb_columnar::read_value(cell.field, cell.array, cell.row).unwrap();
+            let plan = PointCell::prepare(cell).unwrap();
+            assert!(matches!(&plan.storage, PointStorage::NullList(2)));
+            assert_eq!(
+                plan.heap_bytes(),
+                checked.retained_bytes().unwrap() - size_of::<Value>()
+            );
+            let (field, output) = plan.write("items").unwrap();
+            let logical = checked.logical_type();
+            let expected = rtdb_columnar::build_array(&logical, &[checked]).unwrap();
+            assert_eq!(field, rtdb_columnar::to_field("items", &logical).unwrap());
+            assert_eq!(output.to_data(), expected.to_data());
+            assert_eq!(
+                output.get_array_memory_size(),
+                expected.get_array_memory_size()
+            );
+            let data = output.to_data();
+            let [child] = data.child_data() else {
+                panic!("Expected one list child");
+            };
+            assert_eq!(child.data_type(), &DataType::Null);
+            assert_eq!(child.len(), 2);
+            assert!(child.buffers().is_empty());
+        }
     }
 }
 
