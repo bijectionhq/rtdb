@@ -7,5 +7,8 @@
     "crates/kernel_text",
     "crates/geometry"
   ],
-  "rank_digest": "852c5735181081692b43fae86f311f6dc517108cff87d7864ed8643e1736b1d5"
+  "rank_digest": "24b44ac80be6c6700159e2a75b7837bba21de59b3793d30560fa10afd016e35b",
+  "rtdb_patches": [
+    "299af2139401b5d1676260586c9318e903239f90"
+  ]
 }
