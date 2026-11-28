@@ -1046,6 +1046,22 @@
     (t/is (= [3 nil 0 7 4 3]
              (:res (run-projection rel '(octet_length (reverse a))))))))
 
+(t/deftest literal-replace-projections-preserve-java-matching-and-decoding
+  (with-open [rel (vr/rel-reader [(doto (Utf8Vector. tu/*allocator* "a" true)
+                                   (.writeObject "z😀aaaaa😀aa!")
+                                   (.writeObject "😀😀😀")
+                                   (.writeBytes (byte-array [(unchecked-byte 0xff) 97 97]))
+                                   (.writeObject "")
+                                   (.writeNull))])]
+    (t/are [form expected] (= {:res-type #xt/type [:? :utf8], :res expected}
+                              (run-projection rel form))
+      '(replace a "aa" "界") ["z😀界界a😀界!" "😀😀😀" "�界" "" nil]
+      '(replace a "😀😀" "") ["z😀aaaaa😀aa!" "😀" "�aa" "" nil]
+      '(replace a "�" "x") ["z😀aaaaa😀aa!" "😀😀😀" "xaa" "" nil]
+      '(replace (substring a 2 6) "aa" "_") ["😀__a" "😀😀" "_" "" nil])
+    (t/is (= ["-?-?-" "-?-?-" "-a-" "-" nil]
+             (:res (run-projection rel '(replace (substring a 2 1) "" "-")))))))
+
 (t/deftest case-projection-reads-the-default-locale-at-evaluation
   (with-open [rel (tu/open-rel {:a ["iI"]})]
     (let [input-types {:var-types {'a #xt/type :utf8}, :param-types {}}

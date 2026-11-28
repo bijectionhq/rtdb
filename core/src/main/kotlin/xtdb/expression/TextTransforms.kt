@@ -2,6 +2,8 @@ package xtdb.expression
 
 import xtdb.InternalApi
 import xtdb.arrow.VariableWidthVector
+import xtdb.arrow.isWellFormedUtf8
+import xtdb.util.StringUtil
 import java.nio.ByteBuffer
 import java.util.Locale
 
@@ -48,30 +50,40 @@ object TextTransforms {
     }
 
     @JvmStatic
-    fun tryWriteAsciiReplaceByte(out: VariableWidthVector, value: Any?, target: Int, replacement: String): Boolean {
+    fun tryWriteLiteralReplace(out: VariableWidthVector, value: Any?, target: ByteBuffer, replacement: ByteArray): Boolean {
         val input = value as? ByteBuffer ?: return false
-        val start = input.position()
-        val end = input.limit()
+        if (!target.hasRemaining() || !input.isWellFormedUtf8()) return false
+
+        val cursor = input.duplicate()
+        val targetSize = target.remaining()
         var matches = 0
-        for (idx in start until end) {
-            val octet = input[idx].toInt()
-            if (octet < 0) return false
-            if (octet == target) matches++
+        while (true) {
+            val match = StringUtil.SqlBinPosition(target, cursor)
+            if (match == 0) break
+            cursor.position(cursor.position() + (match - 1) + targetSize)
+            matches++
         }
 
-        val size = input.remaining() + matches.toLong() * (replacement.length - 1)
+        val size = input.remaining() + matches.toLong() * (replacement.size - targetSize)
         if (size > Int.MAX_VALUE) return false
 
+        cursor.position(input.position())
         out.writeBytes(size.toInt()) { dest, destinationStart ->
             var offset = destinationStart
-            for (idx in start until end) {
-                val octet = input[idx].toInt()
-                if (octet == target) {
-                    for (char in replacement) dest.setByte(offset++, char.code)
-                } else {
-                    dest.setByte(offset++, octet)
+            repeat(matches) {
+                val prefixSize = StringUtil.SqlBinPosition(target, cursor) - 1
+                val matchStart = cursor.position() + prefixSize
+                if (prefixSize > 0) {
+                    cursor.limit(matchStart)
+                    dest.setBytes(offset, cursor)
+                    cursor.limit(input.limit())
+                    offset += prefixSize
                 }
+                if (replacement.isNotEmpty()) dest.setBytes(offset, replacement)
+                offset += replacement.size
+                cursor.position(matchStart + targetSize)
             }
+            if (cursor.hasRemaining()) dest.setBytes(offset, cursor)
         }
         return true
     }

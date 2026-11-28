@@ -1726,16 +1726,20 @@
   (codegen-overlay #xt/type :utf8 `resolve-utf8-buf `StringUtil/sqlUtf8Overlay `StringUtil/sqlUtf8OverlayParts))
 
 (defmethod codegen-call [:replace :utf8 :utf8 :utf8]
-  [{[_ {target :literal} {replacement :literal}] :args}]
-  (cond-> {:return-type #xt/type :utf8
-           :->call-code (fn [[s target replacement]]
-                          `(-> (.replace (resolve-string ~s) (resolve-string ~target) (resolve-string ~replacement))
-                               (resolve-utf8-buf)))}
-    (and (string? target) (= 1 (count target)) (< (int (.charAt ^String target 0)) 128)
-         (string? replacement) (every? #(< (int %) 128) replacement))
-    (with-byte-transform (fn [out value]
-                           `(TextTransforms/tryWriteAsciiReplaceByte ~out ~value
-                                                                     ~(int (.charAt ^String target 0)) ~replacement)))))
+  [{[_ {target :literal} {replacement :literal}] :args, :keys [::projection-root?]}]
+  (let [call {:return-type #xt/type :utf8
+              :->call-code (fn [[s target replacement]]
+                             `(-> (.replace (resolve-string ~s) (resolve-string ~target) (resolve-string ~replacement))
+                                  (resolve-utf8-buf)))}]
+    (if (and projection-root? (string? target) (seq target) (string? replacement))
+      (let [target-bytes (gensym 'target_bytes)
+            replacement-bytes (gensym 'replacement_bytes)]
+        (-> call
+            (assoc :batch-bindings [[target-bytes (emit-value String target)]
+                                    [replacement-bytes `(.getBytes ~replacement StandardCharsets/UTF_8)]])
+            (with-byte-transform (fn [out value]
+                                   `(TextTransforms/tryWriteLiteralReplace ~out ~value ~target-bytes ~replacement-bytes)))))
+      call)))
 
 (def ^:private ^java.util.Set sql-keywords
   "SQL keywords derived from SqlLexer's vocabulary at load time, used by quote_ident.
