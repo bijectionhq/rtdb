@@ -586,7 +586,9 @@ impl Service {
         }
         let requested_database = requested_database
             .or_else(|| session.caller.principal.workload_grant().map(|grant| grant.database()));
-        let (database, attachment) = if matches!(kind, CallKind::SessionClose) {
+        let (database, attachment) = if store_close {
+            (session.store_drain_database(requested_database)?, None)
+        } else if matches!(kind, CallKind::SessionClose) {
             session.resolve_close_route(requested_database, &self.0.node)?
         } else {
             session.resolve_database(requested_database, &self.0.node)?

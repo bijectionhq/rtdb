@@ -147,6 +147,18 @@ impl Session {
         self.resolve_route(header, node, true)
     }
 
+    /// A Store close needs only the original session and the matching name.
+    /// It does not open the live catalog or an attachment for that name.
+    pub(crate) fn store_drain_database(&self, header: Option<&str>) -> Result<String, Status> {
+        match self.placed_database() {
+            Some(original) if header.is_some_and(|database| database != original) => {
+                Err(Status::permission_denied("This Store drain belongs to another deployment"))
+            },
+            Some(original) => Ok(original.to_owned()),
+            None => Ok(header.unwrap_or("xtdb").to_owned()),
+        }
+    }
+
     fn resolve_route(&self, header: Option<&str>, node: &Node, close: bool) -> Result<(String, Option<Arc<Database>>), Status> {
         let state = self.state.lock().expect("session lock");
         let catalog = match &*state {

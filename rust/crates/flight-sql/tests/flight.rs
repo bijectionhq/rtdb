@@ -167,6 +167,10 @@ impl Client {
     }
 
     async fn connect_with_peer(server: &ServerHandle, basic: Option<&str>, database: Option<&str>, proof: Option<&str>) -> Self {
+        Self::handshake(server, basic, database, proof, false).await
+    }
+
+    async fn handshake(server: &ServerHandle, basic: Option<&str>, database: Option<&str>, proof: Option<&str>, store: bool) -> Self {
         let channel = Channel::from_shared(format!("http://{}", server.address())).unwrap().connect().await.unwrap();
         let client = FlightServiceClient::new(channel); let mut this = Self { client, headers: MetadataMap::new() };
         if let Some(basic) = basic { use base64::Engine; this.headers.insert("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(basic)).parse().unwrap()); }
@@ -174,6 +178,9 @@ impl Client {
         let mut request = this.request(futures::stream::iter(vec![arrow_flight::HandshakeRequest::default()]));
         if let Some(proof) = proof {
             request.metadata_mut().insert(rtdb_flight_sql::FORWARDED_PEER_HEADER, proof.parse().unwrap());
+        }
+        if store {
+            request.metadata_mut().insert("x-rtdb-store-release", ::store::CONTRACT_VERSION.parse().unwrap());
         }
         let response = this.client.handshake(request).await.unwrap();
         if let Some(cookie) = response.metadata().get("set-cookie") { this.headers.insert("cookie", cookie.clone()); }
@@ -817,6 +824,27 @@ async fn retrying_close_confirms_the_original_drain_without_reopening_the_sessio
     }
     let error = client.action("GetSessionOptions", Bytes::new()).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn an_enrolled_store_session_can_close_after_its_original_attachment_leaves() {
+    let running = Running::start_with_placements(Some("correct"), FlightConfig::default(), &["first", "second"]).await;
+    let mut original = Client::handshake(&running.server, Some("xtdb:correct"), Some("first"), None, true).await;
+    running.node.detach_local("first".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while running.node.catalog().is_draining("first") { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    running.node.database_or_attach("first".into(), Default::default()).await.unwrap().unwrap();
+
+    original.headers.insert("x-xtdb-database", "second".parse().unwrap());
+    assert_eq!(original.action("CloseSession", Bytes::new()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    original.headers.insert("x-xtdb-database", "first".parse().unwrap());
+    let error = original.action("GetSessionOptions", Bytes::new()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    let reply = original.action("CloseSession", Bytes::new()).await.unwrap();
+    let [result] = reply.as_slice() else { panic!("one confirmation from the original session") };
+    assert_eq!(result.body.as_ref(), &[8, 1, 16, 1]);
     running.stop().await;
 }
 
