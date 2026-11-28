@@ -634,9 +634,25 @@ impl Service {
             return Err(error::unsupported("rtdb.store.v1.Watch with exact retention"));
         }
         #[cfg(feature = "multi")]
+        let cutoff = hold.as_ref().and_then(|turn| turn.delivery_deadline());
+        #[cfg(feature = "multi")]
         let mut delivery = None;
         let touched = loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            #[cfg(feature = "multi")]
+            if cutoff.is_some() {
+                self.check_local_store_reply(driver, original, &call.cancellation, hold.as_ref()).await?;
+            }
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            #[cfg(feature = "multi")]
+            let remaining = if let Some(cutoff) = cutoff {
+                if !cutoff.is_live() {
+                    return Err(error::not_found("rtdb/cursor-expired", "The exact Store watch has no current retention receipt"));
+                }
+                remaining.min(tokio::time::Instant::from_std(cutoff.instant()).saturating_duration_since(now))
+            } else {
+                remaining
+            };
             let request = Changes {
                 branch: MAIN_BRANCH.into(),
                 tables: [store_table()].into(),
