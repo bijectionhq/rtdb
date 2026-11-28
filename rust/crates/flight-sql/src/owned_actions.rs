@@ -24,7 +24,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_owned_entity_id, selected_cell, try_entity_id_array};
 use rtdb_format::ipc::OwnedStream;
-use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedIdentityPageOutput, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
+use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedIdentityArrowPage, OwnedIdentityPageOutput, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
 use rtdb_types::{Anomaly, OwnedIdentityScan, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation,
@@ -2814,14 +2814,24 @@ impl Service {
         let limit = usize::try_from(history_request_integer(batch, "limit")?)
             .map_err(|_| invalid("Owned identity limit is out of range"))?;
         let after = identity_scan_request(batch)?;
-        let page = held.snapshot.identity_page_all_valid(&relation, system, &after, limit).await.map_err(status)?;
-        let (rows, _copy) = identity_scan_reply(call, &after, &page.keys)?;
+        let page = held.snapshot.identity_page_all_valid_output(&relation, system, &after, limit).await.map_err(status)?;
+        let (rows, charge, more) = match &page {
+            OwnedIdentityPageOutput::Rows(page) => {
+                let (rows, charge) = identity_scan_reply(call, &after, &page.keys)?;
+                (rows, charge, page.more)
+            }
+            OwnedIdentityPageOutput::Arrow(page) => {
+                let (rows, charge) = positioned_identity_scan_reply(call.memory(), page.ids())?;
+                (rows, charge, page.more)
+            }
+        };
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
-            [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
+            [(OWNED_IDENTITY_MORE.into(), u8::from(more).to_string())].into()
         );
         // The reply's valid coordinate is the system cut it enumerated.
         let reply = self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), system, system, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
+        drop((charge, page));
         Ok(reply)
     }
 
@@ -2899,7 +2909,7 @@ impl Service {
         let (page, witness) = held.snapshot.protected_carrier_page(
             &relation, prefix, after.as_deref(), limit, scope,
         ).await.map_err(status)?;
-        self.held_prefix_reply(call, &held, &relation, &scan, page, witness, reply_format)
+        self.held_prefix_reply(call, &held, &relation, page, witness, reply_format)
     }
 
     pub(crate) async fn held_sealed_search_unit_rows_action(
@@ -2916,16 +2926,16 @@ impl Service {
         let (page, witness, original) = held.snapshot.sealed_search_unit_rows_page(
             &relation, prefix, after, limit, scope,
         ).await.map_err(status)?;
-        let reply = self.held_prefix_reply(call, &held, &relation, &OwnedIdentityScan::binary(after), page, witness, reply_format)?;
+        let reply = self.held_prefix_reply(call, &held, &relation, page, witness, reply_format)?;
         original().map_err(status)?;
         Ok(reply)
     }
 
     fn held_prefix_reply(
-        &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, scan: &OwnedIdentityScan<'_>,
-        page: rtdb_node::OwnedIdentityPage, witness: Option<OwnedRangeWitness>, reply_format: OwnedReplyFormat<'_>,
+        &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation,
+        page: OwnedIdentityArrowPage, witness: Option<OwnedRangeWitness>, reply_format: OwnedReplyFormat<'_>,
     ) -> Result<OwnedIpcReply, Status> {
-        let (rows, _copy) = identity_scan_reply(call, scan, &page.keys)?;
+        let (rows, _copy) = positioned_identity_scan_reply(call.memory(), page.ids())?;
         let mut metadata = std::collections::HashMap::from([
             (OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string()),
         ]);

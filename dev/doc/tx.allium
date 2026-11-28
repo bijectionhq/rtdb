@@ -363,7 +363,8 @@
 -- The relation journal certifies historical point coverage, and incomplete coverage refuses the read.
 -- A held Root identity page selects complete Utf8 or Binary keys visible at its valid instant and system cut in ascending order after its exclusive bound.
 -- A page that stops at its row or byte limit reports more when another key is available, and refuses a first key that exceeds the byte bound.
--- At the held head the Flight reply can gather the admitted positions into a funded typed identity column.
+-- At the held head the Flight reply can retain a funded typed Arrow identity column for both valid-instant and all-valid pages.
+-- An all-valid fetch filled by repeated validity slices resumes strictly after its last distinct key before deciding whether more identities are available.
 -- A historical identity page checks live purge floors before returning keys.
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
 -- An owned-read witness expires at the read's own 60-second lifetime clamped to the configured `garbage_lifetime`, and is further bounded by a provider lease where the store grants one.

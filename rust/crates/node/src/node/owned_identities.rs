@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
-use arrow_array::{ArrayRef, builder::{BinaryBuilder, StringBuilder}};
+use arrow_array::{ArrayRef, BinaryArray, builder::{BinaryBuilder, StringBuilder}};
 use rtdb_columnar::{EntityIdRef, MemoryReservation, estimate_read_value_bytes, read_owned_entity_id, retain_array};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedIdentityScan, OwnedRelation, OwnedSchema, PlacedAttemptScope, Result,
     SEALED_SEARCH_UNIT_ROWS, SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp, sealed_search_inventory_row};
@@ -15,7 +15,7 @@ const PROTECTED_PAGE_ROWS: usize = 64;
 pub struct OwnedIdentityPage {
     pub keys: Vec<EntityId>,
     pub more: bool,
-    _charges: Vec<Arc<MemoryReservation>>,
+    _charge: Arc<MemoryReservation>,
 }
 
 /// A validated Root key page for a consumer that can render Arrow identities.
@@ -57,21 +57,33 @@ impl PageKeys {
         }
     }
 
-    fn follows_last(&self, key: EntityIdRef<'_>, bound: Option<EntityIdRef<'_>>) -> bool {
-        fn tail<'a>(bytes: &'a [u8], offsets: &[i32]) -> Option<&'a [u8]> {
-            let [.., start, end] = offsets else { return None; };
-            Some(&bytes[*start as usize..*end as usize])
-        }
+    fn compare_last(&self, key: EntityIdRef<'_>) -> Option<Ordering> {
         let mut integer = [0; 8];
         let current = key.handle_parts(&mut integer);
-        let after = match self {
-            Self::Rows(keys) => return keys.last().map(EntityIdRef::from).or(bound).is_none_or(|previous| previous < key),
-            Self::Text(keys) => tail(keys.values_slice(), keys.offsets_slice()).map(|previous| (0, previous)),
-            Self::Binary(keys) => tail(keys.values_slice(), keys.offsets_slice()).map(|previous| (4, previous)),
+        let previous = match self {
+            Self::Rows(keys) => return keys.last().map(|previous| EntityIdRef::from(previous).cmp(&key)),
+            Self::Text(keys) => (0, last_key_bytes(keys.values_slice(), keys.offsets_slice())?),
+            Self::Binary(keys) => (4, last_key_bytes(keys.values_slice(), keys.offsets_slice())?),
         };
-        match after {
-            Some(previous) => previous < current,
-            None => bound.is_none_or(|previous| previous < key),
+        Some(previous.cmp(&current))
+    }
+
+    fn follows_last(&self, key: EntityIdRef<'_>, bound: Option<EntityIdRef<'_>>) -> bool {
+        self.compare_last(key).or_else(|| bound.map(|previous| previous.cmp(&key))).is_none_or(Ordering::is_lt)
+    }
+
+    fn seek_after_last(&self) -> Result<OwnedIdentityScan<'_>> {
+        match self {
+            Self::Rows(keys) => OwnedIdentityScan::seek(keys.last().ok_or_else(invalid_page)?),
+            Self::Text(keys) => {
+                let key = last_key_bytes(keys.values_slice(), keys.offsets_slice()).ok_or_else(invalid_page)?;
+                let key = std::str::from_utf8(key).map_err(|_| invalid_page())?;
+                Ok(OwnedIdentityScan::text(Some(key)))
+            }
+            Self::Binary(keys) => {
+                let key = last_key_bytes(keys.values_slice(), keys.offsets_slice()).ok_or_else(invalid_page)?;
+                Ok(OwnedIdentityScan::binary(Some(key)))
+            }
         }
     }
 
@@ -95,13 +107,37 @@ impl PageKeys {
 
     fn finish(self, more: bool, charge: Arc<MemoryReservation>) -> Result<OwnedIdentityPageOutput> {
         let ids: ArrayRef = match self {
-            Self::Rows(keys) => return Ok(OwnedIdentityPageOutput::Rows(OwnedIdentityPage { keys, more, _charges: vec![charge] })),
+            Self::Rows(keys) => return Ok(OwnedIdentityPageOutput::Rows(OwnedIdentityPage { keys, more, _charge: charge })),
             Self::Text(mut keys) => Arc::new(keys.finish()),
             Self::Binary(mut keys) => Arc::new(keys.finish()),
         };
         let ids = retain_array(ids, &charge)?;
         Ok(OwnedIdentityPageOutput::Arrow(OwnedIdentityArrowPage { ids, more }))
     }
+}
+
+fn last_key_bytes<'a>(bytes: &'a [u8], offsets: &[i32]) -> Option<&'a [u8]> {
+    let [.., start, end] = offsets else { return None; };
+    Some(&bytes[*start as usize..*end as usize])
+}
+
+fn identity_bound<'a>(scan: &'a OwnedIdentityScan<'_>) -> Option<EntityIdRef<'a>> {
+    match scan {
+        OwnedIdentityScan::Text(bound) => bound.as_deref().map(EntityIdRef::String),
+        OwnedIdentityScan::Binary(bound) => bound.as_deref().map(EntityIdRef::Binary),
+        OwnedIdentityScan::Unbounded => None,
+    }
+}
+
+fn checked_binary_prefix(
+    page: OwnedIdentityPageOutput, contains: impl Fn(&[u8]) -> bool, unavailable: fn() -> Anomaly,
+) -> Result<OwnedIdentityArrowPage> {
+    let OwnedIdentityPageOutput::Arrow(page) = page else { return Err(unavailable()); };
+    let keys = page.ids().as_any().downcast_ref::<BinaryArray>().ok_or_else(unavailable)?;
+    if keys.iter().any(|key| !key.is_some_and(&contains)) {
+        return Err(unavailable());
+    }
+    Ok(page)
 }
 
 impl OwnedReadSession {
@@ -130,8 +166,8 @@ impl OwnedReadSession {
         Ok(present)
     }
 
-    /// Give the installed hosted projector a bounded page of ciphertext
-    /// carrier identities and a witness only on completion of its prefix.
+    /// Gives the installed hosted projector a bounded Binary page of ciphertext carrier identities.
+    /// The relation witness is available on the terminal page of the prefix.
     pub async fn protected_carrier_page(
         &self,
         relation: &OwnedRelation,
@@ -139,19 +175,13 @@ impl OwnedReadSession {
         after: Option<&[u8]>,
         limit: usize,
         scope: rtdb_types::PlacedAttemptScope,
-    ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>)> {
+    ) -> Result<(OwnedIdentityArrowPage, Option<OwnedRangeWitness>)> {
         if !(1..=PROTECTED_PAGE_ROWS).contains(&limit) || after.is_some_and(|id| !prefix.contains(id)) {
             return Err(protected_page_unavailable());
         }
         self.admit_shared_column_carriers(relation, scope).await?;
-        let at = self.present.system_time;
-        let page = self
-            .identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::binary(after), limit,
-                Some(EntityIdRef::Binary(prefix.as_bytes())))
-            .await?;
-        if page.keys.iter().any(|key| !matches!(key, EntityId::Binary(id) if prefix.contains(id))) {
-            return Err(protected_page_unavailable());
-        }
+        let page = self.read_identity_prefix(relation, prefix.as_bytes(), after, limit).await?;
+        let page = checked_binary_prefix(page, |id| prefix.contains(id), protected_page_unavailable)?;
         let witness = if page.more {
             None
         } else {
@@ -162,7 +192,7 @@ impl OwnedReadSession {
 
     pub async fn sealed_search_unit_rows_page(
         &self, relation: &OwnedRelation, prefix: &[u8; 32], after: Option<&[u8]>, limit: usize, scope: PlacedAttemptScope,
-    ) -> Result<(OwnedIdentityPage, Option<OwnedRangeWitness>, impl Fn() -> Result<()> + Send + Sync + use<>)> {
+    ) -> Result<(OwnedIdentityArrowPage, Option<OwnedRangeWitness>, impl Fn() -> Result<()> + Send + Sync + use<>)> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || relation.name() != SEALED_SEARCH_UNIT_ROWS {
@@ -181,12 +211,8 @@ impl OwnedReadSession {
             return Err(sealed_search_unit_unavailable());
         }
         let original = self.original_inventory_provider_guard(scope).await?;
-        let at = self.present.system_time;
-        let page = self.identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::binary(after), limit,
-            Some(EntityIdRef::Binary(prefix))).await?;
-        if page.keys.iter().any(|key| !matches!(key, EntityId::Binary(id) if sealed_search_inventory_row(prefix, id).is_some())) {
-            return Err(sealed_search_unit_unavailable());
-        }
+        let page = self.read_identity_prefix(relation, prefix, after, limit).await?;
+        let page = checked_binary_prefix(page, |id| sealed_search_inventory_row(prefix, id).is_some(), sealed_search_unit_unavailable)?;
         let witness = if page.more { None } else {
             Some(self.relation_witness(relation)?.ok_or_else(sealed_search_unit_unavailable)?)
         };
@@ -281,7 +307,10 @@ impl OwnedReadSession {
         after: &OwnedIdentityScan<'_>,
         limit: usize,
     ) -> Result<OwnedIdentityPage> {
-        self.identity_page_in_prefix(relation, system, valid, after, limit, None).await
+        match self.read_identity_page(relation, system, valid, after, limit, None, false).await? {
+            OwnedIdentityPageOutput::Rows(page) => Ok(page),
+            OwnedIdentityPageOutput::Arrow(_) => unreachable!("Requested owned keys"),
+        }
     }
 
     /// Reads a typed Root page, using compact funded Arrow keys at the held head.
@@ -292,14 +321,29 @@ impl OwnedReadSession {
         self.read_identity_page(relation, system, valid, after, limit, None, true).await
     }
 
-    /// Root identities with any assertion current at `system`, across all
-    /// valid time, in key order, each once. Repeated valid slices of one key
-    /// are skipped by fetching again after the last distinct key, until the
-    /// page holds `limit + 1` distinct keys or the relation ends, so a page is
-    /// short only at the end.
+    /// Returns Root identities with any assertion current at `system`, across all valid time.
+    /// Each key appears once in ascending order after the exclusive bound.
+    /// The page stops at the row or byte bound and reports whether another key remains.
     pub async fn identity_page_all_valid(
         &self, relation: &OwnedRelation, system: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
     ) -> Result<OwnedIdentityPage> {
+        match self.read_identity_page_all_valid(relation, system, after, limit, false).await? {
+            OwnedIdentityPageOutput::Rows(page) => Ok(page),
+            OwnedIdentityPageOutput::Arrow(_) => unreachable!("Requested owned keys"),
+        }
+    }
+
+    /// Returns the same keys and continuation as `Self::identity_page_all_valid`.
+    /// At the held head a typed scan can return funded Arrow keys.
+    pub async fn identity_page_all_valid_output(
+        &self, relation: &OwnedRelation, system: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
+    ) -> Result<OwnedIdentityPageOutput> {
+        self.read_identity_page_all_valid(relation, system, after, limit, true).await
+    }
+
+    async fn read_identity_page_all_valid(
+        &self, relation: &OwnedRelation, system: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize, arrow: bool,
+    ) -> Result<OwnedIdentityPageOutput> {
         const FETCH: usize = 256;
         if !(1..=MAX_PAGE_ROWS).contains(&limit) {
             return Err(Anomaly::incorrect(
@@ -309,18 +353,21 @@ impl OwnedReadSession {
         }
         let at_head = self.admit_root_system(relation, system).await?;
         let context = self.relation_context(relation)?;
-        let mut charges = vec![self.context.memory.reserve(FETCH * 128)?];
-        let mut keys: Vec<EntityId> = Vec::with_capacity(limit + 1);
+        let mut charge = self.context.memory.reserve(FETCH * 128)?;
+        let count = limit + 1;
+        let mut keys = PageKeys::new((at_head && arrow).then_some(after), count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
-        let bound = after.bound().map(|key| key.owned_entity_id()).transpose()?;
-        let mut cursor_after = after.clone().into_owned();
+        let bound = identity_bound(after);
+        let mut reseek = false;
         'fetch: loop {
-            let Some(mut cursor) = rtdb_query::open_owned_identity_page_all_valid(
-                Arc::clone(&context), &self.owner, relation, system, &cursor_after, FETCH as i64,
-            ).await? else {
-                break;
+            let cursor = {
+                let seek = reseek.then(|| keys.seek_after_last()).transpose()?;
+                rtdb_query::open_owned_identity_page_all_valid(
+                    Arc::clone(&context), &self.owner, relation, system, seek.as_ref().unwrap_or(after), FETCH as i64,
+                ).await?
             };
+            let Some(mut cursor) = cursor else { break; };
             let mut fetched = 0usize;
             while let Some(batch) = cursor.next_batch().await? {
                 let batch = batch.batch();
@@ -328,58 +375,46 @@ impl OwnedReadSession {
                 let array = batch.column(column).as_ref();
                 for row in 0..batch.num_rows() {
                     fetched += 1;
-                    let key = read_owned_entity_id(field, array, row).map_err(|_| invalid_page())?.into_owned();
-                    let previous = keys.last().or(bound.as_ref());
-                    if keys.last().is_some_and(|last| last == &key) {
-                        continue;
-                    }
-                    if previous.is_some_and(|previous| previous >= &key) {
-                        return Err(invalid_page());
+                    let key = read_owned_entity_id(field, array, row).map_err(|_| invalid_page())?;
+                    match keys.compare_last(key) {
+                        Some(Ordering::Equal) => continue,
+                        Some(Ordering::Greater) => return Err(invalid_page()),
+                        None if bound.is_some_and(|previous| previous >= key) => return Err(invalid_page()),
+                        _ => (),
                     }
                     if keys.len() == limit {
                         more = true;
                         break 'fetch;
                     }
                     let bytes = estimate_read_value_bytes(field, array, row)?;
-                    let Some(rest) = remaining.checked_sub(bytes) else {
-                        if keys.is_empty() {
-                            return Err(Anomaly::new(
-                                AnomalyCategory::Busy,
-                                "rtdb.owned/identity-size",
-                                "An identity exceeds the page's retained byte bound",
-                            ));
-                        }
+                    let Some(rest) = remaining_page_bytes(remaining, bytes, keys.len())? else {
                         more = true;
                         break 'fetch;
                     };
                     remaining = rest;
-                    charges.push(self.context.memory.reserve(bytes)?);
+                    Arc::get_mut(&mut charge).expect("Identity page owns its reservation")
+                        .grow_to(FETCH * 128 + MAX_PAGE_BYTES - remaining)?;
                     if !at_head {
-                        self.check_point_purge_floor(relation, &key, system).await?;
+                        self.point_purge_guard(relation, key, system, false).await?;
                     }
-                    keys.push(key);
+                    keys.push(key, count);
                 }
             }
-            // A short fetch reached the relation's end.
             if fetched < FETCH {
                 break;
             }
-            // The fetch ended inside the last key's slices: continue after
-            // it, so its remaining slices are not fetched again.
-            cursor_after = OwnedIdentityScan::seek(keys.last().ok_or_else(invalid_page)?)?.into_owned();
+            reseek = true;
         }
         context.check_cancelled()?;
-        Ok(OwnedIdentityPage { keys, more, _charges: charges })
+        keys.finish(more, charge)
     }
 
-    async fn identity_page_in_prefix(
-        &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: &OwnedIdentityScan<'_>,
-        limit: usize, prefix: Option<EntityIdRef<'_>>,
-    ) -> Result<OwnedIdentityPage> {
-        match self.read_identity_page(relation, system, valid, after, limit, prefix, false).await? {
-            OwnedIdentityPageOutput::Rows(page) => Ok(page),
-            OwnedIdentityPageOutput::Arrow(_) => unreachable!("Requested owned keys"),
-        }
+    async fn read_identity_prefix(
+        &self, relation: &OwnedRelation, prefix: &[u8], after: Option<&[u8]>, limit: usize,
+    ) -> Result<OwnedIdentityPageOutput> {
+        let at = self.present.system_time;
+        self.read_identity_page(relation, at, at, &OwnedIdentityScan::binary(after), limit,
+            Some(EntityIdRef::Binary(prefix)), true).await
     }
 
     async fn read_identity_page(
@@ -399,11 +434,7 @@ impl OwnedReadSession {
         let mut keys = PageKeys::new((at_head && arrow).then_some(after), count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
-        let bound = match after {
-            OwnedIdentityScan::Text(bound) => bound.as_deref().map(EntityIdRef::String),
-            OwnedIdentityScan::Binary(bound) => bound.as_deref().map(EntityIdRef::Binary),
-            OwnedIdentityScan::Unbounded => None,
-        };
+        let bound = identity_bound(after);
         let cursor = match prefix {
             Some(prefix) if at_head && valid == system => rtdb_query::open_owned_identity_prefix(
                 Arc::clone(&context), &self.owner, relation, system, after, prefix, count as i64,

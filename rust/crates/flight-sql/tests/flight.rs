@@ -3096,13 +3096,14 @@ async fn binary_owned_flight_retains_identity_order_and_the_scalar_batch_refusal
 }
 
 #[tokio::test]
-async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_completion() {
+async fn held_binary_prefix_pages_preserve_order_scope_and_completion() {
     use arrow_array::{ArrayRef, BinaryArray, BooleanArray, TimestampMicrosecondArray};
-    use rtdb_types::SEALED_SEARCH_UNIT_ROWS as INVENTORY;
+    use rtdb_types::{SEALED_SEARCH_UNIT_ROWS as INVENTORY, SHARED_COLUMN_CARRIERS as CARRIERS, SharedColumnCarrierPrefix};
     use arrow_ipc::writer::IpcWriteOptions;
     use rtdb_format::ipc::write_arrow_stream;
 
     const ACTION: &str = "rtdb.owned.ReadHeldSealedSearchUnitRows.v2";
+    const PROTECTED: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v2";
     const MORE: &str = "rtdb.owned.identity_more";
     const WITNESS: &str = "rtdb.owned.range_witness";
 
@@ -3144,6 +3145,22 @@ async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_complet
     let first = key(&prefix, &[3, 0, 255]);
     let last = key(&prefix, &[3, 1]);
     let other = key(&[0xbd; 32], &[3, 1]);
+    let partial_prefix = [0xbe; 32];
+    let before_malformed = key(&partial_prefix, &[3, 1]);
+    let malformed = [&partial_prefix[..], &[255]].concat();
+    let mut carrier_prefix = [0; SharedColumnCarrierPrefix::WIDTH];
+    carrier_prefix[..5].copy_from_slice(b"BFCP2");
+    let mut adjacent_prefix = carrier_prefix;
+    adjacent_prefix[5] = 1;
+    let carrier_key = |prefix: &[u8], last| {
+        let mut id = prefix.to_vec();
+        id.resize(SharedColumnCarrierPrefix::ID_WIDTH, 0);
+        *id.last_mut().unwrap() = last;
+        id
+    };
+    let carrier_first = carrier_key(&carrier_prefix, 0x7f);
+    let carrier_last = carrier_key(&carrier_prefix, 0x80);
+    let carrier_other = carrier_key(&adjacent_prefix, 0);
     let request = |hold: &[u8], relation, prefix: &[u8], after: ArrayRef, limit| {
         let mut body = [hold, &relation_frame(relation)].concat();
         body.extend(nullable_ipc(vec![
@@ -3161,12 +3178,22 @@ async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_complet
     let mut declaration = relation_frame(INVENTORY);
     declaration.extend(br#"{"fields":[]}"#);
     client.action("rtdb.owned.DeclareRelation.v1", declaration.into()).await.unwrap();
-    let stored = [last.as_slice(), other.as_slice(), first.as_slice()];
-    let mut facts = 1u16.to_be_bytes().to_vec();
+    let mut declaration = relation_frame(CARRIERS);
+    declaration.extend(br#"{"version":2,"fields":[{"name":"sealed_payload","type":{"kind":"opaque_binary"},"optional":false,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v2", declaration.into()).await.unwrap();
+    let stored = [last.as_slice(), other.as_slice(), first.as_slice(), before_malformed.as_slice(), malformed.as_slice()];
+    let mut facts = 2u16.to_be_bytes().to_vec();
     group(&mut facts, INVENTORY, &ipc(vec![
         ("_id", Arc::new(BinaryArray::from_iter_values(stored))),
         ("_op", Arc::new(StringArray::from(vec!["replace"; stored.len()]))),
         ("_valid_from", Arc::new(TimestampMicrosecondArray::from_value(i64::MIN, stored.len()).with_timezone("UTC"))),
+    ]));
+    let stored_carriers = [carrier_last.as_slice(), carrier_other.as_slice(), carrier_first.as_slice()];
+    group(&mut facts, CARRIERS, &ipc(vec![
+        ("_id", Arc::new(BinaryArray::from_iter_values(stored_carriers))),
+        ("_op", Arc::new(StringArray::from(vec!["replace"; stored_carriers.len()]))),
+        ("_valid_from", Arc::new(TimestampMicrosecondArray::from_value(i64::MIN, stored_carriers.len()).with_timezone("UTC"))),
+        ("sealed_payload", Arc::new(BinaryArray::from_iter_values([&[9_u8][..]; 3]))),
     ]));
     let mut commit = claim.to_be_bytes().to_vec();
     commit.extend([7; 16]);
@@ -3184,26 +3211,40 @@ async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_complet
     client.action("rtdb.owned.DecideHosted.v4", commit.into()).await.unwrap();
 
     let hold = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap().remove(0).body.slice(..16);
-    for (bound, expected, more) in [(None, Some(first.as_slice()), true), (Some(first.as_slice()), Some(last.as_slice()), false),
-        (Some(last.as_slice()), None, false)]
-    {
-        let reply = client.action(ACTION, request(&hold, INVENTORY, &prefix, after(bound), 1)).await.unwrap().remove(0).body;
-        let stream = StreamReader::try_new(reply.as_ref(), None).unwrap();
-        let schema = stream.schema();
-        assert_eq!(schema.field(0).data_type(), &DataType::Binary);
-        assert_eq!(schema.metadata()[MORE], if more { "1" } else { "0" });
-        assert_eq!(schema.metadata().contains_key(WITNESS), !more);
-        if let Some(nonce) = schema.metadata().get(WITNESS) {
-            assert_eq!(uuid::Uuid::parse_str(nonce).unwrap().simple().to_string(), *nonce);
+    for (action, relation, prefix, first, last) in [
+        (ACTION, INVENTORY, prefix.as_slice(), first.as_slice(), last.as_slice()),
+        (PROTECTED, CARRIERS, carrier_prefix.as_slice(), carrier_first.as_slice(), carrier_last.as_slice()),
+    ] {
+        for (bound, expected, more) in [
+            (None, Some(first), true), (Some(first), Some(last), false), (Some(last), None, false),
+        ] {
+            let reply = client.action(action, request(&hold, relation, prefix, after(bound), 1)).await.unwrap().remove(0).body;
+            let stream = StreamReader::try_new(reply.as_ref(), None).unwrap();
+            let schema = stream.schema();
+            assert_eq!(schema.field(0).data_type(), &DataType::Binary);
+            assert_eq!(schema.metadata()[MORE], if more { "1" } else { "0" });
+            assert_eq!(schema.metadata().contains_key(WITNESS), !more);
+            if let Some(nonce) = schema.metadata().get(WITNESS) {
+                assert_eq!(uuid::Uuid::parse_str(nonce).unwrap().simple().to_string(), *nonce);
+            }
+            let mut result = Vec::new();
+            for batch in stream {
+                let batch = batch.unwrap();
+                let ids = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+                result.extend(ids.iter().map(|id| id.unwrap().to_vec()));
+            }
+            assert_eq!(result.iter().map(Vec::as_slice).collect::<Vec<_>>(), expected.into_iter().collect::<Vec<_>>());
         }
-        let mut result = Vec::new();
-        for batch in stream {
-            let batch = batch.unwrap();
-            let ids = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
-            result.extend(ids.iter().map(|id| id.unwrap().to_vec()));
-        }
-        assert_eq!(result.iter().map(Vec::as_slice).collect::<Vec<_>>(), expected.into_iter().collect::<Vec<_>>());
     }
+    let reply = client.action(ACTION, request(&hold, INVENTORY, &partial_prefix, after(None), 1)).await.unwrap().remove(0).body;
+    let mut stream = StreamReader::try_new(reply.as_ref(), None).unwrap();
+    assert_eq!(stream.schema().metadata()[MORE], "1");
+    assert!(!stream.schema().metadata().contains_key(WITNESS));
+    let batch = stream.next().unwrap().unwrap();
+    let ids = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(ids.iter().collect::<Vec<_>>(), [Some(before_malformed.as_slice())]);
+    assert!(client.action(ACTION, request(&hold, INVENTORY, &partial_prefix, after(Some(&before_malformed)), 1)).await.is_err());
+    assert!(client.action(PROTECTED, request(&hold, CARRIERS, &carrier_prefix, after(Some(&carrier_other)), 1)).await.is_err());
     for refused in [
         request(&hold, INVENTORY, &prefix[..31], after(None), 1),
         request(&hold, INVENTORY, &prefix, after(Some(other.as_slice())), 1),
@@ -3222,7 +3263,7 @@ async fn held_sealed_search_unit_rows_preserve_binary_order_and_original_complet
         ("after", Arc::new(BinaryArray::from(vec![None::<&[u8]>]))),
         ("limit", Arc::new(Int64Array::from(vec![1]))),
     ]));
-    assert!(client.action("rtdb.owned.ReadHeldProtectedCarrierPage.v2", body.into()).await.is_err());
+    assert!(client.action(PROTECTED, body.into()).await.is_err());
 
     let mut another = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
     assert!(another.action(ACTION, request(&hold, INVENTORY, &prefix, after(None), 1)).await.is_err());

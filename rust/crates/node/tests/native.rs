@@ -6777,6 +6777,57 @@ async fn root_identity_output_pages_keep_the_typed_order_and_hold_fences() {
 }
 
 #[tokio::test]
+async fn all_valid_arrow_identity_pages_reseek_after_repeated_valid_slices() {
+    use rtdb_columnar::read_owned_entity_id;
+    use rtdb_types::OwnedRelation;
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let text = OwnedRelation::new("text-identity-slices").unwrap();
+    let binary = OwnedRelation::new("binary-identity-slices").unwrap();
+    let text_keys = [EntityId::String("é".into()), EntityId::String("é\0".into())];
+    let binary_keys = [EntityId::Binary(vec![0, 255]), EntityId::Binary(vec![0, 255, 0])];
+    let put = |relation: &OwnedRelation, key: &EntityId, from| TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([("_id".into(), key.as_value())])], node.memory()).unwrap(),
+        valid_from: Some(Timestamp(from)),
+        valid_to: Some(Timestamp(from + 1)),
+    };
+    let mut ops = (0..257).map(|slice| put(&text, &text_keys[0], 2 * slice)).collect::<Vec<_>>();
+    ops.push(put(&text, &text_keys[1], 0));
+    ops.push(put(&binary, &binary_keys[1], 0));
+    ops.extend((0..257).map(|slice| put(&binary, &binary_keys[0], 2 * slice)));
+    let tx = writer.state_mut().execute_tx(ops, AutonomousTxOptions::default()).await.unwrap();
+    assert!(tx.committed(), "{:?}", tx.error());
+    let held = writer.open_owned_read().await.unwrap();
+    let cut = held.system_time();
+    for (relation, keys, scan, ty) in [
+        (&text, &text_keys, OwnedIdentityScan::text(None), arrow_schema::DataType::Utf8),
+        (&binary, &binary_keys, OwnedIdentityScan::binary(None), arrow_schema::DataType::Binary),
+    ] {
+        let field = arrow_schema::Field::new("_id", ty.clone(), false);
+        for (bound, limit, expected, more) in [
+            (scan.clone(), 1, &keys[..1], true),
+            (scan, 2, &keys[..], false),
+            (OwnedIdentityScan::seek(&keys[0]).unwrap(), 1, &keys[1..], false),
+            (OwnedIdentityScan::seek(&keys[1]).unwrap(), 1, &keys[2..], false),
+        ] {
+            let output = held.identity_page_all_valid_output(relation, cut, &bound, limit).await.unwrap();
+            let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
+            assert_eq!(page.ids().data_type(), &ty);
+            let actual = (0..page.ids().len()).map(|row| {
+                read_owned_entity_id(&field, page.ids().as_ref(), row).unwrap().into_owned()
+            }).collect::<Vec<_>>();
+            assert_eq!((actual.as_slice(), page.more), (expected, more));
+        }
+    }
+    drop((held, writer));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn binary_owned_history_keeps_original_positions_and_refuses_duplicate_creates() {
     use rtdb_types::{Interval, OwnedChangeKind, OwnedRelation};
 
@@ -6810,6 +6861,9 @@ async fn binary_owned_history_keeps_original_positions_and_refuses_duplicate_cre
     let first_page = held.identity_page_all_valid(&relation, cut, &OwnedIdentityScan::Binary(None), 1).await.unwrap();
     assert_eq!(first_page.keys, [short.clone()]);
     assert!(first_page.more);
+    let output = held.identity_page_all_valid_output(&relation, cut, &OwnedIdentityScan::binary(None), 1).await.unwrap();
+    let OwnedIdentityPageOutput::Rows(output) = output else { panic!("Expected historical owned keys"); };
+    assert_eq!((output.keys, output.more), (first_page.keys, first_page.more));
     let next_page = held.identity_page_all_valid(&relation, cut, &OwnedIdentityScan::seek(&short).unwrap(), 1).await.unwrap();
     assert_eq!(next_page.keys, [long.clone()]);
     assert!(!next_page.more);
