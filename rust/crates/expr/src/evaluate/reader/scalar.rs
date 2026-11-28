@@ -462,7 +462,11 @@ fn nullif<'a>(args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending
         let right = prepare(&args[1],frame)?.await?;
         if right.is_null() { return ready_output(left,frame); }
         let right = right.demand_output().await?;
-        let equal = computed::equal(&left, right, false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), frame).await?;
+        let equal = if let (Some(left), Some(right)) = (left.text(), right.text()) {
+            Some(left == right)
+        } else {
+            computed::equal(&left, right, false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), frame).await?
+        };
         if equal == Some(true) { nil(frame) } else { ready_output(left, frame) }
     },frame)
 }
@@ -478,7 +482,13 @@ fn greatest<'a>(greatest: bool,args: &'a [Expr],frame: &'a EvaluationFrame<'a>) 
             if next.is_null() { return nil(frame); }
             let next = next.demand_output().await?;
             let unordered = [best.number(), next.number()].into_iter().flatten().any(|number| number.as_f64().is_some_and(f64::is_nan));
-            let ordering = if unordered { std::cmp::Ordering::Equal } else { computed::order(&best, &next, frame).await? };
+            let ordering = if let (Some(best), Some(next)) = (best.text(), next.text()) {
+                best.as_bytes().cmp(next.as_bytes())
+            } else if unordered {
+                std::cmp::Ordering::Equal
+            } else {
+                computed::order(&best, &next, frame).await?
+            };
             if ordering != if greatest { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less } { best = next; }
         }
         ready_output(best,frame)
@@ -882,6 +892,51 @@ mod tests {
         ] {
             let result = evaluate(&expression, &frame).unwrap().await.unwrap();
             assert!(is_null(&result));
+        }
+    }
+
+    #[tokio::test]
+    async fn text_selectors_keep_the_last_tie_and_skip_arguments_after_null() {
+        let data_type = LogicalType::Scalar(ScalarType::Utf8);
+        let column = Field { id: ColumnId(0), name: "text".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: data_type.clone() };
+        let schema = Schema::new(vec![column.clone()]).unwrap();
+        let field = arrow_schema::Field::new("text", DataType::Utf8, false);
+        let array = StringArray::from(vec!["one"]);
+        let row = TextRow(ArrowCell { field: &field, array: &array, row: 0 });
+        let context = EvalContext::default();
+        let frame = EvaluationFrame { schema: &schema, row: ExpressionRow::Borrowed(&row), context: &context,
+            asynchronous: true, replacements: None };
+        let call = |name: &str, args: Vec<Expr>| Expr::Call {
+            name: name.into(), return_type: function_type_with_args(name, &args).unwrap(), args,
+        };
+        let failure = Expr::Cast {
+            expr: Box::new(Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(0)))),
+            target: CastTarget::fixed(data_type),
+        };
+        for name in ["least", "greatest"] {
+            let tied = call(name, vec![Expr::Literal(Value::Utf8("one".into())), column.expression()]);
+            let Output::Text(winner, _) = prepare(&tied, &frame).unwrap().await.unwrap().demand_output().await.unwrap() else {
+                panic!("The last equal argument must win");
+            };
+            assert_eq!(winner.as_ptr(), array.value(0).as_ptr());
+        }
+        for name in ["nullif", "least", "greatest"] {
+            let other = if name == "greatest" { "a" } else { "zzz" };
+            let expression = call(name, vec![column.expression(), Expr::Literal(Value::Utf8(other.into()))]);
+            let invocation = crate::ExpressionInvocation::prepare(&expression, &schema, &context).unwrap();
+            let result = invocation.evaluate_projection_row_with_text(ExpressionRow::Borrowed(&row), &context, |winner| {
+                assert_eq!(winner.as_ptr(), array.value(0).as_ptr());
+                Ok(())
+            }).await.unwrap();
+            assert!(result.is_none());
+        }
+        for name in ["nullif", "least", "greatest"] {
+            let args = |first| vec![first, failure.clone()];
+            let skipped = call(name, args(Expr::Literal(Value::Null)));
+            assert!(is_null(&evaluate(&skipped, &frame).unwrap().await.unwrap()));
+            let reached = call(name, args(column.expression()));
+            assert_eq!(evaluate(&reached, &frame).unwrap().await.err().unwrap().code, "xtdb.expression/division-by-zero");
         }
     }
 

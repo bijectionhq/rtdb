@@ -5180,6 +5180,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_text_winners_keep_utf8_bytes_and_sql_nulls_in_row_order() {
+        let memory = MemoryBudget::new(1 << 22);
+        let len = 128;
+        let schema = Schema::new(vec![field(0, ScalarType::Utf8), field(1, ScalarType::Utf8)]).unwrap();
+        let batch = ColumnBatch::settled([
+            [Some("é"), Some("a\0"), None, Some("")],
+            [Some("e\u{301}"), Some("a\0"), Some("x"), None],
+        ].into_iter().zip(schema.fields()).map(|(values, field)| Column::Arrow {
+            array: Arc::new(StringArray::from_iter(values.into_iter().cycle().take(len))),
+            field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+            logical: Some(field.data_type.clone()),
+        }).collect(), len, memory.reserve(0).unwrap()).unwrap();
+        let expressions = ["nullif", "least", "greatest"].map(|name| {
+            let args = schema.fields().iter().map(rtdb_plan::Field::expression).collect::<Vec<_>>();
+            let return_type = rtdb_plan::function_type_with_args(name, &args).unwrap();
+            Expr::Call { name: name.into(), args, return_type }
+        });
+        assert!(expressions.iter().all(|expression| matches!(
+            ProjectionValues::new(expression, &expression.data_type(), len, Some((&schema, &batch))), ProjectionValues::Text(_)
+        )));
+        let mut cursor = record_projection_cursor(batch, schema, expressions.into(), &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        for (column, expected) in page.columns.iter().zip([
+            [Some("é"), None, None, Some("")],
+            [Some("e\u{301}"), Some("a\0"), None, None],
+            [Some("é"), Some("a\0"), None, None],
+        ]) {
+            let Column::Arrow { array, .. } = column else { panic!("Expected an Arrow text column"); };
+            let actual = array.as_any().downcast_ref::<StringArray>().unwrap();
+            assert!(actual.iter().enumerate().all(|(row, value)| value == expected[row % 4]));
+        }
+    }
+
+    #[tokio::test]
     async fn bounded_case_reads_selected_text_children_under_valid_parents() {
         let memory = MemoryBudget::new(1 << 22);
         let len = 256;
@@ -6729,14 +6763,18 @@ fn grow_projection_row(lease: &mut MemoryReservation, bytes: usize) -> Result<()
 }
 
 fn text_result_width(expression: &Expr, input: Option<(&rtdb_plan::Schema, &ColumnBatch)>) -> Option<usize> {
+    let child = |value: &Expr| stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || text_result_width(value, input));
     match expression {
         Expr::Literal(Value::Null) => Some(0),
         Expr::Literal(Value::Utf8(text)) => Some(text.len()),
         Expr::Case { branches, otherwise } | Expr::SimpleCase { branches, otherwise, .. } => {
             branches.iter().map(|(_, value)| value).chain([otherwise.as_ref()]).try_fold(0, |width, value| {
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || text_result_width(value, input))
-                    .map(|next| width.max(next))
+                child(value).map(|next| width.max(next))
             })
+        }
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("nullif") && args.len() == 2 => child(&args[0]),
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("least") || name.eq_ignore_ascii_case("greatest") => {
+            args.iter().try_fold(0, |width, arg| child(arg).map(|next| width.max(next)))
         }
         Expr::Column { .. } | Expr::Field { .. } => {
             let (schema, batch) = input?;

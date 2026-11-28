@@ -181,7 +181,15 @@ impl<'expr> ExpressionInvocation<'expr> {
     pub async fn evaluate_projection_row_with_text(
         &self, row: ExpressionRow<'_>, context: &EvalContext<'_>, write: impl FnOnce(&str) -> Result<()> + Send,
     ) -> Result<Option<Value>> {
-        if !matches!(self.expression, Expr::Case { .. } | Expr::SimpleCase { .. }) {
+        use crate::functions::ScalarFunction;
+
+        let writes_text = match self.expression {
+            Expr::Case { .. } | Expr::SimpleCase { .. } => true,
+            Expr::Call { name, .. } => matches!(ScalarFunction::resolve(name),
+                Some(ScalarFunction::Nullif | ScalarFunction::Least | ScalarFunction::Greatest)),
+            _ => false,
+        };
+        if !writes_text {
             return self.evaluate_projection_row_async(row, context).await.map(Some);
         }
         let mut value = reader::execute_with_text(self.expression, self.schema, row, context, &self.replacements, write).await?;
