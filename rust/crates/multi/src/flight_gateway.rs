@@ -45,6 +45,14 @@ struct Target {
     fresh: bool,
 }
 
+impl Target {
+    fn acknowledge_fresh(&self, headers: &mut HeaderMap) {
+        if self.fresh {
+            headers.insert(FRESH_HEADER, HeaderValue::from_static("1"));
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct FreshReplica {
     stream: String,
@@ -498,9 +506,7 @@ impl Router {
         }
         let session = cookie.strip_prefix("arrow_flight_session_id=").and_then(|id| Uuid::parse_str(id).ok())
             .ok_or_else(|| Status::internal("Invalid private Flight SQL session"))?;
-        if target.replica.is_some() || target.ordered_reader.is_some() {
-            headers.insert(FRESH_HEADER, HeaderValue::from_static("1"));
-        }
+        target.acknowledge_fresh(headers);
         let route = self.encode(&SessionRoute { target, session })?;
         headers.insert(header::SET_COOKIE, header_value(&format!("{COOKIE}={route}"))?);
         if headers.contains_key(header::AUTHORIZATION) {
@@ -550,6 +556,20 @@ fn decode_classic_action(wire: &Bytes) -> std::result::Result<arrow_flight::Acti
     let header = wire.first_chunk::<5>().ok_or_else(invalid_classic_action)?;
     if classic_action_length(header)? != wire.len() { return Err(invalid_classic_action()); }
     arrow_flight::Action::decode(wire.slice(5..)).map_err(|_| invalid_classic_action())
+}
+
+#[cfg(test)]
+#[test]
+fn a_fresh_writer_fallback_acknowledges_the_requested_read_route() {
+    for fresh in [false, true] {
+        let target = Target {
+            name: "db".into(), deployment: "deployment".into(), holder: MemberId("writer".into()),
+            epoch: 1, address: "127.0.0.1:5432".into(), enrollment: None, replica: None, ordered_reader: None, fresh,
+        };
+        let mut headers = HeaderMap::new();
+        target.acknowledge_fresh(&mut headers);
+        assert_eq!(headers.get(FRESH_HEADER).and_then(|value| value.to_str().ok()), fresh.then_some("1"));
+    }
 }
 
 #[cfg(test)]

@@ -197,6 +197,7 @@ surface StatelessDatabase {
         -- A listener without a linked store release refuses an offer before it issues session credentials.
         -- A listener with a linked store release confirms only an exact match and returns its linked release in the handshake metadata.
         -- A release-checked session on a reader route retains the exact admitted database attachment.
+        -- The gateway acknowledges a fresh handshake when the writer serves the fresh reader route.
         -- Read, Watch and Rank are the Store actions admitted on a reader route after agreement.
         -- An assigned follower selects byte-store read and rank pages from its locally applied prefix.
         -- It rechecks the assigned replica and the observed key generation before returning a byte-store page or watch result.

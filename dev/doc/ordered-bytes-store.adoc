@@ -13,6 +13,7 @@ The release-checked contract uses one ASCII `x-rtdb-store-release` metadata valu
 The exact package version is compared byte for byte, and the successful handshake returns the linked version in the same metadata field with the session credentials and an empty response stream.
 The session retains the agreement for subsequent store actions, including through the Flight gateway.
 On an assigned follower or a gateway-routed fresh reader, the handshake binds the session to the exact admitted database attachment.
+The gateway acknowledges a fresh handshake when the writer serves the selected fresh reader route.
 After agreement, reader routes admit `Read`, `Watch` and `Rank` on that attachment.
 The assigned follower reads from its locally applied cut and rechecks the assignment and the observed key generation before returning data.
 An unknown or expired bearer on the assigned follower returns `UNAUTHENTICATED`, so the client can open a new release-checked session.
