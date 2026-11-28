@@ -11,6 +11,8 @@ mod hosted_export;
 #[cfg(feature = "backup-object-holds")]
 mod held_objects;
 #[cfg(feature = "backup-object-holds")]
+mod lineage;
+#[cfg(feature = "backup-object-holds")]
 mod staged;
 #[cfg(all(unix, feature = "backup-object-holds"))]
 mod settle_objects;
@@ -20,6 +22,9 @@ Usage: rtdb multi-backup export --data DIR --archive FILE [--journal-url URL --t
        rtdb multi-backup restore --data DIR --archive FILE --incarnation UUID --source-key-vault DIR
                                  [--journal-url URL --tls-dir DIR] [--immutable-streams] [--authority-id UUID [--cell-id UUID]]
        rtdb multi-backup lineage-inclusion --archive FILE --catalog-root HEX --position N
+       rtdb multi-backup lineage-inclusion-held --authority-id UUID --authority-url URL --authority-tls-dir DIR
+                    --expected-incarnation UUID --expected-revision N [--database NAME]
+                    --catalog-root HEX --position N --bucket BUCKET [--region REGION] [--s3-endpoint URL]
        rtdb multi-backup export-hosted --archive FILE --incarnation UUID --authority-id UUID [--cell-id UUID]
                     [--database NAME]
                     --journal-url URL --tls-dir DIR --key-vault DIR --bucket BUCKET [--region REGION] [--s3-endpoint URL]
@@ -86,6 +91,8 @@ enum BackupCommand {
         position: journal_contract::Lsn,
     },
     #[cfg(feature = "backup-object-holds")]
+    HeldLineageInclusion(lineage::HeldInclusion),
+    #[cfg(feature = "backup-object-holds")]
     HostedExport(hosted_export::Export),
     #[cfg(feature = "backup-object-holds")]
     Stage(staged::Stage),
@@ -131,7 +138,7 @@ impl MultiBackupOptions {
                 position: journal_contract::Lsn(position),
             }));
         }
-        if matches!(operation.as_str(), "export-hosted" | "stage" | "verify-object-holds"
+        if matches!(operation.as_str(), "export-hosted" | "stage" | "verify-object-holds" | "lineage-inclusion-held"
             | "acquire-object-holds" | "attest" | "release-object-holds" | "abandon-object-acquisition")
         {
             if immutable_streams { return Err(arguments_error()); }
@@ -139,6 +146,7 @@ impl MultiBackupOptions {
             return Ok(Self(match operation.as_str() {
                 "export-hosted" => BackupCommand::HostedExport(hosted_export::Export::parse(fields)?),
                 "stage" => BackupCommand::Stage(staged::Stage::parse(fields)?),
+                "lineage-inclusion-held" => BackupCommand::HeldLineageInclusion(lineage::HeldInclusion::parse(fields)?),
                 "verify-object-holds" => BackupCommand::VerifyObjects(held_objects::Verifier::parse(fields)?),
                 "acquire-object-holds" => BackupCommand::AcquireObjects(held_objects::Acquirer::parse(fields)?),
                 #[cfg(unix)]
@@ -210,6 +218,8 @@ impl MultiBackupOptions {
             }
             #[cfg(feature = "backup-object-holds")]
             BackupCommand::HostedExport(export) => export.run(apple_sync).await,
+            #[cfg(feature = "backup-object-holds")]
+            BackupCommand::HeldLineageInclusion(inclusion) => inclusion.run().await,
             #[cfg(feature = "backup-object-holds")]
             BackupCommand::Stage(stage) => stage.run().await,
             #[cfg(feature = "backup-object-holds")]

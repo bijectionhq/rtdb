@@ -101,6 +101,7 @@ impl Abandon {
                 return Err(invalid_plan());
             }
             let targets = plan.targets(&inventory)?;
+            let retired_versions = targets.len();
             let journal = authorize_abandoned_acquisition(
                 &self.authority_socket, intent, hold, journal_contract::Lsn(plan.journal_head), plan.journal_anchor, namespace,
             ).await?;
@@ -120,7 +121,7 @@ impl Abandon {
             keys.release_recovery_key(hold).await?;
             Ok(json!({
                 "incarnation": candidate, "operation_id": hold.operation,
-                "retired_versions": plan.versions.len(), "journal_hold_released": true, "key_hold_released": true,
+                "retired_versions": retired_versions, "journal_hold_released": true, "key_hold_released": true,
             }))
         }.await;
         io.close_and_wait().await;

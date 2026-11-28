@@ -524,6 +524,13 @@ Existing legacy control bindings continue to use ordinary recovery and their leg
 
 Use `rtdb multi-activation lineage-proof` with direct control-catalog reader credentials and the predecessor incarnation and revision to export the publication and its control inclusion.
 Use `rtdb multi-backup lineage-inclusion --archive FILE --catalog-root HEX --position N` to export an application inclusion from a saved portable cut without the source keepers.
+Hosted staging retains the source proof in the destination S3 allocation and the recovery object attestation binds its exact held version to the selected archive.
+Use `rtdb multi-backup lineage-inclusion-held` to reopen that proof by the historical predecessor incarnation and revision with the selected destination's S3 settings.
+The reader needs `s3:GetObject` on the acquisition record and `s3:GetObjectVersion` and `s3:GetObjectLegalHold` on the proof object under `multi/db/<candidate>/lineage/`.
+It uses the installed activation reader and the pinned application catalog root and returns the same inclusion JSON as `lineage-inclusion`.
+The proof remains held when the successor replaces its staged checkpoint and releases the temporary destination-object holds.
+Abandonment retires the proof with the original acquisition.
+Published proof retention has no automatic release while the Kernel can still need the historical proof.
 The Kernel pins each catalog's genesis root independently and can verify settlement evidence offline through the installed RTDB CLI.
 
 ```sh

@@ -3,6 +3,7 @@ use crate::multi::activation::operator::attestation::Intent;
 use crate::multi::activation::operator::attestation::KeyEvidence;
 
 use super::*;
+use super::lineage::{HeldLineage, LineageObject};
 use rtdb_crypt::RecoveryKeyHold;
 use rtdb_db::BackupObjectReadback;
 use rtdb_storage::ObjectVersionHold;
@@ -11,6 +12,7 @@ use rtdb_types::PhysicalObjectVersion;
 mod acquire;
 pub(super) use acquire::Acquirer;
 pub(super) use acquire::require_staging_open;
+pub(super) use acquire::read_published_lineage;
 #[cfg(unix)]
 pub(super) use acquire::Abandon;
 
@@ -25,10 +27,12 @@ pub(super) struct Readback {
     pub(super) object_holds_verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) key_hold: Option<RecoveryKeyHold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lineage: Option<HeldLineage>,
 }
 
 impl Readback {
-    fn confirmed(incarnation: Uuid, checked: BackupObjectReadback, key_hold: Option<RecoveryKeyHold>) -> Self {
+    fn confirmed(incarnation: Uuid, checked: BackupObjectReadback, key_hold: Option<RecoveryKeyHold>, lineage: Option<HeldLineage>) -> Self {
         Self {
             incarnation,
             archive_sha256: digest_hex(&checked.installation.manifest_sha256()),
@@ -37,16 +41,20 @@ impl Readback {
             held_versions: checked.versions,
             object_holds_verified: true,
             key_hold,
+            lineage,
         }
     }
 
-    #[cfg(unix)]
     pub(super) fn digest(&self) -> Result<[u8; 32]> {
         let bytes = serde_json::to_vec(self).map_err(|error| Anomaly::fault("rtdb/backup-object-readback", error.to_string()))?;
         let mut digest = Sha256::new();
         digest.update(b"rtdb.hosted-recovery-readback/v1\0");
         digest.update(bytes);
         Ok(digest.finalize().into())
+    }
+
+    fn pinned_versions(&self) -> Vec<PhysicalObjectVersion> {
+        self.held_versions.iter().chain(self.lineage.iter().map(|proof| &proof.version)).cloned().collect()
     }
 }
 
@@ -63,6 +71,26 @@ struct VerifiedReadback {
 struct StagedBackup {
     archive_sha256: [u8; 32],
     receipt: Option<staged::StageReceipt>,
+}
+
+impl StagedBackup {
+    async fn staging_order(&self, store: &dyn ObjectStore) -> Result<Option<staged::StagingOrder>> {
+        let Some(receipt) = &self.receipt else { return Ok(None); };
+        let hold = receipt.key_hold;
+        let order = staged::read_staging_order(store, hold.authority, hold.generation.database).await?;
+        if order.as_ref().is_some_and(|order| order.key_hold != hold || order.intent != receipt.intent) {
+            return Err(invalid_readback());
+        }
+        Ok(order)
+    }
+
+    async fn held_lineage(
+        &self, incarnation: Uuid, lineage: Option<LineageObject>, store: &dyn ObjectStore, holds: Option<&dyn ObjectVersionHold>,
+    ) -> Result<Option<HeldLineage>> {
+        let Some(lineage) = lineage else { return Ok(None); };
+        let (proof, _) = lineage.read(incarnation, self.archive_sha256, store, holds).await?;
+        Ok(Some(proof))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -159,9 +187,11 @@ impl Verifier {
         inventory.require_versioned().await?;
         let io = IoRegion::new();
         let result = async {
+            let provider = self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?;
+            let lineage = staged.staging_order(provider.as_ref()).await?.and_then(|order| order.lineage);
             let store = match (&requested, source) {
-                (Some(readback), ReadSource::SavedVersions) => inventory.pinned_read_store(&readback.held_versions)?,
-                _ => self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?,
+                (Some(readback), ReadSource::SavedVersions) => inventory.pinned_read_store(&readback.pinned_versions())?,
+                _ => provider,
             };
             #[cfg(unix)]
             if matches!(source, ReadSource::ServingNames)
@@ -169,15 +199,17 @@ impl Verifier {
             {
                 acquire::require_attestation_plan(store.as_ref(), receipt, readback).await?;
             }
-            self.inspect(&staged, store, Some(&inventory)).await
+            let held_lineage = staged.held_lineage(self.incarnation, lineage, store.as_ref(), Some(&inventory)).await?;
+            let (checked, key_hold) = self.inspect(&staged, store, Some(&inventory)).await?;
+            Ok::<_, Anomaly>((checked, key_hold, held_lineage))
         }.await;
         io.close_and_wait().await;
-        let (checked, key_hold) = result?;
+        let (checked, key_hold, held_lineage) = result?;
         #[cfg(unix)]
         let installation = checked.installation;
         #[cfg(unix)]
         let journal_anchor = checked.journal_anchor;
-        let current = Readback::confirmed(self.incarnation, checked, key_hold);
+        let current = Readback::confirmed(self.incarnation, checked, key_hold, held_lineage);
         if requested.is_some_and(|previous| previous != current) {
             return Err(invalid_readback());
         }

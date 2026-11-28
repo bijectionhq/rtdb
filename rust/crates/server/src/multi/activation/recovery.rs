@@ -268,6 +268,12 @@ impl Completed {
 }
 
 impl Installation {
+    #[cfg(feature = "backup-object-holds")]
+    pub(in crate::multi) fn lineage_custody(self) -> Option<([u8; 32], rtdb_crypt::RecoveryKeyHold, [u8; 32], AuthenticatedCut)> {
+        self.journal_hold?;
+        Some((self.manifest_digest, self.key_hold?, self.objects_sha256?, self.source_head?))
+    }
+
     fn valid_authentication(self, lineage: bool, predecessor: Binding, inherited: Option<InstallationAnchor>) -> bool {
         match (lineage, self.source_head, self.installation_anchor) {
             (true, Some(source), Some(anchor)) => anchor.valid()
@@ -353,7 +359,7 @@ impl ActivationAuthority {
         self.recovery_status_at(name, &state.ok_or_else(unavailable)?, operation)
     }
 
-    pub(super) async fn recovery_status_for_predecessor(&self, name: &str, predecessor: Binding) -> Result<Status> {
+    pub(in crate::multi) async fn recovery_status_for_predecessor(&self, name: &str, predecessor: Binding) -> Result<Status> {
         let (_, state) = self.read(self.stream_id(name)?).await?;
         let state = state.ok_or_else(unavailable)?;
         if state.binding == predecessor {
@@ -882,6 +888,14 @@ mod tests {
         assert!(matches!(successor.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
         let before_restore = successor.portable_backup().await.unwrap().into_bytes();
         let verified = PortableBackup::verify(&backup, source_vault).await.unwrap();
+        let mut detached = verified.lineage_proof_bytes(&backup).unwrap().unwrap();
+        let archive = rtdb_stream_journal::authenticated::Archive::read_from(&mut detached).unwrap();
+        assert!(detached.is_empty());
+        assert_eq!(archive.signed_head.head, verified.authenticated_cut().unwrap().head);
+        archive.inclusion(verified.source_lsn()).unwrap().verify(source_root).unwrap();
+        let mut different_backup = backup.clone();
+        *different_backup.last_mut().unwrap() ^= 1;
+        assert!(verified.lineage_proof_bytes(&different_backup).is_err());
         let installed = successor.install_portable_backup(verified).await.unwrap();
         let ready = VerifiedSuccessor::from_installation(&installed);
         assert_eq!(authority.status(NAME).await.unwrap().grant_protocol_version, super::super::LINEAGE_PROTOCOL);

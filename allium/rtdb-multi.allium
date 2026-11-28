@@ -538,6 +538,10 @@ contract PublishedLineageEvidence {
     @invariant ProofsOutliveTrim
         -- Checkpoints and payload trim preserve the authenticated application and control leaves and the ability to prove inclusion against retained heads.
         -- A recoverable cut makes its signed head and the proof material for that head available independently of its source keepers.
+        -- A hosted recovery retains the selected source proof as an exact object version in the destination provider.
+        -- The selected recovery's signed object readback binds that proof to its portable cut and operation.
+        -- A historical proof reader reopens the held version through the published recovery and confirms its exact signed application head.
+        -- The published source proof remains held after replacement of the destination checkpoint and release of its temporary object holds.
         -- Retirement archives the material needed to produce inclusion and consistency proofs.
 
     @invariant VerificationPinsCatalogRoots

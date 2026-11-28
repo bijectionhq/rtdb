@@ -178,6 +178,13 @@ impl VerifiedBackup {
         self.source.authentication.source
     }
 
+    pub fn lineage_proof_bytes<'a>(&self, bytes: &'a [u8]) -> Result<Option<&'a [u8]>> {
+        if <[u8; 32]>::from(Sha256::digest(bytes)) != self.manifest_sha256 {
+            return Err(invalid_backup());
+        }
+        Ok(BackupHeader::parse(bytes)?.proof)
+    }
+
     pub fn source_basis(&self) -> Basis {
         self.source.cut.basis
     }

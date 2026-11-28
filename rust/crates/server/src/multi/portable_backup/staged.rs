@@ -10,6 +10,7 @@ use crate::multi::activation::{
 };
 
 use super::*;
+use super::lineage::LineageObject;
 
 #[derive(Clone, Debug)]
 pub(super) struct Stage {
@@ -51,6 +52,8 @@ pub(super) struct StagingOrder {
     pub(super) vault_identity: Uuid,
     #[serde(default, skip_serializing_if = "untracked_uploads")]
     pub(super) tracked_uploads: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lineage: Option<LineageObject>,
 }
 
 fn untracked_uploads(tracked: &bool) -> bool { !*tracked }
@@ -100,8 +103,10 @@ impl Stage {
 
     pub(super) async fn run_with_authority(self, authority: &ActivationAuthority) -> Result<Value> {
         let source_keys = Arc::new(FileKms::open(&self.source_key_vault, || SystemClock.now().0)?);
-        let archive = read_archive(&self.archive)?;
+        let archive = Bytes::from(read_archive(&self.archive)?);
         let backup = PortableBackup::verify(&archive, source_keys).await?;
+        let manifest = backup.manifest_sha256();
+        let proof = backup.lineage_proof_bytes(&archive)?.map(|proof| archive.slice_ref(proof));
         let source_lsn = backup.source_lsn();
         if backup.source_basis().incarnation() != *self.operation.predecessor.incarnation.as_bytes() {
             return Err(stage_source());
@@ -130,6 +135,7 @@ impl Stage {
             destination_journal_sha256: KeeperJournal::connect(&self.destination.journal_url, &credentials)?.connection_sha256,
             vault_identity: keys.enroll_recovery_vault().await?,
             tracked_uploads: true,
+            lineage: proof.as_deref().map(LineageObject::describe),
         };
         let io = IoRegion::new();
         let mut writer_io = IoRegion::new();
@@ -137,6 +143,7 @@ impl Stage {
             let store = self.destination.objects.open(&root, &remotes, Arc::clone(&io)).await?;
             if let Some(prior) = read_staging_order(store.as_ref(), hold.authority, candidate.incarnation).await? {
                 order.tracked_uploads = prior.tracked_uploads;
+                if prior.lineage.is_none() { order.lineage = None; }
             }
             let encoded = serde_json::to_vec(&order).map_err(|_| stage_source())?;
             store.put(&staging_key(hold.authority, candidate.incarnation)?, Bytes::from(encoded)).await?;
@@ -154,6 +161,13 @@ impl Stage {
             } else {
                 (store, true)
             };
+            if let Some(lineage) = order.lineage {
+                if can_write {
+                    let bytes = proof.as_ref().ok_or_else(stage_source)?.clone();
+                    store.put(&lineage.key(candidate.incarnation, manifest)?, bytes).await?;
+                }
+                lineage.read(candidate.incarnation, manifest, store.as_ref(), None).await?;
+            }
             let mut database = MultiDatabase::new(
                 MultiOptions {
                     database: candidate.incarnation,
