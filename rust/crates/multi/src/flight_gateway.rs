@@ -8,7 +8,7 @@ use hyper::{body::{Body, Frame, Incoming, SizeHint}, server::conn::http2, servic
 use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExecutor, TokioIo, TokioTimer}};
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, now_ms};
+use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberRole, now_ms};
 use rtdb_flight_sql::{FlightEgress, FlightEgressIo, GATEWAY_ANSWER_DEADLINE_HEADER, FORWARDED_PEER_HEADER, ISOLATED_WATCH_FORWARD, LINKED_STORE_RELEASE, REQUEST_STORE_DRAIN_HEADER, RETAINED_STORE_WATCH_HEADER, STORE_DRAIN_PROOF_HEADER, STORE_RELEASE_HEADER};
 use rtdb_storage::sealing::DeliveryDeadline;
 use rtdb_types::{Anomaly, Result};
@@ -389,8 +389,9 @@ impl Router {
         Ok(rtdb_directory::classic_flight::excludes_unclassified(&record).then_some(record))
     }
 
-    /// Resolve the ticket's original live worker, without selecting or
-    /// activating the deployment's current holder.
+    /// Route only a close to the original receiver named by the ticket.
+    /// A worker can still drain its session after it loses placement eligibility.
+    /// The endpoint check and the worker's session proof remain mandatory.
     async fn validate_drain_target(&self, target: &Target) -> std::result::Result<(), Status> {
         let control = if let Some(installed) = self.options.ordered_placement(&target.name).await.map_err(directory_error)? {
             let enrollment = target.enrollment.filter(|enrollment| enrollment.worker.to_string() == target.holder.0)
@@ -402,7 +403,7 @@ impl Router {
                 return Err(moved());
             }
             self.directory.member(&target.holder).await.map_err(directory_error)?
-                .filter(|member| member.id == target.holder && member.may_hold(now_ms()))
+                .filter(|member| member.id == target.holder && member.role == MemberRole::Node)
                 .and_then(|member| member.control_address).ok_or_else(moved)?
         };
         target.confirm_drain_endpoint(&self.reported_flight_endpoint(&control).await?)

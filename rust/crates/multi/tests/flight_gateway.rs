@@ -189,7 +189,19 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     assert!(!confirmation.metadata().contains_key(rtdb_flight_sql::STORE_DRAIN_PROOF_HEADER));
     let mut results = confirmation.into_inner();
     let result = results.message().await.unwrap().unwrap();
-    assert_eq!(result.body.as_ref(), &[8, 1, 16, 1]);
+    #[derive(Message)]
+    struct CloseResult {
+        #[prost(int32, tag = "1")]
+        status: i32,
+        #[prost(bool, tag = "2")]
+        store_reads_drained: bool,
+        #[prost(bytes, tag = "3")]
+        store_watch_drain: Vec<u8>,
+    }
+    let closed = CloseResult::decode(result.body).unwrap();
+    assert_eq!(closed.status, 1);
+    assert!(closed.store_reads_drained);
+    assert_eq!(closed.store_watch_drain.len(), 16 + 64);
     assert!(results.message().await.unwrap().is_none());
 
     let mut replacement = FlightSqlServiceClient::new(channel(address).await);
