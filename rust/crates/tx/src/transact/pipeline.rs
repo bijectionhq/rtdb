@@ -803,6 +803,24 @@ mod tests {
     }
 
     #[test]
+    fn timed_store_admission_uses_the_raw_reading_after_a_future_sql_head() {
+        let mut state = TransactState::new(INCARNATION);
+        let mut index = state.index().clone();
+        index.advance_classic(BranchCut { basis: Basis::new(INCARNATION, 1), system_time: Timestamp(1_000) }).unwrap();
+        state.replace_applied_index(index).unwrap();
+        let pipeline = TransactPipeline::new(state, 2, 8).unwrap();
+        let (companion, effect) = timed_store_test_requests();
+        let cutoff = TimedJournalCutoff::new(Timestamp(115), [7; 32]).unwrap();
+        let (_, Decision::Append { position: 3, record }) =
+            pipeline.preview_timed_store_pair(&companion, &effect, Timestamp(100), FEATURES, &claims(), cutoff).unwrap()
+        else { panic!("expected the timed Store effect"); };
+        let TransactionRecord::Tx(tx) = TransactionRecord::decode(&record).unwrap()
+        else { panic!("expected a Store transaction"); };
+        assert_eq!(tx.receipt.system_time, Timestamp(1_002));
+        assert_eq!(tx.receipt.store_reading, Some(Timestamp(100)));
+    }
+
+    #[test]
     fn timed_store_pair_previews_exact_bytes_and_retains_authenticated_checkpoint_boundary() {
         let mut pipeline = pipeline();
         let (companion, effect) = timed_store_test_requests();
