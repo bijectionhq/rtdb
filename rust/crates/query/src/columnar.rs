@@ -5077,6 +5077,10 @@ mod tests {
     fn record_projection_cursor(
         batch: ColumnBatch, schema: Schema, expressions: Vec<Expr>, memory: &Arc<MemoryBudget>,
     ) -> BatchExpressions {
+        BatchExpressions::new(Box::new(RecordProjectionInput(Some(batch))), schema, expressions, record_projection_execution(memory))
+    }
+
+    fn record_projection_execution(memory: &Arc<MemoryBudget>) -> crate::context::Execution {
         let database = crate::DatabaseSnapshot {
             partitions: vec![],
             storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
@@ -5084,11 +5088,10 @@ mod tests {
         let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false).unwrap();
         let context = crate::QueryContext::new(catalog, Arc::clone(memory), Timestamp(0), "UTC", Default::default(),
             &tokio_util::sync::CancellationToken::new()).unwrap();
-        let execution = crate::context::Execution {
+        crate::context::Execution {
             context, parameters: Arc::new(crate::parameters::BoundParameters::infer(Vec::new(), memory).unwrap()),
             outer: crate::context::OuterRows::empty(memory).unwrap(), bindings: None, analysis: None,
-        };
-        BatchExpressions::new(Box::new(RecordProjectionInput(Some(batch))), schema, expressions, execution)
+        }
     }
 
     #[tokio::test]
@@ -5293,9 +5296,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn fixed_list_subscripts_follow_sliced_children_and_parent_validity() {
+    #[test]
+    fn fixed_list_subscript_kernel_follows_sliced_children_and_parent_validity() {
         let memory = MemoryBudget::new(1 << 20);
+        let execution = record_projection_execution(&memory);
         for (scalar, winner) in [
             (ScalarType::Utf8, Value::Utf8("é\0".into())),
             (ScalarType::Binary, Value::Binary(vec![0, 255])),
@@ -5323,24 +5327,43 @@ mod tests {
                     index: Box::new(Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(index)), Expr::Literal(Value::I64(1)))),
                     data_type: element.clone(),
                 };
-                let mut cursor = record_projection_cursor(batch, schema, vec![subscript(2), subscript(3)], &memory);
-                cursor.scalar_fallbacks = Some(0);
-                let page = cursor.next_batch().await.unwrap().unwrap();
-                assert_eq!(cursor.scalar_fallbacks, Some(0));
-                assert_eq!(page.columns[0].value(0).unwrap(), if width == 0 { Value::Null } else { winner.clone() });
-                for row in [1, 2] { assert_eq!(page.columns[0].value(row).unwrap(), Value::Null); }
-                for row in 0..3 { assert_eq!(page.columns[1].value(row).unwrap(), Value::Null); }
+                let select = |index| projection::list_subscript(&subscript(index), &element, &schema, &batch, &execution).unwrap().unwrap();
+                let (selected, charge) = select(2);
+                let (out_of_range, _out_of_range_charge) = select(3);
+                drop(batch);
+                assert_eq!(selected.value(0).unwrap(), if width == 0 { Value::Null } else { winner.clone() });
+                for row in [1, 2] { assert_eq!(selected.value(row).unwrap(), Value::Null); }
+                for row in 0..3 { assert_eq!(out_of_range.value(row).unwrap(), Value::Null); }
                 if width != 0 {
-                    let cell = page.columns[0].funded_arrow_cell(0, page.column_reservation(0)).unwrap().unwrap();
+                    let cell = selected.funded_arrow_cell(0, &charge).unwrap().unwrap();
                     assert!(Arc::ptr_eq(cell.array, &child));
                     assert_eq!(cell.row, 1);
                     assert!(cell.owner.backing().iter().any(|owner| Arc::downgrade(owner).ptr_eq(&source)));
                 }
-                drop(cursor);
-                drop(page);
+                drop((selected, charge));
                 assert!(source.upgrade().is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn projection_cursor_rejects_logical_fixed_list_subscripts() {
+        let memory = MemoryBudget::new(1 << 20);
+        let element = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let mut input = field(0, ScalarType::Utf8);
+        input.data_type = LogicalType::List { kind: ListKind::FixedSizeList(2), element: Box::new(element.clone()) };
+        let field = Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap());
+        let value = Value::FixedSizeList(vec![Value::Utf8("a".into()), Value::Utf8("b".into())].into());
+        let array = rtdb_columnar::copy_array(&input.data_type, &[value]).unwrap();
+        let column = Column::Arrow { array, field, logical: Some(input.data_type.clone()) };
+        let batch = ColumnBatch::settled(vec![column], 1, memory.reserve(4096).unwrap()).unwrap();
+        let expression = Expr::Subscript {
+            expr: Box::new(input.expression()), index: Box::new(Expr::Literal(Value::I64(0))), data_type: element,
+        };
+        let schema = Schema::new(vec![input]).unwrap();
+        let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
+        let error = cursor.next_batch().await.err().expect("Expected the nth type check to reject a fixed-size list");
+        assert_eq!(error.code, "xtdb.expression/function-type-mismatch");
     }
 
     #[tokio::test]
