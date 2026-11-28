@@ -223,12 +223,27 @@ mod tests {
             Arc::clone(&held), owner, &root, at, at, &OwnedIdentityScan::binary(None), 1, within,
         ).await?;
         let next = rtdb_query::owned_identity_candidates_in_prefix(
-            held, owner, &root, at, at, &OwnedIdentityScan::binary(Some(&low)), 2, within,
+            Arc::clone(&held), owner, &root, at, at, &OwnedIdentityScan::binary(Some(&low)), 2, within,
         ).await?;
+        let binary_end = rtdb_query::owned_identity_candidates_in_prefix(
+            Arc::clone(&held), owner, &root, at, at, &OwnedIdentityScan::binary(Some(&high)), 2, within,
+        ).await?;
+        assert!(binary_end.keys.is_empty());
         let enumerated: Vec<_> = first.keys.into_iter().chain(next.keys).collect();
         let mut expected: Vec<_> = keys.into_iter().filter(|id| id.starts_with(&prefix)).map(EntityId::Binary).collect();
         expected.sort();
         assert_eq!(enumerated, expected);
+
+        let text = rtdb_query::owned_identity_candidates_in_prefix(
+            Arc::clone(&held), owner, &overlay, at, at, &OwnedIdentityScan::text(Some("world-column/fixtur")), 2,
+            Some(rtdb_columnar::EntityIdRef::String("world-column/")),
+        ).await?;
+        assert_eq!(text.keys, [EntityId::String("world-column/fixture".into())]);
+        let text_end = rtdb_query::owned_identity_candidates_in_prefix(
+            held, owner, &overlay, at, at, &OwnedIdentityScan::text(Some("world-column/fixture")), 2,
+            Some(rtdb_columnar::EntityIdRef::String("world-column/")),
+        ).await?;
+        assert!(text_end.keys.is_empty());
 
         let bound = |at_most| Operation::Public(TxOp::OwnedCheckCapacity {
             relation: journal.clone(), column: PROTECTED_MEMBERSHIP.into(), prefix: operand(&prefix, &fence), at_most,

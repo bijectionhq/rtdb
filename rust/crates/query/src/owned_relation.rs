@@ -659,7 +659,11 @@ pub async fn owned_identity_candidates_in_prefix(
     let mut charges = vec![context.memory.reserve(fetch * 128)?];
     let mut keys: Vec<EntityId> = Vec::with_capacity(fetch);
     let mut remaining: usize = 8 << 20;
-    let bound = after.bound().map(|key| key.owned_entity_id()).transpose()?;
+    let bound = match after {
+        OwnedIdentityScan::Text(after) => after.as_deref().map(EntityIdRef::String),
+        OwnedIdentityScan::Binary(after) => after.as_deref().map(EntityIdRef::Binary),
+        OwnedIdentityScan::Unbounded => None,
+    };
     if let Some(mut cursor) = open_owned_identity_candidates(
         Arc::clone(&context), owner, relation, system, valid, after, prefix, fetch as i64,
     ).await? {
@@ -672,13 +676,14 @@ pub async fn owned_identity_candidates_in_prefix(
                 remaining = remaining.checked_sub(size).ok_or_else(unavailable)?;
                 charges.push(context.memory.reserve(size)?);
                 let id = rtdb_columnar::read_owned_entity_id(field, array, row)
-                    .map_err(|_| unavailable())?.into_owned();
+                    .map_err(|_| unavailable())?;
                 if keys.len() == fetch
-                    || prefix.is_some_and(|prefix| !identity_has_prefix(prefix, EntityIdRef::from(&id)))
-                    || keys.last().or(bound.as_ref()).is_some_and(|prior| prior >= &id)
+                    || prefix.is_some_and(|prefix| !identity_has_prefix(prefix, id))
+                    || keys.last().map(EntityIdRef::from).or(bound).is_some_and(|prior| prior >= id)
                 {
                     return Err(unavailable());
                 }
+                let id = id.into_owned();
                 let mut point = open_owned_point(
                     Arc::clone(&context), owner, relation, &id,
                     Some(Interval::at(valid)?), Some(&["_id"]),
