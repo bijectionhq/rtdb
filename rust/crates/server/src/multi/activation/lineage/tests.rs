@@ -168,6 +168,54 @@ fn lineage_capture_waits_for_publication() {
 }
 
 #[test]
+fn lineage_leaves_a_matching_untimed_record_pending() {
+    let source = archive(SOURCE, STREAM, [Leaf { timing: None, ..leaf(1) }]);
+    let inclusion = source.inclusion(Lsn(1)).unwrap();
+    let (publication, control_root) = publication(&source);
+    assert_eq!(
+        verify_settlement(
+            AUTHORITY,
+            DATABASE,
+            control_root,
+            source.history.genesis.root(),
+            authorization(1),
+            Some(&publication),
+            Some(&inclusion),
+        )
+        .unwrap(),
+        Settlement::Pending,
+    );
+}
+
+#[test]
+fn lineage_rejects_conflicting_timing_for_a_matching_record() {
+    let source = archive(
+        SOURCE,
+        STREAM,
+        [Leaf {
+            timing: Some(Timing {
+                receiver_certificate_sha256: [23; 32],
+                ..authorization(1).timing
+            }),
+            ..leaf(1)
+        }],
+    );
+    let inclusion = source.inclusion(Lsn(1)).unwrap();
+    let (publication, control_root) = publication(&source);
+    let error = verify_settlement(
+        AUTHORITY,
+        DATABASE,
+        control_root,
+        source.history.genesis.root(),
+        authorization(1),
+        Some(&publication),
+        Some(&inclusion),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "rtdb/lineage-proof");
+}
+
+#[test]
 fn lineage_releases_an_authorized_position_filled_by_a_replacement() {
     let replacement = Leaf {
         writer_epoch: Epoch(2),

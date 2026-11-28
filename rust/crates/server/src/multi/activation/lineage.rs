@@ -144,13 +144,11 @@ impl Authorization {
             && self.timing.receiver_certificate_sha256 != [0; 32]
     }
 
-    fn matches(self, leaf: &Leaf) -> bool {
+    fn identifies(self, leaf: &Leaf) -> bool {
         leaf.stream == self.stream
             && leaf.at == self.at
             && leaf.writer_epoch == self.writer_epoch
             && leaf.payload_sha256 == self.payload_sha256
-            && leaf.timing == Some(self.timing)
-            && leaf.quorum_durable_upper_micros < self.timing.exclusive_cutoff_micros
     }
 }
 
@@ -213,11 +211,19 @@ pub fn verify_settlement(
     if leaf.at != authorization.at {
         return Err(invalid("The application proof opens a different position"));
     }
-    Ok(if authorization.matches(leaf) {
-        Settlement::Capture
-    } else {
-        Settlement::Release
-    })
+    if !authorization.identifies(leaf) {
+        return Ok(Settlement::Release);
+    }
+    match leaf.timing {
+        None => Ok(Settlement::Pending),
+        Some(timing) if timing != authorization.timing => {
+            Err(invalid("The authorized append has conflicting timing evidence"))
+        }
+        Some(timing) if leaf.quorum_durable_upper_micros < timing.exclusive_cutoff_micros => {
+            Ok(Settlement::Capture)
+        }
+        Some(_) => Err(invalid("The authorized append has an invalid durability bound")),
+    }
 }
 
 fn invalid(message: &str) -> Anomaly {
