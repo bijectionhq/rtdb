@@ -2447,6 +2447,14 @@ surface QueryAccess {
         -- An execution spanning several databases holds one such snapshot per database.
         -- Derived ordered-index state belongs to the captured snapshot and observes the same catalog, system-time cap, and staged writes.
 
+    @guarantee JvmTextTransformProjections
+        -- JVM UPPER and LOWER use the default locale at evaluation and can write ASCII directly when the locale admits ASCII case mapping.
+        -- JVM REVERSE can write reached ASCII in reverse byte order and applies JVM character reversal to other text.
+        -- JVM REPLACE can write reached ASCII directly when the target is a one-byte ASCII literal and the replacement is an ASCII literal.
+        -- A JVM text-to-binary cast can write even-length ASCII hex directly after validating every digit, preserving the diagnostics and additional digits accepted by the JVM hex decoder.
+        -- A JVM binary-to-text cast can write lowercase hex with the existing backslash-x prefix and binary extent.
+        -- Direct writes preserve the result layout, null slots, and the order of reached operand errors.
+
     @guarantee JvmValuesAndRecordExpressions
         -- JVM VALUES retains the order of rows and evaluates each reached cell in its existing expression order.
         -- Compatible scalar parameters and children of bound records are copied at their Arrow positions.

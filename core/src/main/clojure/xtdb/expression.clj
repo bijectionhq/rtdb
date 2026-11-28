@@ -21,7 +21,7 @@
            (org.apache.arrow.vector.types.pojo ArrowType$Decimal)
            (org.apache.commons.codec.binary Hex)
            (xtdb.arrow KeywordVector ListValueReader RelationReader RowMask Utf8Vector ValueBox ValueReader VariableWidthVector Vector VectorReader VectorType VectorType$Listy VectorType$Maybe VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
-           (xtdb.expression PgFormat)
+           (xtdb.expression PgFormat TextTransforms)
            (xtdb.operator ProjectionSpec ProjectionSpec$Factory SelectionSpec SelectionSpec$Factory)
            (xtdb.pgwire PgTypes)
            xtdb.time.Interval
@@ -311,12 +311,24 @@
   {:return-type #xt/type :utf8
    :->call-code (fn [[code]] code)})
 
+(defn- with-byte-transform [{:keys [->call-code] :as call} try-write]
+  (assoc call :->write-code
+         (fn [out [input & args]]
+           (let [value (gensym 'input)]
+             `(let [~value ~input]
+                (when-not ~(try-write out value)
+                  (.writeBytes ~out ~(with-tag (->call-code (cons value args)) ByteBuffer))))))))
+
 (defmethod codegen-cast [:utf8 :varbinary] [_]
-  {:return-type #xt/type :varbinary, :->call-code #(do `(ByteBuffer/wrap (Hex/decodeHex (resolve-string ~@%))))})
+  (with-byte-transform
+    {:return-type #xt/type :varbinary, :->call-code #(do `(ByteBuffer/wrap (Hex/decodeHex (resolve-string ~@%))))}
+    (fn [out value] `(TextTransforms/tryWriteHexDecoded ~out ~value))))
 
 (defmethod codegen-cast [:varbinary :utf8] [_]
-  {:return-type #xt/type :utf8
-   :->call-code #(do `(str->buf (str "\\x" (Hex/encodeHexString (resolve-bytes ~@%)))))})
+  (with-byte-transform
+    {:return-type #xt/type :utf8
+     :->call-code #(do `(str->buf (str "\\x" (Hex/encodeHexString (resolve-bytes ~@%)))))}
+    (fn [out value] `(TextTransforms/tryWriteHexEncoded ~out ~value))))
 
 (defmethod codegen-cast [:transit :utf8] [_]
   {:return-type #xt/type :utf8
@@ -1399,22 +1411,28 @@
                                                          ~leading? ~trailing?)))}))
 
 (defmethod codegen-call [:upper :utf8] [_]
-  {:return-type #xt/type :utf8
-   :valid-utf8? true
-   :->call-code (fn [[code]]
-                  `(str->buf (.toUpperCase (resolve-string ~code))))})
+  (with-byte-transform
+    {:return-type #xt/type :utf8
+     :valid-utf8? true
+     :->call-code (fn [[code]]
+                    `(str->buf (.toUpperCase (resolve-string ~code))))}
+    (fn [out value] `(TextTransforms/tryWriteAsciiCase ~out ~value true))))
 
 (defmethod codegen-call [:lower :utf8] [_]
-  {:return-type #xt/type :utf8
-   :valid-utf8? true
-   :->call-code (fn [[code]]
-                  `(str->buf (.toLowerCase (resolve-string ~code))))})
+  (with-byte-transform
+    {:return-type #xt/type :utf8
+     :valid-utf8? true
+     :->call-code (fn [[code]]
+                    `(str->buf (.toLowerCase (resolve-string ~code))))}
+    (fn [out value] `(TextTransforms/tryWriteAsciiCase ~out ~value false))))
 
 (defmethod codegen-call [:reverse :utf8] [_]
-  {:return-type #xt/type :utf8
-   :valid-utf8? true
-   :->call-code (fn [[code]]
-                  `(str->buf (-> (resolve-string ~code) (StringBuilder.) (.reverse) (.toString))))})
+  (with-byte-transform
+    {:return-type #xt/type :utf8
+     :valid-utf8? true
+     :->call-code (fn [[code]]
+                    `(str->buf (-> (resolve-string ~code) (StringBuilder.) (.reverse) (.toString))))}
+    (fn [out value] `(TextTransforms/tryWriteAsciiReverse ~out ~value))))
 
 (defmethod codegen-call [:namespace :keyword] [_]
   {:return-type #xt/type [:? :utf8]
@@ -1707,11 +1725,17 @@
 (defmethod codegen-call [:overlay :utf8 :utf8 :int :int] [_]
   (codegen-overlay #xt/type :utf8 `resolve-utf8-buf `StringUtil/sqlUtf8Overlay `StringUtil/sqlUtf8OverlayParts))
 
-(defmethod codegen-call [:replace :utf8 :utf8 :utf8] [_]
-  {:return-type #xt/type :utf8
-   :->call-code (fn [[s target replacement]]
-                  `(-> (.replace (resolve-string ~s) (resolve-string ~target) (resolve-string ~replacement))
-                       (resolve-utf8-buf)))})
+(defmethod codegen-call [:replace :utf8 :utf8 :utf8]
+  [{[_ {target :literal} {replacement :literal}] :args}]
+  (cond-> {:return-type #xt/type :utf8
+           :->call-code (fn [[s target replacement]]
+                          `(-> (.replace (resolve-string ~s) (resolve-string ~target) (resolve-string ~replacement))
+                               (resolve-utf8-buf)))}
+    (and (string? target) (= 1 (count target)) (< (int (.charAt ^String target 0)) 128)
+         (string? replacement) (every? #(< (int %) 128) replacement))
+    (with-byte-transform (fn [out value]
+                           `(TextTransforms/tryWriteAsciiReplaceByte ~out ~value
+                                                                     ~(int (.charAt ^String target 0)) ~replacement)))))
 
 (def ^:private ^java.util.Set sql-keywords
   "SQL keywords derived from SqlLexer's vocabulary at load time, used by quote_ident.

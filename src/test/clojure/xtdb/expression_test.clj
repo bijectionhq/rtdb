@@ -14,10 +14,12 @@
   (:import (java.nio ByteBuffer)
            (java.time Duration Instant InstantSource LocalDate LocalDateTime LocalTime Period ZoneId ZonedDateTime)
            (java.time.temporal ChronoUnit)
+           (java.util Locale Locale$Category)
            org.apache.arrow.vector.types.TimeUnit
+           org.apache.commons.codec.DecoderException
            (xtdb.api.error Incorrect)
-           (xtdb.arrow DecimalVector NullVector RelationReader Vector VectorReader)
-           (xtdb.operator ProjectionSpec$Star)
+           (xtdb.arrow DecimalVector NullVector RelationReader Utf8Vector Vector VectorReader)
+           (xtdb.operator ProjectionSpec ProjectionSpec$Star)
            (xtdb.time Interval)
            (xtdb.util StringUtil)))
 
@@ -1023,6 +1025,76 @@
 (tct/defspec lower-is-equiv-to-java-lower-prop
   (tcp/for-all [^String s tcg/string]
     (= (.toLowerCase s) (project1 '(lower a) {:a s}))))
+
+(t/deftest byte-text-projections-preserve-unicode-and-null-slots
+  (with-open [rel (vr/rel-reader [(doto (Utf8Vector. tu/*allocator* "a" true)
+                                   (.writeObject "a!A")
+                                   (.writeNull)
+                                   (.writeObject "")
+                                   (.writeObject "a😀é")
+                                   (.writeBytes (byte-array [(unchecked-byte 0xff) 97]))
+                                   (.writeObject "aaa"))])]
+    (t/are [form expected] (= {:res-type #xt/type [:? :utf8], :res expected}
+                              (run-projection rel form))
+      '(upper a) ["A!A" nil "" "A😀É" "�A" "AAA"]
+      '(lower a) ["a!a" nil "" "a😀é" "�a" "aaa"]
+      '(reverse a) ["A!a" nil "" "é😀a" "a�" "aaa"]
+      '(reverse (substring a 2)) ["A!" nil "" "é😀" "a" "aa"]
+      '(replace a "a" "xy") ["xy!A" nil "" "xy😀é" "�xy" "xyxyxy"]
+      '(replace a "a" "") ["!A" nil "" "😀é" "�" ""]
+      '(replace a "aa" "X") ["a!A" nil "" "a😀é" "�a" "Xa"])
+    (t/is (= [3 nil 0 7 4 3]
+             (:res (run-projection rel '(octet_length (reverse a))))))))
+
+(t/deftest case-projection-reads-the-default-locale-at-evaluation
+  (with-open [rel (tu/open-rel {:a ["iI"]})]
+    (let [input-types {:var-types {'a #xt/type :utf8}, :param-types {}}
+          open-projection (fn [form]
+                            (-> (expr/->expression-projection-spec "out" (expr/form->expr form input-types) input-types)
+                                (.open tu/*allocator* {} vw/empty-args)))
+          original (Locale/getDefault)
+          original-display (Locale/getDefault Locale$Category/DISPLAY)
+          original-format (Locale/getDefault Locale$Category/FORMAT)]
+      (with-open [^ProjectionSpec upper (open-projection '(upper a))
+                  ^ProjectionSpec lower (open-projection '(lower a))]
+        (try
+          (doseq [[locale expected-upper expected-lower] [[Locale/ROOT "II" "ii"]
+                                                         [(Locale/forLanguageTag "tr") "İI" "iı"]
+                                                         [Locale/ROOT "II" "ii"]]]
+            (Locale/setDefault locale)
+            (with-open [upper-col (.project upper rel)
+                        lower-col (.project lower rel)]
+              (t/is (= expected-upper (.getObject upper-col 0)))
+              (t/is (= expected-lower (.getObject lower-col 0)))))
+          (finally
+            (Locale/setDefault original)
+            (Locale/setDefault Locale$Category/DISPLAY original-display)
+            (Locale/setDefault Locale$Category/FORMAT original-format)))))))
+
+(t/deftest hex-projections-preserve-binary-layout-and-legacy-digits
+  (with-open [rel (tu/open-rel {:a ["00aF" nil "" "Ｆｆ" "12"]})]
+    (let [{:keys [res res-type]} (run-projection rel '(cast a #xt/type :varbinary))]
+      (t/is (= #xt/type [:? :varbinary] res-type))
+      (t/is (= [[0 175] nil [] [255] [18]]
+               (mapv #(some->> % (mapv (fn [b] (bit-and b 0xff)))) res))))
+    (t/is (= [2 nil 0 1 1]
+             (:res (run-projection rel '(octet_length (cast a #xt/type :varbinary)))))))
+  (let [bytes (byte-array [1 (unchecked-byte 0xaf) 2])]
+    (with-open [rel (tu/open-rel {:a [bytes nil (byte-array 0)]})]
+      (t/is (= {:res-type #xt/type [:? :utf8], :res ["\\x01af02" nil "\\x"]}
+               (run-projection rel '(cast a #xt/type :utf8))))
+      (t/is (= ["\\xaf" nil "\\x"]
+               (:res (run-projection rel '(cast (substring a 2 1) #xt/type :utf8))))))
+    (t/is (= ["\\x01af02"]
+             (:res (run-projection RelationReader/DUAL
+                                   (list 'cast (list 'substring bytes 2 1) #xt/type :utf8)))))))
+
+(t/deftest hex-projection-preserves-the-first-reached-decoder-error
+  (t/are [inputs message] (with-open [rel (tu/open-rel {:a inputs})]
+                             (thrown-with-msg? DecoderException message
+                                               (run-projection rel '(cast a #xt/type :varbinary))))
+    ["00" nil "0g" "f"] (re-pattern (format "Illegal hexadecimal character 0x67 at index %,d" 1))
+    ["00" nil "g" "0g"] #"Odd number of characters"))
 
 (t/deftest concat-test
   (t/are [s1 s2 expected]
