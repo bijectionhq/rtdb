@@ -466,7 +466,7 @@ impl PreparedQuery {
                         context.check_cancelled()?;
                     }
                 }
-                QueryInput::Rows { .. } | QueryInput::Projection { .. } => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
+                QueryInput::Rows { .. } | QueryInput::TypedRows(_) | QueryInput::Projection { .. } => return Err(invalid("analysis-input", "Query analysis requires an execution cursor")),
             }
             let peak = context.memory.peak_bytes();
             let reservation = context.memory.reserve(analysis.output_bound()?)?;
@@ -667,11 +667,14 @@ fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory
 
 enum QueryInput {
     Rows { input: ReportRows, offset: usize },
+    TypedRows(Box<TypedOutputPage>),
     Columns(ColumnOutput),
     ColumnPages(crate::columnar::BoxBatchCursor),
     Ordered(crate::columnar::BoxBatchCursor),
     Projection { batch: Option<OwnedBatch>, trace: Option<crate::trace::CursorTrace> },
 }
+
+type TypedOutputPage = dyn FnMut(&Schema, &mut Option<ResultArrowSchema>, &QueryContext) -> Result<Option<OwnedBatch>> + Send;
 
 fn uses_row_batch_limit(relation: &Relation) -> bool {
     use rtdb_plan::{Expr, JoinKind, RelationNode};
@@ -831,9 +834,51 @@ impl QueryCursor {
         Self::from_report_rows(&schema, ReportRows::Owned { rows: rows.into_iter(), _reservation: reservation }, context, sample)
     }
     fn from_report_rows(schema: &Schema, input: ReportRows, context: Arc<QueryContext>, sample: Option<ExecutionSample>) -> Result<Self> {
+        Self::from_output(schema, QueryInput::Rows { input, offset: 0 }, context, sample)
+    }
+
+    /// Builds Arrow pages lazily in input order with up to `context.options.batch_rows` rows per pull.
+    /// `write_columns` must return one array per schema field with a value for every row of the page.
+    /// `column_bound` must cover each column's allocations before `write_columns` runs for a page.
+    /// The row reservation must cover the complete retained capacity and stays charged until the input is released.
+    #[doc(hidden)]
+    pub fn from_typed_rows<R: Send + 'static>(
+        schema: Schema,
+        rows: Vec<R>,
+        context: Arc<QueryContext>,
+        reservation: Arc<MemoryReservation>,
+        column_bound: fn(usize, &LogicalType, &[R]) -> Result<usize>,
+        write_columns: fn(&[R]) -> Vec<ArrayRef>,
+    ) -> Result<Self> {
+        let mut retained = (rows.into_iter(), reservation);
+        let input = QueryInput::TypedRows(Box::new(move |schema, cache, context| {
+            let (rows, _) = &mut retained;
+            let count = rows.len().min(context.options.batch_rows);
+            if count == 0 {
+                return Ok(None);
+            }
+            let page = &rows.as_slice()[..count];
+            let mut bound = 4096usize;
+            for (column, field) in schema.fields().iter().enumerate() {
+                bound = bound
+                    .checked_add(column_bound(column, &field.data_type, page)?)
+                    .ok_or_else(|| {
+                        invalid("batch-size", "Output batch allocation bound overflow")
+                    })?;
+            }
+            let reservation = context.memory.reserve(bound)?;
+            let arrow = ResultArrowSchema::cached(cache, schema, &context.memory)?;
+            let arrays = write_columns(page);
+            rows.by_ref().take(count).for_each(drop);
+            arrow.own_batch(arrays, count, reservation).map(Some)
+        }));
+        Self::from_output(&schema, input, context, None)
+    }
+
+    fn from_output(schema: &Schema, input: QueryInput, context: Arc<QueryContext>, sample: Option<ExecutionSample>) -> Result<Self> {
         let runtime_schema = RuntimeSchema::fixed(schema, &context.memory)?;
         let sample = sample.or_else(|| Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query)));
-        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, result_arrow: None, input: Some(QueryInput::Rows { input, offset: 0 }), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
+        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, result_arrow: None, input: Some(input), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
     }
     pub fn schema(&self) -> &Schema { self.schema.schema() }
     pub fn context(&self) -> &Arc<QueryContext> { &self.context }
@@ -988,6 +1033,9 @@ impl QueryCursor {
                     return cached_column_batch(schema, arrow, &self.context.memory, batch).map(Some);
                 }
             },
+            QueryInput::TypedRows(next) => {
+                return next(self.runtime_schema.schema(), &mut self.result_arrow, &self.context);
+            }
             QueryInput::Rows { input, offset } => {
                 let limit = self.context.options.batch_rows;
                 match input {
@@ -1017,9 +1065,7 @@ impl QueryCursor {
         if let QueryInput::Rows { input: ReportRows::Owned { rows, .. }, .. } = input {
             rows.by_ref().take(count).for_each(drop);
         }
-        let options = RecordBatchOptions::new().with_row_count(Some(count));
-        let batch = RecordBatch::try_new_with_options(Arc::clone(&arrow.schema), arrays, &options).map_err(|error| invalid("output-arrow", error))?;
-        Ok(Some(OwnedBatch::with_reservation(batch, reservation)?.with_schema_reservation(Arc::clone(&arrow.reservation))))
+        arrow.own_batch(arrays, count, reservation).map(Some)
     }
 }
 
@@ -1029,6 +1075,13 @@ struct ResultArrowSchema {
 }
 
 impl ResultArrowSchema {
+    fn own_batch(&self, arrays: Vec<ArrayRef>, count: usize, reservation: Arc<MemoryReservation>) -> Result<OwnedBatch> {
+        let options = RecordBatchOptions::new().with_row_count(Some(count));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
+            .map_err(|error| invalid("output-arrow", error))?;
+        Ok(OwnedBatch::with_reservation(batch, reservation)?.with_schema_reservation(Arc::clone(&self.reservation)))
+    }
+
     fn new(
         logical: &Schema, indices: impl Iterator<Item = usize> + Clone, defer: &impl Fn(usize) -> bool,
         memory: &Arc<MemoryBudget>,

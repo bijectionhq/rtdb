@@ -82,6 +82,7 @@ Missing and zero-norm vectors contribute no distance.
 
 The Arrow result has non-null `identity_key` (Binary) and `distance` (Float64), ordered by ascending cosine distance and then complete typed identity.
 The handle encodes a string as tag 0 followed by UTF-8, a keyword as tag 1 followed by its UTF-8 name, an integer as tag 2 followed by its sign-biased big-endian 64-bit encoding, and a UUID as tag 3 followed by its 16 bytes.
+A Binary identity, such as a staged replacement's key, uses tag 4 followed by its original bytes.
 `QueryTrailer.ranked_ivf` (field 10) gives the executed declaration generation, `candidate_count` and `approximate`, alongside the basis and branch-wide claim even for an empty window.
 `candidate_count` counts the filtered, scored rows in the settled round, including replacements.
 When `approximate = true`, the candidate count covers the shortlist, and closer eligible rows may exist beyond it.

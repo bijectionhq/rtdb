@@ -1,7 +1,8 @@
-use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, io::Write, sync::Arc};
 
+use arrow_array::{ArrayRef, Float64Array, builder::BinaryBuilder};
 use arrow_schema::DataType;
-use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget};
+use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, estimate_scalar_builder_bytes};
 use rtdb_index::branches::RankedIndexDeclaration;
 use rtdb_plan::{Binder, Catalog, Expr, QualifiedTable, Relation, Scan, Schema, TemporalFilter};
 use rtdb_query::{CandidateIids, PreparedQuery, QueryContext, QueryCursor};
@@ -12,7 +13,7 @@ use rtdb_types::{
 use rtdb_vector::{Cut, Partition, Round, Shortlist, UnitProbe, VectorDefinition};
 
 use super::{
-    HeldVectorOverlay, MAX_NEAREST_FILTERS, NearestQuery, NearestWindow, identity_charge,
+    HeldVectorOverlay, MAX_NEAREST_FILTERS, NearestHit, NearestQuery, NearestWindow, identity_charge,
     not_a_vector, run_vector_span,
 };
 
@@ -286,33 +287,236 @@ fn native_nearest_scores_run_encoded_f32_and_preserves_admission_and_component_e
     assert_eq!(memory.used_bytes(), 0);
 }
 
-fn finish(context: &Arc<QueryContext>, window: NearestWindow) -> Result<QueryCursor> {
-    let bytes = window.hits.iter().fold(4096usize, |bytes, hit| {
+fn reply_bytes(hits: &[NearestHit]) -> usize {
+    hits.iter().fold(4096usize, |bytes, hit| {
         bytes
             .saturating_add(identity_charge(EntityIdRef::from(&hit.id)))
             .saturating_add(512)
-    });
-    let reservation = context.memory.reserve(bytes)?;
+    })
+}
+
+fn reply_schema() -> Result<Schema> {
     let mut binder = Binder::default();
-    let schema = Schema::new(vec![
+    Schema::new(vec![
         binder.field(
             "identity_key",
             None,
             LogicalType::Scalar(ScalarType::Binary),
         )?,
         binder.field("distance", None, LogicalType::Scalar(ScalarType::F64))?,
-    ])?;
-    let rows = window
-        .hits
-        .iter()
-        .map(|hit| {
-            vec![
-                Value::Binary(hit.id.handle_bytes()),
-                Value::F64(hit.distance),
-            ]
-        })
-        .collect();
-    QueryCursor::from_rows(schema, rows, Arc::clone(context), reservation)
+    ])
+}
+
+fn handle_len(hit: &NearestHit) -> usize {
+    1 + EntityIdRef::from(&hit.id).handle_parts(&mut [0; 8]).1.len()
+}
+
+fn reply_column_bound(column: usize, logical: &LogicalType, hits: &[NearestHit]) -> Result<usize> {
+    match column {
+        0 => estimate_scalar_builder_bytes(
+            logical,
+            hits.iter()
+                .map(|hit| Some((&ScalarType::Binary, handle_len(hit)))),
+        ),
+        1 => {
+            estimate_scalar_builder_bytes(logical, hits.iter().map(|_| Some((&ScalarType::F64, 0))))
+        }
+        _ => unreachable!("The native IVF reply has two columns"),
+    }
+}
+
+fn write_reply_columns(hits: &[NearestHit]) -> Vec<ArrayRef> {
+    let mut keys = BinaryBuilder::with_capacity(hits.len(), hits.iter().map(handle_len).sum());
+    for hit in hits {
+        let mut integer = [0; 8];
+        let id = EntityIdRef::from(&hit.id);
+        let (tag, payload) = id.handle_parts(&mut integer);
+        keys.write_all(&[tag])
+            .expect("Writing to an Arrow byte buffer is infallible");
+        keys.append_value(payload);
+    }
+    let distances = Float64Array::from_iter_values(hits.iter().map(|hit| hit.distance));
+    vec![Arc::new(keys.finish()), Arc::new(distances)]
+}
+
+fn finish(context: &Arc<QueryContext>, mut window: NearestWindow) -> Result<QueryCursor> {
+    let reservation = context.memory.reserve(reply_bytes(&window.hits))?;
+    let schema = reply_schema()?;
+    // The reply grant covers the admitted hits, while the ranking buffer was sized for k.
+    let mut hits = Vec::with_capacity(window.hits.len());
+    hits.append(&mut window.hits);
+    QueryCursor::from_typed_rows(
+        schema,
+        hits,
+        Arc::clone(context),
+        reservation,
+        reply_column_bound,
+        write_reply_columns,
+    )
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, BinaryArray, Float64Array};
+    use rtdb_columnar::{EntityIdRef, MemoryBudget};
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryCursor, QueryOptions};
+    use rtdb_storage::sealing::PlaintextDelivery;
+    use rtdb_types::{EntityId, Keyword, Result, Timestamp, Value};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{NearestWindow, finish, reply_bytes, reply_schema};
+    use crate::nearest::MAX_NEAREST_K;
+
+    fn context() -> Result<Arc<QueryContext>> {
+        let database = DatabaseSnapshot {
+            partitions: Vec::new(),
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(
+                Arc::new(rtdb_storage::MemoryStore::default()),
+                1 << 20,
+            )),
+        };
+        let catalog = CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false)?;
+        QueryContext::new(
+            catalog,
+            MemoryBudget::new(1 << 20),
+            Timestamp(10),
+            "UTC",
+            QueryOptions {
+                batch_rows: 3,
+                ..QueryOptions::default()
+            },
+            &CancellationToken::new(),
+        )
+    }
+
+    fn winners() -> [(EntityId, f64); 7] {
+        [
+            (EntityId::Binary(vec![]), -0.0),
+            (EntityId::String("é".into()), 0.0),
+            (EntityId::Keyword(Keyword::from_name("ns/key")), 0.0),
+            (EntityId::Integer(i64::MIN), 0.0),
+            (EntityId::Integer(i64::MAX), 0.0),
+            (EntityId::Uuid([0xab; 16]), 0.0),
+            (EntityId::Binary(vec![0xff, 0, 4]), 0.5),
+        ]
+    }
+
+    fn window(context: &Arc<QueryContext>, hits: &[(EntityId, f64)]) -> Result<NearestWindow> {
+        let mut window = NearestWindow::new(&context.memory, MAX_NEAREST_K)?;
+        for (id, distance) in hits.iter().rev() {
+            window.admit(0, EntityIdRef::from(id), *distance)?;
+        }
+        Ok(window)
+    }
+
+    fn legacy_rows(hits: &[(EntityId, f64)]) -> Vec<Vec<Value>> {
+        hits.iter()
+            .map(|(id, distance)| vec![Value::Binary(id.handle_bytes()), Value::F64(*distance)])
+            .collect()
+    }
+
+    fn legacy_cursor(context: &Arc<QueryContext>, hits: &[(EntityId, f64)]) -> Result<QueryCursor> {
+        let window = window(context, hits)?;
+        let reservation = context.memory.reserve(reply_bytes(&window.hits))?;
+        QueryCursor::from_rows(
+            reply_schema()?,
+            legacy_rows(hits),
+            Arc::clone(context),
+            reservation,
+        )
+    }
+
+    #[tokio::test]
+    async fn native_ivf_reply_preserves_typed_handles_distance_bits_and_page_boundaries()
+    -> Result<()> {
+        let ctx = context()?;
+        let legacy = context()?;
+        let hits = winners();
+        let mut cursor = finish(&ctx, window(&ctx, &hits)?)?;
+        let mut reference = legacy_cursor(&legacy, &hits)?;
+        assert_eq!(ctx.memory.used_bytes(), legacy.memory.used_bytes());
+        assert_eq!(ctx.memory.peak_bytes(), legacy.memory.peak_bytes());
+        for expected in hits.chunks(ctx.options.batch_rows) {
+            let page = cursor.next_batch().await?.unwrap();
+            let previous = reference.next_batch().await?.unwrap();
+            let batch = page.batch();
+            assert_eq!(batch.schema_ref(), previous.batch().schema_ref());
+            assert_eq!(batch.get_array_memory_size(), previous.batch().get_array_memory_size());
+            assert_eq!(batch.num_rows(), expected.len());
+            assert_eq!(ctx.memory.used_bytes(), legacy.memory.used_bytes());
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            let distances = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for (row, (id, distance)) in expected.iter().enumerate() {
+                assert_eq!(keys.value(row), id.handle_bytes().as_slice());
+                assert_eq!(distances.value(row).to_bits(), distance.to_bits());
+            }
+            assert_eq!((keys.null_count(), distances.null_count()), (0, 0));
+        }
+        assert!(cursor.next_batch().await?.is_none());
+        assert!(reference.next_batch().await?.is_none());
+        assert_eq!(ctx.memory.used_bytes(), legacy.memory.used_bytes());
+
+        let mut empty = finish(&ctx, window(&ctx, &[])?)?;
+        let pressure = ctx
+            .memory
+            .reserve(ctx.memory.available_bytes() - size_of::<PlaintextDelivery>())?;
+        assert!(empty.next_batch().await?.is_none());
+        drop(pressure);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_ivf_reply_preserves_pull_refusals_and_cancellation_order() -> Result<()> {
+        let hits = winners();
+        let schema = reply_schema()?;
+        let rows = legacy_rows(&hits[..3]);
+        let mut page_bytes = 4096;
+        for (column, field) in schema.fields().iter().enumerate() {
+            page_bytes += rtdb_columnar::estimate_builder_bytes_refs(
+                &field.data_type,
+                rows.iter().map(|row| &row[column]),
+            )?;
+        }
+        for (available, cancelled) in [(page_bytes - 1, false), (page_bytes, false), (0, true)] {
+            let ctx = context()?;
+            let legacy = context()?;
+            let mut cursor = finish(&ctx, window(&ctx, &hits)?)?;
+            let mut reference = legacy_cursor(&legacy, &hits)?;
+            let _pressure = ctx
+                .memory
+                .reserve(ctx.memory.available_bytes() - available)?;
+            let _legacy_pressure = legacy
+                .memory
+                .reserve(legacy.memory.available_bytes() - available)?;
+            if cancelled {
+                cursor.context().cancellation.cancel();
+                reference.context().cancellation.cancel();
+            }
+            let error = cursor.next_batch().await.unwrap_err();
+            assert_eq!(error, reference.next_batch().await.unwrap_err());
+            assert_eq!(
+                error.code,
+                if cancelled {
+                    "xtdb/query-cancelled"
+                } else {
+                    "rtdb/memory-budget-exceeded"
+                }
+            );
+            assert_eq!(ctx.memory.used_bytes(), legacy.memory.used_bytes());
+            assert!(ctx.check_cancelled().is_ok());
+        }
+        Ok(())
+    }
 }
 
 pub fn native_uncovered() -> Anomaly {
