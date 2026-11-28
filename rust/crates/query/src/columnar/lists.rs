@@ -10,11 +10,11 @@ use rtdb_plan::{BinaryOp, Expr, Schema};
 use rtdb_types::{Anomaly, AnomalyKind, ListBuilder, ListKind, LogicalType, Result, ScalarType, Value};
 
 use super::binary::{Input, SignedInput};
-use super::{BatchRow, Column, ColumnBatch, SelectedColumn, StoredVector, owned_projection_bytes, plain_scalar, size_error};
+use super::{BatchRow, Column, ColumnBatch, SelectedColumn, StoredVector, owned_projection_bytes, plain_scalar, size_error, stable_read_layout};
 use crate::context::Execution;
 
 fn bind_input<'a, T: Copy>(
-    expr: &'a Expr, schema: &'a Schema, batch: &'a ColumnBatch, execution: &'a Execution,
+    expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, execution: &'a Execution,
     accepts: impl Fn(&LogicalType) -> bool, literal: impl Fn(&'a Value) -> Option<T>,
 ) -> Option<Input<'a, T>> {
     if let Some(input) = Input::bind(expr, schema, batch, execution, &accepts, |expr| {
@@ -32,6 +32,20 @@ fn bind_input<'a, T: Copy>(
     }))
 }
 
+fn bind_signed_input<'a>(
+    expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, execution: &'a Execution,
+) -> Option<SignedInput<'a>> {
+    bind_input(expr, schema, batch, execution, |ty|
+        *ty == LogicalType::Null || matches!(plain_scalar(ty), Some(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)),
+        |value| match value {
+            Value::I8(value) => Some(i64::from(*value)),
+            Value::I16(value) => Some(i64::from(*value)),
+            Value::I32(value) => Some(i64::from(*value)),
+            Value::I64(value) => Some(*value),
+            _ => None,
+        })
+}
+
 pub(super) struct RuntimeIndex<'a> {
     input: SignedInput<'a>,
     one_based: bool,
@@ -45,15 +59,7 @@ impl<'a> RuntimeIndex<'a> {
             _ => (expr, false),
         };
         if !matches!(input, Expr::Column { .. } | Expr::Parameter { .. }) { return None; }
-        let input = bind_input(input, schema, batch, execution, |ty|
-            *ty == LogicalType::Null || matches!(plain_scalar(ty), Some(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)),
-            |value| match value {
-                Value::I8(value) => Some(i64::from(*value)),
-                Value::I16(value) => Some(i64::from(*value)),
-                Value::I32(value) => Some(i64::from(*value)),
-                Value::I64(value) => Some(*value),
-                _ => None,
-            })?;
+        let input = bind_signed_input(input, schema, batch, execution)?;
         Some(Self { input, one_based })
     }
 
@@ -106,21 +112,21 @@ pub(super) fn list_call(
             project_runs(row, batch.len, execution)
         }
         "trim_array" => {
-            let Expr::Literal(count) = argument else { return Ok(None); };
-            let Some(count) = rtdb_expr::integer(count).and_then(|count| i64::try_from(count).ok())
-                .and_then(|count| usize::try_from(count).ok()) else { return Ok(None); };
             let Some(input) = bind_input(source, schema, batch, execution, |ty| {
                 let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
                 matches!(ty, LogicalType::List { kind: ListKind::List, element }
                     if matches!(plain_scalar(element), Some(ScalarType::Utf8 | ScalarType::Binary)))
             }, |_| None) else { return Ok(None); };
+            let Some(count) = bind_signed_input(argument, schema, batch, execution) else { return Ok(None); };
             project_runs(|row| {
                 let Some(cell) = input.read(row, |cell| {
                     let DataType::List(child) = cell.field.data_type() else { return None; };
                     if !child.metadata().is_empty() || !matches!(child.data_type(), DataType::Utf8 | DataType::Binary) { return None; }
                     Some(cell.array.is_valid(cell.row).then_some(cell))
                 })? else { return Some(ListRow::Null); };
+                let Some(count) = count.signed(row)? else { return Some(ListRow::Null); };
                 let (field, array, range) = cell.sequence_range()?;
+                let count = usize::try_from(count).ok()?;
                 let end = range.end.checked_sub(count).filter(|end| *end >= range.start)?;
                 let range = range.start..end;
                 if range.is_empty() { return Some(ListRow::Empty); }

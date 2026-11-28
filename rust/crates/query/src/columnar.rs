@@ -5342,48 +5342,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trim_array_copies_text_and_binary_prefixes_with_their_observed_child_layouts() {
+    async fn trim_array_preserves_observed_layouts_with_literal_column_and_bound_counts() {
         let memory = MemoryBudget::new(1 << 22);
+        let count = field(1, ScalarType::I64);
         for (scalar, kept, removed) in [
             (ScalarType::Utf8, Value::Utf8("é\0".into()), Value::Utf8("removed".into())),
             (ScalarType::Binary, Value::Binary(vec![0, 255]), Value::Binary(vec![123])),
         ] {
             let mut input = field(0, scalar.clone());
             input.data_type = LogicalType::list(LogicalType::Scalar(scalar).maybe()).maybe();
-            let schema = Schema::new(vec![input.clone()]).unwrap();
+            let schema = Schema::new(vec![input.clone(), count.clone()]).unwrap();
             let list = Value::list;
             let source = [
                 Value::Null, list(vec![removed.clone()]), list(vec![Value::Null, removed.clone()]),
                 list(vec![kept.clone(), Value::Null, removed.clone()]),
-                list(vec![kept.clone(), removed.clone()]), list(vec![kept.clone(), removed]),
+                list(vec![kept.clone(), removed.clone()]), list(vec![kept.clone(), removed.clone()]),
+                list(vec![removed]),
             ];
             let expected = [
                 Value::Null, list(vec![]), list(vec![Value::Null]),
-                list(vec![kept.clone(), Value::Null]), list(vec![kept.clone()]), list(vec![kept]),
+                list(vec![kept.clone(), Value::Null]), list(vec![kept.clone()]), list(vec![kept]), list(vec![]),
             ];
-            let batch = |values: &[Value]| ColumnBatch::settled(vec![Column::Arrow {
-                array: rtdb_columnar::copy_array(&input.data_type, values).unwrap(),
-                field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
-                logical: Some(input.data_type.clone()),
-            }], values.len(), memory.reserve(4096).unwrap()).unwrap();
+            let batch = |values: &[Value], counts: Vec<Option<i64>>| {
+                let arrays = [
+                    (rtdb_columnar::copy_array(&input.data_type, values).unwrap(), &input),
+                    (Arc::new(Int64Array::from(counts)) as ArrayRef, &count),
+                ];
+                let columns = arrays.map(|(array, field)| Column::Arrow {
+                    array,
+                    field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                    logical: Some(field.data_type.clone()),
+                });
+                ColumnBatch::settled(columns.into(), values.len(), memory.reserve(4096).unwrap()).unwrap()
+            };
             let expr = |count| {
-                let args = vec![input.expression(), Expr::Literal(count)];
+                let args = vec![input.expression(), count];
                 let name = "trim_array";
                 Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args }
             };
-            let mut cursor = record_projection_cursor(batch(&source), schema.clone(), vec![expr(Value::I32(1))], &memory);
+            let mut cursor = record_projection_cursor(
+                batch(&source, vec![None; source.len()]), schema.clone(), vec![expr(Expr::Literal(Value::I32(1)))], &memory,
+            );
             cursor.scalar_fallbacks = Some(0);
             let page = cursor.next_batch().await.unwrap().unwrap();
             assert_eq!(cursor.scalar_fallbacks, Some(0));
             assert_observed_list_result(&page.columns[0], &expected, &memory);
-            for (count, code) in [
-                (2, "xtdb.expression/array-element-error"),
-                (-1, "xtdb/invalid-argument-types"),
-                (i64::MIN, "xtdb.expression/array-element-error"),
+
+            let mut cursor = record_projection_cursor(
+                batch(&source, vec![Some(i64::MIN), Some(1), Some(1), Some(1), Some(1), Some(0), None]),
+                schema.clone(), vec![expr(count.expression())], &memory,
+            );
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            let mut runtime_expected = expected.clone();
+            runtime_expected[5] = source[5].clone();
+            runtime_expected[6] = Value::Null;
+            assert_observed_list_result(&page.columns[0], &runtime_expected, &memory);
+
+            let parameter_ty = LogicalType::Scalar(ScalarType::I16);
+            let binding = arrow_array::RecordBatch::try_new(
+                Arc::new(arrow_schema::Schema::new(vec![rtdb_columnar::to_field("arg", &parameter_ty).unwrap()])),
+                vec![Arc::new(arrow_array::Int16Array::from(vec![0, 1]))],
+            ).unwrap();
+            let backing = memory.reserve(binding.get_array_memory_size()).unwrap();
+            let binding = rtdb_columnar::OwnedBatch::with_reservation(binding, backing).unwrap();
+            let mut cursor = record_projection_cursor(
+                batch(&source, vec![None; source.len()]), schema.clone(),
+                vec![expr(Expr::Parameter { index: 0, data_type: parameter_ty.clone() })], &memory,
+            );
+            cursor.execution.parameters = Arc::new(crate::parameters::BoundParameters::from_arrow(binding, 1, vec![parameter_ty], &memory).unwrap());
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            assert_observed_list_result(&page.columns[0], &expected, &memory);
+
+            for (first, second, code, size) in [
+                (2, -1, "xtdb.expression/array-element-error", Some(-1)),
+                (-1, 2, "xtdb/invalid-argument-types", None),
+                (i64::MIN, -1, "xtdb.expression/array-element-error", Some(i64::MIN + 1)),
             ] {
-                let mut cursor = record_projection_cursor(batch(&source[..2]), schema.clone(), vec![expr(Value::I64(count))], &memory);
+                let mut cursor = record_projection_cursor(
+                    batch(&source[..3], vec![Some(i64::MIN), Some(first), Some(second)]),
+                    schema.clone(), vec![expr(count.expression())], &memory,
+                );
                 cursor.scalar_fallbacks = Some(0);
-                assert_eq!(cursor.next_batch().await.err().unwrap().code, code);
+                let error = cursor.next_batch().await.err().unwrap();
+                assert_eq!(error.code, code);
+                assert_eq!(error.context.get("nlen").and_then(|value| value.as_i64()), size);
                 assert_eq!(cursor.scalar_fallbacks, Some(1));
             }
         }
