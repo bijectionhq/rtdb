@@ -607,6 +607,26 @@ async fn store_purge_floor_append_is_fenced_after_admission() {
 }
 
 #[tokio::test]
+async fn store_purge_retry_requires_the_current_journal_seal() {
+    let journal = journals().await;
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let basis = writer.transact(&store_write(1, b"a", Some(b"value"))).await.unwrap().basis;
+    writer.publish_store_purge_floor(basis, basis.position(), 0, &[], None).await.unwrap();
+
+    let head = writer.stream.head().await.unwrap();
+    writer.publish_store_purge_floor(basis, basis.position(), 0, &[], None).await.unwrap();
+    let successor = journal.handle(NODE_2_IDENTITY);
+    let epoch = writer.authority().unwrap().epoch;
+    assert_eq!(successor.seal(writer.journal_stream(), Epoch(epoch.0 + 1)).await.unwrap(), head);
+    assert_eq!(writer.publish_store_purge_floor(basis, basis.position(), 0, &[], None).await.unwrap_err().code,
+        "rtdb/writer-fenced");
+    assert_eq!(writer.stream.head().await.unwrap(), head);
+}
+
+#[tokio::test]
 async fn queued_store_purge_keeps_its_slot_when_the_caller_drops_the_reply() {
     use rtdb_index::branches::store::KeyRange;
 

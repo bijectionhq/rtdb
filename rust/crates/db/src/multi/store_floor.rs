@@ -3,7 +3,7 @@ use rtdb_index::branches::store::{KeyRange, StoreWriterClaim};
 use rtdb_store::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::Basis};
 
-use super::{Lease, MultiDatabase, next, no_writer};
+use super::{Lease, Lsn, MultiDatabase, next, no_writer};
 
 impl MultiDatabase {
     pub(super) async fn reclaim_store_checkpoint_manifests(&mut self) -> Result<()> {
@@ -78,7 +78,7 @@ impl MultiDatabase {
                 "The writer's lower clock bound has not certified the retention census"));
         }
         if keep_from <= state.store_purge_floor && keep_from <= index.store_history_floor() {
-            self.require_authority(lease)?;
+            self.require_store_writer_prefix(lease, head).await?;
             return Ok(None);
         }
         index.check_store_purge_branch_retention(keep_from)?;
@@ -94,10 +94,21 @@ impl MultiDatabase {
         if self.authority()?.epoch != lease.epoch || self.state().head != head || self.state().floor != journal_floor {
             return Err(prefix_unsettled());
         }
+        self.require_store_writer_prefix(lease, head).await?;
         self.store_reads.check_floor(keep_from)?;
         self.state().store_holds.check_floor(keep_from, clock.lower_bound_micros)?;
         // The journal compares the next slot and writer fence when the caller appends.
         Ok(Some((lease, clock)))
+    }
+
+    pub(super) async fn require_store_writer_prefix(&mut self, lease: Lease, head: Lsn) -> Result<()> {
+        // A successor can fence the writer without adding any journal record.
+        // An immutable stream may return the original seal's earlier head.
+        let sealed = self.stream.seal(lease.epoch).await.map_err(|error| self.mutation_failed(error))?;
+        if sealed > head || !self.stream.immutable_history() && sealed != head {
+            return Err(prefix_unsettled());
+        }
+        self.require_authority(lease)
     }
 
     pub(super) fn settled_store_writer(&self) -> Result<Lease> {

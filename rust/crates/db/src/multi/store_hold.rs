@@ -306,13 +306,7 @@ impl MultiDatabase {
             return Err(stale_read_turn());
         }
         let head = self.state().head;
-        // A successor can fence the original writer before appending a
-        // record. Confirm the original seal in addition to the byte floor.
-        let sealed = self.stream.seal(writer.epoch).await.map_err(|error| self.mutation_failed(error))?;
-        if sealed > head || !self.stream.immutable_history() && sealed != head {
-            return Err(prefix_unsettled());
-        }
-        self.require_authority(writer)
+        self.require_store_writer_prefix(writer, head).await
     }
 
     pub(super) fn preserves_store_watch_history(&self, through: Lsn) -> Result<bool> {
@@ -339,13 +333,7 @@ impl MultiDatabase {
         let generation = state.generation;
         self.check_generation(generation).await?;
 
-        // An empty successor seal fences this writer before a newer lease appears in the prefix.
-        // Immutable journals return the original seal's head on an exact retry.
-        let sealed = self.stream.seal(lease.epoch).await.map_err(|error| self.mutation_failed(error))?;
-        if sealed > head || !self.stream.immutable_history() && sealed != head {
-            return Err(prefix_unsettled());
-        }
-        self.require_authority(lease)?;
+        self.require_store_writer_prefix(lease, head).await?;
         let upper = self.upper();
         let lower = self.lower();
 
