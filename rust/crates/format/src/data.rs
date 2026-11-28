@@ -512,6 +512,12 @@ impl EventBatch {
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
+
+    /// Returns the retained allocation for the decoded put layout, if it has been read.
+    pub fn cached_put_type_bytes(&self) -> Result<usize> {
+        self.put_type.get().map_or(Ok(0), LogicalType::retained_bytes)
+    }
+
     /// The page's events read in place, each reading its document's cells only as an event batch encodes them.
     pub fn page_events(&self) -> Result<Vec<PageEvent>> {
         let mut events = Vec::with_capacity(self.len());

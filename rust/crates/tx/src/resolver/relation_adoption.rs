@@ -182,17 +182,21 @@ impl OpenTransaction<'_> {
         }
         let data = match try_copy_positioned_data(
             &data_history.events,
-            base.iter_segments(&data).flat_map(|segment| segment.batches().map(|batch| batch.view())),
+            data_history.durable_pages.iter().flatten()
+                .chain(base.iter_segments(&data).flat_map(|segment| segment.batches().map(|batch| batch.view()))),
             field, orders, &self.context.memory,
         ) {
             Ok(Some(batch)) => batch,
             _ => IndexBatch::copy_events(&data_history.events, &StructFields::new(), &self.context.memory)?,
         };
+        drop(data_history.durable_pages);
         let journal = copy_adoption_journal(
             &journal_history.events,
-            base.iter_segments(&journal).flat_map(|segment| segment.batches().map(|batch| batch.view())),
+            journal_history.durable_pages.iter().flatten()
+                .chain(base.iter_segments(&journal).flat_map(|segment| segment.batches().map(|batch| batch.view()))),
             &self.context.memory,
         )?;
+        drop(journal_history.durable_pages);
         self.retire_owned_relation(source, retain_micros).await?;
         self.buffer.adopt_owned_history(destination.table(owner), data)?;
         self.buffer.adopt_owned_history(destination.change_journal(owner)?, journal)?;
@@ -262,12 +266,7 @@ impl OpenTransaction<'_> {
     async fn read_adoption_history(
         &self, base: &Snapshot, table: &TableRef, expected: usize, bytes_left: &mut usize, files: &mut usize,
     ) -> Result<History> {
-        let reserve = expected.checked_mul(1024).ok_or_else(overflow)?;
-        let mut history = History {
-            events: Vec::new(), _rows: self.context.memory.reserve(reserve)?,
-            decoded: Vec::new(), bytes_left: MAX_INVENTORY_BYTES,
-        };
-        history.events.reserve_exact(expected);
+        let mut history = History::new(expected, &self.context.memory)?;
         let catalog = base.trie_catalog();
         if catalog.iter_tries(table).take(MAX_FILES + 1).count() > MAX_FILES {
             return Err(uncovered("The source exceeds its trie inventory bound"));
@@ -320,13 +319,16 @@ impl OpenTransaction<'_> {
         require_publication().await?;
         let mut file = Cursor::new(bytes);
         let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
-        let _opening = memory.reserve(layout.opening_allocation_bound()?)?;
+        let mut opening_bytes = layout.opening_allocation_bound()?;
+        let _opening = memory.reserve(opening_bytes)?;
         let mut file = ArrowFile::from_inspected_reader(file, None, layout)?;
         let before = history.events.len();
         for page in 0..file.page_count() {
             self.context.check_cancelled()?;
-            let _page = memory.reserve(file.page_allocation_bound(page)?)?;
-            history.read(&EventBatch::new(file.read_page(page)?)?, expected, memory)?;
+            let page_bytes = file.page_allocation_bound(page)?;
+            let _page = memory.reserve(page_bytes)?;
+            let batch = EventBatch::new(file.read_page(page)?)?;
+            history.read_durable_page(batch, expected, memory, page_bytes, &mut opening_bytes)?;
         }
         if history.events.len() - before != rows {
             return Err(uncovered("The authenticated source trie has another row count"));
@@ -364,19 +366,32 @@ fn intrinsic_orders(relation: &OwnedRelation) -> Result<[String; 2]> {
 
 struct History {
     events: Vec<StoredEvent>,
+    durable_pages: Option<Vec<EventBatch>>,
+    page_credit: usize,
     _rows: Arc<MemoryReservation>,
     decoded: Vec<Arc<MemoryReservation>>,
     bytes_left: usize,
 }
 
 impl History {
-    fn read(&mut self, batch: &EventBatch, limit: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+    fn new(expected: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reserve = expected.checked_mul(1024).ok_or_else(overflow)?;
+        let rows = memory.reserve(reserve)?;
+        Ok(Self {
+            events: Vec::with_capacity(expected), durable_pages: Some(Vec::new()), page_credit: 0,
+            _rows: rows, decoded: Vec::new(), bytes_left: MAX_INVENTORY_BYTES,
+        })
+    }
+
+    fn read(&mut self, batch: &EventBatch, limit: usize, memory: &Arc<MemoryBudget>) -> Result<usize> {
         if batch.len() > limit - self.events.len() {
             return Err(uncovered("The source exceeds its admitted event frontier"));
         }
+        let mut page_credit = 0;
         for row in 0..batch.len() {
             let borrowed = batch.borrow_event(row)?;
-            let bytes = borrowed.document_allocation_bound()?.checked_mul(8)
+            let document_bound = borrowed.document_allocation_bound()?;
+            let bytes = document_bound.checked_mul(8)
                 .and_then(|size| size.checked_add(borrowed.physical_entity_key().map_or(0, |key| key.len())))
                 .and_then(|size| size.checked_add(2048)).ok_or_else(overflow)?;
             self.bytes_left = self.bytes_left.checked_sub(bytes).ok_or_else(|| uncovered("The source exceeds its decoded history budget"))?;
@@ -386,22 +401,46 @@ impl History {
                 return Err(uncovered("The source history contains an unpositioned event"));
             }
             self.events.push(event);
+            page_credit += document_bound * 4;
         }
+        Ok(page_credit)
+    }
+
+    fn read_durable_page(
+        &mut self, batch: EventBatch, limit: usize, memory: &Arc<MemoryBudget>,
+        page_bytes: usize, opening_bytes: &mut usize,
+    ) -> Result<()> {
+        let page_credit = self.read(&batch, limit, memory)?;
+        self.page_credit += page_credit;
+        if batch.is_empty() { return Ok(()); }
+        let Some(pages) = &mut self.durable_pages else { return Ok(()); };
+        // The row charges stay until staging and leave four document bounds for decoded values and proof scratch.
+        // StreamReader copies record blocks, so only the page and the file's schema and dictionaries outlive this read.
+        let retained = batch.cached_put_type_bytes().ok().and_then(|decoded_type| {
+            page_bytes.checked_add(*opening_bytes)?.checked_add(decoded_type)
+        });
+        let Some(remaining) = retained.and_then(|bytes| self.page_credit.checked_sub(bytes)) else {
+            self.durable_pages = None;
+            return Ok(());
+        };
+        pages.push(batch);
+        self.page_credit = remaining;
+        *opening_bytes = 0;
         Ok(())
     }
 }
 
 fn copy_adoption_journal<'a>(
-    events: &'a [StoredEvent], live: impl Iterator<Item = &'a EventBatch>, memory: &Arc<MemoryBudget>,
+    events: &'a [StoredEvent], pages: impl Iterator<Item = &'a EventBatch>, memory: &Arc<MemoryBudget>,
 ) -> Result<Arc<IndexBatch>> {
-    if let Ok(Some(batch)) = try_copy_positioned_journal(events, live, memory) {
+    if let Ok(Some(batch)) = try_copy_positioned_journal(events, pages, memory) {
         return Ok(batch);
     }
     IndexBatch::copy_events(events, &StructFields::new(), memory)
 }
 
 fn try_copy_positioned_journal<'a>(
-    events: &'a [StoredEvent], live: impl Iterator<Item = &'a EventBatch>, memory: &Arc<MemoryBudget>,
+    events: &'a [StoredEvent], pages: impl Iterator<Item = &'a EventBatch>, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<Arc<IndexBatch>>> {
     const NAMES: [&str; 3] = ["_id", "entry", "through_events"];
     let documents = || events.iter().filter_map(|event| match &event.operation {
@@ -412,7 +451,7 @@ fn try_copy_positioned_journal<'a>(
         return Ok(None);
     }
     let _scratch = reserve_positioned_copy(events, memory)?;
-    let Some(positions) = live_history_positions(events, live)? else { return Ok(None); };
+    let Some(positions) = history_positions(events, pages)? else { return Ok(None); };
     let Some(fields) = IndexBatch::inferred_event_put_types(events) else { return Ok(None); };
     let target = fields.iter().map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()?;
     let mut columns = BTreeMap::new();
@@ -427,11 +466,11 @@ fn try_copy_positioned_journal<'a>(
 }
 
 fn try_copy_positioned_data<'a>(
-    events: &'a [StoredEvent], live: impl Iterator<Item = &'a EventBatch>,
+    events: &'a [StoredEvent], pages: impl Iterator<Item = &'a EventBatch>,
     converted: &str, orders: [(&str, &str); 2], memory: &Arc<MemoryBudget>,
 ) -> Result<Option<Arc<IndexBatch>>> {
     let _scratch = reserve_positioned_copy(events, memory)?;
-    let Some(positions) = live_history_positions(events, live)? else { return Ok(None); };
+    let Some(positions) = history_positions(events, pages)? else { return Ok(None); };
     let Some(fields) = IndexBatch::inferred_event_put_types(events) else { return Ok(None); };
     let target = fields.iter().map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()?;
     let mut columns = BTreeMap::new();
@@ -460,11 +499,11 @@ fn reserve_positioned_copy(events: &[StoredEvent], memory: &Arc<MemoryBudget>) -
     memory.reserve(scratch)
 }
 
-fn live_history_positions<'a>(
-    events: &[StoredEvent], live: impl Iterator<Item = &'a EventBatch>,
+fn history_positions<'a>(
+    events: &[StoredEvent], pages: impl Iterator<Item = &'a EventBatch>,
 ) -> Result<Option<Vec<EventRef<'a>>>> {
     let mut positions = Vec::with_capacity(events.len());
-    for batch in live {
+    for batch in pages {
         if batch.is_empty() { continue; }
         if batch.len() > events.len() - positions.len() { return Ok(None); }
         if let Some(put) = batch.put_document()? {
@@ -477,8 +516,11 @@ fn live_history_positions<'a>(
     }
     if positions.len() != events.len() { return Ok(None); }
     positions.sort_unstable_by_key(|event| event.header().position);
-    Ok(positions.iter().zip(events).all(|(source, verified)| source.header() == verified.header())
-        .then_some(positions))
+    let complete = positions.iter().zip(events).all(|(source, verified)| {
+        source.header() == verified.header() && source.origin() == verified.origin
+            && source.recency() == verified.recency && source.entity_key() == verified.entity_key()
+    });
+    Ok(complete.then_some(positions))
 }
 
 fn exact_column(positions: &[EventRef<'_>], events: &[StoredEvent], name: &str, target: &Field) -> bool {
@@ -601,10 +643,11 @@ pub(super) fn uncovered(reason: impl Into<String>) -> Anomaly {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU32, sync::Arc};
+    use std::{io::Cursor, num::NonZeroU32, sync::Arc};
 
     use rtdb_columnar::{MemoryBudget, to_field};
-    use rtdb_format::{data::{StoredEvent, StoredOperation}, envelope::ReplicaBody};
+    use rtdb_format::{data::{EventBatch, StoredEvent, StoredOperation}, envelope::ReplicaBody,
+        ipc::{ArrowFile, inspect_file_reserved, write_file}};
     use rtdb_index::{IndexBatch, PartitionState};
     use rtdb_query::QueryOptions;
     use rtdb_storage::{MemoryStore, cache::BufferPool};
@@ -616,17 +659,54 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::{Documents, HostedAuthority, HostedControlWrite, SourceTransaction, SubmitOptions, TxOp, bind_installed_authority};
-    use super::{copy_adoption_journal, exact_column, intrinsic_orders, live_history_positions, plain_history_field,
+    use super::{History, copy_adoption_journal, exact_column, intrinsic_orders, history_positions, plain_history_field,
         try_copy_positioned_data, try_copy_positioned_journal, verify_journal};
     use super::super::{OpenTransaction, OwnedPathKind, ResolveContext, TransactionAuthorization, TxResolver, attempt_marker_document};
 
     const PAYLOAD: &str = "c_0123456789abcdef0123456789abcdef";
 
+    fn read_durable_fixture(history: &mut History, batch: &IndexBatch, expected: usize, memory: &Arc<MemoryBudget>) -> Result<()> {
+        let mut bytes = Cursor::new(write_file(batch.arrow().schema_ref(), std::slice::from_ref(batch.arrow()))?);
+        let layout = inspect_file_reserved(&mut bytes, |size| memory.reserve(size))?;
+        let mut opening_bytes = layout.opening_allocation_bound()?;
+        let _opening = memory.reserve(opening_bytes)?;
+        let mut file = ArrowFile::from_inspected_reader(bytes, None, layout)?;
+        let page_bytes = file.page_allocation_bound(0)?;
+        let _page = memory.reserve(page_bytes)?;
+        let page = EventBatch::new(file.read_page(0)?)?;
+        history.read_durable_page(page, expected, memory, page_bytes, &mut opening_bytes)
+    }
+
+    #[test]
+    fn unfunded_durable_positions_leave_the_complete_row_census_charged() -> Result<()> {
+        let memory = MemoryBudget::new(2 << 20);
+        let events = [StoredEvent {
+            position: Some(EventPosition { transaction: TxId(2), ordinal: 1 }),
+            origin: Some(EventOrigin([1; 32])),
+            entity_key: None,
+            iid: EntityId::Integer(42).iid(),
+            system_from: Timestamp(200),
+            commit_position: 0,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Delete,
+            recency: None,
+        }];
+        let batch = IndexBatch::copy_events(&events, &StructFields::new(), &memory)?;
+        let mut history = History::new(events.len(), &memory)?;
+        let before = memory.used_bytes();
+        read_durable_fixture(&mut history, &batch, events.len(), &memory)?;
+        assert_eq!(memory.used_bytes(), before + 2048);
+        assert_eq!(history.events.as_slice(), &events);
+        assert!(history.durable_pages.is_none());
+        assert!(history_positions(&history.events, std::iter::empty())?.is_none());
+        Ok(())
+    }
+
     #[test]
     fn positioned_journal_copy_preserves_canonical_replica_bytes() -> Result<()> {
         let memory = MemoryBudget::new(32 << 20);
         let touch = |kind| OwnedChange {
-            id: EntityId::Binary(vec![0, 0xff]),
+            id: EntityId::Binary((0..64 * 1024).map(|index| (index % 251) as u8).collect()),
             kind,
             valid: Interval::new(Timestamp(180), Timestamp::MAX).unwrap(),
             assertion_ordinal: NonZeroU32::new(7),
@@ -663,6 +743,19 @@ mod tests {
         for (row, expected) in events.iter().enumerate() {
             assert_eq!(&copied.view().read_event(row)?, expected);
         }
+        let mut durable = History::new(events.len(), &memory)?;
+        read_durable_fixture(&mut durable, &new, events.len(), &memory)?;
+        read_durable_fixture(&mut durable, &old, events.len(), &memory)?;
+        durable.events.sort_unstable_by_key(|event| event.position);
+        let pages = durable.durable_pages.as_ref().expect("the journal row grants cover both files");
+        let mut wrong_origin = durable.events.clone();
+        wrong_origin[2].origin = None;
+        assert!(history_positions(&wrong_origin, pages.iter())?.is_none());
+        let copied = try_copy_positioned_journal(&durable.events, pages.iter(), &memory)?
+            .expect("exact durable journal layouts");
+        drop(durable);
+        assert_eq!(copied.arrow(), expected.arrow());
+        assert_eq!(wire(&copied)?.as_slice(), wire(&expected)?.as_slice());
 
         let StoredOperation::Put(document) = &mut events[0].operation else { unreachable!(); };
         document.insert("fixed_assertion_keys".into(), Value::Null);
@@ -688,7 +781,7 @@ mod tests {
         };
         let mut first = document(1);
         first.insert(PAYLOAD.into(), Value::Binary(vec![12, 6]));
-        first.insert("caption".into(), Value::Utf8("unchanged".into()));
+        first.insert("caption".into(), Value::Utf8("unchanged".repeat(8192)));
         first.insert("nullable".into(), Value::Bool(true));
         first.insert("details".into(), Value::Struct(StructFields::from([
             ("labels".into(), Value::list(vec![Value::Utf8("one".into()), Value::Utf8("two".into())])),
@@ -744,14 +837,25 @@ mod tests {
         let fields = IndexBatch::inferred_event_put_types(&events).unwrap();
         let details = to_field("details", &fields["details"])?;
         assert!(plain_history_field(&details));
-        assert!(exact_column(&live_history_positions(&events, live.into_iter())?.unwrap(), &events, "details", &details));
+        assert!(exact_column(&history_positions(&events, live.into_iter())?.unwrap(), &events, "details", &details));
         let copied = try_copy_positioned_data(&events, live.into_iter(), PAYLOAD, orders, &memory)?
             .expect("the order columns and plain nested sibling are positioned");
+        let mut durable = History::new(events.len(), &memory)?;
+        read_durable_fixture(&mut durable, &old, events.len(), &memory)?;
+        durable.read(new.view(), events.len(), &memory)?;
+        assert_eq!(durable.events, [old.view().read_event(0)?, new.view().read_event(0)?,
+            new.view().read_event(1)?, new.view().read_event(2)?]);
+        let pages = durable.durable_pages.as_ref().expect("the data row grants cover the file");
+        let mixed = try_copy_positioned_data(&events, pages.iter().chain([new.view()]), PAYLOAD, orders, &memory)?
+            .expect("mixed history covers the complete positioned census");
+        drop(durable);
         drop((old, new));
         let scalar = IndexBatch::copy_events(&events, &StructFields::new(), &memory)?;
         let wire = |batch: &IndexBatch| crate::ipc::encode(batch.arrow().schema_ref(), [batch.arrow()], &memory);
         assert_eq!(copied.arrow(), scalar.arrow());
         assert_eq!(wire(&copied)?.as_slice(), wire(&scalar)?.as_slice());
+        assert_eq!(mixed.arrow(), scalar.arrow());
+        assert_eq!(wire(&mixed)?.as_slice(), wire(&scalar)?.as_slice());
         for row in 0..events.len() {
             assert_eq!(copied.view().read_event(row)?, scalar.view().read_event(row)?);
         }
