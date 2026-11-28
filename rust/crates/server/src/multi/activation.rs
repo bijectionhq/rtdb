@@ -95,7 +95,7 @@ impl ActivationStatus {
             destination_cell: state.destination_cell(),
             grants_closed: false,
             grants_end_micros: None,
-            grant_protocol_version: state.version,
+            grant_protocol_version: state.protocol.version(),
         }
     }
 }
@@ -149,9 +149,49 @@ impl VerifiedSuccessor {
     }
 }
 
+/// The protocol an activation record follows. A lineage record still
+/// grants and recovers by the protocol beneath it, its base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Protocol {
+    Plain(u8),
+    Lineage { base: u8 },
+}
+
+impl Protocol {
+    fn version(self) -> u8 {
+        match self {
+            Self::Plain(version) => version,
+            Self::Lineage { .. } => LINEAGE_PROTOCOL,
+        }
+    }
+
+    fn base(self) -> u8 {
+        match self {
+            Self::Plain(base) | Self::Lineage { base } => base,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "StateRecord", into = "StateRecord")]
 struct State {
+    protocol: Protocol,
+    binding: Binding,
+    grants_closed: bool,
+    grants_end: Option<i64>,
+    retired: BTreeSet<Uuid>,
+    ranked: Option<ranked::RankedState>,
+    publication: Option<Publication>,
+    recovery: Option<recovery::Pending>,
+    superseded_recoveries: BTreeSet<Uuid>,
+    floor: Option<rtdb_lineage::LineageFloor>,
+}
+
+/// The persisted form of a record, which older activation readers and the
+/// offline verifier parse.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StateRecord {
     version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lineage_base_version: Option<u8>,
@@ -170,11 +210,55 @@ struct State {
     floor: Option<rtdb_lineage::LineageFloor>,
 }
 
+impl TryFrom<StateRecord> for State {
+    type Error = &'static str;
+
+    fn try_from(record: StateRecord) -> std::result::Result<Self, Self::Error> {
+        let protocol = match (record.version, record.lineage_base_version) {
+            (LINEAGE_PROTOCOL, Some(base)) if base != LINEAGE_PROTOCOL => Protocol::Lineage { base },
+            (version, None) if version != LINEAGE_PROTOCOL => Protocol::Plain(version),
+            _ => return Err("the activation record's lineage base does not match its protocol"),
+        };
+        Ok(Self {
+            protocol,
+            binding: record.binding,
+            grants_closed: record.grants_closed,
+            grants_end: record.grants_end,
+            retired: record.retired,
+            ranked: record.ranked,
+            publication: record.publication,
+            recovery: record.recovery,
+            superseded_recoveries: record.superseded_recoveries,
+            floor: record.floor,
+        })
+    }
+}
+
+impl From<State> for StateRecord {
+    fn from(state: State) -> Self {
+        Self {
+            version: state.protocol.version(),
+            lineage_base_version: match state.protocol {
+                Protocol::Plain(_) => None,
+                Protocol::Lineage { base } => Some(base),
+            },
+            binding: state.binding,
+            grants_closed: state.grants_closed,
+            grants_end: state.grants_end,
+            retired: state.retired,
+            ranked: state.ranked,
+            publication: state.publication,
+            recovery: state.recovery,
+            superseded_recoveries: state.superseded_recoveries,
+            floor: state.floor,
+        }
+    }
+}
+
 impl State {
     fn initial(incarnation: Uuid) -> Self {
         Self {
-            version: ELAPSED_GRANT_PROTOCOL,
-            lineage_base_version: None,
+            protocol: Protocol::Plain(ELAPSED_GRANT_PROTOCOL),
             binding: Binding {
                 incarnation,
                 revision: 1,
@@ -193,30 +277,27 @@ impl State {
     /// Signed-import recoveries stamped their successor 9 to 11 even after
     /// vacating its funding, and the record is otherwise the protocol beneath.
     fn unstamp_signed_import(&mut self) {
-        if matches!(self.version, 9..=11) {
-            self.version = if self.ranked.is_some() { RANKED_RECOVERY_PROTOCOL } else { RECOVERY_HOSTED_CUSTODY_PROTOCOL };
+        if matches!(self.protocol, Protocol::Plain(9..=11)) {
+            self.protocol = Protocol::Plain(if self.ranked.is_some() { RANKED_RECOVERY_PROTOCOL } else { RECOVERY_HOSTED_CUSTODY_PROTOCOL });
         }
     }
 
     fn base_version(&self) -> u8 {
-        self.lineage_base_version.unwrap_or(self.version)
+        self.protocol.base()
     }
 
     fn set_base_version(&mut self, version: u8) {
-        if let Some(base) = &mut self.lineage_base_version {
-            *base = version;
-        } else {
-            self.version = version;
+        match &mut self.protocol {
+            Protocol::Plain(base) | Protocol::Lineage { base } => *base = version,
         }
     }
 
     fn enable_lineage(&mut self) {
-        self.lineage_base_version = Some(self.base_version());
-        self.version = LINEAGE_PROTOCOL;
+        self.protocol = Protocol::Lineage { base: self.base_version() };
     }
 
     fn uses_lineage(&self) -> bool {
-        self.version == LINEAGE_PROTOCOL
+        matches!(self.protocol, Protocol::Lineage { .. })
     }
 
     fn destination_cell(&self) -> Option<Uuid> {
@@ -242,7 +323,7 @@ impl State {
             return Err(conflict());
         }
         self.require(publication.predecessor)?;
-        if self.version >= RECOVERY_INTENT_PROTOCOL && publication.recovery.is_none() {
+        if self.protocol.version() >= RECOVERY_INTENT_PROTOCOL && publication.recovery.is_none() {
             return Err(conflict());
         }
         if !self.grants_closed || self.retired.contains(&successor) {
@@ -399,7 +480,7 @@ impl ActivationAuthority {
             destination_cell: state.destination_cell(),
             grants_closed: state.grants_closed,
             grants_end_micros: state.grants_end,
-            grant_protocol_version: state.version,
+            grant_protocol_version: state.protocol.version(),
         })
     }
 
@@ -407,11 +488,11 @@ impl ActivationAuthority {
         self.change(self.stream_id(name)?, |state| {
             let state = state.ok_or_else(unavailable)?;
             state.require(expected)?;
-            if state.version >= ELAPSED_GRANT_PROTOCOL {
+            if state.protocol.version() >= ELAPSED_GRANT_PROTOCOL {
                 return Ok(None);
             }
             let mut next = state.clone();
-            next.version = ELAPSED_GRANT_PROTOCOL;
+            next.set_base_version(ELAPSED_GRANT_PROTOCOL);
             Ok(Some(next))
         })
         .await
@@ -422,14 +503,14 @@ impl ActivationAuthority {
         self.change(self.stream_id(name)?, |state| {
             let state = state.ok_or_else(unavailable)?;
             state.require(expected)?;
-            if state.version >= RECOVERY_INTENT_PROTOCOL {
+            if state.protocol.version() >= RECOVERY_INTENT_PROTOCOL {
                 return Err(conflict());
             }
             if state.grants_closed {
                 return Ok(None);
             }
             let mut next = state.clone();
-            next.version = state.version.max(ELAPSED_GRANT_PROTOCOL);
+            next.set_base_version(state.base_version().max(ELAPSED_GRANT_PROTOCOL));
             next.grants_closed = true;
             Ok(Some(next))
         })
@@ -587,7 +668,7 @@ impl ActivationAuthority {
         if state.grants_closed || state.binding.incarnation != incarnation || state.destination_cell() != cell {
             return Err(not_active());
         }
-        if state.version < ELAPSED_GRANT_PROTOCOL {
+        if state.protocol.version() < ELAPSED_GRANT_PROTOCOL {
             return Err(Anomaly::unsupported(
                 "rtdb/activation-grant-protocol",
                 "Upgrade the activation binding before opening this incarnation",
@@ -648,13 +729,12 @@ impl ActivationAuthority {
             let mut state: State = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
             state.unstamp_signed_import();
             if !matches!(state.base_version(), ABSOLUTE_GRANT_PROTOCOL | ELAPSED_GRANT_PROTOCOL | CELL_GRANT_PROTOCOL | RECOVERY_INTENT_PROTOCOL | RECOVERY_KEY_CUSTODY_PROTOCOL | RECOVERY_JOURNAL_CUSTODY_PROTOCOL | RECOVERY_HOSTED_CUSTODY_PROTOCOL | RANKED_RECOVERY_PROTOCOL)
-                || (state.version == LINEAGE_PROTOCOL) != state.lineage_base_version.is_some()
                 || state.publication.as_ref().and_then(|publication| publication.segment.as_ref())
-                    .is_some_and(|segment| state.version != LINEAGE_PROTOCOL || !segment.valid()
+                    .is_some_and(|segment| !state.uses_lineage() || !segment.valid()
                         || segment.authority != self.identity || self.stream_id(&segment.database).ok() != Some(stream))
-                || state.floor.as_ref().is_some_and(|floor| state.version != LINEAGE_PROTOCOL || !floor.valid()
+                || state.floor.as_ref().is_some_and(|floor| !state.uses_lineage() || !floor.valid()
                     || floor.binding != state.binding)
-                || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.version < CELL_GRANT_PROTOCOL)
+                || state.destination_cell().is_some_and(|cell| cell.is_nil() || state.protocol.version() < CELL_GRANT_PROTOCOL)
                 || state.binding.incarnation.is_nil()
                 || state.binding.revision == 0
                 || state.retired.contains(&state.binding.incarnation)
@@ -1207,14 +1287,34 @@ mod tests {
     fn funding_free_signed_import_records_read_as_the_protocol_beneath() {
         for version in 9..=11 {
             let mut state = State::initial(Uuid::new_v4());
-            state.version = version;
+            state.protocol = Protocol::Plain(version);
             state.unstamp_signed_import();
-            assert_eq!(state.version, RECOVERY_HOSTED_CUSTODY_PROTOCOL);
+            assert_eq!(state.protocol, Protocol::Plain(RECOVERY_HOSTED_CUSTODY_PROTOCOL));
         }
         let mut funded = serde_json::to_value(State::initial(Uuid::new_v4())).unwrap();
         funded["version"] = 11.into();
         funded["funded"] = serde_json::json!({"scopes": []});
         assert!(serde_json::from_value::<State>(funded).is_err());
+    }
+
+    #[test]
+    fn lineage_records_keep_their_base_protocol() {
+        let mut state = State::initial(Uuid::new_v4());
+        state.enable_lineage();
+        let recorded = serde_json::to_value(&state).unwrap();
+        assert_eq!(recorded["version"], LINEAGE_PROTOCOL);
+        assert_eq!(recorded["lineage_base_version"], ELAPSED_GRANT_PROTOCOL);
+        assert_eq!(serde_json::from_value::<State>(recorded.clone()).unwrap(), state);
+        for (version, base) in [
+            (serde_json::json!(LINEAGE_PROTOCOL), serde_json::Value::Null),
+            (serde_json::json!(ELAPSED_GRANT_PROTOCOL), serde_json::json!(ELAPSED_GRANT_PROTOCOL)),
+            (serde_json::json!(LINEAGE_PROTOCOL), serde_json::json!(LINEAGE_PROTOCOL)),
+        ] {
+            let mut mismatched = recorded.clone();
+            mismatched["version"] = version;
+            mismatched["lineage_base_version"] = base;
+            assert!(serde_json::from_value::<State>(mismatched).is_err());
+        }
     }
 
     #[tokio::test]
@@ -1228,7 +1328,7 @@ mod tests {
         let stream = authority.commissioning_stream_id("xtdb").unwrap();
         authority.change(stream, |state| {
             let mut state = state.unwrap().clone();
-            state.version = ABSOLUTE_GRANT_PROTOCOL;
+            state.protocol = Protocol::Plain(ABSOLUTE_GRANT_PROTOCOL);
             state.grants_end = Some(123);
             Ok(Some(state))
         }).await.unwrap();

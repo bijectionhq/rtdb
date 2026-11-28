@@ -169,8 +169,9 @@ impl ActivationAuthority {
             [(at, bytes)] if *at == position && page.head == position => {
                 if let Ok(archived) = serde_json::from_slice::<ArchivedControlRecord>(bytes) {
                     let state = serde_json::from_str::<State>(&archived.record).map_err(|_| corrupt())?;
+                    let lineage = state.uses_lineage();
                     let publication = state.publication.filter(|publication| publication.segment.is_some()).ok_or_else(corrupt)?;
-                    if archived.position.0 == 0 || state.version != LINEAGE_PROTOCOL { return Err(corrupt()); }
+                    if archived.position.0 == 0 || !lineage { return Err(corrupt()); }
                     Ok(Some((publication, Some(archived))))
                 } else {
                     let publication: Publication = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
