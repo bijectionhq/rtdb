@@ -1490,7 +1490,7 @@ pub fn close<E: From<DeriveError>>(
     let segments = newest
         .segments
         .iter()
-        .filter(|segment| segment.kind == (EntryKind::Edged { counts_erased: true }) && same_place(&segment.identity, manifest_prefix))
+        .filter(|segment| segment.kind == (EntryKind::Edged { retain: true }) && same_place(&segment.identity, manifest_prefix))
         .map(|segment| Segment { live_key: Vec::new(), ..segment.clone() })
         .collect();
     Ok(Some((writes, Manifest { segments, horizon: newest.horizon, written_keys: Vec::new(), closed: true })))
