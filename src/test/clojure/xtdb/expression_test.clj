@@ -1219,6 +1219,48 @@
     (t/is (= ["-?-?-" "-?-?-" "-a-" "-" nil]
              (:res (run-projection rel '(replace (substring a 2 1) "" "-")))))))
 
+(t/deftest runtime-replace-projects-java-matches-and-decoding
+  (with-open [^Vector source (tu/open-vec "s" #xt/type [:? :utf8] [])
+              ^Vector target (tu/open-vec "t" #xt/type [:? :utf8] [])
+              ^Vector replacement (tu/open-vec "r" #xt/type [:? :utf8] [])]
+    (let [malformed (byte-array [-1])
+          rows [["z😀aaaaa😀aa!" "aa" "界" "z😀界界a😀界!"]
+                ["x😀x" "😀" "" "xx"]
+                ["😀" "" "-" "-?-?-"]
+                [(byte-array [97 -1 98]) "�" "x" "axb"]
+                ["a�b" malformed "x" "axb"]
+                ["aab" "aa" malformed "�b"]
+                ["" "aa" "x" ""]
+                [nil "aa" "x" nil]
+                ["aa" nil "x" nil]
+                ["aa" "a" nil nil]]]
+      (doseq [[s t r] rows
+              [^Vector column value] [[source s] [target t] [replacement r]]]
+        (if (bytes? value)
+          (.writeBytes column ^bytes value)
+          (.writeObject column value)))
+      (t/is (= {:res (mapv #(nth % 3) rows), :res-type #xt/type [:? :utf8]}
+               (run-projection (vr/rel-reader [source target replacement]) '(replace s t r))))))
+  (with-open [rel (tu/open-rel {:s ["[aaaaa]"], :t ["[aa]"], :r ["[😀]"]})]
+    (t/is (= {:res ["😀😀a"], :res-type #xt/type :utf8}
+             (run-projection rel '(replace (substring s 2 5) (substring t 2 2) (substring r 2 1)))))))
+
+(t/deftest runtime-replace-projection-keeps-null-and-error-order
+  (with-open [rel (tu/open-rel {:s ["skipped" "x"], :n [-1 1], :t [nil "x"], :r ["unused" "y"]})]
+    (t/is (= {:res [nil "y"], :res-type #xt/type [:? :utf8]}
+             (run-projection rel '(replace (substring s 1 n) t r)))))
+  (with-open [rel (tu/open-rel {:s ["x"], :n [-1], :t ["f"], :r ["y"]})]
+    (t/is (thrown-with-msg? Incorrect #"Negative substring length"
+                           (run-projection rel '(replace (substring s 1 n)
+                                                        (cast (cast t #xt/type :varbinary) #xt/type :utf8)
+                                                        r)))))
+  (let [opts {:var-types {'s #xt/type :utf8, 't #xt/type :utf8, 'r #xt/type :utf8}, :projection? true}]
+    (doseq [form ['(replace s t r) '(replace s t "!") '(replace s "x" r)]]
+      (t/is (some? (-> (expr/form->expr form opts)
+                       (#'expr/emit-row-expr opts)
+                       :continue-projection))
+            (pr-str form)))))
+
 (t/deftest case-projection-reads-the-default-locale-at-evaluation
   (with-open [rel (tu/open-rel {:a ["iI"]})]
     (let [input-types {:var-types {'a #xt/type :utf8}, :param-types {}}

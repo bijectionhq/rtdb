@@ -1,5 +1,6 @@
 package xtdb.expression
 
+import org.apache.arrow.memory.ArrowBuf
 import xtdb.InternalApi
 import xtdb.arrow.VariableWidthVector
 import xtdb.arrow.isWellFormedUtf8
@@ -50,7 +51,26 @@ object TextTransforms {
     }
 
     @JvmStatic
-    fun tryWriteLiteralReplace(out: VariableWidthVector, value: Any?, target: ByteBuffer, replacement: ByteArray): Boolean {
+    fun tryWriteLiteralReplace(out: VariableWidthVector, value: Any?, target: ByteBuffer, replacement: ByteArray): Boolean =
+        tryWriteReplaceBytes(out, value, target, replacement.size) { dest, offset -> dest.setBytes(offset, replacement) }
+
+    @JvmStatic
+    fun tryWriteReplace(out: VariableWidthVector, source: Any?, search: Any?, substitute: Any?): Boolean {
+        val target = search as? ByteBuffer ?: return false
+        val replacement = substitute as? ByteBuffer ?: return false
+        if (!target.hasRemaining() || !target.isWellFormedUtf8() || !replacement.isWellFormedUtf8()) return false
+
+        val replacementCursor = replacement.duplicate()
+        return tryWriteReplaceBytes(out, source, target, replacement.remaining()) { dest, offset ->
+            replacementCursor.position(replacement.position())
+            dest.setBytes(offset, replacementCursor)
+        }
+    }
+
+    private inline fun tryWriteReplaceBytes(
+        out: VariableWidthVector, value: Any?, target: ByteBuffer, replacementSize: Int,
+        writeReplacement: (ArrowBuf, Long) -> Unit
+    ): Boolean {
         val input = value as? ByteBuffer ?: return false
         if (!target.hasRemaining() || !input.isWellFormedUtf8()) return false
 
@@ -64,7 +84,7 @@ object TextTransforms {
             matches++
         }
 
-        val size = input.remaining() + matches.toLong() * (replacement.size - targetSize)
+        val size = input.remaining() + matches.toLong() * (replacementSize - targetSize)
         if (size > Int.MAX_VALUE) return false
 
         cursor.position(input.position())
@@ -79,8 +99,8 @@ object TextTransforms {
                     cursor.limit(input.limit())
                     offset += prefixSize
                 }
-                if (replacement.isNotEmpty()) dest.setBytes(offset, replacement)
-                offset += replacement.size
+                if (replacementSize > 0) writeReplacement(dest, offset)
+                offset += replacementSize
                 cursor.position(matchStart + targetSize)
             }
             if (cursor.hasRemaining()) dest.setBytes(offset, cursor)

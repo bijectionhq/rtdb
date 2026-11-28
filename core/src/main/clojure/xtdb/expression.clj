@@ -1765,19 +1765,33 @@
 
 (defmethod codegen-call [:replace :utf8 :utf8 :utf8]
   [{[_ {target :literal} {replacement :literal}] :args, :keys [::projection-root? ::byte-projection-branch?]}]
-  (let [call {:return-type #xt/type :utf8
-              :->call-code (fn [[s target replacement]]
-                             `(-> (.replace (resolve-string ~s) (resolve-string ~target) (resolve-string ~replacement))
-                                  (resolve-utf8-buf)))}]
-    (if (and (or projection-root? byte-projection-branch?) (string? target) (seq target) (string? replacement))
-      (let [target-bytes (gensym 'target_bytes)
-            replacement-bytes (gensym 'replacement_bytes)]
-        (-> call
-            (assoc :batch-bindings [[target-bytes (emit-value String target)]
-                                    [replacement-bytes `(.getBytes ~replacement StandardCharsets/UTF_8)]])
-            (with-byte-transform (fn [out value]
-                                   `(TextTransforms/tryWriteLiteralReplace ~out ~value ~target-bytes ~replacement-bytes)))))
-      call)))
+  (letfn [(replace-code [[s target replacement]]
+            `(resolve-utf8-buf (.replace (resolve-string ~s) (resolve-string ~target) (resolve-string ~replacement))))]
+    (let [call {:return-type #xt/type :utf8, :->call-code replace-code}]
+      (cond
+        (or (not (or projection-root? byte-projection-branch?)) (= "" target)) call
+
+        (and (string? target) (string? replacement))
+        (let [target-bytes (gensym 'target_bytes)
+              replacement-bytes (gensym 'replacement_bytes)]
+          (-> call
+              (assoc :batch-bindings [[target-bytes (emit-value String target)]
+                                      [replacement-bytes `(.getBytes ~replacement StandardCharsets/UTF_8)]])
+              (with-byte-transform (fn [out value]
+                                     `(TextTransforms/tryWriteLiteralReplace ~out ~value ~target-bytes ~replacement-bytes)))))
+
+        :else
+        (assoc call :->write-code
+               (fn [out [s target replacement]]
+                 (let [source (gensym 'source)
+                       search (gensym 'search)
+                       substitute (gensym 'substitute)
+                       operands [source search substitute]]
+                   `(let [~source ~s
+                          ~search ~target
+                          ~substitute ~replacement]
+                      (when-not (TextTransforms/tryWriteReplace ~out ~@operands)
+                        (.writeBytes ~out ~(with-tag (replace-code operands) ByteBuffer)))))))))))
 
 (def ^:private ^java.util.Set sql-keywords
   "SQL keywords derived from SqlLexer's vocabulary at load time, used by quote_ident.
