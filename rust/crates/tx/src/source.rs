@@ -3562,6 +3562,8 @@ fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.tx/
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use rtdb_columnar::copy_array;
     use rtdb_types::ListKind;

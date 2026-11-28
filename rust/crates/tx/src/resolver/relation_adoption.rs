@@ -794,10 +794,10 @@ mod tests {
         third.insert("caption".into(), Value::Null);
         third.insert("details".into(), Value::Null);
         let valid_time = Interval::new(Timestamp(180), Timestamp(900))?;
-        let event = |id, transaction, ordinal, operation| {
+        let event = |id, transaction, ordinal: u32, operation| {
             let id = EntityId::Binary(vec![id]);
             StoredEvent {
-                position: Some(EventPosition { transaction: TxId(transaction), ordinal }),
+                position: Some(EventPosition { transaction: TxId(transaction), ordinal: u64::from(ordinal) }),
                 origin: Some(EventOrigin([ordinal as u8; 32])),
                 entity_key: Some(id.handle_bytes().into()),
                 iid: id.iid(),
