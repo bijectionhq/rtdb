@@ -5248,6 +5248,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_subscripts_keep_funded_text_and_binary_child_positions() {
+        let memory = MemoryBudget::new(1 << 22);
+        for (scalar, winner) in [
+            (ScalarType::Utf8, Value::Utf8("é\0".into())),
+            (ScalarType::Binary, Value::Binary(vec![0, 255])),
+        ] {
+            let ty = LogicalType::list(LogicalType::Scalar(scalar.clone()).maybe()).maybe();
+            let mut input = field(0, scalar.clone());
+            input.data_type = ty.clone();
+            let schema = Schema::new(vec![input.clone()]).unwrap();
+            let field = Arc::new(rtdb_columnar::to_field(&input.name, &ty).unwrap());
+            let list = |values| Value::list(values);
+            let values = [
+                list(vec![winner.clone(), winner.clone()]), Value::Null, list(vec![]),
+                list(vec![winner.clone(), Value::Null]),
+            ];
+            let array = rtdb_columnar::copy_array(&ty, &values).unwrap();
+            let child = array.as_any().downcast_ref::<ListArray>().unwrap().values().clone();
+            let batch = ColumnBatch::settled(vec![Column::Selected(SelectedColumn::new(
+                vec![Some((array, field, Some(ty), None)), None],
+                Arc::new(vec![(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (0, 0)]),
+            ))], 6, memory.reserve(4096).unwrap()).unwrap();
+            let backing = Arc::downgrade(batch.column_reservation(0));
+            let subscript = |index| Expr::Subscript {
+                expr: Box::new(input.expression()),
+                index: Box::new(Expr::binary(BinaryOp::Subtract, Expr::Literal(Value::I64(index)), Expr::Literal(Value::I64(1)))),
+                data_type: LogicalType::Scalar(scalar.clone()).maybe(),
+            };
+            let mut cursor = record_projection_cursor(batch, schema, vec![subscript(2), subscript(0)], &memory);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            let projected = &page.columns[0];
+            for (row, expected) in [winner.clone(), Value::Null, Value::Null, Value::Null, Value::Null, winner].into_iter().enumerate() {
+                assert_eq!(projected.value(row).unwrap(), expected);
+                assert_eq!(page.columns[1].value(row).unwrap(), Value::Null);
+            }
+            let (array, _, _, offset) = projected.arrow_cell(5).unwrap().unwrap();
+            assert!(std::ptr::eq(array, child.as_ref()));
+            assert_eq!(offset, 1);
+            assert!(backing.upgrade().is_some());
+            drop(page);
+            assert!(backing.upgrade().is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn scalar_length_over_a_computed_argument_writes_an_i32_column() {
         let memory = MemoryBudget::new(1 << 22);
         let len = 256;
@@ -6529,6 +6574,13 @@ impl BatchCursor for BatchExpressions {
             }
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+            if let Some((column, owner)) = projection::list_subscript(
+                expression, invocation.data_type(), &self.schema, &batch, &self.execution.context,
+            )? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
             let scope = self.execution.scope()?;
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             let retained = lease.bytes();
@@ -7623,6 +7675,101 @@ pub(crate) mod projection {
         let parent = array.as_any().downcast_ref::<StructArray>()?;
         let position = parent.fields().iter().position(|field| field.name() == name)?;
         Some((parent, parent.column(position), &parent.fields()[position], logical))
+    }
+
+    pub(super) fn list_subscript(
+        expression: &Expr, output: &LogicalType, schema: &Schema, batch: &ColumnBatch, context: &crate::QueryContext,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        use std::collections::HashMap;
+        use arrow_array::NullArray;
+        use rtdb_columnar::ArrowCell;
+        use rtdb_plan::{BinaryOp, UnaryOp};
+        use rtdb_types::ScalarType;
+        use super::{FundedArrowCell, size_error};
+
+        fn literal_index(index: &Expr) -> Option<i64> {
+            match index {
+                Expr::Literal(Value::I64(index)) => Some(*index),
+                Expr::Unary { op: UnaryOp::Negate, expr } => match expr.as_ref() {
+                    Expr::Literal(Value::I64(index)) => index.checked_neg(),
+                    _ => None,
+                },
+                Expr::Binary { op: BinaryOp::Subtract, left, right } if matches!(right.as_ref(), Expr::Literal(Value::I64(1))) => {
+                    match left.as_ref() {
+                        Expr::Literal(_) | Expr::Unary { .. } => literal_index(left)?.checked_sub(1),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        let Expr::Subscript { expr, index, .. } = expression else { return Ok(None); };
+        let Expr::Column { id, .. } = expr.as_ref() else { return Ok(None); };
+        let Some(position) = schema.position(*id) else { return Ok(None); };
+        let Some(index) = literal_index(index) else { return Ok(None); };
+        let index = usize::try_from(index).ok();
+        let (result_type, scalar) = match super::plain_scalar(output) {
+            Some(ScalarType::Utf8) => (DataType::Utf8, ScalarType::Utf8),
+            Some(ScalarType::Binary) => (DataType::Binary, ScalarType::Binary),
+            _ => return Ok(None),
+        };
+        if batch.len == 0 { return Ok(None); }
+        let column = &batch.columns[position];
+        let owner = batch.column_reservation(position);
+        let bound = batch.len.checked_mul(384).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
+        let Ok(mut charge) = context.memory.reserve(bound) else { return Ok(None); };
+        let mut sources = vec![None];
+        let mut source_positions = HashMap::new();
+        let mut picks = Vec::with_capacity(batch.len);
+        for row in 0..batch.len {
+            context.check_cancelled_at(row)?;
+            let Some(cell) = column.funded_arrow_cell(row, owner) else { return Ok(None); };
+            let Some(FundedArrowCell { array, field, logical, owner, row }) = cell else {
+                picks.push((0, 0));
+                continue;
+            };
+            let DataType::List(child) = field.data_type() else { return Ok(None); };
+            if !field.metadata().is_empty() || field.data_type() != array.data_type()
+                || !child.metadata().is_empty() || child.data_type() != &result_type
+                || logical.is_some_and(|logical| !super::stable_read_layout(logical, field))
+            {
+                return Ok(None);
+            }
+            if array.is_null(row) {
+                picks.push((0, 0));
+                continue;
+            }
+            let Some((_, _, range)) = (ArrowCell { field, array: array.as_ref(), row }).sequence_range() else { return Ok(None); };
+            let Some(child_row) = index.filter(|&index| index < range.len()).map(|index| range.start + index) else {
+                picks.push((0, 0));
+                continue;
+            };
+            let Some(list) = array.as_any().downcast_ref::<ListArray>() else { return Ok(None); };
+            let child_array = list.values();
+            if child_array.is_null(child_row) {
+                picks.push((0, 0));
+                continue;
+            }
+            let key = (Arc::as_ptr(child_array).cast::<()>(), Arc::as_ptr(child), Arc::as_ptr(owner));
+            let source = *source_positions.entry(key).or_insert_with(|| {
+                let id = sources.len();
+                let logical = LogicalType::Scalar(scalar.clone());
+                let logical = if child.is_nullable() { logical.maybe() } else { logical };
+                sources.push(Some((Arc::clone(child_array), Arc::clone(child), Some(logical), Some(Arc::clone(owner)))));
+                id
+            });
+            picks.push((source, child_row));
+        }
+        drop(source_positions);
+        let column = if sources.len() == 1 {
+            drop((sources, picks));
+            super::observed_scalar_column(NullArray::new(batch.len))?
+        } else {
+            Column::Selected(SelectedColumn::new(sources, Arc::new(picks)))
+        };
+        Arc::get_mut(&mut charge).expect("List selection owns its reservation").shrink_to(super::owned_projection_bytes(&column)?)?;
+        Ok(Some((column, charge)))
     }
 
     fn project_struct_child(parent: &StructArray, child: &ArrayRef, field: &Arc<ArrowField>, logical: &LogicalType) -> Option<Column> {
