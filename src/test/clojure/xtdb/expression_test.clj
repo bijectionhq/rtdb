@@ -16,7 +16,7 @@
            (java.time.temporal ChronoUnit)
            org.apache.arrow.vector.types.TimeUnit
            (xtdb.api.error Incorrect)
-           (xtdb.arrow NullVector RelationReader Vector VectorReader)
+           (xtdb.arrow DecimalVector NullVector RelationReader Vector VectorReader)
            (xtdb.operator ProjectionSpec$Star)
            (xtdb.time Interval)
            (xtdb.util StringUtil)))
@@ -1997,6 +1997,24 @@
       '(. s a) #xt/type :null [nil]
       '(== s s) #xt/type [:? :bool] [nil]
       '(=== s s) #xt/type :bool [true])))
+
+(t/deftest positioned-decimal-field-projection-checks-reached-coefficients-in-row-order
+  (with-open [rel (vr/rel-reader [(tu/open-vec "s" #xt/type [:? :struct {"inner" [:? :struct {"amount" [:? :decimal 5 2 32]}]}]
+                                               [{:inner {:amount -999.99M}} nil {:inner {}}
+                                                {:inner {:amount 999.99M}} {:inner {:amount 0.00M}}])])]
+    (let [^DecimalVector amount (-> (.vectorFor rel "s") (.vectorFor "inner") (.vectorFor "amount"))
+          form '(.. s inner amount)]
+      (.setBigDecimal amount 1 -1000.00M)
+      (let [{:keys [res res-type]} (run-projection rel form)]
+        (t/is (= ["-999.99" nil nil "999.99" "0.00"] (mapv #(some-> % str) res)))
+        (t/is (= #xt/type [:? :decimal 5 2 32] res-type)))
+
+      (.setBigDecimal amount 3 -1000.00M)
+      (.setBigDecimal amount 4 1000.00M)
+      (let [error (try (run-projection rel form)
+                       (catch IllegalStateException e e))]
+        (t/is (= "invalid writeObject" (ex-message error)))
+        (t/is (= {:target "DecimalVector", :obj -1000.00M} (ex-data error)))))))
 
 (t/deftest indexing-a-column-of-empty-lists-yields-null-5948
   (with-open [rel (tu/open-rel {:xs [[] []]})]

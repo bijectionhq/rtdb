@@ -20,7 +20,7 @@
            (org.apache.arrow.vector PeriodDuration)
            (org.apache.arrow.vector.types.pojo ArrowType$Decimal)
            (org.apache.commons.codec.binary Hex)
-           (xtdb.arrow ListValueReader RelationReader RowMask Utf8Vector ValueBox ValueReader Vector VectorReader VectorType VectorType$Listy VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
+           (xtdb.arrow ListValueReader RelationReader RowMask Utf8Vector ValueBox ValueReader Vector VectorReader VectorType VectorType$Listy VectorType$Maybe VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
            (xtdb.expression PgFormat)
            (xtdb.operator ProjectionSpec ProjectionSpec$Factory SelectionSpec SelectionSpec$Factory)
            (xtdb.pgwire PgTypes)
@@ -810,19 +810,23 @@
 
 (declare codegen-concat codegen-format)
 
-(defmethod codegen-expr :call [{:keys [f args] :as expr} opts]
+(defmethod codegen-expr :call [{:keys [f args ::projection-root?] :as expr} opts]
   (let [emitted-args (for [arg args]
                        (codegen-expr arg opts))
-        expr (assoc expr :emitted-args emitted-args)]
-    (-> (case f
-          :and (codegen-and emitted-args)
-          :or (codegen-or emitted-args)
-          :concat (codegen-concat expr)
-          :format (codegen-format expr)
-          (codegen-call* expr))
-
-        (update :children (fnil into []) emitted-args)
-        (wrap-boxed-poly-return opts))))
+        expr (assoc expr :emitted-args emitted-args)
+        {^VectorType return-type :return-type, :as emitted-expr}
+        (-> (case f
+              :and (codegen-and emitted-args)
+              :or (codegen-or emitted-args)
+              :concat (codegen-concat expr)
+              :format (codegen-format expr)
+              (codegen-call* expr))
+            (update :children (fnil into []) emitted-args))]
+    (if (and projection-root? (= :get_field (normalise-fn-name f))
+             (instance? VectorType$Maybe return-type)
+             (instance? ArrowType$Decimal (.getArrowType return-type)))
+      emitted-expr
+      (wrap-boxed-poly-return emitted-expr opts))))
 
 (doseq [[f-kw cmp] [[:< #(do `(neg? ~%))]
                     [:<= #(do `(not (pos? ~%)))]
@@ -2001,12 +2005,19 @@
                             child-code (cond
                                          struct-reader `(.readField ~(with-tag struct-reader ValueReader) ~field)
                                          (and struct-fields (empty? struct-bindings)) (get struct-fields field)
-                                         :else `(.get ~(with-tag struct-code Map) ~field))]
+                                         :else `(.get ~(with-tag struct-code Map) ~field))
+                            read-child (fn [child]
+                                         (continue-read (fn [^VectorType child-type code]
+                                                          (f child-type
+                                                             (cond-> code
+                                                               (and struct-reader (instance? ArrowType$Decimal (.getArrowType child-type)))
+                                                               (vary-meta assoc ::decimal-reader child))))
+                                                        val-type child))]
                         (if (and (next legs) (some #{#xt/type :null} legs))
                           (let [child-sym (with-tag (gensym 'child) ValueReader)]
                             `(let [~child-sym ~child-code]
-                               ~(continue-read f val-type child-sym)))
-                          (continue-read f val-type (with-tag child-code ValueReader)))))}
+                               ~(read-child child-sym)))
+                          (read-child (with-tag child-code ValueReader)))))}
 
     {:return-type #xt/type :null, :->call-code (constantly nil)}))
 
@@ -2540,7 +2551,7 @@
                           (update-vals children (fn [_] (with-tag (gensym 'out-child) VectorWriter))))]
       {:writer-bindings (into [] (mapcat (fn [[k writer]] [writer `(.vectorFor ~out-vec-sym ~k)])) child-writers)
        :write-value-out! (fn [value-type code]
-                           (let [{::keys [struct-fields struct-bindings struct-reader interval-reader]} (meta code)]
+                           (let [{::keys [struct-fields struct-bindings struct-reader interval-reader decimal-reader]} (meta code)]
                              (if (and child-writers
                                       (= struct-type value-type)
                                       (= (set (keys child-writers)) (set (keys struct-fields)))
@@ -2552,7 +2563,7 @@
                                     ~@(for [[reader _ writer] readers]
                                         `(.writeValue ~writer ~reader))
                                     (.endStruct ~out-vec-sym)))
-                               (if-let [reader (or struct-reader interval-reader)]
+                               (if-let [reader (or struct-reader interval-reader decimal-reader)]
                                  `(.writeValue0 ~out-vec-sym ~(with-tag reader ValueReader))
                                  (write-value-code value-type out-vec-sym code)))))})))
 
@@ -2572,8 +2583,9 @@
       :else
       (err/incorrect ::unknown-arithmetic-error "data exception - arithmetic exception" {::err/cause cause}))))
 
-(defn- emit-row-expr [expr opts]
-  (let [expr (prepare-expr expr)
+(defn- emit-row-expr [expr {:keys [projection?] :as opts}]
+  (let [expr (cond-> (prepare-expr expr)
+               projection? (assoc ::projection-root? true))
         emitted-expr (codegen-expr expr opts)]
     (assert (:return-type emitted-expr) (pr-str expr))
     emitted-expr))
@@ -2584,7 +2596,7 @@
    assumption wouldn't hold if macroexpansion created new variable exprs, for example.
    macroexpansion is non-deterministic (gensym), so busts the memo cache."
   (-> (fn [expr opts]
-        (let [{:keys [return-type continue valid-utf8?] :as emitted-expr} (emit-row-expr expr opts)
+        (let [{:keys [return-type continue valid-utf8?] :as emitted-expr} (emit-row-expr expr (assoc opts :projection? true))
               {:keys [writer-bindings write-value-out!]} (write-value-out-code return-type)]
           {:!projection-fn (delay
                              (-> `(fn [~(-> rel-sym (with-tag RelationReader))

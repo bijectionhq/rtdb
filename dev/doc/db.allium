@@ -2451,6 +2451,7 @@ surface QueryAccess {
         -- Malformed text keys participate in duplicate resolution after Java UTF-8 replacement.
         -- A positioned decimal identity write retains the original coefficient and scale and applies the destination's declared precision.
         -- The precision bound applies equally to positive and negative coefficients and accepts both endpoints.
+        -- A generated field projection into a matching decimal layout checks the reached coefficient at its Arrow position and preserves nulls and the first invalid-write diagnostic.
         -- A positioned interval identity write retains the signed components in the units of the matching input and output layout.
         -- An interval projection with a matching single layout writes the reached value at its position and preserves nulls.
 
