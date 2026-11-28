@@ -124,9 +124,8 @@ impl DurableGrantRow {
             || self.footprint.iter().any(|t| other.contains(t))
     }
 
-    fn positioned_document(&self, memory: &Arc<MemoryBudget>) -> Result<Option<ArrayRef>> {
-        let Some(footprint) = self.positioned_footprint.as_ref() else { return Ok(None); };
-        let Some(footprint) = footprint_with_additions(footprint, &self.footprint, memory)? else {
+    fn positioned_document(&self, source: &ArrayRef, memory: &Arc<MemoryBudget>) -> Result<Option<ArrayRef>> {
+        let Some(footprint) = footprint_with_additions(source, &self.footprint, memory)? else {
             return Ok(None);
         };
         control_record(memory, &[
@@ -164,6 +163,17 @@ impl DurableGrantRow {
             ),
         ])
     }
+}
+
+#[derive(Clone, Copy)]
+enum RetainFootprint<'a> {
+    WorkKey(&'a str),
+    FirstWaiterExcept(&'a str),
+}
+
+enum GrantScan {
+    Complete(Vec<DurableGrantRow>),
+    RetryWithoutFootprint,
 }
 
 enum StoredFootprint {
@@ -271,10 +281,20 @@ fn footprint_with_additions(
 }
 
 impl OpenTransaction<'_> {
-    async fn load_ss8_grants(&self, retain_for: Option<&str>) -> Result<Vec<DurableGrantRow>> {
+    async fn load_ss8_grants(&self, retain: Option<RetainFootprint<'_>>) -> Result<Vec<DurableGrantRow>> {
+        match self.scan_ss8_grants(retain).await? {
+            GrantScan::Complete(rows) => Ok(rows),
+            GrantScan::RetryWithoutFootprint => match self.scan_ss8_grants(None).await? {
+                GrantScan::Complete(rows) => Ok(rows),
+                GrantScan::RetryWithoutFootprint => unreachable!("An ordinary scan retains no footprint"),
+            },
+        }
+    }
+
+    async fn scan_ss8_grants(&self, mut retain: Option<RetainFootprint<'_>>) -> Result<GrantScan> {
         let table = ss8_footprint_grants_table();
         if !self.snapshot()?.contains_table(&table) {
-            return Ok(Vec::new());
+            return Ok(GrantScan::Complete(Vec::new()));
         }
         let mut query = self
             .open_query(
@@ -283,17 +303,27 @@ impl OpenTransaction<'_> {
             )
             .await?;
         let mut rows = Vec::new();
-        let mut retain_for = retain_for;
-        while let Some(batch) = query.next_batch().await? {
+        let mut retained_footprint = false;
+        loop {
+            let next = match query.next_batch().await {
+                Err(error) if retained_footprint && error.is(AnomalyKind::ResourceExhausted) => {
+                    return Ok(GrantScan::RetryWithoutFootprint);
+                }
+                other => other?,
+            };
+            let Some(batch) = next else { return Ok(GrantScan::Complete(rows)); };
             let batch = batch.batch();
             for row in 0..batch.num_rows() {
                 let cell = |index: usize| {
                     read_value(batch.schema().field(index), batch.column(index).as_ref(), row)
                 };
                 let work_key_cell = cell(0)?;
-                let keep_footprint = matches!(&work_key_cell, Value::Utf8(key) if retain_for == Some(key.as_str()));
+                let keep_footprint = matches!(
+                    (&work_key_cell, retain),
+                    (Value::Utf8(key), Some(RetainFootprint::WorkKey(target))) if key.as_str() == target
+                );
                 if keep_footprint {
-                    retain_for = None;
+                    retain = None;
                 }
                 let footprint_cell = || {
                     let positioned = if keep_footprint { copy_footprint(batch, row, &self.context.memory) } else { None };
@@ -320,7 +350,14 @@ impl OpenTransaction<'_> {
                         "Durable SS8 footprint grant row has an invalid schema",
                     ));
                 };
-                let (footprint, positioned_footprint) = stored_footprint.normalize();
+                let (footprint, mut positioned_footprint) = stored_footprint.normalize();
+                if status == STATUS_WAITING
+                    && matches!(retain, Some(RetainFootprint::FirstWaiterExcept(released)) if work_key.as_str() != released)
+                {
+                    retain = None;
+                    positioned_footprint = copy_footprint(batch, row, &self.context.memory);
+                }
+                retained_footprint |= positioned_footprint.is_some();
                 rows.push(DurableGrantRow {
                     work_key,
                     work_age: work_age as u64,
@@ -333,7 +370,6 @@ impl OpenTransaction<'_> {
                 });
             }
         }
-        Ok(rows)
     }
 
     pub(super) async fn load_ss8_debit(&self, work_key: &str) -> Result<Option<(u64, u8)>> {
@@ -363,13 +399,16 @@ impl OpenTransaction<'_> {
         Ok(None)
     }
 
-    fn write_ss8_grant_row(&mut self, row: &DurableGrantRow) -> Result<()> {
+    fn write_ss8_grant_row(&mut self, mut row: DurableGrantRow) -> Result<()> {
         let table = ss8_footprint_grants_table();
         let valid = interval(Timestamp(0), Timestamp::MAX)?;
-        if row.positioned_document(&self.context.memory).ok().flatten().is_some_and(|document| {
-            let iid = EntityId::string_iid(&row.work_key);
-            self.try_stage_control_put(&table, iid, valid, document)
-        }) {
+        let staged = row.positioned_footprint.take().is_some_and(|source| {
+            row.positioned_document(&source, &self.context.memory).ok().flatten().is_some_and(|document| {
+                let iid = EntityId::string_iid(&row.work_key);
+                self.try_stage_control_put(&table, iid, valid, document)
+            })
+        });
+        if staged {
             return Ok(());
         }
         self.buffer.put(table, row.to_document(), valid)
@@ -502,7 +541,7 @@ impl OpenTransaction<'_> {
                 attempt,
                 footprint,
             } => {
-                let mut grants = self.load_ss8_grants(Some(work_key)).await?;
+                let mut grants = self.load_ss8_grants(Some(RetainFootprint::WorkKey(work_key))).await?;
                 let requested: BTreeSet<String> = footprint.iter().cloned().collect();
                 let existing = grants.iter().position(|g| g.work_key == *work_key);
                 let mut entry = match existing {
@@ -515,7 +554,7 @@ impl OpenTransaction<'_> {
                             if *attempt > prior.holder_attempt {
                                 prior.holder_attempt = *attempt;
                             }
-                            self.write_ss8_grant_row(&prior)?;
+                            self.write_ss8_grant_row(prior)?;
                             return Ok(());
                         }
                         prior
@@ -548,7 +587,7 @@ impl OpenTransaction<'_> {
                         entry.reopened_cut = self.tx_key().tx_id.0;
                     }
                 }
-                self.write_ss8_grant_row(&entry)
+                self.write_ss8_grant_row(entry)
             }
             OwnedFootprintGrantOp::TransferOnLeaseLoss {
                 work_key,
@@ -556,7 +595,7 @@ impl OpenTransaction<'_> {
                 progress_step,
                 additional_footprint,
             } => {
-                let grants = self.load_ss8_grants(Some(work_key)).await?;
+                let grants = self.load_ss8_grants(Some(RetainFootprint::WorkKey(work_key))).await?;
                 let Some(mut grant) = grants.into_iter().find(|g| g.work_key == *work_key) else {
                     return Err(Anomaly::new(
                         AnomalyCategory::Conflict,
@@ -579,7 +618,7 @@ impl OpenTransaction<'_> {
                         grant.progress_step = transferred.progress_step;
                         grant.footprint = next_footprint;
                         grant.active = transferred.active;
-                        self.write_ss8_grant_row(&grant)
+                        self.write_ss8_grant_row(grant)
                     }
                     TransferVerdict::RejectNotActive
                     | TransferVerdict::RejectWrongWorkKey
@@ -620,7 +659,7 @@ impl OpenTransaction<'_> {
         work_key: &str,
         expected_attempt: Option<u64>,
     ) -> Result<()> {
-        let mut grants = self.load_ss8_grants(None).await?;
+        let mut grants = self.load_ss8_grants(Some(RetainFootprint::FirstWaiterExcept(work_key))).await?;
         let Some(index) = grants.iter().position(|g| g.work_key == work_key) else {
             return Ok(());
         };
@@ -642,7 +681,6 @@ impl OpenTransaction<'_> {
                 "Cannot release a durable SS8 grant with a stale attempt token",
             ));
         }
-        self.delete_ss8_grant_row(work_key)?;
         // Rotate strictly by work-key age among remaining eligible waiters
         // whose footprint is not blocked by another active grant.
         let eligible: Vec<WaiterEntry> = grants
@@ -655,11 +693,26 @@ impl OpenTransaction<'_> {
             })
             .map(DurableGrantRow::as_waiter)
             .collect();
-        if let Some(winner) = footprint_grant::select_next_holder(&eligible)
-            && let Some(promoted) = grants
-                .iter_mut()
-                .find(|g| !g.active && g.as_waiter() == winner)
-        {
+        let mut candidates = grants.into_iter();
+        let promoted = footprint_grant::select_next_holder(&eligible)
+            .and_then(|winner| candidates.find(|grant| !grant.active && grant.as_waiter() == winner));
+        drop(candidates);
+        self.stage_ss8_rotation(work_key, promoted)
+    }
+
+    fn stage_ss8_rotation(&mut self, work_key: &str, mut promoted: Option<DurableGrantRow>) -> Result<()> {
+        match self.delete_ss8_grant_row(work_key) {
+            Err(error) if error.is(AnomalyKind::ResourceExhausted) => {
+                let retained = promoted.as_mut().and_then(|grant| grant.positioned_footprint.take());
+                if retained.is_none() {
+                    return Err(error);
+                }
+                drop(retained);
+                self.delete_ss8_grant_row(work_key)?;
+            }
+            result => result?,
+        }
+        if let Some(mut promoted) = promoted {
             promoted.active = true;
             promoted.reopened_cut = self.tx_key().tx_id.0;
             self.write_ss8_grant_row(promoted)?;
@@ -689,24 +742,24 @@ mod tests {
         grant.active = true;
         grant.holder_attempt = 4;
         grant.progress_step = 3;
-        let positioned = grant.positioned_document(&memory)?.expect("same canonical footprint");
+        let source = grant.positioned_footprint.as_ref().unwrap();
+        let positioned = grant.positioned_document(source, &memory)?.expect("same canonical footprint");
         super::super::positioned_control::assert_control_bytes(
             &memory, &ss8_footprint_grants_table(), grant.to_document(), positioned, None,
         )?;
 
         grant.footprint.extend(["public.aa".into(), "public.b".into(), "public.z".into()]);
-        let source = grant.positioned_footprint.as_ref().unwrap();
         assert_eq!(
             footprint_with_additions(source, &grant.footprint, &MemoryBudget::new(1)).unwrap_err().code,
             "rtdb/memory-budget-exceeded",
         );
-        let positioned = grant.positioned_document(&memory)?.expect("canonical footprint with additions");
+        let positioned = grant.positioned_document(source, &memory)?.expect("canonical footprint with additions");
         super::super::positioned_control::assert_control_bytes(
             &memory, &ss8_footprint_grants_table(), grant.to_document(), positioned, None,
         )?;
 
         grant.footprint.remove("public.a");
-        assert!(grant.positioned_document(&memory)?.is_none());
+        assert!(grant.positioned_document(source, &memory)?.is_none());
         for names in [["public.b", "public.a"], ["public.a", "public.a"]] {
             let list = Value::list(names.map(|name| Value::Utf8(name.into())).into());
             let ty = list.logical_type();
@@ -717,6 +770,110 @@ mod tests {
             assert!(canonical_footprint(&batch, 0).is_none());
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotation_can_publish_one_funded_waiter_without_changing_event_bytes() -> Result<()> {
+        use rtdb_index::{PartitionState, TransactionBuffer};
+        use rtdb_types::{TransactionKey, TxId};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let context = grant_test_context(&memory);
+        let options = crate::SubmitOptions::default();
+        let base = PartitionState::empty(Default::default())?;
+        let prior = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(20) };
+        let table = ss8_footprint_grants_table();
+        let valid = interval(Timestamp(0), Timestamp::MAX)?;
+        let mut waiter = DurableGrantRow {
+            work_key: "waiter".into(), work_age: 2, holder_attempt: 1, reopened_cut: prior.tx_id.0, progress_step: 0,
+            footprint: ["public.a".into(), "public.b".into()].into(), active: false, positioned_footprint: None,
+        };
+        let mut released = waiter.clone();
+        released.work_key = "released".into();
+        released.active = true;
+        let mut seed = TransactionBuffer::new(base.snapshot(), prior, Arc::clone(&memory))?;
+        seed.put(table.clone(), released.to_document(), valid)?;
+        seed.put(table.clone(), waiter.to_document(), valid)?;
+        base.apply(&seed.stage()?)?;
+
+        let mut transaction = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
+        let rows = transaction.load_ss8_grants(Some(RetainFootprint::FirstWaiterExcept("released"))).await?;
+        let selected = rows.iter().filter(|grant| grant.positioned_footprint.is_some())
+            .map(|grant| grant.work_key.as_str()).collect::<Vec<_>>();
+        assert_eq!(selected, ["waiter"]);
+        drop(selected);
+        drop(rows);
+        transaction.release_and_rotate_ss8_grant("released", Some(released.holder_attempt)).await?;
+
+        let mut baseline = TransactionBuffer::new(base.snapshot(), key, Arc::clone(&memory))?;
+        baseline.delete(table.clone(), &EntityId::String(released.work_key), valid)?;
+        waiter.active = true;
+        waiter.reopened_cut = key.tx_id.0;
+        baseline.put(table.clone(), waiter.to_document(), valid)?;
+
+        let expected = baseline.stage()?;
+        let actual = transaction.buffer.stage()?;
+        let encode = |batch: &RecordBatch| crate::ipc::encode(batch.schema_ref(), [batch], &memory);
+        let expected = expected.tables()[&table].batch().unwrap().arrow();
+        let actual = actual.tables()[&table].batch().unwrap().arrow();
+        assert_eq!(encode(expected)?.as_slice(), encode(actual)?.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_releases_its_copy_when_only_the_ordinary_writes_fit() -> Result<()> {
+        use rtdb_index::PartitionState;
+        use rtdb_types::{TransactionKey, TxId};
+
+        let table = ss8_footprint_grants_table();
+        let base = PartitionState::empty(Default::default())?;
+        let options = crate::SubmitOptions::default();
+        let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let mut waiter = DurableGrantRow {
+            work_key: "waiter".into(), work_age: 2, holder_attempt: 1, reopened_cut: key.tx_id.0, progress_step: 0,
+            footprint: ["public.a".into(), "public.b".into()].into(), active: true, positioned_footprint: None,
+        };
+        let delete_bytes = 4096 + table.schema.len() + table.table.len();
+        let put_bytes = delete_bytes + Value::document_retained_bytes(&waiter.to_document())?;
+        waiter.active = false;
+        let footprint = waiter.to_document().remove("footprint").unwrap();
+        let array = rtdb_columnar::build_array(&footprint.logical_type(), &[footprint])?;
+        let compact_bytes = array.get_array_memory_size();
+        assert!(compact_bytes < put_bytes && put_bytes < 8192);
+
+        for footprint_bytes in [compact_bytes, put_bytes + 1] {
+            let memory = MemoryBudget::new(delete_bytes + put_bytes);
+            let context = grant_test_context(&memory);
+            let mut transaction = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
+            let mut promoted = waiter.clone();
+            promoted.positioned_footprint = Some(rtdb_columnar::retain_array(Arc::clone(&array), &memory.reserve(footprint_bytes)?)?);
+            transaction.stage_ss8_rotation("released", Some(promoted))?;
+            assert!(transaction.buffer.has_pending_table(&table));
+            assert_eq!(memory.used_bytes(), put_bytes + delete_bytes);
+        }
+        Ok(())
+    }
+
+    fn grant_test_context(memory: &Arc<MemoryBudget>) -> super::super::ResolveContext {
+        use rtdb_query::QueryOptions;
+        use rtdb_storage::cache::BufferPool;
+        use tokio_util::sync::CancellationToken;
+
+        struct AllowRoles;
+        impl super::super::TransactionAuthorization for AllowRoles {
+            fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Ok(()) }
+        }
+
+        super::super::ResolveContext {
+            footprint_grants: Default::default(), decision_clock: None,
+            write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None,
+            world_constraints: None, database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
+            execution_observer: None, tracer: None,
+        }
     }
 
     #[test]

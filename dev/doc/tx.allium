@@ -462,7 +462,9 @@
 -- An ordered write that advances a capacity frontier under existing rules preserves the complete rule list, including its predicate bytes.
 -- An ordered write that advances a uniqueness frontier under existing paths preserves their projected columns in canonical path-name order.
 -- A durable grant refresh or transfer publishes the sorted, distinct union of the prior footprint and the additional tables.
--- A promoted waiter retains its sorted, distinct footprint members.
+-- A release promotes the oldest eligible waiter.
+-- The promoted waiter retains its sorted, distinct footprint members.
+-- If a grant scan exhausts its budget while carrying an optional footprint copy, it retries the same ordered cut with ordinary row admission.
 -- When an Original replay receipt carries archived assertion positions, the governed events retain those exact positions in the destination transaction.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.
