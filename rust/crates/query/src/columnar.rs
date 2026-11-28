@@ -5294,6 +5294,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bound_binary_list_subscript_keeps_the_selected_argument_child_charge() {
+        use arrow_array::RecordBatch;
+
+        let memory = MemoryBudget::new(1 << 22);
+        let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Binary));
+        let field = rtdb_columnar::to_field("arg", &ty).unwrap();
+        let first = Value::Binary(vec![128]);
+        let second = Value::Binary(vec![255, 0]);
+        let array = rtdb_columnar::copy_array(&ty, &[
+            Value::list(vec![Value::Binary(vec![])]), Value::list(vec![first, second.clone()]),
+        ]).unwrap();
+        let source = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![array]).unwrap();
+        let backing = memory.reserve(source.get_array_memory_size()).unwrap();
+        let source = rtdb_columnar::OwnedBatch::with_reservation(source, backing).unwrap();
+        let child = source.batch().column(0).as_any().downcast_ref::<ListArray>().unwrap().values().clone();
+        let charge = Arc::downgrade(source.reservation());
+        let expression = Expr::Subscript {
+            expr: Box::new(Expr::Parameter { index: 0, data_type: ty.clone() }),
+            index: Box::new(Expr::Literal(Value::I64(1))),
+            data_type: LogicalType::Scalar(ScalarType::Binary).maybe(),
+        };
+        let batch = ColumnBatch::settled(vec![], 2, memory.reserve(4096).unwrap()).unwrap();
+        let mut cursor = record_projection_cursor(batch, Schema::default(), vec![expression], &memory);
+        cursor.execution.parameters = Arc::new(crate::parameters::BoundParameters::from_arrow(source, 1, vec![ty], &memory).unwrap());
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        for row in 0..2 {
+            assert_eq!(page.columns[0].value(row).unwrap(), second);
+            let (array, _, _, offset) = page.columns[0].arrow_cell(row).unwrap().unwrap();
+            assert!(std::ptr::eq(array, child.as_ref()));
+            assert_eq!(offset, 2);
+        }
+        drop(cursor);
+        drop(child);
+        assert!(charge.upgrade().is_some());
+        drop(page);
+        assert!(charge.upgrade().is_none());
+    }
+
+    #[tokio::test]
     async fn binary_substring_uses_byte_offsets_and_reports_the_first_reached_limit_error() {
         use arrow_array::BinaryArray;
 
@@ -6672,7 +6711,7 @@ impl BatchCursor for BatchExpressions {
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
             if let Some((column, owner)) = projection::list_subscript(
-                expression, invocation.data_type(), &self.schema, &batch, &self.execution.context,
+                expression, invocation.data_type(), &self.schema, &batch, &self.execution,
             )? {
                 columns.push(column);
                 owners[index] = Some(owner);
@@ -7780,7 +7819,7 @@ pub(crate) mod projection {
     }
 
     pub(super) fn list_subscript(
-        expression: &Expr, output: &LogicalType, schema: &Schema, batch: &ColumnBatch, context: &crate::QueryContext,
+        expression: &Expr, output: &LogicalType, schema: &Schema, batch: &ColumnBatch, execution: &crate::context::Execution,
     ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
         use std::collections::HashMap;
         use arrow_array::NullArray;
@@ -7806,9 +7845,12 @@ pub(crate) mod projection {
             }
         }
 
+        enum Input<'a> {
+            Column(&'a Column, &'a Arc<MemoryReservation>),
+            Parameter(FundedArrowCell<'a>),
+        }
+
         let Expr::Subscript { expr, index, .. } = expression else { return Ok(None); };
-        let Expr::Column { id, .. } = expr.as_ref() else { return Ok(None); };
-        let Some(position) = schema.position(*id) else { return Ok(None); };
         let Some(index) = literal_index(index) else { return Ok(None); };
         let index = usize::try_from(index).ok();
         let (result_type, scalar) = match super::plain_scalar(output) {
@@ -7817,8 +7859,25 @@ pub(crate) mod projection {
             _ => return Ok(None),
         };
         if batch.len == 0 { return Ok(None); }
-        let column = &batch.columns[position];
-        let owner = batch.column_reservation(position);
+        let input = match expr.as_ref() {
+            Expr::Column { id, .. } => {
+                let Some(position) = schema.position(*id) else { return Ok(None); };
+                Input::Column(&batch.columns[position], batch.column_reservation(position))
+            }
+            Expr::Parameter { index, .. } => {
+                let cell = if let Some(cell) = execution.parameters.captured_arrow_cell(*index) {
+                    cell
+                } else {
+                    let Some((source, row)) = execution.parameters.arrow_input(*index) else { return Ok(None); };
+                    let Some(owner) = source.buffer_backing() else { return Ok(None); };
+                    FundedArrowCell { array: source.batch().column(*index), field: &source.batch().schema_ref().fields()[*index],
+                        logical: None, owner, row }
+                };
+                Input::Parameter(cell)
+            }
+            _ => return Ok(None),
+        };
+        let context = &execution.context;
         let bound = batch.len.checked_mul(384).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)?;
         let Ok(mut charge) = context.memory.reserve(bound) else { return Ok(None); };
         let mut sources = vec![None];
@@ -7826,7 +7885,13 @@ pub(crate) mod projection {
         let mut picks = Vec::with_capacity(batch.len);
         for row in 0..batch.len {
             context.check_cancelled_at(row)?;
-            let Some(cell) = column.funded_arrow_cell(row, owner) else { return Ok(None); };
+            let cell = match &input {
+                Input::Column(column, owner) => {
+                    let Some(cell) = column.funded_arrow_cell(row, owner) else { return Ok(None); };
+                    cell
+                }
+                Input::Parameter(cell) => Some(*cell),
+            };
             let Some(FundedArrowCell { array, field, logical, owner, row }) = cell else {
                 picks.push((0, 0));
                 continue;

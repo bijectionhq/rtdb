@@ -192,7 +192,7 @@
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
 -- A packed list page carries its backing reservation into the query batch, whose slices retain the charge for the buffers they keep alive.
 -- A packed child page with an admitted execution layout carries the logical type of its physical field.
--- A native list subscript with a constant index can preserve a plain text or binary child position and its backing charge.
+-- A native list subscript with a constant index can preserve a plain text or binary child position and its backing charge from an input column or a funded bound argument.
 -- The selected position uses the SQL index adjustment and yields null for a null parent, null child, or out-of-range index.
 -- Owned numeric list reads copy the selected child range into buffers charged to the result and preserve the bits of present components and their validity.
 -- Dense-union list copies retain their leg identifiers and compact the child offsets in selection order.
