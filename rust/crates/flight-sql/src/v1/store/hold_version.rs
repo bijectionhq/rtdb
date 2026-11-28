@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use prost::Message;
+use rtdb_crypt::store_watch_drain::Proof as WatchDrainProof;
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity, serving::{
     StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest,
 }};
@@ -58,6 +59,10 @@ fn decode_request(request: proto::HoldVersionRequest) -> Result<([u8; 16], Store
         },
         Operation::Reopen(key) => StoreVersionHoldRequest::Reopen(hold_key(incarnation, key)?),
         Operation::Release(key) => StoreVersionHoldRequest::Release(hold_key(incarnation, key)?),
+        Operation::DrainWatch(drain) => StoreVersionHoldRequest::DrainWatch {
+            key: hold_key(incarnation, drain.key.ok_or_else(|| error::incorrect("A Store watch drain requires its receipt"))?)?,
+            proof: WatchDrainProof::decode(&drain.proof).map_err(error::anomaly)?,
+        },
     };
     Ok((incarnation, operation))
 }
@@ -99,6 +104,9 @@ impl Service {
                     expires_at_micros: Some(hold.expires_at.0), change_history: Some(hold.change_history) })
             }
             StoreVersionHoldReply::Released(key) => Outcome::Released(encode_key(key)),
+            StoreVersionHoldReply::WatchDrained { key, receiver } => Outcome::WatchDrained(proto::DrainedWatchReceiver {
+                key: Some(encode_key(key)), receiver: receiver.to_vec(),
+            }),
         };
         Ok(proto::HoldVersionReply { incarnation: incarnation.to_vec(), outcome: Some(outcome) }.encode_to_vec())
     }

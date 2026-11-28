@@ -1,10 +1,37 @@
 //! Terminal evidence from one Flight receiver. A new receiver has a
 //! different signing key even if it reopens the same Store hold.
 
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rtdb_types::{Anomaly, Result};
 
 const DOMAIN: &[u8] = b"rtdb.store.watch-drained.v1\0";
+
+#[derive(Clone, Copy, Debug)]
+pub struct Proof {
+    pub receiver: [u8; 16],
+    pub signature: [u8; 64],
+}
+
+impl Proof {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let (receiver, signature) = bytes.split_first_chunk::<16>().ok_or_else(invalid)?;
+        let signature = signature.try_into().map_err(|_| invalid())?;
+        if *receiver == [0; 16] {
+            return Err(invalid());
+        }
+        Ok(Self { receiver: *receiver, signature })
+    }
+
+    pub fn verify(&self, key: &[u8; 32]) -> Result<()> {
+        let message = [DOMAIN, &self.receiver].concat();
+        UnparsedPublicKey::new(&ED25519, key).verify(&message, &self.signature)
+            .map_err(|_| invalid())
+    }
+}
+
+fn invalid() -> Anomaly {
+    Anomaly::incorrect("rtdb.store/watch-drain", "The Store watch drain must come from its original receiver")
+}
 
 pub struct Signer {
     key: Ed25519KeyPair,

@@ -820,7 +820,10 @@ async fn admitted_store_watch_retains_history_after_release_and_writer_replaceme
     let StoreVersionHoldReply::Held(hold) = writer.store_version_hold(reader, acquire).await.unwrap()
         else { panic!("expected a watch receipt"); };
     let use_key = StoreVersionHoldKey { basis: old, id: [9; 16] };
-    let body = writer.enter_held_store_watch(current, reader, hold.key, use_key.id, watch_receiver(8)).await.unwrap();
+    let session = [8; 16];
+    let original = rtdb_crypt::store_watch_drain::Signer::from_seed(&[7; 32], session).unwrap();
+    let receiver = rtdb_format::journal::StoreWatchReceiver { session, drain_key: original.public_key() };
+    let body = writer.enter_held_store_watch(current, reader, hold.key, use_key.id, receiver).await.unwrap();
     writer.store_version_hold(reader, StoreVersionHoldRequest::Release(hold.key)).await.unwrap();
 
     cluster.at(200);
@@ -831,14 +834,23 @@ async fn admitted_store_watch_retains_history_after_release_and_writer_replaceme
     assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
         "rtdb.store/purge-retention");
     assert!(successor.checkpoint_retained_suffix(1).await.unwrap().is_none());
-    assert_eq!(successor.finish_held_store_watch(use_key, [2; 32], watch_receiver(8)).await.unwrap_err().code, "rtdb.store/stale-read-turn");
+    assert_eq!(successor.finish_held_store_watch(use_key, [2; 32], receiver).await.unwrap_err().code, "rtdb.store/stale-read-turn");
     assert_eq!(successor.finish_held_store_watch(use_key, reader, watch_receiver(7)).await.unwrap_err().code, "rtdb.store/stale-read-turn");
 
+    let replacement = rtdb_crypt::store_watch_drain::Signer::from_seed(&[6; 32], session).unwrap();
+    let drain = |signer: &rtdb_crypt::store_watch_drain::Signer| StoreVersionHoldRequest::DrainWatch {
+        key: hold.key, proof: rtdb_crypt::store_watch_drain::Proof::decode(&signer.drained()).unwrap(),
+    };
+    assert_eq!(successor.store_version_hold(reader, drain(&replacement)).await.unwrap_err().code, "rtdb.store/watch-drain");
+
+    // The original worker signs only after its closed receiver drains.
     drop(body);
-    // The fixture observes the original provider's body drain in process.
-    // Production only invokes this settlement from its receiver's drop.
-    successor.finish_held_store_watch(use_key, reader, watch_receiver(8)).await.unwrap();
-    successor.finish_held_store_watch(use_key, reader, watch_receiver(8)).await.unwrap();
+    let expected = StoreVersionHoldReply::WatchDrained { key: hold.key, receiver: session };
+    successor.store_version_hold([2; 32], drain(&original)).await.unwrap();
+    assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
+        "rtdb.store/purge-retention");
+    assert_eq!(successor.store_version_hold(reader, drain(&original)).await.unwrap(), expected);
+    assert_eq!(successor.store_version_hold(reader, drain(&original)).await.unwrap(), expected);
     successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap();
 }
 

@@ -401,7 +401,7 @@ message PurgeFloorReply {
 }
 
 // rtdb.store.v1.HoldVersion orders exact byte retention on the current Multi writer.
-// A fresh Store handshake advertises x-rtdb-store-hold-version: 3 for holds and retained watches.
+// A fresh Store handshake advertises x-rtdb-store-hold-version: 4 for holds, retained watches and drain settlement.
 // Reopen and release require database read access for the same authenticated account
 // and issuer in this incarnation. The receipt carries no data authority.
 message HoldVersionRequest {
@@ -411,7 +411,19 @@ message HoldVersionRequest {
     RetainVersion retain = 2;
     HeldVersionKey reopen = 3;
     HeldVersionKey release = 4;
+    DrainWatchReceiver drain_watch = 5;
   }
+}
+
+message DrainWatchReceiver {
+  HeldVersionKey key = 1;
+  // Original Flight receiver's signed terminal result from CloseSession.
+  bytes proof = 2;
+}
+
+message DrainedWatchReceiver {
+  HeldVersionKey key = 1;
+  bytes receiver = 2;
 }
 
 message RetainVersion {
@@ -440,5 +452,6 @@ message HoldVersionReply {
   oneof outcome {
     HeldVersion held = 2;
     HeldVersionKey released = 3;
+    DrainedWatchReceiver watch_drained = 4;
   }
 }

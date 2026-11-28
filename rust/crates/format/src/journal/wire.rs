@@ -163,7 +163,7 @@ struct StorePurgeReclaim {
 struct StoreHold {
     #[prost(sint64, optional, tag = "1")]
     lower_bound_micros: Option<i64>,
-    #[prost(oneof = "HoldChange", tags = "2, 3")]
+    #[prost(oneof = "HoldChange", tags = "2, 3, 4")]
     change: Option<HoldChange>,
 }
 
@@ -173,6 +173,16 @@ enum HoldChange {
     Retain(OrderedStoreHold),
     #[prost(message, tag = "3")]
     Release(OrderedStoreHold),
+    #[prost(message, tag = "4")]
+    DrainedWatch(DrainedWatchTurn),
+}
+
+#[derive(Message)]
+struct DrainedWatchTurn {
+    #[prost(message, optional, tag = "1")]
+    turn: Option<OrderedStoreHold>,
+    #[prost(bytes, tag = "2")]
+    signature: Vec<u8>,
 }
 
 #[derive(Message)]
@@ -284,6 +294,9 @@ impl TryFrom<&super::Record> for Record {
                 change: Some(match change {
                     super::StoreHoldChange::Retain(hold) => HoldChange::Retain(hold.into()),
                     super::StoreHoldChange::Release(hold) => HoldChange::Release(hold.into()),
+                    super::StoreHoldChange::DrainedWatch { turn, signature } => HoldChange::DrainedWatch(DrainedWatchTurn {
+                        turn: Some(turn.into()), signature: signature.to_vec(),
+                    }),
                 }),
             }),
         };
@@ -375,6 +388,10 @@ impl TryFrom<Record> for super::Record {
                     change: match hold.change.ok_or_else(|| invalid("A Store hold records its ordered change"))? {
                         HoldChange::Retain(hold) => super::StoreHoldChange::Retain(hold.try_into()?),
                         HoldChange::Release(hold) => super::StoreHoldChange::Release(hold.try_into()?),
+                        HoldChange::DrainedWatch(drained) => super::StoreHoldChange::DrainedWatch {
+                            turn: drained.turn.ok_or_else(|| invalid("Store watch drain names its original turn"))?.try_into()?,
+                            signature: drained.signature.try_into().map_err(|_| invalid("A Store watch drain signature has 64 bytes"))?,
+                        },
                     },
                 },
             },

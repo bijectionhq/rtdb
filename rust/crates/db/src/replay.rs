@@ -810,7 +810,8 @@ impl Committed {
                 }
                 let index = self.transactions.index();
                 let hold = match change {
-                    StoreHoldChange::Retain(hold) | StoreHoldChange::Release(hold) => hold,
+                    StoreHoldChange::Retain(hold) | StoreHoldChange::Release(hold)
+                        | StoreHoldChange::DrainedWatch { turn: hold, .. } => hold,
                 };
                 if hold.basis.incarnation() != index.head().basis.incarnation() {
                     return Err(invalid("A Store hold belongs to another incarnation"));

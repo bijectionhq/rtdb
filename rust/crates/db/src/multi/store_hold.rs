@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::{Arc, Weak}};
 
+use rtdb_crypt::store_watch_drain::Proof as WatchDrainProof;
 use rtdb_format::journal::{OrderedStoreHold, OrderedStoreWatchTurn, Record, StoreHoldChange, StoreWatchReceiver};
 use rtdb_index::branches::BranchIndex;
 use rtdb_types::{
@@ -124,13 +125,14 @@ pub enum StoreVersionHoldRequest {
     Retain { basis: Basis, expires_at: Timestamp, change_history: bool },
     Reopen(StoreVersionHoldKey),
     Release(StoreVersionHoldKey),
+    DrainWatch { key: StoreVersionHoldKey, proof: WatchDrainProof },
 }
 
 impl StoreVersionHoldRequest {
     fn basis(self) -> Basis {
         match self {
             Self::Retain { basis, .. } => basis,
-            Self::Reopen(key) | Self::Release(key) => key.basis,
+            Self::Reopen(key) | Self::Release(key) | Self::DrainWatch { key, .. } => key.basis,
         }
     }
 }
@@ -139,6 +141,7 @@ impl StoreVersionHoldRequest {
 pub enum StoreVersionHoldReply {
     Held(StoreVersionHold),
     Released(StoreVersionHoldKey),
+    WatchDrained { key: StoreVersionHoldKey, receiver: [u8; 16] },
 }
 
 /// The settled writer's byte promises are replayed with its journal.
@@ -224,20 +227,29 @@ impl StoreHolds {
                 self.check_new(hold, lower)?;
                 self.0.insert(hold.id, hold);
             },
-            StoreHoldChange::Release(hold) => {
-                if self.0.get(&hold.id) != Some(&hold) || !retains(&hold, lower) {
-                    return Err(invalid_hold("A Store hold release must name its exact ordered admission"));
-                }
-                self.0.remove(&hold.id);
+            StoreHoldChange::Release(hold) => self.release(hold, lower)?,
+            StoreHoldChange::DrainedWatch { turn, signature } => {
+                let watch = turn.watch_turn.ok_or_else(|| invalid_hold("A Store watch drain needs an ordered turn"))?;
+                let proof = WatchDrainProof { receiver: watch.receiver.session, signature };
+                proof.verify(&watch.receiver.drain_key)?;
+                self.release(turn, lower)?;
             },
         }
         self.expire(lower);
         Ok(())
     }
 
+    fn release(&mut self, hold: OrderedStoreHold, lower: i64) -> Result<()> {
+        if self.0.get(&hold.id) != Some(&hold) || !retains(&hold, lower) {
+            return Err(invalid_hold("A Store hold release must name its exact ordered admission"));
+        }
+        self.0.remove(&hold.id);
+        Ok(())
+    }
+
     fn plan(
         &self, request: StoreVersionHoldRequest, reader: [u8; 32], lower: i64, upper: i64,
-    ) -> Result<(StoreVersionHoldReply, Option<StoreHoldChange>)> {
+    ) -> Result<(StoreVersionHoldReply, Vec<StoreHoldChange>)> {
         match request {
             StoreVersionHoldRequest::Retain { basis, expires_at, change_history } => {
                 if !(1..=MAX_HOLD_MICROS).contains(&expires_at.0.saturating_sub(upper)) {
@@ -250,17 +262,28 @@ impl StoreHolds {
                 };
                 self.check_new(ordered, lower)?;
                 let held = StoreVersionHold { key: StoreVersionHoldKey { basis, id }, expires_at, change_history };
-                Ok((StoreVersionHoldReply::Held(held), Some(StoreHoldChange::Retain(ordered))))
+                Ok((StoreVersionHoldReply::Held(held), vec![StoreHoldChange::Retain(ordered)]))
             },
             StoreVersionHoldRequest::Reopen(key) => {
                 let hold = self.find(key, reader, upper)?;
                 Ok((StoreVersionHoldReply::Held(StoreVersionHold {
                     key, expires_at: Timestamp(hold.expires_at_micros), change_history: hold.change_history,
-                }), None))
+                }), Vec::new()))
             },
             StoreVersionHoldRequest::Release(key) => {
                 let hold = self.find(key, reader, lower)?;
-                Ok((StoreVersionHoldReply::Released(key), Some(StoreHoldChange::Release(hold))))
+                Ok((StoreVersionHoldReply::Released(key), vec![StoreHoldChange::Release(hold)]))
+            },
+            StoreVersionHoldRequest::DrainWatch { key, proof } => {
+                let mut changes = Vec::new();
+                for hold in self.0.values().filter(|hold| hold.reader == reader && hold.basis == key.basis) {
+                    let Some(watch) = hold.watch_turn.filter(|turn|
+                        turn.receipt == key.id && turn.receiver.session == proof.receiver)
+                    else { continue; };
+                    proof.verify(&watch.receiver.drain_key)?;
+                    changes.push(StoreHoldChange::DrainedWatch { turn: *hold, signature: proof.signature });
+                }
+                Ok((StoreVersionHoldReply::WatchDrained { key, receiver: proof.receiver }, changes))
             },
         }
     }
@@ -459,7 +482,7 @@ impl MultiDatabase {
         let upper = self.upper();
         let lower = self.lower();
 
-        if !matches!(request, StoreVersionHoldRequest::Release(_)) {
+        if matches!(request, StoreVersionHoldRequest::Retain { .. } | StoreVersionHoldRequest::Reopen(_)) {
             let state = self.state();
             let index = state.transactions.index();
             if index.has_custody_groups() || index.has_visibility_history() {
@@ -472,13 +495,13 @@ impl MultiDatabase {
             }
             index.view(MAIN_BRANCH, At::Exactly(basis), Layer::Merged, Timestamp(upper))?;
         }
-        let (reply, change) = self.state().store_holds.plan(request, reader, lower, upper)?;
+        let (reply, changes) = self.state().store_holds.plan(request, reader, lower, upper)?;
         if matches!(reply, StoreVersionHoldReply::Held(hold) if hold.change_history)
             && basis.position() < self.state().retained_changes_after()?
         {
             return Err(watch_gap());
         }
-        if let Some(change) = change {
+        for change in changes {
             self.append_control(lease, Record::StoreHold { change, lower_bound_micros: lower }).await?;
         }
         if matches!(reply, StoreVersionHoldReply::Held(hold) if self.upper() >= hold.expires_at.0) {

@@ -154,6 +154,7 @@ pub struct StoreWatchReceiver {
 pub enum StoreHoldChange {
     Retain(OrderedStoreHold),
     Release(OrderedStoreHold),
+    DrainedWatch { turn: OrderedStoreHold, signature: [u8; 64] },
 }
 
 /// The requested retention census and the ordered writer's lower time bound.
