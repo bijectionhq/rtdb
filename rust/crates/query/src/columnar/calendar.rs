@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, Date32Array, Date64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, builder::PrimitiveBuilder, types::{ArrowPrimitiveType, Date32Type, Date64Type, IntervalDayTime, IntervalDayTimeType, IntervalMonthDayNano,
+    TimestampSecondArray, builder::PrimitiveBuilder, types::{ArrowPrimitiveType, Date32Type, Date64Type, Int32Type, IntervalDayTime, IntervalDayTimeType, IntervalMonthDayNano,
         IntervalMonthDayNanoType, IntervalYearMonthType, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType}};
 use arrow_schema::{DataType, Field as ArrowField, IntervalUnit as ArrowIntervalUnit};
 use rtdb_columnar::MemoryReservation;
 use rtdb_expr::kernels::{AgeOperand, DateBin, DateBinInput, calendar_age, cast_date_timestamp_ticks, cast_timestamp_ticks,
-    timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_interval, truncate_timestamp};
+    extract_date, extract_timestamp, timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_interval, truncate_timestamp};
 use rtdb_plan::{CastTarget, CastTimezone, Expr, Schema, TemporalCast, TemporalField, TemporalKind, truncation_zone};
 use rtdb_types::{AnomalyKind, IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value, ZoneId, java_date::MILLIS_PER_DAY};
 
-use super::{Column, ColumnBatch, owned_projection_bytes, plain_scalar, size_error};
+use super::{Column, ColumnBatch, observed_scalar_column, owned_projection_bytes, plain_scalar, size_error};
 use crate::{QueryContext, parameters::BoundParameters};
 
 enum CalendarSource<'a> {
@@ -42,7 +42,7 @@ impl<'a> CalendarType<'a> {
         }
     }
 
-    fn bin_value(self, ticks: i64) -> i64 {
+    fn epoch_day_or_ticks(self, ticks: i64) -> i64 {
         match self {
             Self::DateMilli => ticks.div_euclid(MILLIS_PER_DAY),
             _ => ticks,
@@ -383,6 +383,26 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
     if batch.len == 0 { return Ok(None); }
     let Some(result) = plain_scalar(return_type) else { return Ok(None); };
     match (name.as_str(), args.as_slice()) {
+        ("extract", [Expr::Literal(Value::Utf8(field)), operand]) if *result == ScalarType::I32 => {
+            let Some(source) = CalendarInput::bind(operand, schema, batch, params) else { return Ok(None); };
+            let operand_type = operand.data_type();
+            let Some(scalar) = plain_scalar(&operand_type) else { return Ok(None); };
+            if CalendarType::of(scalar) != Some(source.ty) { return Ok(None); }
+            let Ok(field) = TemporalField::parse(field) else { return Ok(None); };
+            if !field.supports("extract", scalar) { return Ok(None); }
+            match source.ty {
+                CalendarType::DateDay | CalendarType::DateMilli => build::<Int32Type>(batch, context, result, |row| {
+                    source.map_ticks(row, |ticks| extract_date(field, source.ty.epoch_day_or_ticks(ticks)))
+                }),
+                CalendarType::Timestamp(TimeUnit::Microsecond, _) => Ok(None),
+                CalendarType::Timestamp(unit, label) => {
+                    let Ok(zone) = label.map(ZoneId::parse).transpose() else { return Ok(None); };
+                    build::<Int32Type>(batch, context, result, |row| {
+                        source.map_ticks(row, |ticks| extract_timestamp(field, ticks, unit, zone))
+                    })
+                }
+            }
+        }
         ("date_trunc" | "date-trunc", [_, _]) if matches!(result, ScalarType::Interval(_) | ScalarType::IntervalMonthDayMicro) => {
             let Some(source) = IntervalInput::bind_truncation(expr, schema, batch, params) else { return Ok(None); };
             match result {
@@ -455,8 +475,8 @@ pub(super) fn project(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params:
                 let (Some(parts), Some(origin_ticks)) = (stride_parts, origin_ticks) else { return Ok(Some(None)); };
                 let Some(source_cell) = source.prepare(row, timezone)? else { return Ok(None); };
                 let Some(source_cell) = source_cell else { return Ok(Some(None)); };
-                let source_ticks = source.ty.bin_value(source_cell.demand(timezone)?);
-                let origin_ticks = origin.ty.bin_value(origin_ticks);
+                let source_ticks = source.ty.epoch_day_or_ticks(source_cell.demand(timezone)?);
+                let origin_ticks = origin.ty.epoch_day_or_ticks(origin_ticks);
                 bin.cell((parts.months, parts.days, parts.nanoseconds), source_ticks, origin_ticks, timezone)
                     .map(|value| Some(Some(value)))
             };
@@ -515,8 +535,12 @@ fn build<T: ArrowPrimitiveType>(batch: &ColumnBatch, context: &QueryContext, sca
         out.append_option(value);
     }
     let array = out.finish();
-    let (logical, field) = if array.null_count() != 0 { (logical.maybe(), base_field.with_nullable(true)) } else { (logical, base_field) };
-    let column = Column::Arrow { array: Arc::new(array), field: Arc::new(field), logical: Some(logical) };
+    let column = if *scalar == ScalarType::I32 {
+        observed_scalar_column(array)?
+    } else {
+        let (logical, field) = if array.null_count() != 0 { (logical.maybe(), base_field.with_nullable(true)) } else { (logical, base_field) };
+        Column::Arrow { array: Arc::new(array), field: Arc::new(field), logical: Some(logical) }
+    };
     let retained = owned_projection_bytes(&column)?;
     let lease = Arc::get_mut(&mut owner).expect("Calendar projection owns its reservation");
     if retained <= lease.bytes() { lease.shrink_to(retained)?; } else { lease.grow_to(retained)?; }
@@ -601,6 +625,85 @@ mod tests {
         }
         drop(page);
         assert_eq!(execution.context.memory.used_bytes(), baseline);
+    }
+
+    #[tokio::test]
+    async fn extract_preserves_date_days_timestamp_units_and_stored_zones() {
+        use TimeUnit::{Millisecond, Nanosecond, Second};
+
+        let day = Field { data_type: LogicalType::Scalar(ScalarType::DateDay).maybe(), ..field(0, Second, None) };
+        let date_millis = Field { data_type: LogicalType::Scalar(ScalarType::DateMilli).maybe(), ..field(1, Second, None) };
+        let seconds = field(2, Second, Some("America/New_York"));
+        let millis = field(3, Millisecond, None);
+        let nanos = field(4, Nanosecond, Some("+05:30"));
+        let schema = Schema::new(vec![day.clone(), date_millis.clone(), seconds.clone(), millis.clone(), nanos.clone()]).unwrap();
+        let batch = dataset(vec![
+            arrow(Date32Array::from(vec![Some(-1), Some(18_624), None]), &day),
+            arrow(Date64Array::from(vec![Some(-1), Some(86_400_001), None]), &date_millis),
+            arrow(TimestampSecondArray::from(vec![Some(1_615_705_199), Some(1_615_705_200), None])
+                .with_timezone("America/New_York"), &seconds),
+            arrow(TimestampMillisecondArray::from(vec![Some(-1), Some(1_001), None]), &millis),
+            arrow(TimestampNanosecondArray::from(vec![Some(-1), Some(0), None]).with_timezone("+05:30"), &nanos),
+        ], 3);
+        let calls = [
+            ("WEEK", &day), ("YEAR", &date_millis), ("DAY", &date_millis),
+            ("HOUR", &seconds), ("TIMEZONE_HOUR", &seconds), ("SECOND", &millis),
+            ("EPOCH", &nanos), ("TIMEZONE_MINUTE", &nanos),
+        ].map(|(name, source)| call("extract", vec![Expr::Literal(Value::Utf8(name.into())), source.expression()]));
+        let types = vec![ScalarType::I32; calls.len()];
+        assert_parity(execution("Asia/Tokyo"), schema, batch, calls.into(), types).await;
+
+        let mut execution = execution("Asia/Tokyo");
+        let memory = &execution.context.memory;
+        let physical = rtdb_columnar::to_field(&date_millis.name, &date_millis.data_type).unwrap();
+        let argument = Arc::new(Date64Array::from(vec![0, -1]));
+        let record = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![physical])), vec![argument]).unwrap();
+        execution.parameters = Arc::new(BoundParameters::from_arrow(
+            OwnedBatch::new(record, memory).unwrap(), 1, vec![date_millis.data_type.clone()], memory,
+        ).unwrap());
+        let parameter = Expr::Parameter { index: 0, data_type: date_millis.data_type };
+        let bound = call("extract", vec![Expr::Literal(Value::Utf8("YEAR".into())), parameter]);
+        assert_parity(execution, Schema::default(), dataset(vec![], 2), vec![bound], vec![ScalarType::I32]).await;
+    }
+
+    #[tokio::test]
+    async fn extract_keeps_observed_nulls_and_reports_reached_calendar_errors() {
+        let zone = "+05:30";
+        let ts = field(0, TimeUnit::Second, Some(zone));
+        let schema = Schema::new(vec![ts.clone()]).unwrap();
+        let expression = call("extract", vec![Expr::Literal(Value::Utf8("YEAR".into())), ts.expression()]);
+        let batch = dataset(vec![arrow(TimestampSecondArray::from(vec![None]).with_timezone(zone), &ts)], 1);
+        let mut nulls = cursor(execution("UTC"), schema.clone(), batch, vec![expression.clone()]);
+        let page = nulls.next_batch().await.unwrap().unwrap();
+        assert!(matches!(&page.columns[0], Column::Arrow { array, .. } if array.data_type() == &arrow_schema::DataType::Null));
+        assert_eq!(nulls.scalar_fallbacks, Some(0));
+
+        for ticks in [[i64::MAX, i64::MIN], [i64::MIN, i64::MAX]] {
+            let first = timestamp(ticks[0], TimeUnit::Second, Some(zone));
+            let expected = rtdb_expr::evaluate_projection(&expression, &schema, &[first], &Default::default()).unwrap_err();
+            let batch = dataset(vec![arrow(TimestampSecondArray::from(vec![None, Some(ticks[0]), Some(ticks[1])])
+                .with_timezone(zone), &ts)], 3);
+            let mut reached = cursor(execution("UTC"), schema.clone(), batch, vec![expression.clone()]);
+            let error = reached.next_batch().await.err().unwrap();
+            assert_eq!(error.code, expected.code);
+            assert_eq!(error.message, expected.message);
+            assert_eq!(reached.scalar_fallbacks, Some(0));
+        }
+
+        let invalid_zone = "Not/A_Zone";
+        let ts = field(0, TimeUnit::Second, Some(invalid_zone));
+        let schema = Schema::new(vec![ts.clone()]).unwrap();
+        let expression = call("extract", vec![Expr::Literal(Value::Utf8("YEAR".into())), ts.expression()]);
+        for ticks in [None, Some(0)] {
+            let batch = dataset(vec![arrow(TimestampSecondArray::from(vec![ticks]).with_timezone(invalid_zone), &ts)], 1);
+            let mut reached = cursor(execution("UTC"), schema.clone(), batch, vec![expression.clone()]);
+            let result = reached.next_batch().await;
+            if ticks.is_none() {
+                assert_eq!(result.unwrap().unwrap().columns[0].value(0).unwrap(), Value::Null);
+            } else {
+                assert_eq!(result.err().unwrap().code, "xtdb/invalid-timezone");
+            }
+        }
     }
 
     #[tokio::test]

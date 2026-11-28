@@ -134,8 +134,8 @@ fn clock_field(field: F,seconds: i64) -> Result<i64> {
     match field { F::Hour => Ok(seconds / 3600),F::Minute => Ok((seconds / 60) % 60),F::Second => Ok(seconds % 60),_ => Err(inapplicable("extract",&[])) }
 }
 fn extract(field: F,value: &Value) -> Result<Value> {
-    let result = if let Some(day) = value.date_days() { date_field(field,CivilDate::from_epoch_day(day)?)? }
-    else if let Some(interval) = IntervalParts::of(value) {
+    if let Some(day) = value.date_days() { return extract_date(field, day).map(Value::I32); }
+    let result = if let Some(interval) = IntervalParts::of(value) {
         match field { F::Year => i64::from(interval.months / 12), F::Month => i64::from(interval.months % 12), F::Day => i64::from(interval.days), _ => clock_field(field,interval.nanos.div_euclid(1_000_000_000))? }
     } else {
         match value {
@@ -144,13 +144,24 @@ fn extract(field: F,value: &Value) -> Result<Value> {
                 if !(0..86_400_000_000_000).contains(&nanos) { return Err(inapplicable("extract",&[])); }
                 clock_field(field,nanos / 1_000_000_000)?
             }
-            Value::Timestamp { value,unit,timezone } => timestamp_field(field,*value,*unit,timezone.as_deref().map(ZoneId::parse).transpose()?)?,
+            Value::Timestamp { value,unit,timezone } => return extract_timestamp(field, *value, *unit, timezone.as_deref().map(ZoneId::parse).transpose()?).map(Value::I32),
             _ => return Err(inapplicable("extract",&[value])),
         }
     };
     Ok(Value::I32(extracted(result)?))
 }
 fn extracted(result: i64) -> Result<i32> { i32::try_from(result).map_err(|_|overflow()) }
+
+/// Extracts an applicable field from an epoch day with the scalar result width.
+pub fn extract_date(field: F, days: i64) -> Result<i32> {
+    date_field(field, CivilDate::from_epoch_day(days)?).and_then(extracted)
+}
+
+/// Extracts an applicable field from a timestamp's original ticks and parsed zone.
+pub fn extract_timestamp(field: F, ticks: i64, unit: U, zone: Option<ZoneId>) -> Result<i32> {
+    timestamp_field(field, ticks, unit, zone).and_then(extracted)
+}
+
 /// A timestamp's field under its zone label's rules, `zone` being the parsed label of a zoned timestamp.
 fn timestamp_field(field: F,value: i64,unit: U,zone: Option<ZoneId>) -> Result<i64> {
     let seconds = value.div_euclid(unit.units_per_second());
@@ -176,7 +187,7 @@ pub(crate) fn extract_timestamps(field: &str,values: &arrow_array::TimestampMicr
     let mut cells = Vec::with_capacity(values.len());
     for row in 0..values.len() {
         let read = !values.is_null(row) && selection.is_none_or(|rows| rows[row]);
-        cells.push(if read { Some(timestamp_field(field,values.value(row),U::Microsecond,zone).and_then(extracted)?) } else { None });
+        cells.push(if read { Some(extract_timestamp(field,values.value(row),U::Microsecond,zone)?) } else { None });
     }
     Ok(Some(arrow_array::Int32Array::from(cells)))
 }

@@ -2721,6 +2721,7 @@ surface QueryAccess {
         -- The period projection evaluates explicit endpoint expressions in scalar order before converting their results to the period's endpoint unit.
         -- A null endpoint denotes the corresponding infinity in that projection.
         -- An inverted or empty period fails with the period constructor's validation error.
+        -- EXTRACT with a literal field can read compatible Arrow dates and timestamps and write observed integer results using the scalar calendar, stored timestamp zone, and reached error order.
         -- A DATE_TRUNC projection with a literal field and compatible date or timestamp input can write Arrow cells in the input unit and retain the timestamp's zone label.
         -- DATE_TRUNC over an exact interval cell preserves its layout and truncates signed month, day and time components toward zero.
         -- DATE_BIN and RANGE_BINS can consume the components of a compatible truncated interval without materializing an intermediate column.

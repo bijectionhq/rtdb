@@ -14,7 +14,7 @@ pub type Selection<'a> = Option<&'a [bool]>;
 
 fn reads(selection: Selection<'_>, row: usize) -> bool { selection.is_none_or(|rows| rows[row]) }
 
-pub use crate::temporal_functions::{AgeOperand, DateBin, DateBinInput, timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_timestamp};
+pub use crate::temporal_functions::{AgeOperand, DateBin, DateBinInput, extract_date, extract_timestamp, timestamp_truncation_zone, truncate_date32, truncate_date64, truncate_timestamp};
 
 /// Truncates signed interval components in months, days and nanoseconds.
 pub fn truncate_interval(field: rtdb_plan::TemporalField, months: i32, days: i32, nanos: i64) -> Result<(i32, i32, i64)> {
