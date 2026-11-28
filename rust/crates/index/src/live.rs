@@ -133,6 +133,11 @@ impl IndexBatch {
     pub fn inferred_event_put_types(events: &[StoredEvent]) -> Option<StructFields<LogicalType>> {
         event_column_types(events)
     }
+    /// Infers the put layout from exact document types in event order, with one entry per put.
+    /// The caller funds schema inference scratch.
+    pub fn inferred_document_put_types(documents: &[StructFields<LogicalType>]) -> Option<StructFields<LogicalType>> {
+        row_column_types(documents)
+    }
     fn build_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let mut schema_bytes = 4096usize;
         for (name, ty) in declared {

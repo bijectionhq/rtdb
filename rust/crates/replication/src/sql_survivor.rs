@@ -3,6 +3,7 @@
 mod selection;
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     io::{self, Cursor, Write},
     sync::Arc,
@@ -15,7 +16,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field};
 use rtdb_format::{
     block::proto as pb,
     catalog::{BlockCatalog, TableEntry, publication_digest},
-    data::{EventBatch, StoredEvent, StoredOperation, owned_event_batch},
+    data::{EncodedEvent, EventBatch, EventRef, PutColumn, StoredEvent, StoredOperation, owned_event_batch},
     ipc::{ArrowFile, ArrowFileEncoder, inspect_file_reserved},
     keys::{TrieKey, block_key},
     metadata::MetadataBuilder,
@@ -25,7 +26,7 @@ use rtdb_storage::{IoRegion, MemoryStore, ObjectKey, ObjectStore, ReadReservatio
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{
     Anomaly, AnomalyCategory, AnomalyKind, BlockIndex, CatalogCut, EventHeader, EventOp, EventOrigin,
-    EventPosition, Iid, LogicalType, Result, SourcePosition, StructFields, Value,
+    EventPosition, Iid, LogicalType, Result, SourcePosition, StructFields, Timestamp, Value,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -278,6 +279,39 @@ enum SurvivorPayload {
     Scalar(StoredEvent),
 }
 
+enum SurvivorEvent<'a> {
+    Position(EventRef<'a>),
+    Scalar(&'a StoredEvent),
+}
+
+impl SurvivorEvent<'_> {
+    fn event(&self) -> &dyn EncodedEvent {
+        match self {
+            Self::Position(event) => event,
+            Self::Scalar(event) => *event,
+        }
+    }
+}
+
+impl EncodedEvent for SurvivorEvent<'_> {
+    fn header(&self) -> EventHeader { self.event().header() }
+    fn recency(&self) -> Option<Timestamp> { None }
+    fn origin(&self) -> Option<EventOrigin> { self.event().origin() }
+    fn entity_key(&self) -> Option<&[u8]> { self.event().entity_key() }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool { self.event().put_within(fields) }
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<Cow<'_, Value>> { self.event().put_cell(name, ty) }
+
+    fn put_column(&self, name: &str) -> Option<PutColumn<'_>> {
+        match self {
+            Self::Position(event) => event.put_column(name),
+            Self::Scalar(event) => match &event.operation {
+                StoredOperation::Put(document) if !document.contains_key(name) => Some(PutColumn::Absent),
+                _ => None,
+            },
+        }
+    }
+}
+
 struct SurvivorPage {
     batch: EventBatch,
     _disk: Option<(Arc<MemoryReservation>, Arc<MemoryReservation>)>,
@@ -368,18 +402,19 @@ impl Events<'_> {
             while ordered.peek().is_some_and(|(following, _)| following.transaction == position.transaction) {
                 rows.push(ordered.next().expect("peeked row").1);
             }
-            let batch = match copy_positions(rows.iter(), self.memory)? {
+            let positioned = match copy_positions(rows.iter(), self.memory)? {
+                Some(batch) => Some(batch),
+                None => copy_mixed_positions(&rows, self.memory)?,
+            };
+            let batch = match positioned {
                 Some(batch) => batch,
                 None => {
                     let mut events = Vec::with_capacity(rows.len());
                     let mut reservations = Vec::with_capacity(rows.len());
                     for row in rows {
-                        let (event, reservation) = match row.payload {
-                            SurvivorPayload::Scalar(event) => (event, row.reservation),
-                            SurvivorPayload::Position(page, row) => normalized_event(&page.batch, row, self.memory)?,
-                        };
+                        let SurvivorPayload::Scalar(event) = row.payload else { unreachable!("No positioned survivors"); };
                         events.push(event);
-                        reservations.push(reservation);
+                        reservations.push(row.reservation);
                     }
                     IndexBatch::copy_events(&events, declarations, self.memory)?
                 }
@@ -456,6 +491,43 @@ fn copy_positions<'a>(
     let events = rows.map(|row| {
         let SurvivorPayload::Position(page, index) = &row.payload else { unreachable!("admitted position"); };
         Ok(page.batch.borrow_event(*index)?.without_recency())
+    }).collect::<Result<Vec<_>>>()?;
+    let batch = owned_event_batch(&events, fields, true, memory)?;
+    IndexBatch::from_owned(batch).map(Some)
+}
+
+fn copy_mixed_positions(rows: &[SurvivorRow], memory: &Arc<MemoryBudget>) -> Result<Option<Arc<IndexBatch>>> {
+    if !rows.iter().any(|row| matches!(&row.payload, SurvivorPayload::Position(..))) {
+        return Ok(None);
+    }
+    let overflow = || invalid("Survivor schema exceeds addressable memory");
+    let base = rows.len().checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let bound = rows.iter().filter(|row| row.header.op == EventOp::Put).try_fold(base, |bytes, row| {
+        match &row.payload {
+            SurvivorPayload::Position(page, _) => page.batch.put_document()?.expect("admitted put").fields().iter()
+                .try_fold(bytes, |bytes, field| field.size().checked_mul(8)
+                    .and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)),
+            SurvivorPayload::Scalar(event) => {
+                let StoredOperation::Put(document) = &event.operation else { unreachable!("Put header"); };
+                Value::document_retained_bytes(document)?.checked_mul(4)
+                    .and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+            }
+        }
+    })?;
+    let _schema = memory.reserve(bound)?;
+    let documents = rows.iter().filter(|row| row.header.op == EventOp::Put).map(|row| {
+        match &row.payload {
+            SurvivorPayload::Position(page, _) => positioned_fields(page.batch.put_document()?.expect("admitted put")),
+            SurvivorPayload::Scalar(event) => {
+                let StoredOperation::Put(document) = &event.operation else { unreachable!("Put header"); };
+                Ok(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect())
+            }
+        }
+    }).collect::<Result<Vec<_>>>()?;
+    let fields = IndexBatch::inferred_document_put_types(&documents);
+    let events = rows.iter().map(|row| match &row.payload {
+        SurvivorPayload::Position(page, index) => Ok(SurvivorEvent::Position(page.batch.borrow_event(*index)?)),
+        SurvivorPayload::Scalar(event) => Ok(SurvivorEvent::Scalar(event)),
     }).collect::<Result<Vec<_>>>()?;
     let batch = owned_event_batch(&events, fields, true, memory)?;
     IndexBatch::from_owned(batch).map(Some)
@@ -931,6 +1003,101 @@ mod tests {
         assert_eq!(outputs[0], outputs[1]);
         drop(outputs);
         assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_survivors_match_scalar_bytes_across_put_shapes() -> Result<()> {
+        use rtdb_format::ipc::write_stream;
+
+        let memory = MemoryBudget::new(16 << 20);
+        let declarations = StructFields::new();
+        let position = |ordinal| EventPosition { transaction: TxId(10), ordinal };
+        let put = |ordinal, document| StoredEvent {
+            position: Some(position(ordinal)), origin: Some(EventOrigin([ordinal as u8; EventOrigin::WIDTH as usize])),
+            entity_key: None, iid: Iid([5; 16]), system_from: Timestamp(10), commit_position: 0,
+            valid_time: Interval::ALL, recency: Some(Timestamp(100)), operation: StoredOperation::Put(document),
+        };
+        let key = Value::Struct(StructFields::from([
+            ("name".into(), Value::Utf8("key".into())), ("null_key_field".into(), Value::Null),
+        ]));
+        let map = Value::Map { sorted: false, entries: vec![(key.clone(), Value::Struct(StructFields::from([
+            ("kept".into(), Value::I64(7)), ("null_value_field".into(), Value::Null),
+            ("missing_value_field".into(), Value::Undefined),
+        ])))] };
+        let first = IndexBatch::copy_events(&[put(1, StructFields::from([
+            ("text".into(), Value::Utf8("first".into())),
+            ("nested".into(), Value::Struct(StructFields::from([("z".into(), Value::I64(10))]))),
+        ]))], &declarations, &memory)?;
+        let second = IndexBatch::copy_events(&[put(2, StructFields::from([
+            ("map".into(), map), ("text".into(), Value::Utf8("second".into())),
+            ("nested".into(), Value::Struct(StructFields::from([
+                ("a".into(), Value::Bool(true)), ("padding".into(), Value::Null),
+            ]))),
+        ]))], &declarations, &memory)?;
+        let third = IndexBatch::copy_events(&[put(3, StructFields::from([
+            ("nested".into(), Value::Struct(StructFields::from([
+                ("a".into(), Value::Bool(false)), ("z".into(), Value::I64(20)),
+            ]))),
+            ("other".into(), Value::Binary(vec![0x42, 0])),
+        ]))], &declarations, &memory)?;
+        let mut used_positions = false;
+        let mut events = Events { memory: &memory, rows: BTreeMap::new(), targets: &BTreeMap::new(),
+            inherited_erasure: None, positions: true, used_positions: &mut used_positions };
+        for page in [&third, &second, &first, &first] {
+            events.add(page.view(), None)?;
+        }
+        let rows = events.rows.into_values().collect::<Vec<_>>();
+        assert!(used_positions);
+        assert!(matches!(&rows[0].payload, SurvivorPayload::Position(..)));
+        let SurvivorPayload::Scalar(normalized) = &rows[1].payload else { panic!("Expected a normalized put"); };
+        let StoredOperation::Put(document) = &normalized.operation else { panic!("Expected a put"); };
+        assert_eq!(document["map"], Value::Map { sorted: false, entries: vec![(key, Value::Struct(
+            StructFields::from([("kept".into(), Value::I64(7))]),
+        ))] });
+        assert!(matches!(&rows[2].payload, SurvivorPayload::Position(..)));
+        assert!(copy_positions(rows.iter(), &memory)?.is_none());
+
+        let expected_events = [&first, &second, &third].into_iter()
+            .map(|page| normalized_event(page.view(), 0, &memory)).collect::<Result<Vec<_>>>()?;
+        let expected_rows = expected_events.iter().map(|(event, _)| event.clone()).collect::<Vec<_>>();
+        let expected = IndexBatch::copy_events(&expected_rows, &declarations, &memory)?;
+        let actual = copy_mixed_positions(&rows, &memory)?.expect("Mixed transaction keeps positions");
+        let encode = |batch: &IndexBatch| write_stream(batch.arrow().schema_ref(), std::slice::from_ref(batch.arrow()));
+        assert_eq!(encode(&actual)?, encode(&expected)?);
+        assert_eq!(actual.put_types().keys().map(String::as_str).collect::<Vec<_>>(), ["text", "nested", "map", "other"]);
+        assert_eq!((0..actual.len()).map(|row| actual.header(row).unwrap().position.unwrap()).collect::<Vec<_>>(),
+            [position(1), position(2), position(3)]);
+
+        let constrained = MemoryBudget::new(4095);
+        let error = copy_mixed_positions(&rows, &constrained).err().expect("Schema scratch must be funded");
+        assert!(error.is(AnomalyKind::ResourceExhausted));
+        assert_eq!(constrained.used_bytes(), 0);
+
+        let entry = TableEntry::new(1, TableRef::new("public", "orders"))?;
+        let block = BlockIndex(2);
+        let trie = TrieKey::l0(block)?;
+        let cancellation = CancellationToken::new();
+        let key = ObjectKey::new(entry.slug.data_key(&trie))?;
+        let metadata = ObjectKey::new(entry.slug.metadata_key(&trie))?;
+        for input in [&[&third, &second, &first, &first][..], &[&third, &first][..]] {
+            let mut checkpoints = Vec::new();
+            for positions in [true, false] {
+                let mut used_positions = false;
+                let mut events = Events { memory: &memory, rows: BTreeMap::new(), targets: &BTreeMap::new(),
+                    inherited_erasure: None, positions, used_positions: &mut used_positions };
+                for page in input {
+                    events.add(page.view(), None)?;
+                }
+                let live = events.into_live(&entry, block, &declarations, &cancellation)?;
+                assert_eq!(used_positions, positions);
+                let store = MemoryStore::default();
+                let mut output = Candidate { store: &store, memory: &memory, remaining: 16 << 20 };
+                output.write_trie(&entry, &trie, &live, &cancellation).await?.unwrap();
+                checkpoints.push((store.get(&key).await?, store.get(&metadata).await?, live.block_metadata()?.0));
+            }
+            assert_eq!(checkpoints[0], checkpoints[1]);
+        }
         Ok(())
     }
 

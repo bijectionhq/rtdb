@@ -30,6 +30,7 @@
 -- Surviving occurrences of one original event position must agree after clearing recency and removing null and absent struct fields, including inside sequences and map values.
 -- The rebuild writes one event at each surviving original position in transaction and ordinal order, keeping the stored IID.
 -- A document with all fields present and compatible plain leaves can supply its survivor by Arrow position under a retained page reservation.
+-- One transaction can combine these positions with individually normalized documents in its original event order.
 -- Its output retains numeric types, temporal units and zones, byte cells and nested field order, with the same inferred types as the normalized document.
 -- Recovery accepts the rewrite only when the authenticated checkpoint contains that same receipt installation.
 -- An authenticated inventory binds prior checkpoint and replay objects to the exact replacement.
