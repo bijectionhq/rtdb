@@ -1,7 +1,8 @@
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, Int32Array, MapArray, NullArray, TimestampMicrosecondArray, UnionArray,
-    builder::PrimitiveBuilder, cast::AsArray, make_array, types::{ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type}};
+    builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, PrimitiveBuilder, StringBuilder},
+    cast::AsArray, make_array, types::{ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_data::{ArrayData, transform::MutableArrayData};
 use arrow_schema::{DataType, Field, UnionMode};
@@ -215,6 +216,102 @@ fn build_primitive<T: ArrowPrimitiveType, E: EncodedEvent>(events: &[&E], target
         }
     }
     Arc::new(output.finish())
+}
+
+fn plain_cells<'a, E: EncodedEvent, T: 'a>(
+    events: &'a [&'a E], target: &'a Field, logical: &'a LogicalType,
+    stored: impl Fn(&'a dyn Array, usize) -> T + 'a,
+    scalar: impl Fn(&'a Value) -> Option<T> + 'a,
+) -> impl Iterator<Item = Option<Option<T>>> + 'a {
+    events.iter().map(move |&event| {
+        match event.put_column(target.name()) {
+            Some(PutColumn::Stored(field, array, row)) if field.metadata().is_empty()
+                && field.data_type() == target.data_type() && array.data_type() == target.data_type()
+                && row < array.len() => {
+                    if array.is_valid(row) { Some(Some(stored(array, row))) }
+                    else { target.is_nullable().then_some(None) }
+                }
+            Some(PutColumn::Absent) => target.is_nullable().then_some(None),
+            None => match event.put_cell(target.name(), logical).ok()? {
+                Cow::Borrowed(Value::Null) => target.is_nullable().then_some(None),
+                Cow::Borrowed(value) => scalar(value).map(Some),
+                Cow::Owned(_) => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+pub(super) fn plain_leaf_column<E: EncodedEvent>(
+    events: &[&E], target: &Field, logical: &LogicalType, builder: &mut BatchBuilder,
+) -> Result<Option<ArrayRef>> {
+    let ty = target.data_type();
+    if !target.metadata().is_empty() || !matches!(ty, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(1..))
+        || !events.iter().any(|event| matches!(event.put_column(target.name()), Some(PutColumn::Stored(..))))
+    {
+        return Ok(None);
+    }
+    let rows = events.len();
+    let bound = |width, payload| rows.checked_mul(width).and_then(|bytes| bytes.checked_add(payload))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size);
+    macro_rules! variable_width {
+        ($builder:ty, $stored:expr, $scalar:expr) => {{
+            let cells = || plain_cells(events, target, logical, $stored, $scalar);
+            let Some(payload) = cells().try_fold(0usize, |bytes, cell| {
+                bytes.checked_add(cell?.map_or(0, |value| value.len()))
+            }) else { return Ok(None); };
+            if i32::try_from(payload).is_err() { return Ok(None); }
+            builder.try_funded_column(bound(5, payload)?, || {
+                let mut output = <$builder>::with_capacity(rows, payload);
+                for cell in cells() {
+                    output.append_option(cell.expect("Admitted plain byte cell"));
+                }
+                Ok(Some(Arc::new(output.finish())))
+            })?
+        }};
+    }
+    let column = match ty {
+        DataType::Utf8 => variable_width!(StringBuilder, |array, row| array.as_string::<i32>().value(row), |value| {
+            if let Value::Utf8(text) = value { Some(text.as_str()) } else { None }
+        }),
+        DataType::Binary => variable_width!(BinaryBuilder, |array, row| array.as_binary::<i32>().value(row), |value| {
+            if let Value::Binary(bytes) = value { Some(bytes.as_slice()) } else { None }
+        }),
+        DataType::Boolean => {
+            let cells = || plain_cells(events, target, logical, |array, row| array.as_boolean().value(row), |value| {
+                if let Value::Bool(value) = value { Some(*value) } else { None }
+            });
+            if !cells().all(|cell| cell.is_some()) { return Ok(None); }
+            builder.try_funded_column(bound(2, 0)?, || {
+                let mut output = BooleanBuilder::with_capacity(rows);
+                for cell in cells() { output.append_option(cell.expect("Admitted plain Boolean cell")); }
+                Ok(Some(Arc::new(output.finish())))
+            })?
+        }
+        DataType::FixedSizeBinary(width) => {
+            let cells = || plain_cells(events, target, logical, |array, row| array.as_fixed_size_binary().value(row), |value| {
+                if let Value::FixedSizeBinary(bytes) = value && bytes.len() == *width as usize {
+                    Some(bytes.as_slice())
+                } else { None }
+            });
+            if !cells().all(|cell| cell.is_some()) { return Ok(None); }
+            builder.try_funded_column(bound(*width as usize + 1, 0)?, || {
+                let mut output = FixedSizeBinaryBuilder::with_capacity(rows, *width);
+                for cell in cells() {
+                    match cell.expect("Admitted plain fixed-width byte cell") {
+                        Some(value) => output.append_value(value).map_err(rtdb_columnar::arrow_error)?,
+                        None => output.append_null(),
+                    }
+                }
+                Ok(Some(Arc::new(output.finish())))
+            })?
+        }
+        _ => unreachable!("Admitted plain leaf type"),
+    };
+    match column {
+        FundedColumn::Built(column) => Ok(column),
+        FundedColumn::Unfunded => Ok(None),
+    }
 }
 
 fn has_packed_null_payload(item: &Field, values: &dyn Array, start: usize, end: usize) -> bool {
@@ -1098,6 +1195,89 @@ mod tests {
     }
 
     #[test]
+    fn plain_leaf_output_keeps_scalar_ipc_when_selection_scratch_is_unfunded() {
+        let cases = [
+            (ScalarType::Bool, [Value::Bool(true), Value::Null, Value::Bool(false)]),
+            (ScalarType::Utf8, [Value::Utf8("élan".into()), Value::Null, Value::Utf8(String::new())]),
+            (ScalarType::Binary, [Value::Binary(vec![0xff, 0, 1]), Value::Null, Value::Binary(Vec::new())]),
+            (ScalarType::FixedSizeBinary(3), [Value::FixedSizeBinary(vec![0xff, 0, 1]), Value::Null, Value::FixedSizeBinary(vec![1, 0, 0])]),
+        ];
+        for (scalar, input) in cases {
+            let ty = LogicalType::Scalar(scalar).maybe();
+            let fields = StructFields::from([("v".into(), ty.clone())]);
+            let field = to_field("v", &ty).unwrap();
+            let array = copy_array(&ty, &input).unwrap();
+            let picks = (0..512).map(|row| [Some(2), None, Some(0), Some(1)][row % 4]).collect::<Vec<_>>();
+            let events = picks.iter().map(|&row| ArrowOnly(match row {
+                Some(row) => PutColumn::Stored(&field, array.as_ref(), row),
+                None => PutColumn::Absent,
+            })).collect::<Vec<_>>();
+            let values = picks.into_iter().map(|row| row.map_or(Value::Null, |row| input[row].clone())).collect();
+            let expected = copy_event_batch_with_recency(&stored(values), Some(fields.clone()), None, false).unwrap();
+            let baseline = MemoryBudget::new(8 << 20);
+            let (base, _) = super::super::event_builder(events.len(), Some(&fields), &baseline).unwrap();
+            let memory = MemoryBudget::new(baseline.used_bytes() + (32 << 10));
+            drop(base);
+            let (mut builder, _) = super::super::event_builder(events.len(), Some(&fields), &memory).unwrap();
+            let refs = events.iter().collect::<Vec<_>>();
+            assert!(super::super::columns::gather_column(&refs, &field, &ty, Some(&mut builder)).unwrap().is_none());
+            assert!(builder.try_reserve_scratch(events.len() * 128).is_none());
+            drop(builder);
+
+            let actual = copy_compaction_batch(&events, Some(fields), None, false, false, &memory).unwrap();
+            assert_eq!(write_stream(expected.schema_ref(), std::slice::from_ref(&expected)).unwrap(),
+                write_stream(actual.batch().schema_ref(), std::slice::from_ref(actual.batch())).unwrap());
+            let retained = actual.batch().clone();
+            drop(actual);
+            assert!(memory.used_bytes() > 0);
+            drop(retained);
+            assert_eq!(memory.used_bytes(), 0);
+
+            let small = MemoryBudget::new(4095);
+            let mut builder = BatchBuilder::new(0, &small).unwrap();
+            assert!(plain_leaf_column(&refs, &field, &ty, &mut builder).unwrap().is_none());
+            assert_eq!(small.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn mixed_plain_text_output_keeps_positioned_and_normalized_cells() {
+        struct Mixed<'a>(&'a Value, Option<PutColumn<'a>>);
+
+        impl EncodedEvent for Mixed<'_> {
+            fn header(&self) -> EventHeader { ArrowOnly(PutColumn::Absent).header() }
+            fn recency(&self) -> Option<Timestamp> { None }
+            fn put_within(&self, _: &StructFields<LogicalType>) -> bool { true }
+            fn put_cell(&self, _: &str, _: &LogicalType) -> Result<Cow<'_, Value>> {
+                assert!(self.1.is_none(), "Positioned cells must stay in Arrow");
+                Ok(Cow::Borrowed(self.0))
+            }
+            fn put_column(&self, _: &str) -> Option<PutColumn<'_>> {
+                self.1.as_ref().map(|column| match *column {
+                    PutColumn::Absent => PutColumn::Absent,
+                    PutColumn::Stored(field, array, row) => PutColumn::Stored(field, array, row),
+                })
+            }
+        }
+
+        let ty = LogicalType::Scalar(ScalarType::Utf8);
+        let fields = StructFields::from([("v".into(), ty.clone())]);
+        let field = to_field("v", &ty).unwrap();
+        let text = arrow_array::StringArray::from(vec!["first"]);
+        let normalized = Value::Utf8("second".into());
+        let pick = || Mixed(&Value::Null, Some(PutColumn::Stored(&field, &text, 0)));
+        let events = [pick(), Mixed(&normalized, None), pick()];
+        let expected = copy_event_batch_with_recency(&stored(vec![Value::Utf8("first".into()), normalized.clone(),
+            Value::Utf8("first".into())]), Some(fields.clone()), None, false).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let actual = copy_compaction_batch(&events, Some(fields), None, false, false, &memory).unwrap();
+        assert_eq!(write_stream(expected.schema_ref(), std::slice::from_ref(&expected)).unwrap(),
+            write_stream(actual.batch().schema_ref(), std::slice::from_ref(actual.batch())).unwrap());
+        let mut builder = BatchBuilder::new(0, &memory).unwrap();
+        assert!(plain_leaf_column(&[&pick(), &Mixed(&Value::I64(2), None)], &field, &ty, &mut builder).unwrap().is_none());
+    }
+
+    #[test]
     fn native_selection_defers_scalar_sizing_for_a_bounded_layout() {
         let ty = LogicalType::list(LogicalType::Scalar(ScalarType::I64));
         let field = to_field("v", &ty).unwrap();
@@ -1164,7 +1344,8 @@ mod tests {
             ArrowOnly(PutColumn::Stored(&bottom, &nulls, 0)),
         ];
         let memory = MemoryBudget::new(1 << 20);
-        for target in [integer.clone(), LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(integer) }] {
+        for target in [integer.clone(), LogicalType::Scalar(ScalarType::Utf8),
+            LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(integer) }] {
             let fields = StructFields::from([("v".into(), target)]);
             let error = copy_compaction_batch(&events, Some(fields), None, false, false, &memory).unwrap_err();
             assert_eq!(error.code, "xtdb/zero-leg-read");

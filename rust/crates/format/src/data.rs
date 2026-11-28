@@ -1361,6 +1361,13 @@ fn put_columns<E: EncodedEvent>(
             columns.push(column);
             continue;
         }
+        if copy && let Some(builder) = builder.as_deref_mut()
+            && let Some(column) = selected::plain_leaf_column(documents, &field, &ty, builder)?
+        {
+            schema.push(field);
+            columns.push(column);
+            continue;
+        }
         let _scratch = builder.as_deref().map(|builder| {
             let bytes = read_bytes.map_or_else(read_size, Ok)?;
             builder.reserve_scratch(bytes)

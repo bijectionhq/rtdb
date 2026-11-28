@@ -158,6 +158,7 @@ config {
 -- A single aligned selection can supply a complete output column when it has the recorded offsets and padding.
 -- If the budget cannot fund whole-layout alignment, compaction can gather admitted nested cells and union legs directly from their selected positions.
 -- A selected plain numeric or temporal column with the exact output type can use a reservation for the typed output buffers when a selection plan is too large.
+-- Selected plain Boolean, UTF-8 and variable- or fixed-width binary columns with the exact output type can use the same bounded approach, preserving values and null slots.
 -- Bloom metadata sets each distinct position derived from a page's cells before serializing the bitmap.
 -- Similarly to the scan operator, we calculate a list of merge tasks.
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.
