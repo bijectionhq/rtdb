@@ -425,6 +425,17 @@ fn project<'a>(
     project_with_context(rows, &execution.context, read)
 }
 
+pub(super) fn project_slices<'a>(
+    rows: usize,
+    context: &QueryContext,
+    read: impl Fn(usize) -> Option<Option<&'a str>>,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    match project_with_context(rows, context, |row| Some(read(row)?.map(Spans::Slice))) {
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
+        result => result,
+    }
+}
+
 fn project_with_context<'a>(
     rows: usize,
     context: &QueryContext,

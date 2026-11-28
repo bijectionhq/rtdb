@@ -11,6 +11,7 @@ pub(crate) mod functions;
 mod patch;
 pub(crate) mod periods;
 pub(crate) mod search;
+mod tagged_text;
 mod text;
 pub(crate) mod window;
 
@@ -5956,6 +5957,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyword_components_keep_empty_names_and_split_at_the_first_slash() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Keyword);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let names = [Some("solo"), Some("/"), Some("ns/名/more"), Some("ns/"), Some(":a/:b"), None];
+        let column = Column::Arrow {
+            array: Arc::new(StringArray::from_iter(names)),
+            field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+            logical: Some(input.data_type.clone()),
+        };
+        let batch = ColumnBatch::settled(vec![column], names.len(), memory.reserve(4096).unwrap()).unwrap();
+        let calls = ["namespace", "local_name"].map(|name| {
+            let args = vec![input.expression()];
+            Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args }
+        });
+        let mut cursor = record_projection_cursor(batch, schema, calls.to_vec(), &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        drop(cursor);
+        let expected = [
+            [None, Some(""), Some("ns"), Some("ns"), Some(":a"), None],
+            [Some("solo"), Some(""), Some("名/more"), Some(""), Some(":b"), None],
+        ];
+        for (index, expected) in expected.into_iter().enumerate() {
+            let Column::Arrow { array, field, .. } = &page.columns[index] else { panic!("Expected Arrow text"); };
+            assert!(field.is_nullable());
+            assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().iter().collect::<Vec<_>>(), expected);
+            assert!(page.column_reservation(index).bytes() >= array.get_array_memory_size());
+        }
+        drop(page);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn uri_scheme_and_host_keep_spelling_and_validate_in_selected_order() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Uri);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let uris = [Some("1bad:x"), Some("HtTp://EXAMPLE.com/a%2Fb"), Some("//[fe80::1%eth0]/"),
+            Some("urn:example"), Some("//reg_name/path"), Some("http://example.com/%"), None];
+        let batch = |picks: &[(usize, usize)]| {
+            let array = Arc::new(StringArray::from_iter(uris));
+            let field = Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap());
+            let selected = SelectedColumn::new(vec![Some((array, field, Some(input.data_type.clone()), None)), None], Arc::new(picks.to_vec()));
+            ColumnBatch::settled(vec![Column::Selected(selected)], picks.len(), memory.reserve(4096).unwrap()).unwrap()
+        };
+        let [scheme, host] = ["uri_scheme", "uri_host"].map(|name| {
+            let args = vec![input.expression()];
+            Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args }
+        });
+        let selected = batch(&[(0, 2), (0, 1), (0, 3), (0, 4), (1, 0), (0, 6)]);
+        let mut cursor = record_projection_cursor(selected, schema.clone(), vec![scheme.clone(), host.clone()], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        for (column, expected) in page.columns.iter().zip([
+            [None, Some("HtTp"), Some("urn"), None, None, None],
+            [Some("[fe80::1%eth0]"), Some("EXAMPLE.com"), None, None, None, None],
+        ]) {
+            let Column::Arrow { array, .. } = column else { panic!("Expected Arrow text"); };
+            assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().iter().collect::<Vec<_>>(), expected);
+        }
+        drop((page, cursor));
+
+        let mut cursor = record_projection_cursor(batch(&[(0, 4), (0, 6)]), schema.clone(), vec![scheme, host.clone()], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(page.columns.iter().all(|column| matches!(column, Column::Arrow { array, field, .. } if array.data_type() == &DataType::Null && field.is_nullable())));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        drop((page, cursor));
+
+        for [first, second] in [[5, 0], [0, 5]] {
+            let mut cursor = record_projection_cursor(batch(&[(0, 1), (0, first), (0, second)]), schema.clone(), vec![host.clone()], &memory);
+            let expected = rtdb_types::UriParts::parse(uris[first].unwrap()).unwrap_err();
+            let error = cursor.next_batch().await.err().unwrap();
+            assert_eq!(error.code, expected.code);
+            assert_eq!(error.message, expected.message);
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn native_text_projections_write_borrowed_spans_with_observed_nulls() {
         let memory = MemoryBudget::new(1 << 22);
         let schema = Schema::new(vec![
@@ -7779,6 +7863,11 @@ impl BatchCursor for BatchExpressions {
             }
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+            if let Some((column, owner)) = tagged_text::column(expression, invocation.data_type(), &self.schema, &batch, &self.execution)? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
             if let Some((column, owner)) = text::column(expression, invocation.data_type(), &self.schema, &batch, &self.execution)? {
                 columns.push(column);
                 owners[index] = Some(owner);

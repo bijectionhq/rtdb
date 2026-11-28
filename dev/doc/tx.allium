@@ -137,6 +137,8 @@
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
+-- Native NAMESPACE and LOCAL_NAME over canonical Arrow Keyword cells write the components at the first slash, preserving empty strings and returning null for an unqualified namespace.
+-- Native URI_SCHEME and URI_HOST over canonical Arrow URI cells validate each reached URI and preserve the raw spelling and absence of its component.
 -- Native Binary concatenation and OVERLAY can write reached byte spans directly into a funded Binary result.
 -- Binary TRIM with a Binary token uses its first octet and reports an empty token when both operands are present.
 -- Binary TRIM can read exact plain Arrow signed operands and checks the signed octet range when both operands are present.
