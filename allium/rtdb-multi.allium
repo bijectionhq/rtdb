@@ -1350,6 +1350,7 @@ contract PortableApplicationBackup {
         -- Closing staging upload admission drains every recorded upload before the custodian verifies that the abandoned candidate's object and wrapped-key prefixes are empty.
         -- The original object allocation orders a saved acquisition plan and closure before acquisition on the same immutable record.
         -- Pre-acquisition closure retires the destination journal and permanently fences the original generation before a late staging writer can recreate it.
+        -- Pre-acquisition journal retirement preserves the genesis of any existing immutable stream and tombstones an unused identity.
         -- Before replacing a recovery publication, the activation authority preserves the previous publication in an immutable record addressed by its predecessor binding.
         -- A retained publication identifies the original chosen recovery and settles the disposition of other candidates derived from the same predecessor.
         -- For an interrupted acquisition, the broker confirms the selected checkpoint with the custodian enrolled for the destination cell.

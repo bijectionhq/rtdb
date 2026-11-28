@@ -554,7 +554,7 @@ mod tests {
         let (journal_url, tls) = keeper_access(home.path(), "destination-writer", &keepers, &placement, PRINCIPAL);
         let (_, reader_tls) = keeper_access(home.path(), "destination-reader", &keepers, &placement, READER);
         let (_, custodian_tls) = keeper_access(home.path(), "destination-custodian", &keepers, &placement, CUSTODIAN);
-        let destination_keepers = RestartedKeepers::with_roles(&mut keepers, READER, Some(CUSTODIAN)).await;
+        let mut destination_keepers = RestartedKeepers::with_roles(&mut keepers, READER, Some(CUSTODIAN)).await;
         let reader = KeeperJournal::connect(&journal_url, &crate::cli::journal_credentials(&reader_tls).unwrap()).unwrap();
         let options = |database| MultiOptions {
             database, node: Ipv4Addr::LOCALHOST.into(), lease_micros: WRITER_LEASE_MICROS,
@@ -1033,9 +1033,7 @@ mod tests {
         assert!(custodian.retain(abandoned, retained).await.is_err());
         assert!(original_keys.require_recovery_key(plan.key_hold.unwrap()).await.is_err());
 
-        // The broad custody fixture exercises interrupted staging; the
-        // authenticated fixture goes straight to its selected proof.
-        let interrupted_stages = [&reader_tls, &tls].into_iter().filter(|_| !authenticated);
+        let interrupted_stages = [&reader_tls, &tls].into_iter().filter(|path| !authenticated || *path == &tls);
         for journal_tls in interrupted_stages {
             let operation = serving_intent.operation;
             let Status::Pending { candidate, .. } = activation.recovery_status(DATABASE, operation).await.unwrap()
@@ -1066,6 +1064,13 @@ mod tests {
             activation.begin_recovery(DATABASE, serving_intent, Some(operation.operation_id)).await.unwrap();
             assert!(discover(candidate, &empty_vault).await.is_err());
             assert!(!original_keys.generation_destroyed(order.key_hold.generation).await.unwrap());
+            if authenticated {
+                journal.require_authenticated(stream).await.unwrap();
+                destination_keepers.shutdown().await;
+                destination_keepers = RestartedKeepers::with_roles(&mut keepers, READER, Some(CUSTODIAN)).await;
+                let reopened = FileKms::open(&vault, || SystemClock.now().0).unwrap();
+                reopened.require_recovery_key(order.key_hold).await.unwrap();
+            }
             let retired = discover(candidate, &vault).await.unwrap();
             assert_eq!(retired["journal_retired"], true);
             assert_eq!(retired["generation_destroyed"], true);
@@ -1073,6 +1078,9 @@ mod tests {
             assert_eq!(discover(candidate, &vault).await.unwrap(), retired);
             assert!(matches!(journal.head(stream).await, Err(JournalError::Deleted)));
             assert!(journal.create_immutable(stream).await.is_err());
+            if authenticated {
+                assert!(journal.create_authenticated(stream).await.is_err());
+            }
             assert!(original_keys.create(order.key_hold.generation).await.is_err());
             assert!(inventory.is_empty(&ObjectKey::new(format!("db/{candidate}")).unwrap()).await.unwrap());
             assert!(inventory.is_empty(&ObjectKey::new(format!("~rtdb-v1/{}/keys", candidate.simple())).unwrap()).await.unwrap());
