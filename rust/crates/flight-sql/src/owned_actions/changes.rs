@@ -1,16 +1,17 @@
 use std::{mem::size_of, sync::Arc};
 
 use arrow_array::{
-    ArrayRef, UnionArray,
+    ArrayRef, BinaryArray, UnionArray,
     builder::{ArrayBuilder, BinaryBuilder, FixedSizeBinaryBuilder, Int64Builder, StringBuilder, UInt64Builder},
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field, FieldRef, Fields, UnionMode};
 use rtdb_columnar::{
     EntityIdRef, MemoryBudget, MemoryReservation, arrow_error, build_list_array, build_struct_array,
 };
 use rtdb_node::OwnedChangeCommit;
 use rtdb_types::{
-    Anomaly, Interval, LogicalType, OwnedChange, OwnedChangeGroup, OwnedChangeKind, ScalarType,
+    Anomaly, EntityId, Interval, LogicalType, OwnedChange, OwnedChangeGroup, OwnedChangeKind, ScalarType,
     StructFields, Timestamp, Value,
 };
 use tonic::Status;
@@ -45,25 +46,24 @@ pub(super) fn merged_type() -> LogicalType {
 }
 
 pub(super) fn touches_column(
-    memory: &Arc<MemoryBudget>, logical: &LogicalType, field: &Field, groups: &[OwnedChangeGroup],
+    memory: &Arc<MemoryBudget>, logical: &LogicalType, field: &Field, groups: Vec<OwnedChangeGroup>,
 ) -> Result<(ArrayRef, Arc<MemoryReservation>), Status> {
-    let groups = groups.iter().map(|group| group.touches.as_slice());
     let mut counts = TouchCounts::default();
     let mut bytes = schema_bytes(logical)?;
-    for touches in groups.clone() {
-        bytes = wire::add(bytes, counts.list_size(touches)?.bytes()?)?;
+    for group in &groups {
+        bytes = wire::add(bytes, counts.list_size(&group.touches)?.bytes()?)?;
     }
     let charge = memory.reserve(bytes).map_err(status)?;
-    Ok((build_touches(field, groups, counts)?, charge))
+    Ok((build_touches(field, groups.into_iter().map(|group| group.touches), counts)?, charge))
 }
 
 pub(super) fn merged_column(
-    memory: &Arc<MemoryBudget>, logical: &LogicalType, field: &Field, commits: &[OwnedChangeCommit],
+    memory: &Arc<MemoryBudget>, logical: &LogicalType, field: &Field, mut commits: Vec<OwnedChangeCommit>,
 ) -> Result<(ArrayRef, Arc<MemoryReservation>), Status> {
     let mut counts = TouchCounts::default();
     let mut bytes = schema_bytes(logical)?;
     let mut relations = 0;
-    for commit in commits {
+    for commit in &commits {
         let mut list = BuilderSize::cell();
         for change in &commit.changes {
             relations = wire::add(relations, 1)?;
@@ -79,7 +79,8 @@ pub(super) fn merged_column(
 
     let item = list_item(field)?;
     let fields = struct_fields(item)?;
-    let groups = commits.iter().flat_map(|commit| &commit.changes).map(|change| change.touches.as_slice());
+    let groups = commits.iter_mut().flat_map(|commit| &mut commit.changes)
+        .map(|change| std::mem::take(&mut change.touches));
     let touches = build_touches(&fields[2], groups, counts)?;
     let mut names = StringBuilder::with_capacity(relations, BYTE_ARRAY_DATA_CAPACITY);
     let mut sequences = UInt64Builder::with_capacity(relations);
@@ -97,8 +98,8 @@ pub(super) fn merged_column(
     Ok((changes, charge))
 }
 
-fn build_touches<'a>(
-    field: &Field, groups: impl IntoIterator<Item = &'a [OwnedChange]>, counts: TouchCounts,
+fn build_touches(
+    field: &Field, groups: impl IntoIterator<Item = Vec<OwnedChange>>, counts: TouchCounts,
 ) -> Result<ArrayRef, Status> {
     let item = list_item(field)?;
     let fields = struct_fields(item)?;
@@ -110,7 +111,9 @@ fn build_touches<'a>(
     let mut strings = StringBuilder::with_capacity(counts.text, BYTE_ARRAY_DATA_CAPACITY);
     let mut keywords = StringBuilder::with_capacity(counts.keyword, BYTE_ARRAY_DATA_CAPACITY);
     let mut uuids = FixedSizeBinaryBuilder::with_capacity(counts.uuid, 16);
-    let mut binaries = BinaryBuilder::with_capacity(counts.binary, BYTE_ARRAY_DATA_CAPACITY);
+    let new_binary_builder = || BinaryBuilder::with_capacity(counts.binary, BYTE_ARRAY_DATA_CAPACITY);
+    let mut binary_builder = None;
+    let mut moved_binary = None;
     let mut id_tags = Vec::<i8>::with_capacity(len);
     let mut id_offsets = Vec::with_capacity(len);
     let mut ops = StringBuilder::with_capacity(len, BYTE_ARRAY_DATA_CAPACITY);
@@ -122,32 +125,43 @@ fn build_touches<'a>(
     let mut offsets = vec![0i32];
     for touches in groups {
         for touch in touches {
+            let upper = valid_upper(&touch);
             // Tags follow the Changes schema, whose integer leg comes first.
-            let (tag, offset) = match EntityIdRef::from(&touch.id) {
-                EntityIdRef::Integer(value) => {
+            let (tag, offset) = match touch.id {
+                EntityId::Integer(value) => {
                     let offset = integers.len();
                     integers.append_value(value);
                     (0, offset)
                 }
-                EntityIdRef::String(value) => {
+                EntityId::String(value) => {
                     let offset = strings.len();
                     strings.append_value(value);
                     (1, offset)
                 }
-                EntityIdRef::Keyword(value) => {
+                EntityId::Keyword(value) => {
                     let offset = keywords.len();
-                    keywords.append_value(value);
+                    keywords.append_value(value.as_str());
                     (2, offset)
                 }
-                EntityIdRef::Uuid(value) => {
+                EntityId::Uuid(value) => {
                     let offset = uuids.len();
                     uuids.append_value(value).map_err(arrow_error).map_err(status)?;
                     (3, offset)
                 }
-                EntityIdRef::Binary(value) => {
-                    let offset = binaries.len();
-                    binaries.append_value(value);
-                    (4, offset)
+                EntityId::Binary(value) => {
+                    // IPC scratch is charged by allocation capacity.
+                    if counts.binary == 1 && value.capacity() == BYTE_ARRAY_DATA_CAPACITY {
+                        let end = value.len() as i32;
+                        moved_binary = Some(BinaryArray::try_new(
+                            OffsetBuffer::new(vec![0, end].into()), value.into(), None,
+                        ).map_err(arrow_error).map_err(status)?);
+                        (4, 0)
+                    } else {
+                        let builder = binary_builder.get_or_insert_with(&new_binary_builder);
+                        let offset = builder.len();
+                        builder.append_value(value);
+                        (4, offset)
+                    }
                 }
             };
             id_tags.push(tag);
@@ -157,16 +171,17 @@ fn build_touches<'a>(
             let (op, lifetime) = touch_operation(touch.kind);
             ops.append_value(op);
             valid_from.append_value(touch.valid.lower().0);
-            valid_to.append_option(valid_upper(touch));
+            valid_to.append_option(upper);
             created.append_option(lifetime.map(|period| period.lower().0));
             expiry.append_option(lifetime.map(|period| period.upper().0));
             ordinals.append_option(touch.assertion_ordinal.map(|ordinal| i64::from(ordinal.get())));
         }
         offsets.push(list_offset(id_tags.len())?);
     }
+    let binaries = moved_binary.unwrap_or_else(|| binary_builder.unwrap_or_else(new_binary_builder).finish());
     let id_children: Vec<ArrayRef> = vec![
         Arc::new(integers.finish()), Arc::new(strings.finish()),
-        Arc::new(keywords.finish()), Arc::new(uuids.finish()), Arc::new(binaries.finish()),
+        Arc::new(keywords.finish()), Arc::new(uuids.finish()), Arc::new(binaries),
     ];
     let ids = UnionArray::try_new(id_fields.clone(), id_tags.into(), Some(id_offsets.into()), id_children)
         .map_err(arrow_error).map_err(status)?;
@@ -329,11 +344,11 @@ mod tests {
     use super::*;
     use std::num::NonZeroU32;
 
-    use arrow_array::RecordBatch;
+    use arrow_array::{ListArray, RecordBatch, StructArray};
     use arrow_ipc::writer::IpcWriteOptions;
     use arrow_schema::Schema;
     use rtdb_node::OwnedRelationChanges;
-    use rtdb_types::{EntityId, Keyword, OwnedRelation, TransactionKey, TxId};
+    use rtdb_types::{Keyword, OwnedRelation, TransactionKey, TxId};
 
     use crate::actions::OwnedIpcReply;
 
@@ -353,6 +368,15 @@ mod tests {
 
     fn legacy_touches(touches: &[OwnedChange]) -> Value {
         Value::list(touches.iter().map(OwnedChange::to_value).collect())
+    }
+
+    fn list_items(list: &ArrayRef) -> &StructArray {
+        let list = list.as_any().downcast_ref::<ListArray>().unwrap();
+        list.values().as_any().downcast_ref().unwrap()
+    }
+
+    fn touch_ids(touches: &ArrayRef) -> &UnionArray {
+        list_items(touches).column(0).as_any().downcast_ref().unwrap()
     }
 
     fn assert_legacy_column(
@@ -390,7 +414,7 @@ mod tests {
 
     #[test]
     fn held_change_touches_keep_legacy_bytes_and_reservation() {
-        let groups = [
+        let groups = vec![
             OwnedChangeGroup { revision: 1, system_time: Timestamp(25), touches: touches() },
             OwnedChangeGroup { revision: 2, system_time: Timestamp(27), touches: vec![] },
         ];
@@ -398,11 +422,69 @@ mod tests {
         let field = rtdb_columnar::to_field("touches", &logical).unwrap();
         let values = groups.iter().map(|group| legacy_touches(&group.touches)).collect::<Vec<_>>();
         let bytes = rtdb_columnar::estimate_builder_bytes(&logical, &values).unwrap();
-        let refused = touches_column(&MemoryBudget::new(bytes - 1), &logical, &field, &groups).unwrap_err();
+        let refused = touches_column(&MemoryBudget::new(bytes - 1), &logical, &field, groups.clone()).unwrap_err();
         assert_eq!(refused.code(), tonic::Code::InvalidArgument);
         assert_eq!(refused.message(), format!("Cannot reserve {bytes} bytes from budget {} with 0 retained", bytes - 1));
-        let (column, charge) = touches_column(&MemoryBudget::new(bytes), &logical, &field, &groups).unwrap();
+        let (column, charge) = touches_column(&MemoryBudget::new(bytes), &logical, &field, groups).unwrap();
         assert_legacy_column(&logical, field, &values, column, charge);
+    }
+
+    #[test]
+    fn singleton_binary_id_moves_when_the_original_buffer_capacity_matches() {
+        let logical = touches_type();
+        let field = rtdb_columnar::to_field("touches", &logical).unwrap();
+        for size in [BYTE_ARRAY_DATA_CAPACITY, BYTE_ARRAY_DATA_CAPACITY + 1] {
+            let payload = vec![0xa5; size];
+            let original = payload.as_ptr();
+            let mut touches = touches();
+            touches[5].id = EntityId::Binary(payload);
+            let values = [legacy_touches(&touches)];
+            let bytes = rtdb_columnar::estimate_builder_bytes(&logical, &values).unwrap();
+            let (column, charge) = touches_column(&MemoryBudget::new(bytes), &logical, &field, vec![
+                OwnedChangeGroup { revision: 1, system_time: Timestamp(25), touches },
+            ]).unwrap();
+            let ids = touch_ids(&column);
+            let binary = ids.child(4).as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(ids.type_id(5), 4);
+            assert_eq!(ids.value_offset(5), 0);
+            assert_eq!(binary.value(0).as_ptr() == original, size == BYTE_ARRAY_DATA_CAPACITY);
+            assert_legacy_column(&logical, field.clone(), &values, column, charge);
+        }
+    }
+
+    #[test]
+    fn merged_reply_moves_the_only_binary_id_across_relation_groups() {
+        let payload = vec![0x55; BYTE_ARRAY_DATA_CAPACITY];
+        let original = payload.as_ptr();
+        let mut first = touches();
+        first[5].id = EntityId::Binary(payload);
+        let second = touches()[..5].to_vec();
+        let group = |name, sequence, touches| OwnedRelationChanges {
+            relation: OwnedRelation::new(name).unwrap(), sequence, touches,
+        };
+        let logical = merged_type();
+        let field = rtdb_columnar::to_field("changes", &logical).unwrap();
+        let commits = vec![OwnedChangeCommit {
+            publication: TransactionKey { tx_id: TxId(81), system_time: Timestamp(27) },
+            changes: vec![group("alpha", 2, first), group("beta", 3, second)],
+        }];
+        let values = legacy_commits(&commits);
+        let bytes = rtdb_columnar::estimate_builder_bytes(&logical, &values).unwrap();
+        let (column, charge) = merged_column(&MemoryBudget::new(bytes), &logical, &field, commits).unwrap();
+        let ids = touch_ids(list_items(&column).column(2));
+        let binary = ids.child(4).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(binary.value(0).as_ptr(), original);
+        assert_legacy_column(&logical, field, &values, column, charge);
+    }
+
+    fn legacy_commits(commits: &[OwnedChangeCommit]) -> Vec<Value> {
+        commits.iter().map(|commit| Value::list(commit.changes.iter().map(|change| {
+            Value::Struct(StructFields::from([
+                ("relation".into(), Value::Utf8(change.relation.name().into())),
+                ("relation_sequence".into(), Value::U64(change.sequence)),
+                ("touches".into(), legacy_touches(&change.touches)),
+            ]))
+        }).collect())).collect()
     }
 
     #[test]
@@ -410,7 +492,7 @@ mod tests {
         let group = |name, sequence, touches| OwnedRelationChanges {
             relation: OwnedRelation::new(name).unwrap(), sequence, touches,
         };
-        let commits = [
+        let commits = vec![
             OwnedChangeCommit {
                 publication: TransactionKey { tx_id: TxId(81), system_time: Timestamp(27) },
                 changes: vec![group("alpha", 2, touches()), group("beta", 3, touches()[2..].to_vec())],
@@ -422,15 +504,9 @@ mod tests {
         ];
         let logical = merged_type();
         let field = rtdb_columnar::to_field("changes", &logical).unwrap();
-        let values = commits.iter().map(|commit| Value::list(commit.changes.iter().map(|change| {
-            Value::Struct(StructFields::from([
-                ("relation".into(), Value::Utf8(change.relation.name().into())),
-                ("relation_sequence".into(), Value::U64(change.sequence)),
-                ("touches".into(), legacy_touches(&change.touches)),
-            ]))
-        }).collect())).collect::<Vec<_>>();
+        let values = legacy_commits(&commits);
         let bytes = rtdb_columnar::estimate_builder_bytes(&logical, &values).unwrap();
-        let (column, charge) = merged_column(&MemoryBudget::new(bytes), &logical, &field, &commits).unwrap();
+        let (column, charge) = merged_column(&MemoryBudget::new(bytes), &logical, &field, commits).unwrap();
         assert_legacy_column(&logical, field, &values, column, charge);
     }
 }

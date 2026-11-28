@@ -3011,13 +3011,13 @@ impl Service {
         let selected = Timestamp(i64::from_be_bytes(*selected));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let limit = usize::from(u16::from_be_bytes(*limit));
-        let (page, witness) = if ancestor {
+        let (mut page, witness) = if ancestor {
             held.snapshot.ancestor_changes(&relation, selected, after, through, limit, reverse).await
         } else {
             held.snapshot.parent_changes_at(&relation, selected, after, through, limit, reverse).await
         }.map_err(status)?;
         let nonce = held.remember(call, witness, false)?;
-        let reply = self.owned_merged_changes_reply(&page, selected, reverse, Some(nonce), ipc_stream)?;
+        let reply = self.owned_merged_changes_reply(&mut page, selected, reverse, Some(nonce), ipc_stream)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -4416,13 +4416,13 @@ impl Service {
         let (limit, tail) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned change read has no group limit"))?;
         let after = Timestamp(i64::from_be_bytes(*after));
         let limit = usize::from(u16::from_be_bytes(*limit));
-        let page = if tail.is_empty() {
+        let mut page = if tail.is_empty() {
             held.snapshot.changes(&relation, after, limit).await
         } else {
             let (lower, upper, valid, _bounds) = change_region_request(call, tail)?;
             held.snapshot.changes_in_region(&relation, after, limit, lower.as_ref(), upper.as_ref(), valid).await
         }.map_err(status)?;
-        let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time, ipc_stream)?;
+        let reply = self.owned_changes_reply(&mut page, held.snapshot.present().system_time, ipc_stream)?;
         held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
         Ok(reply)
     }
@@ -4531,8 +4531,8 @@ impl Service {
             return Err(status(error));
         }
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = held.snapshot.merged_changes_window(&relations, after, through, limit, descending).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time, descending, None, ipc_stream)?;
+        let mut page = held.snapshot.merged_changes_window(&relations, after, through, limit, descending).await.map_err(status)?;
+        let reply = self.owned_merged_changes_reply(&mut page, held.snapshot.present().system_time, descending, None, ipc_stream)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
     }
@@ -4544,8 +4544,8 @@ impl Service {
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World changes require a held world handle"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = held.snapshot.changes(&relations, after, through, limit, descending).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending, None, ipc_stream)?;
+        let mut page = held.snapshot.changes(&relations, after, through, limit, descending).await.map_err(status)?;
+        let reply = self.owned_merged_changes_reply(&mut page, held.snapshot.present(), descending, None, ipc_stream)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
@@ -4570,7 +4570,7 @@ impl Service {
             Timestamp(i64::from_be_bytes(*through)).into(), usize::from(u16::from_be_bytes(*limit)), false,
         ).await.map_err(status)?.into_relation_page().map_err(status)?;
         page.retain_identity_region(lower.as_ref(), upper.as_ref(), valid).map_err(status)?;
-        let reply = self.owned_changes_reply(&page, held.snapshot.present(), ipc_stream)?;
+        let reply = self.owned_changes_reply(&mut page, held.snapshot.present(), ipc_stream)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -4599,7 +4599,7 @@ impl Service {
     }
 
     fn owned_merged_changes_reply(
-        &self, page: &rtdb_node::OwnedMergedChanges, present: Timestamp, descending: bool, witness: Option<Uuid>,
+        &self, page: &mut rtdb_node::OwnedMergedChanges, present: Timestamp, descending: bool, witness: Option<Uuid>,
         ipc_stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
         let changes_type = changes::merged_type();
@@ -4631,13 +4631,14 @@ impl Service {
         let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
         let history = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.system_time.0));
         let positions = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.tx_id.0));
-        let (changes, _arrow) = changes::merged_column(self.memory(), &changes_type, schema.field(2), &page.commits)?;
+        let commits = std::mem::take(&mut page.commits);
+        let (changes, _arrow) = changes::merged_column(self.memory(), &changes_type, schema.field(2), commits)?;
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(history), Arc::new(positions), changes]).map_err(arrow)?;
         self.encode_owned_stream_reply(self.memory(), &schema, &[batch], ipc_stream)
     }
 
     fn owned_changes_reply(
-        &self, page: &rtdb_node::OwnedChangePage, present: Timestamp, ipc_stream: bool,
+        &self, page: &mut rtdb_node::OwnedChangePage, present: Timestamp, ipc_stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
         let touches_type = changes::touches_type();
         let schema = Arc::new(Schema::new(vec![
@@ -4654,7 +4655,8 @@ impl Service {
         let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
         let revisions = UInt64Array::from(page.groups.iter().map(|group| group.revision).collect::<Vec<_>>());
         let times = Int64Array::from(page.groups.iter().map(|group| group.system_time.0).collect::<Vec<_>>());
-        let (touches, _arrow) = changes::touches_column(self.memory(), &touches_type, schema.field(2), &page.groups)?;
+        let groups = std::mem::take(&mut page.groups);
+        let (touches, _arrow) = changes::touches_column(self.memory(), &touches_type, schema.field(2), groups)?;
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(revisions), Arc::new(times), touches]).map_err(arrow)?;
         self.encode_owned_stream_reply(self.memory(), &schema, &[batch], ipc_stream)
     }
