@@ -50,6 +50,23 @@ object TextSlices {
     }
 
     @JvmStatic
+    fun tryWriteAsciiChars(out: ListVector, source: Any?): Boolean {
+        val input = source as? ByteBuffer ?: return false
+        val elements = out.listElements as? Utf8Vector ?: return false
+        val size = input.remaining()
+        if (elements.valueCount + size.toLong() > Int.MAX_VALUE ||
+            elements.dataBuffer.writerIndex + size > Int.MAX_VALUE ||
+            !input.isAscii()
+        ) return false
+
+        for (index in input.position() until input.limit()) {
+            elements.writeBytes(1) { dest, offset -> dest.setByte(offset, input[index].toInt()) }
+        }
+        out.endList()
+        return true
+    }
+
+    @JvmStatic
     fun tryWriteKeywordPart(out: VariableWidthVector, input: ByteBuffer, namespace: Boolean): Boolean {
         if (Charset.defaultCharset() != Charsets.UTF_8 || !input.isWellFormedUtf8()) return false
 

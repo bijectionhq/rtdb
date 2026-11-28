@@ -1847,9 +1847,14 @@
                             (.writeObject ~out ~(split-code [source separator]))))))}))
 
 (defmethod codegen-call [:string_to_array :utf8 :null] [_]
-  {:return-type #xt/type [:list :utf8]
-   :->call-code (fn [[s _delim]]
-                  `(string-to-chars (resolve-string ~s)))})
+  (letfn [(split-code [[s _delim]]
+            `(string-to-chars (resolve-string ~s)))]
+    {:return-type #xt/type [:list :utf8]
+     :->call-code split-code
+     :->write-code (fn [out [s]]
+                     `(let [source# ~s]
+                        (when-not (TextSlices/tryWriteAsciiChars ~out source#)
+                          (.writeObject ~out (string-to-chars (resolve-string source#))))))}))
 
 (defmethod codegen-call [:string_to_array :null :utf8] [_]
   {:return-type #xt/type :null, :->call-code (constantly nil)})

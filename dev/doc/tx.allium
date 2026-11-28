@@ -227,7 +227,8 @@
 -- An empty delimiter keeps nonempty text as one token, and a null delimiter splits it into UTF-16 units.
 -- JVM STRING_TO_ARRAY with well-formed UTF-8 operands can write token spans into a plain Arrow UTF-8 list using its projection allocator.
 -- It retains leading, consecutive, and trailing empty tokens in nonempty input, and preserves empty lists and null input.
--- A null delimiter uses the scalar UTF-16 code unit split, and malformed byte operands use the scalar UTF-8 decoding rules.
+-- With a null delimiter, JVM STRING_TO_ARRAY can write each ASCII byte as one UTF-16 unit directly to the list.
+-- Other source text with a null delimiter uses the scalar UTF-16 code unit split, and malformed byte operands use the scalar UTF-8 decoding rules.
 -- Owned numeric list reads copy the selected child range into buffers charged to the result and preserve the bits of present components and their validity.
 -- Dense-union list copies retain their leg identifiers and compact the child offsets in selection order.
 -- Fixed-width list read bounds account for the selected length and any null-sensitive payload charge.

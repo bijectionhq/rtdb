@@ -572,6 +572,21 @@
                (run-projection rel split)))
       (t/is (= ["東京"] (:res (run-projection rel (list 'nth split 1))))))))
 
+(t/deftest null-delimiter-projections-preserve-utf16-units-and-list-layout
+  (with-open [rel (tu/open-rel {:s ["_a\u0000\u007f" "_" "_é😀" nil "_x,y"], :delimiter [nil nil nil nil ","]})]
+    (let [split '(string_to_array (substring s 2) delimiter)]
+      (t/is (= {:res [["a" "\u0000" "\u007f"] [] ["é" "?" "?"] nil ["x" "y"]]
+                :res-type #xt/type [:? [:list :utf8]]}
+               (run-projection rel split)))))
+  (with-open [^Vector source (tu/open-vec "s" #xt/type :utf8 [])]
+    (.writeBytes source (byte-array [97 -1 98]))
+    (t/is (= {:res [["a" "�" "b"]], :res-type #xt/type [:list :utf8]}
+             (run-projection (vr/rel-reader [source]) '(string_to_array s nil)))))
+  (let [opts {:var-types {'s #xt/type :utf8}, :projection? true}]
+    (t/is (some? (-> (expr/form->expr '(string_to_array s nil) opts)
+                     (#'expr/emit-row-expr opts)
+                     :continue-projection)))))
+
 (t/deftest keyword-name-projections-preserve-symbol-splitting
   (with-open [^Vector keywords (tu/open-vec "kw" #xt/type [:? :keyword] [])]
     (let [inputs (conj (mapv #(.getBytes ^String % StandardCharsets/UTF_8)

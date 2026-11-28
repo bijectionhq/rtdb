@@ -7,16 +7,16 @@ import xtdb.util.StringUtil
 import java.nio.ByteBuffer
 import java.util.Locale
 
+internal fun ByteBuffer.isAscii(): Boolean {
+    for (idx in position() until limit()) {
+        if (get(idx) < 0) return false
+    }
+    return true
+}
+
 /** @suppress */
 @InternalApi
 object TextTransforms {
-    private fun ByteBuffer.isAscii(): Boolean {
-        for (idx in position() until limit()) {
-            if (get(idx) < 0) return false
-        }
-        return true
-    }
-
     @JvmStatic
     fun tryWriteAsciiCase(out: VariableWidthVector, value: Any?, upper: Boolean): Boolean {
         val input = value as? ByteBuffer ?: return false
