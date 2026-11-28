@@ -5,7 +5,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{FutureExt, TryStreamExt, stream::FuturesOrdered};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch, PageEvent};
 use rtdb_temporal::HistoryResolver;
@@ -237,6 +236,37 @@ impl EditBatch {
         Ok(Self { entries: Vec::new(), allocation: memory.reserve(0)? })
     }
 
+    fn project_replayed(
+        &mut self,
+        address: &Address,
+        events: &[Event],
+        revision: IndexRevision,
+        through: IndexRevision,
+        order: EventOrder,
+        before: &[Span],
+    ) -> Result<()> {
+        let memory = self.allocation.budget();
+        let after = if revision > through {
+            Spans::default()
+        } else if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
+            let _scratch = memory.reserve(events.len().saturating_mul(2 * size_of::<&Event>()))?;
+            let mut ordered: Vec<_> = events.iter().collect();
+            if matches!(order, EventOrder::OldestFirst) {
+                ordered.reverse();
+            }
+            ordered.sort_by_key(|event| std::cmp::Reverse(event.header.precedence()));
+            resolve(address.iid, revision.time, before, ordered, memory)?
+        } else if matches!(order, EventOrder::OldestFirst) {
+            resolve(address.iid, revision.time, before, events.iter().rev(), memory)?
+        } else {
+            resolve(address.iid, revision.time, before, events, memory)?
+        };
+        if before != after.as_ref() {
+            self.project(address, before, after)?;
+        }
+        Ok(())
+    }
+
     fn project(&mut self, address: &Address, before: &[Span], after: Spans) -> Result<()> {
         let start = self.entries.len();
         let grant = Arc::get_mut(&mut self.allocation).expect("edit staging owns its reservation");
@@ -325,66 +355,63 @@ impl Changes {
         order: EventOrder,
         cancellation: &CancellationToken,
     ) -> Result<Root> {
-        const READ_AHEAD: usize = 8;
+        const GROUP_SIZE: usize = 128;
+        const GROUP_WORKSPACE: usize = 32 << 10;
         if tree.memory.snapshot_budget().is_some()
-            && self.revisions.values().any(|rows| rows.len() >= READ_AHEAD)
-            && let Ok(_read_ahead) = tree.memory.reserve(READ_AHEAD * 4096)
+            && self.revisions.values().any(|rows| rows.len() >= 8)
+            && let Ok(workspace) = tree.memory.reserve(GROUP_WORKSPACE)
         {
-            match self.read_with_window(tree, root.clone(), through, order, cancellation, READ_AHEAD).await {
+            let result = self.read_grouped(tree, root.clone(), through, order, cancellation, GROUP_SIZE).await;
+            drop(workspace);
+            match result {
                 Err(error) if error.is(AnomalyKind::ResourceExhausted) => (),
                 result => return result,
             }
         }
-        self.read_with_window(tree, root, through, order, cancellation, 1).await
+        self.read_grouped(tree, root, through, order, cancellation, 1).await
     }
 
-    async fn read_with_window(
+    async fn read_grouped(
         &self,
         tree: &Tree,
         mut root: Root,
         through: IndexRevision,
         order: EventOrder,
         cancellation: &CancellationToken,
-        window: usize,
+        group_size: usize,
     ) -> Result<Root> {
+        let mut group = Vec::with_capacity(group_size);
+        let mut addresses = Vec::with_capacity(group_size);
         for (&revision, rows) in &self.revisions {
             let mut edits = EditBatch::new(&tree.memory)?;
-            let base = &root;
             let mut rows = rows.iter();
-            let mut reads = FuturesOrdered::new();
             loop {
-                while reads.len() < window {
+                while group.len() < group_size {
                     let Some((address, events)) = rows.next() else { break; };
                     if cancellation.is_cancelled() { return Err(cancelled()); }
                     if revision > through && !events.iter().any(|event| event.header.op == EventOp::Erase) {
                         continue;
                     }
-                    reads.push_back(async move {
-                        let before = tree.spans(base, address).await?;
-                        Ok::<_, Anomaly>((address, events, before))
-                    }.boxed());
+                    group.push((address, events));
                 }
-                let Some((address, events, before)) = reads.try_next().await? else { break; };
-                let after = if revision > through {
-                    Spans::default()
-                } else if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
-                    let _scratch = tree.memory.reserve(events.len().saturating_mul(2 * size_of::<&Event>()))?;
-                    let mut ordered: Vec<_> = events.iter().collect();
-                    if matches!(order, EventOrder::OldestFirst) {
-                        ordered.reverse();
+                match group.as_slice() {
+                    [] => break,
+                    [(address, events)] => {
+                        let before = tree.spans(&root, address).await?;
+                        edits.project_replayed(address, events, revision, through, order, &before)?;
                     }
-                    ordered.sort_by_key(|event| std::cmp::Reverse(event.header.precedence()));
-                    resolve(address.iid, revision.time, &before, ordered, &tree.memory)?
-                } else if matches!(order, EventOrder::OldestFirst) {
-                    resolve(address.iid, revision.time, &before, events.iter().rev(), &tree.memory)?
-                } else {
-                    resolve(address.iid, revision.time, &before, events, &tree.memory)?
-                };
-                if before.as_ref() != after.as_ref() {
-                    edits.project(address, &before, after)?;
+                    _ => {
+                        addresses.extend(group.iter().map(|&(address, _)| address));
+                        let spans = tree.spans_in_order(&root, &addresses, cancellation).await?;
+                        for (&(address, events), before) in group.iter().zip(spans) {
+                            if cancellation.is_cancelled() { return Err(cancelled()); }
+                            edits.project_replayed(address, events, revision, through, order, &before)?;
+                        }
+                        addresses.clear();
+                    }
                 }
+                group.clear();
             }
-            drop(reads);
             root = edits.apply(tree, root).await?;
         }
         Ok(root)
@@ -643,7 +670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_replay_read_ahead_keeps_the_cut_and_applies_later_erases() -> Result<()> {
+    async fn ordered_replay_grouping_keeps_the_cut_and_applies_later_erases() -> Result<()> {
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
         let directory = ObjectKey::new("ordered-read-ahead")?;
         let memory = MemoryBudget::new(32 << 20);

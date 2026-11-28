@@ -2,12 +2,14 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    ops::Range,
     pin::Pin,
     sync::Arc,
 };
 
 use arrow_buffer::Buffer;
 use bytes::Bytes;
+use futures::{TryStreamExt, stream::FuturesOrdered};
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_storage::{IoRegion, ObjectKey, cache::BufferPool, object_store::IndexPageScope};
@@ -543,6 +545,16 @@ pub(super) struct Node {
 enum Page {
     Leaf(Leaf),
     Branch(Vec<Link>),
+}
+
+fn row_spans(leaf: &Leaf, key: KeyRef<'_>) -> Result<Spans> {
+    let Ok(slot) = leaf.metadata.binary_search_by(|entry| entry.key.view().compare(key)) else {
+        return Ok(Spans::default());
+    };
+    let Item::Row(spans) = &leaf.metadata[slot].item else {
+        return Err(format_error("Ordered index row has another item type"));
+    };
+    Ok(spans.clone())
 }
 
 impl Page {
@@ -1089,30 +1101,84 @@ impl Tree {
     }
 
     pub async fn spans(&self, root: &Root, address: &Address) -> Result<Spans> {
-        let key = Key::Row(address.clone());
+        let key = KeyRef::Row(address.view());
         let mut link = root.clone();
         while let Some(page) = link.take() {
-            if &key < page.first() || &key > page.last() {
+            if key.compare(page.first().view()).is_lt() || key.compare(page.last().view()).is_gt() {
                 break;
             }
             let node = self.open(&page).await?;
             match &node.page {
-                Page::Leaf(leaf) => {
-                    if let Ok(slot) = leaf.metadata.binary_search_by(|entry| entry.key.cmp(&key)) {
-                        let Item::Row(spans) = &leaf.metadata[slot].item else {
-                            return Err(format_error("Ordered index row has another item type"));
-                        };
-                        return Ok(spans.clone());
-                    }
-                    break;
-                }
+                Page::Leaf(leaf) => return row_spans(leaf, key),
                 Page::Branch(children) => {
-                    let slot = children.partition_point(|child| child.last() < &key);
+                    let slot = children.partition_point(|child| child.last().view().compare(key).is_lt());
                     link = children.get(slot).cloned();
                 }
             }
         }
         Ok(Spans::default())
+    }
+
+    pub async fn spans_in_order(
+        &self,
+        root: &Root,
+        addresses: &[&Address],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Spans>> {
+        const READ_AHEAD: usize = 8;
+        debug_assert!(addresses.is_sorted());
+        let mut spans = vec![Spans::default(); addresses.len()];
+        let Some(root) = root else { return Ok(spans); };
+        let key = |index: usize| KeyRef::Row(addresses[index].view());
+        let first = addresses.partition_point(|address| KeyRef::Row(address.view()).compare(root.first().view()).is_lt());
+        let end = first + addresses[first..].partition_point(|address| {
+            !KeyRef::Row(address.view()).compare(root.last().view()).is_gt()
+        });
+        if first == end { return Ok(spans); }
+        let mut pages: Vec<(Link, Range<usize>)> = Vec::with_capacity(addresses.len());
+        let mut children = Vec::with_capacity(addresses.len());
+        pages.push((root.clone(), first..end));
+        while !pages.is_empty() {
+            for chunk in pages.chunks(READ_AHEAD) {
+                let mut reads = FuturesOrdered::<Work<'_, Arc<Node>>>::new();
+                for (page, _) in chunk {
+                    reads.push_back(Box::pin(self.open(page)));
+                }
+                for (_, range) in chunk {
+                    if cancellation.is_cancelled() { return Err(cancelled()); }
+                    let node = reads.try_next().await?.expect("one read per page");
+                    match &node.page {
+                        Page::Leaf(leaf) => {
+                            for index in range.clone() {
+                                spans[index] = row_spans(leaf, key(index))?;
+                            }
+                        }
+                        Page::Branch(links) => {
+                            let mut first = range.start;
+                            let mut remaining = links.as_slice();
+                            while first < range.end {
+                                let start = remaining.partition_point(|link| link.last().view().compare(key(first)).is_lt());
+                                let Some((child, rest)) = remaining[start..].split_first() else { break; };
+                                remaining = rest;
+                                first += addresses[first..range.end].partition_point(|address| {
+                                    KeyRef::Row(address.view()).compare(child.first().view()).is_lt()
+                                });
+                                let end = first + addresses[first..range.end].partition_point(|address| {
+                                    !KeyRef::Row(address.view()).compare(child.last().view()).is_gt()
+                                });
+                                if end > first {
+                                    children.push((child.clone(), first..end));
+                                }
+                                first = end;
+                            }
+                        }
+                    }
+                }
+            }
+            pages.clear();
+            std::mem::swap(&mut pages, &mut children);
+        }
+        Ok(spans)
     }
 
     pub async fn edit(&self, root: Root, edits: Vec<(Key, Option<Item>)>) -> Result<Root> {
@@ -1825,6 +1891,50 @@ mod count_tests {
 
         let reopened = Tree::new(&storage, &directory, &memory, 0).await?;
         let error = reopened.open(&Link::Stored(pointer)).await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("Ordered index page checksum mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_replay_groups_addresses_across_leaves_and_checks_only_reached_pages() -> Result<()> {
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let directory = ObjectKey::new("ordered-grouped-spans")?;
+        let memory = MemoryBudget::new(16 << 20);
+        let token = CancellationToken::new();
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let address = |n: u16| {
+            let mut iid = Iid::MIN;
+            iid.0[..2].copy_from_slice(&n.to_be_bytes());
+            Address::new(iid, Bytes::new())
+        };
+        let mut edits = Vec::new();
+        for n in (2..320).step_by(2) {
+            let tuple = KeyRow::Fence(Arc::from([Atom::Integer(i128::from(n))]));
+            let spans = Spans::new(vec![Span { valid: Interval::ALL, tuple }], memory.reserve(Spans::allocation_bytes(1))?);
+            edits.push((Key::Row(address(n)), Some(Item::Row(spans))));
+        }
+        let root = tree.edit(None, edits).await?.unwrap();
+        let pointer = tree.persist(&root, 0, &mut BTreeMap::new(), &token).await?;
+        let root = Some(Link::Stored(pointer));
+        let node = tree.open(root.as_ref().unwrap()).await?;
+        let Page::Branch(children) = &node.page else { panic!("Expected multiple leaves"); };
+        let Link::Stored(skipped) = &children[1] else { panic!("Expected a stored leaf"); };
+        let Key::Row(skipped_address) = &skipped.first else { panic!("Expected a correction row"); };
+        let object = tree.page_key(skipped.generation, &skipped.digest)?;
+        let store = storage.object_store();
+        let mut bytes = store.get(&object).await?.to_vec();
+        bytes[0] ^= 1;
+        store.delete(&object).await?;
+        store.put(&object, Bytes::from(bytes)).await?;
+
+        let tree = Tree::new(&storage, &directory, &memory, 0).await?;
+        let addresses = [0, 2, 5, 106, 107, 300, 318, 320].map(address);
+        let addresses = addresses.each_ref();
+        let spans = tree.spans_in_order(&root, &addresses, &token).await?;
+        for (address, grouped) in addresses.into_iter().zip(spans) {
+            assert_eq!(grouped.as_ref(), tree.spans(&root, address).await?.as_ref());
+        }
+        let error = tree.spans_in_order(&root, &[skipped_address], &token).await.unwrap_err();
         assert_eq!(error.message.as_deref(), Some("Ordered index page checksum mismatch"));
         Ok(())
     }
