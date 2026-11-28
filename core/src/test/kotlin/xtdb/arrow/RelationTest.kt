@@ -19,6 +19,8 @@ import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.ClosedByInterruptException
 import java.nio.channels.SeekableByteChannel
+import java.time.LocalDate
+import java.util.UUID
 
 class RelationTest {
 
@@ -64,6 +66,42 @@ class RelationTest {
                     dst["nested"].asList
                 )
                 assertEquals(ByteBuffer.wrap("\uFFFD".toByteArray()), dst["nested"].vectorFor("text").getBytes(2))
+            }
+        }
+    }
+
+    @Test
+    fun `bound record copies uuid and date children into matching layouts`() {
+        val nestedType = VectorType.structOf("id" to VectorType.UUID, "day" to VectorType.DATE_DAY)
+        val recordType = VectorType.structOf(
+            "day" to maybe(VectorType.DATE_DAY), "id" to maybe(VectorType.UUID), "nested" to nestedType
+        )
+        val id = UUID.fromString("fedcba98-7654-3210-8123-456789abcdef")
+        val day = LocalDate.ofEpochDay(Int.MIN_VALUE.toLong())
+        val nested = mapOf("id" to id, "day" to day)
+        val idUnion = VectorType.fromLegs(listOf(VectorType.UUID, VectorType.I64))
+
+        Vector.open(allocator, "src", recordType).use { src ->
+            src.writeObject(nested + ("nested" to nested))
+            src.writeObject(mapOf("nested" to nested))
+
+            Relation(allocator, mapOf("id" to idUnion, "day" to VectorType.DATE_DAY, "nested" to nestedType)).use { dst ->
+                assertTrue(dst.tryCopyStructRow(src, 0))
+                assertEquals(idUnion, dst["id"].type)
+                assertEquals(VectorType.DATE_DAY, dst["day"].type)
+                assertTrue(dst.tryCopyStructRow(src, 1))
+                assertEquals(listOf(id, null), dst["id"].asList)
+                assertEquals(listOf(day, null), dst["day"].asList)
+                assertEquals(listOf(nested, nested), dst["nested"].asList)
+            }
+
+            Relation(allocator, mapOf("id" to VectorType.I64, "day" to VectorType.DATE_DAY, "nested" to nestedType)).use { dst ->
+                dst.writeRow(mapOf("id" to 7L, "day" to day, "nested" to nested))
+                assertFalse(dst.tryCopyStructRow(src, 0))
+                assertEquals(1, dst.rowCount)
+                assertEquals(1, dst["day"].valueCount)
+                dst.writeRow(src.getObject(0) as Map<*, *>)
+                assertEquals(listOf(7L, id), dst["id"].asList)
             }
         }
     }

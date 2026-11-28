@@ -2450,6 +2450,7 @@ surface QueryAccess {
     @guarantee JvmValuesAndRecordExpressions
         -- JVM VALUES retains the order of rows and evaluates each reached cell in its existing expression order.
         -- Compatible scalar parameters and children of bound records are copied at their Arrow positions.
+        -- JVM VALUES and RECORDS preserve canonical 16-byte UUIDs and signed DateDay ticks when copying bound cells into matching layouts, including existing union legs.
         -- A nested bound record with matching child layouts and complete compatible reached fields can be copied as a record.
         -- Compatible computed scalar cells write to the result column as they are evaluated.
         -- VALUES writes computed text known to be valid UTF-8 directly into a matching text column.

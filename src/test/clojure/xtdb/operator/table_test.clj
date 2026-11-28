@@ -5,11 +5,12 @@
             [xtdb.logical-plan :as lp]
             [xtdb.test-util :as tu]
             [xtdb.time :as time])
-  (:import (java.nio.charset StandardCharsets)
-           (java.time Duration)
+  (:import (java.nio BufferUnderflowException ByteBuffer)
+           (java.nio.charset StandardCharsets)
+           (java.time Duration LocalDate)
            (java.util.function Consumer)
            (xtdb.api ICursor)
-           (xtdb.arrow Relation RelationReader)))
+           (xtdb.arrow FixedSizeBinaryVector Relation RelationReader UuidVector Vector VectorWriterKt)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
 
@@ -201,6 +202,34 @@
                         {:args {:record {:numeric-value 12, :label "record"}
                                 :n 7, :label "é", :flag false}
                          :with-types? true}))))
+
+(t/deftest values-and-records-preserve-bound-uuid-and-date-day-types
+  (let [id #uuid "fedcba98-7654-3210-8123-456789abcdef"
+        first-day (LocalDate/ofEpochDay Integer/MIN_VALUE)
+        last-day (LocalDate/ofEpochDay Integer/MAX_VALUE)]
+    (t/is (= {:res [{:id id, :day first-day}
+                    {:id id, :day last-day}
+                    {:id 7}
+                    {}]
+              :types '{id #xt/type #{:uuid :i64 :null}, day #xt/type [:? [:date :day]]}}
+             (tu/query-ra '[:table {:rows [{:id ?id, :day ?day}
+                                          ?record
+                                          {:id 7, :day nil}
+                                          {}]}]
+                          {:args {:id id, :day first-day, :record {:id id, :day last-day}}
+                           :with-types? true})))))
+
+(t/deftest values-uuid-cells-preserve-checked-noncanonical-widths
+  (with-open [^Vector out (tu/open-vec "u" #xt/type :uuid [])
+              short-source (UuidVector. (FixedSizeBinaryVector. tu/*allocator* "short" false 8))
+              wide-source (UuidVector. (FixedSizeBinaryVector. tu/*allocator* "wide" false 24))]
+    (.writeBytes short-source (ByteBuffer/wrap (byte-array (range 8))))
+    (.writeBytes wide-source (ByteBuffer/wrap (byte-array (range 24))))
+    (t/is (thrown? BufferUnderflowException (VectorWriterKt/writeScalarCell out short-source 0)))
+    (t/is (zero? (.getValueCount out)))
+    (VectorWriterKt/writeScalarCell out wide-source 0)
+    (t/is (= #uuid "00010203-0405-0607-0809-0a0b0c0d0e0f" (.getObject out 0)))
+    (t/is (= (ByteBuffer/wrap (byte-array (range 16))) (.getBytes out 0)))))
 
 (t/deftest values-text-cells-preserve-java-utf8-replacement
   (let [^bytes malformed (byte-array (map unchecked-byte [0xed 0xa0 0x80 0x61 0xf0 0x9f]))

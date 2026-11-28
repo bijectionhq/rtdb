@@ -5,6 +5,7 @@ import clojure.lang.IPersistentMap
 import clojure.lang.PersistentArrayMap
 import com.google.protobuf.UnsafeByteOperations
 import org.apache.arrow.vector.types.pojo.ArrowType
+import xtdb.arrow.extensions.UuidType
 import xtdb.kw
 import java.nio.ByteBuffer
 
@@ -84,14 +85,29 @@ internal fun ArrowType.hasScalarObjectIdentity() = when (this) {
 
 internal fun ByteBuffer.isWellFormedUtf8() = UnsafeByteOperations.unsafeWrap(this).isValidUtf8
 
+private tailrec fun unwrapScalarSource(reader: VectorReader): VectorReader = when (val source = VectorReader.unwrapRenamed(reader)) {
+    is IndirectVector -> unwrapScalarSource(source.inner)
+    else -> source
+}
+
 internal fun VectorWriter.scalarObjectTarget(src: VectorReader, idx: Int): VectorWriter? {
     val sourceType = src.arrowType
     if (src.type.encoding != Encoding.Plain) return null
-    if (!sourceType.hasScalarObjectIdentity() &&
-        !(sourceType == UTF8_TYPE && (src.isNull(idx) || src.getBytes(idx).isWellFormedUtf8()))) return null
+    val hasIdentity = when (sourceType) {
+        VectorType.DATE_DAY.arrowType -> unwrapScalarSource(src) is DateDayVector
+        UuidType -> (unwrapScalarSource(src) as? UuidVector)?.hasCanonicalWidth == true
+        UTF8_TYPE -> src.isNull(idx) || src.getBytes(idx).isWellFormedUtf8()
+        else -> sourceType.hasScalarObjectIdentity()
+    }
+    if (!hasIdentity) return null
 
     val target = if (this is DenseUnionVector) vectorForOrNull(sourceType.toLeg()) else this
-    return target?.takeIf { it.arrowType == sourceType }
+    if (target?.arrowType != sourceType) return null
+    if (sourceType == UuidType) {
+        val storage = if (target is DenseUnionVector.LegVector) target.inner else target
+        if (storage !is UuidVector || !storage.hasCanonicalWidth) return null
+    }
+    return target
 }
 
 internal fun VectorWriter.copyNonNullScalar(src: VectorReader, idx: Int) {

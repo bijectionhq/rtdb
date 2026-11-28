@@ -162,19 +162,19 @@ class StructVector private constructor(
 
     internal fun canCopyObjectValueTo(dest: StructVector, idx: Int): Boolean =
         nullable == dest.nullable && childFields == dest.childFields &&
-            dest.isAtRowBoundary() && hasObjectIdentityChildren(idx)
+            dest.isAtRowBoundary() && canCopyObjectChildrenTo(dest, idx)
 
     private fun isAtRowBoundary(): Boolean =
         childWriters.values.all { child ->
             child.valueCount == valueCount && (child !is StructVector || child.isAtRowBoundary())
         }
 
-    private fun hasObjectIdentityChildren(idx: Int): Boolean =
-        childWriters.values.all { child ->
+    private fun canCopyObjectChildrenTo(dest: StructVector, idx: Int): Boolean =
+        childWriters.all { (name, child) ->
+            val target = dest.vectorForOrNull(name) ?: return@all false
             child.type.encoding == Encoding.Plain && !child.isNull(idx) && when (child) {
-                is StructVector -> child.hasObjectIdentityChildren(idx)
-                is Utf8Vector -> child.getBytes(idx).isWellFormedUtf8()
-                else -> child.arrowType.hasScalarObjectIdentity()
+                is StructVector -> target is StructVector && child.canCopyObjectChildrenTo(target, idx)
+                else -> target.scalarObjectTarget(child, idx) != null
             }
         }
 
