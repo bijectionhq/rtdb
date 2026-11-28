@@ -6755,8 +6755,20 @@ async fn root_identity_output_pages_keep_the_typed_order_and_hold_fences() {
     assert!(erase.committed(), "{:?}", erase.error());
     assert_eq!(held.check_relation(&binary).unwrap_err().code, "rtdb.owned/read-purged");
     let after_erase = session.open_owned_read().await.unwrap();
-    let error = after_erase.identity_page_output(&binary, cut, cut, &OwnedIdentityScan::binary(None), 2).await.err().unwrap();
+    let error = after_erase.check_point_purge_floor(&binary, &binary_keys[0], cut).await.unwrap_err();
     assert_eq!(error.code, "rtdb.owned/read-purged");
+    let scan = OwnedIdentityScan::binary(None);
+    let original = after_erase.identity_page(&binary, cut, cut, &scan, 2).await;
+    let output = after_erase.identity_page_output(&binary, cut, cut, &scan, 2).await;
+    match (original, output) {
+        (Ok(original), Ok(OwnedIdentityPageOutput::Rows(page))) => {
+            assert_eq!((page.keys.as_slice(), page.more), (original.keys.as_slice(), original.more));
+            assert_eq!(original.keys, [binary_keys[1].clone()]);
+            assert!(!original.more);
+        }
+        (Err(original), Err(output)) => assert_eq!(output, original),
+        _ => panic!("The historical output must follow the owned page API"),
+    }
     clock.monotonic.store(60_000_000, Ordering::Relaxed);
     let error = held.identity_page_output(&text, cut, cut, &OwnedIdentityScan::text(None), 1).await.err().unwrap();
     assert_eq!(error.code, "rtdb.owned/read-expired");
