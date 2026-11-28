@@ -327,6 +327,22 @@
                                :p {:inner nil}}]}]]
             {}))))
 
+(t/deftest positioned-patch-preserves-date-day-layout-and-absent-fields
+  (let [first-day (LocalDate/ofEpochDay Integer/MIN_VALUE)
+        last-day (LocalDate/ofEpochDay Integer/MAX_VALUE)
+        result (tu/query-ra
+                '[:project {:projections [{patched (_patch l r)}]}
+                  [:table {:rows [{:l {:day ?first_day, :kept 1}, :r {:day nil, :extra nil}}
+                                  {:l {:day ?first_day, :kept 2}, :r {:day ?last_day, :extra ?first_day}}
+                                  {:l {:day nil, :kept 3}, :r {:day nil, :extra nil}}]}]]
+                {:args {:first_day first-day, :last_day last-day}, :with-types? true})]
+    (t/is (= {:res [{:patched {:day first-day, :kept 1}}
+                    {:patched {:day last-day, :kept 2, :extra first-day}}
+                    {:patched {:kept 3}}]
+              :types '{patched #xt/type [:struct {"day" [:? [:date :day]], "kept" :i64,
+                                                 "extra" [:? [:date :day]]}]}}
+             result))))
+
 (t/deftest positioned-interval-projection-keeps-null-and-signed-components
   (t/is (= [{:copied #xt/interval "P12M"} {} {:copied #xt/interval "P-4M"}]
            (tu/query-ra

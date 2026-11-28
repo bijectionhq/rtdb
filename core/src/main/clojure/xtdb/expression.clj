@@ -2665,7 +2665,8 @@
                                              (and (= child-type (.getUnencoded child-type))
                                                   (or (= #xt/type :null child-type)
                                                       (VectorWriterKt/hasScalarObjectIdentity (.getArrowType child-type))
-                                                      (= #xt.arrow/type :utf8 (.getArrowType child-type)))))
+                                                      (contains? #{#xt.arrow/type :utf8 #xt.arrow/type [:date :day]}
+                                                                 (.getArrowType child-type)))))
                                            (vals children)))
                           (update-vals children (fn [_] (with-tag (gensym 'out-child) VectorWriter))))]
       {:writer-bindings (into [] (mapcat (fn [[k writer]] [writer `(.vectorFor ~out-vec-sym ~k)])) child-writers)
