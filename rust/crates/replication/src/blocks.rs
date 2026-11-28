@@ -518,7 +518,7 @@ impl BlockStore {
             let reachable = Reachability::from_roots(database, epoch, roots)?;
             let plan = reachable.plan_gc(files.iter().map(|object| &object.key));
             check_cancelled(cancellation)?;
-            plan.execute(self.store.as_ref()).await
+            plan.execute(self.store.as_ref()).await.map(drop)
         }).await
     }
 
