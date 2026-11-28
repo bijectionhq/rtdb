@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc};
 
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{EntityIdRef, MemoryReservation};
 use rtdb_index::Snapshot;
 use rtdb_plan::Catalog;
 use rtdb_query::{OwnedJournalHeader, read_owned_change_entry, read_owned_journal_header};
@@ -265,6 +265,31 @@ pub struct ExpiryCandidatePage {
     _charges: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
+pub struct TypedExpiryCandidate {
+    pub identity: EntityId,
+    pub nomination: String,
+    pub created: Timestamp,
+    pub expiry: Timestamp,
+}
+
+pub struct TypedExpiryCandidatePage {
+    candidates: Vec<TypedExpiryCandidate>,
+    pub through: Timestamp,
+    pub diagnostic_cutoff: Timestamp,
+    pub state: &'static str,
+    pub next_eligible: Option<Timestamp>,
+    _charges: Vec<Arc<MemoryReservation>>,
+}
+
+impl TypedExpiryCandidatePage {
+    pub fn candidates(&self) -> &[TypedExpiryCandidate] { &self.candidates }
+}
+
+fn expiry_candidate_bytes(id: &EntityId) -> usize {
+    (std::mem::size_of::<Value>() + EntityIdRef::from(id).owned_payload_bytes())
+        .saturating_mul(2).saturating_add(512)
+}
+
 impl OwnedReadSession {
     /// Reads whole ordered owner-relation groups after an exclusive system time.
     pub async fn changes(
@@ -295,6 +320,24 @@ impl OwnedReadSession {
         &self, relation: &OwnedRelation, after: Timestamp, groups: usize,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<ExpiryCandidatePage> {
+        let page = self.expired_typed_candidate_page(relation, after, groups, scope).await?;
+        let candidates = page.candidates.into_iter().map(|candidate| ExpiryCandidate {
+            identity: candidate.identity.handle_bytes(),
+            nomination: candidate.nomination,
+            created: candidate.created,
+            expiry: candidate.expiry,
+        }).collect();
+        Ok(ExpiryCandidatePage {
+            candidates, through: page.through, diagnostic_cutoff: page.diagnostic_cutoff,
+            state: page.state, next_eligible: page.next_eligible, _charges: page._charges,
+        })
+    }
+
+    /// A bounded diagnostic page with complete typed identities for direct reply encoding.
+    pub async fn expired_typed_candidate_page(
+        &self, relation: &OwnedRelation, after: Timestamp, groups: usize,
+        scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<TypedExpiryCandidatePage> {
         const MAX_CANDIDATES: usize = 64;
         self.require_unscoped_root()?;
         self.admit_read().await?;
@@ -312,15 +355,15 @@ impl OwnedReadSession {
         for _ in 0..groups {
             // Decode one accepted group. Its successors are unnecessary
             // while it still has a candidate or needs a later held present.
-            let page = self.merged_change_journals(
+            let mut page = self.merged_change_journals(
                 std::slice::from_ref(relation), through.into(), self.present.system_time.into(), 1, if through == Timestamp::MIN { ChangeScan::RetainedStart } else { ChangeScan::Forward },
             ).await?;
-            let Some(group) = page.commits.first() else {
+            let Some(group) = page.commits.first_mut() else {
                 through = page.covered_through()?;
                 state = "quiescent";
                 break;
             };
-            let [change] = group.changes.as_slice() else { return Err(change_feed_uncovered()); };
+            let [change] = group.changes.as_mut_slice() else { return Err(change_feed_uncovered()); };
             let expiry = Timestamp(group.publication.system_time.0.checked_add(policy.duration).ok_or_else(change_feed_uncovered)?);
             let valid = Interval::new(group.publication.system_time, expiry)?;
             for touch in &change.touches {
@@ -332,7 +375,7 @@ impl OwnedReadSession {
                     _ => return Err(change_feed_uncovered()),
                 }
             }
-            for touch in change.touches.iter().filter(|touch| touch.kind == rtdb_types::OwnedChangeKind::Put) {
+            for touch in std::mem::take(&mut change.touches).into_iter().filter(|touch| touch.kind == rtdb_types::OwnedChangeKind::Put) {
                 if rtdb_query::owned_purge_floor(Arc::clone(&context), &self.owner, relation, &touch.id).await?.is_some() {
                     continue;
                 }
@@ -345,9 +388,8 @@ impl OwnedReadSession {
                 if created != group.publication.system_time || expires != expiry {
                     return Err(change_feed_uncovered());
                 }
-                let bytes = touch.id.as_value().retained_bytes()?.saturating_mul(2).saturating_add(512);
-                charges.push(context.memory.reserve(bytes)?);
-                candidates.push(ExpiryCandidate { identity: touch.id.handle_bytes(), nomination, created, expiry });
+                charges.push(context.memory.reserve(expiry_candidate_bytes(&touch.id))?);
+                candidates.push(TypedExpiryCandidate { identity: touch.id, nomination, created, expiry });
                 state = "pending";
                 if candidates.len() == MAX_CANDIDATES { break; }
             }
@@ -364,7 +406,7 @@ impl OwnedReadSession {
             }
         }
         self.check_live_change_relations(std::slice::from_ref(relation))?;
-        Ok(ExpiryCandidatePage { candidates, through, diagnostic_cutoff: cutoff, state, next_eligible, _charges: charges })
+        Ok(TypedExpiryCandidatePage { candidates, through, diagnostic_cutoff: cutoff, state, next_eligible, _charges: charges })
     }
 
     /// Reads exact local overlay commits. The archived parent is immutable;
@@ -1459,6 +1501,44 @@ fn ordered_or_same(higher: i64, lower: i64, a: OwnedJournalHeader, b: OwnedJourn
     } else {
         b.publication.tx_id < a.publication.tx_id && b.publication.at_or_before(a.publication)
             && a.through_events > b.through_events
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn expiry_candidates_charge_the_legacy_cloned_value_footprint() {
+    let mut binary = Vec::with_capacity(1024);
+    binary.extend_from_slice(&[0, 255, 0, 1]);
+    let mut text = String::with_capacity(1024);
+    text.push_str("text/λ");
+    let ids = [
+        EntityId::Binary(binary),
+        EntityId::String(String::new()),
+        EntityId::String(text),
+        EntityId::Keyword(rtdb_types::Keyword::from_name("scope/λ")),
+        EntityId::Integer(i64::MIN),
+        EntityId::Uuid([42; 16]),
+    ];
+    for id in &ids {
+        let legacy = id.as_value().retained_bytes().unwrap().saturating_mul(2).saturating_add(512);
+        assert_eq!(expiry_candidate_bytes(id), legacy, "{id:?}");
+    }
+
+    let entry = Value::list(ids.iter().map(|id| OwnedChange {
+        id: id.clone(), kind: rtdb_types::OwnedChangeKind::Put,
+        valid: Interval::from_micros(10, 20).unwrap(), assertion_ordinal: None,
+    }.to_value()).collect());
+    let logical = entry.logical_type();
+    let field = rtdb_columnar::to_field("entry", &logical).unwrap();
+    let column = rtdb_columnar::copy_array(&logical, &[entry]).unwrap();
+    let Value::List(decoded) = rtdb_columnar::read_value(&field, column.as_ref(), 0).unwrap() else {
+        panic!("Expected the journal touch list");
+    };
+    let decoded = decode_touches(decoded).unwrap();
+    assert_eq!(decoded.len(), ids.len());
+    for (touch, id) in decoded.iter().zip(&ids) {
+        assert_eq!(&touch.id, id);
+        assert_eq!(touch.id.retained_bytes(), EntityIdRef::from(id).owned_payload_bytes());
     }
 }
 

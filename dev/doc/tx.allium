@@ -318,6 +318,10 @@
 -- The minimum expiry bounds the range witness and release.
 -- An uncertified batch falls back to point verification in page order.
 -- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
+-- A placed held expiry candidate page returns complete tagged identities as Arrow Binary in journal order.
+-- A pending page leaves the journal boundary before the candidate group so replay can skip identities with durable purges.
+-- A version 1 expiry nomination authenticates the held scope, owner, relation and complete tagged identity.
+-- The nomination digest frames the tag and payload together as one length-prefixed field.
 -- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its original receiver decision reading and have no valid end.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
 -- A Flight owned create or commit with compatible legacy Root document fields retains its vectors, structs, decimals, intervals and keywords through source encoding.

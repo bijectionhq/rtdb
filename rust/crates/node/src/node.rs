@@ -16,6 +16,7 @@ mod owned_identities;
 mod owned_unique;
 pub use owned_identities::{OwnedIdentityArrowPage, OwnedIdentityPage, OwnedIdentityPageOutput};
 pub use owned_changes::{ChangeEdgeOrder, OwnedChangeEdge, archived_changes_at_cut, archived_path_touch_at_cut, archived_versions_at_cut, ExpiryCandidate, ExpiryCandidatePage, OwnedChangeCommit, OwnedMergedChanges, OwnedPublicationLookup, OwnedRelationChanges, OwnedWorldVersionRead, OWNED_MERGED_CHANGE_RELATIONS};
+pub use owned_changes::{TypedExpiryCandidate, TypedExpiryCandidatePage};
 
 use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -3635,15 +3636,48 @@ fn expiry_nomination_digest(
     relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let handle = id.handle_bytes();
+    let mut integer = [0; 8];
+    let id = EntityIdRef::from(id);
+    let (tag, payload) = id.handle_parts(&mut integer);
     let mut digest = Sha256::new();
     digest.update(b"rtdb.expiry-nomination.v1\0");
     digest.update(scope.encode());
-    for input in [owner.as_bytes(), relation.name().as_bytes(), handle.as_slice()] {
+    for input in [owner.as_bytes(), relation.name().as_bytes()] {
         digest.update((input.len() as u64).to_be_bytes());
         digest.update(input);
     }
+    digest.update(((payload.len() + 1) as u64).to_be_bytes());
+    digest.update([tag]);
+    digest.update(payload);
     digest.finalize().into()
+}
+
+#[cfg(test)]
+#[test]
+fn expiry_nomination_v1_hashes_the_complete_handle_as_one_field() {
+    use sha2::{Digest, Sha256};
+
+    let scope = rtdb_types::PlacedAttemptScope::new("expiry-history", 17).unwrap();
+    let relation = rtdb_types::OwnedRelation::new("facts").unwrap();
+    let owner = "expiry-owner";
+    for id in [
+        EntityId::String("event/λ".into()),
+        EntityId::Keyword(rtdb_types::Keyword::from_name("event/λ")),
+        EntityId::Integer(i64::MIN),
+        EntityId::Integer(i64::MAX),
+        EntityId::Uuid([42; 16]),
+        EntityId::Binary(vec![0, 255, 0, 1]),
+        EntityId::Binary(vec![]),
+    ] {
+        let mut frame = b"rtdb.expiry-nomination.v1\0".to_vec();
+        frame.extend_from_slice(&scope.encode());
+        for field in [owner.as_bytes(), relation.name().as_bytes(), &id.handle_bytes()] {
+            frame.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            frame.extend_from_slice(field);
+        }
+        let expected: [u8; 32] = Sha256::digest(frame).into();
+        assert_eq!(expiry_nomination_digest(scope, owner, &relation, &id), expected, "{id:?}");
+    }
 }
 
 pub struct NativeSession {

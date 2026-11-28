@@ -18,6 +18,7 @@ pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_buffer::{MutableBuffer, OffsetBuffer};
 use arrow_flight::Result as ActionResult;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
@@ -25,6 +26,7 @@ use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_owned_entity_id, selected_cell, try_entity_id_array};
 use rtdb_format::ipc::OwnedStream;
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedIdentityArrowPage, OwnedIdentityPageOutput, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
+use rtdb_node::TypedExpiryCandidate;
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
 use rtdb_types::{Anomaly, OwnedIdentityScan, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation,
@@ -4345,15 +4347,16 @@ impl Service {
         let (relation, page) = split_relation(request)?;
         let (after, rest) = page.split_first_chunk::<8>().ok_or_else(|| invalid("Expiry candidates need an exclusive journal position"))?;
         let groups: &[u8; 2] = rest.try_into().map_err(|_| invalid("Expiry candidates need one group limit"))?;
-        let page = held.snapshot.expired_candidate_page(
+        let page = held.snapshot.expired_typed_candidate_page(
             &relation, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*groups)), scope,
         ).await.map_err(status)?;
-        let _charge = call.reserve(4096 + page.candidates.iter().map(|row| row.identity.len() + row.nomination.len() + 64).sum::<usize>())?;
+        let candidates = page.candidates();
+        let _charge = call.reserve(expiry_candidate_reply_bytes(candidates))?;
         let fields = [
-            ("identity", Arc::new(BinaryArray::from_iter_values(page.candidates.iter().map(|row| row.identity.as_slice()))) as ArrayRef),
-            ("nomination", Arc::new(StringArray::from_iter_values(page.candidates.iter().map(|row| row.nomination.as_str()))) as ArrayRef),
-            ("created_micros", Arc::new(Int64Array::from_iter_values(page.candidates.iter().map(|row| row.created.0))) as ArrayRef),
-            ("expiry_micros", Arc::new(Int64Array::from_iter_values(page.candidates.iter().map(|row| row.expiry.0))) as ArrayRef),
+            ("identity", Arc::new(expiry_candidate_identities(candidates)?) as ArrayRef),
+            ("nomination", Arc::new(StringArray::from_iter_values(candidates.iter().map(|row| row.nomination.as_str()))) as ArrayRef),
+            ("created_micros", Arc::new(Int64Array::from_iter_values(candidates.iter().map(|row| row.created.0))) as ArrayRef),
+            ("expiry_micros", Arc::new(Int64Array::from_iter_values(candidates.iter().map(|row| row.expiry.0))) as ArrayRef),
         ];
         let batch = RecordBatch::try_from_iter(fields).map_err(arrow)?;
         let mut metadata = batch.schema().metadata().clone();
@@ -6280,6 +6283,66 @@ impl Service {
         &self, memory: &Arc<MemoryBudget>, schema: &Schema, pages: &[RecordBatch], stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
         OwnedIpcReply::encode(memory, schema, pages, stream, self.0.config.maximum_message_bytes)
+    }
+}
+
+fn expiry_candidate_reply_bytes(candidates: &[TypedExpiryCandidate]) -> usize {
+    4096 + candidates.iter().map(|row| {
+        let mut integer = [0; 8];
+        let id = EntityIdRef::from(&row.identity);
+        let (_, payload) = id.handle_parts(&mut integer);
+        1 + payload.len() + row.nomination.len() + 64
+    }).sum::<usize>()
+}
+
+fn expiry_candidate_identities(candidates: &[TypedExpiryCandidate]) -> Result<BinaryArray, Status> {
+    let mut offsets = MutableBuffer::new((candidates.len() + 1) * std::mem::size_of::<i32>());
+    offsets.push(0i32);
+    let mut values = MutableBuffer::new(0);
+    for candidate in candidates {
+        let mut integer = [0; 8];
+        let id = EntityIdRef::from(&candidate.identity);
+        let (tag, payload) = id.handle_parts(&mut integer);
+        // IPC scratch is charged by buffer capacity, so grow once for each complete handle.
+        values.reserve(1 + payload.len());
+        values.push(tag);
+        values.extend_from_slice(payload);
+        let end = i32::try_from(values.len())
+            .map_err(|_| arrow(arrow_schema::ArrowError::OffsetOverflowError(values.len())))?;
+        offsets.push(end);
+    }
+    BinaryArray::try_new(OffsetBuffer::new(offsets.into()), values.into(), None).map_err(arrow)
+}
+
+#[cfg(test)]
+#[test]
+fn held_expiry_candidate_identities_match_legacy_handles_layout_and_grants() {
+    let candidates: Vec<_> = [
+        EntityId::String("a".repeat(63)),
+        EntityId::Binary(vec![255; 80]),
+        EntityId::String("scope/λ".into()),
+        EntityId::Keyword(rtdb_types::Keyword::from_name("scope/λ")),
+        EntityId::Integer(-1),
+        EntityId::Integer(0),
+        EntityId::Uuid([42; 16]),
+        EntityId::Binary(vec![0, 255, 0, 1]),
+        EntityId::Binary(vec![]),
+        EntityId::String(String::new()),
+    ].into_iter().enumerate().map(|(row, identity)| TypedExpiryCandidate {
+        identity, nomination: format!("nomination-{row}"), created: Timestamp(1), expiry: Timestamp(2),
+    }).collect();
+
+    for rows in 0..=candidates.len() {
+        let page = &candidates[..rows];
+        let handles: Vec<_> = page.iter().map(|candidate| candidate.identity.handle_bytes()).collect();
+        let legacy = BinaryArray::from_iter_values(&handles);
+        let identities = expiry_candidate_identities(page).unwrap();
+        assert_eq!(identities, legacy);
+        let capacities = |array: &BinaryArray| array.to_data().buffers().iter().map(|buf| buf.capacity()).collect::<Vec<_>>();
+        assert_eq!(capacities(&identities), capacities(&legacy));
+        let legacy_reply_bytes = 4096 + page.iter().zip(handles).map(|(row, handle)|
+            handle.len() + row.nomination.len() + 64).sum::<usize>();
+        assert_eq!(expiry_candidate_reply_bytes(page), legacy_reply_bytes);
     }
 }
 

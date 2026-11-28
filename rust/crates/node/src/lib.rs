@@ -40,6 +40,7 @@ pub use rtdb_tx::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceW
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{DurableRange, FundedMutationClock, MAX_DURABLE_RANGE_BYTES, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};
 pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityArrowPage, OwnedIdentityPage, OwnedIdentityPageOutput, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
+pub use node::{TypedExpiryCandidate, TypedExpiryCandidatePage};
 pub use node::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
 pub use node::{AssertionFenceStatus, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader, RetiredOriginalFamilyRead, RetiredOriginalFamilySource, RootCatalogRead};
 pub use node::SearchFileFormat;
