@@ -14,31 +14,31 @@ use super::{
 };
 use crate::context::Execution;
 
-enum Input<'a, T> {
+pub(super) enum Input<'a, T> {
     Column(&'a Column),
     Parameter(ArrowCell<'a>),
     Literal(Option<T>),
 }
 
 impl<'a, T: Copy> Input<'a, T> {
-    fn bind(
+    pub(super) fn bind(
         expr: &'a Expr,
         schema: &Schema,
         batch: &'a ColumnBatch,
         execution: &'a Execution,
-        accepts: impl FnOnce(&ScalarType) -> bool,
+        accepts: impl FnOnce(&LogicalType) -> bool,
         literal: impl FnOnce(&'a Expr) -> Option<T>,
     ) -> Option<Self> {
         Some(match expr {
             Expr::Column { id, .. } => {
                 let position = schema.position(*id)?;
-                if !accepts(plain_scalar(&schema.fields()[position].data_type)?) {
+                if !accepts(&schema.fields()[position].data_type) {
                     return None;
                 }
                 Self::Column(&batch.columns[position])
             }
             Expr::Parameter { index, .. } => {
-                if !accepts(plain_scalar(execution.parameters.types().get(*index)?)?) {
+                if !accepts(execution.parameters.types().get(*index)?) {
                     return None;
                 }
                 Self::Parameter(execution.parameters.evaluator().arrow_cell(*index)?)
@@ -48,7 +48,7 @@ impl<'a, T: Copy> Input<'a, T> {
         })
     }
 
-    fn read(
+    pub(super) fn read(
         &self,
         row: usize,
         read: impl FnOnce(ArrowCell<'a>) -> Option<Option<T>>,
@@ -94,7 +94,7 @@ impl<'a> Input<'a, &'a [u8]> {
             schema,
             batch,
             execution,
-            |scalar| *scalar == ScalarType::Binary,
+            |logical| plain_scalar(logical) == Some(&ScalarType::Binary),
             |expr| match expr {
                 Expr::Literal(Value::Binary(bytes)) => Some(bytes.as_slice()),
                 _ => None,
@@ -110,10 +110,10 @@ impl<'a> Input<'a, &'a [u8]> {
     }
 }
 
-type SignedInput<'a> = Input<'a, i64>;
+pub(super) type SignedInput<'a> = Input<'a, i64>;
 
 impl<'a> Input<'a, i64> {
-    fn bind_signed(
+    pub(super) fn bind_signed(
         expr: &'a Expr,
         schema: &Schema,
         batch: &'a ColumnBatch,
@@ -124,17 +124,17 @@ impl<'a> Input<'a, i64> {
             schema,
             batch,
             execution,
-            |scalar| {
+            |logical| {
                 matches!(
-                    scalar,
-                    ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+                    plain_scalar(logical),
+                    Some(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)
                 )
             },
             signed_literal,
         )
     }
 
-    fn signed(&self, row: usize) -> Option<Option<i64>> {
+    pub(super) fn signed(&self, row: usize) -> Option<Option<i64>> {
         self.read(row, |cell| {
             if !matches!(
                 cell.field.data_type(),

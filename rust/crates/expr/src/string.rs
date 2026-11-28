@@ -166,11 +166,8 @@ impl StringFunction {
                     Value::Binary(retained.to_vec())
                 } else {
                     let source = text(&args[0])?;
-                    let trim = args.get(1).map(text).transpose()?.unwrap_or(" ");
-                    let mut characters = trim.chars();
-                    let character = characters.next().filter(|_| characters.next().is_none()).ok_or_else(|| Anomaly::incorrect("xtdb.expression/data-exception", "Data Exception - trim error."))?;
-                    let source = if self == Self::TrimTrailing { source } else { source.trim_start_matches(character) };
-                    let source = if self == Self::TrimLeading || character.len_utf16() == 2 { source } else { source.trim_end_matches(character) };
+                    let token = args.get(1).map(text).transpose()?.unwrap_or(" ");
+                    let source = text_trim(source, token, self != Self::TrimTrailing, self != Self::TrimLeading)?;
                     Value::Utf8(source.into())
                 }
             }
@@ -188,9 +185,7 @@ impl StringFunction {
                     for unit in source.encode_utf16() { output.push(unit); output.extend_from_slice(&replacement); }
                     Value::Utf8(java_utf16(output))
                 } else {
-                    let occurrences = source.matches(target).count();
-                    let length = source.len().checked_sub(occurrences.checked_mul(target.len()).ok_or_else(overflow)?).and_then(|length| length.checked_add(occurrences.checked_mul(replacement.len())?)).ok_or_else(overflow)?;
-                    check_size(length)?;
+                    let length = literal_replace_length(source, target, replacement)?;
                     context.reserve(length)?;
                     Value::Utf8(source.replace(target, replacement))
                 }
@@ -228,6 +223,24 @@ pub(crate) fn overlay_edges(source: &[u8], start: i32, length: i32, utf8: bool) 
     let prefix = substring(source, 1, Some(start.wrapping_sub(1)), utf8)?;
     let suffix = substring(source, start.wrapping_add(length), None, utf8)?;
     Ok([prefix, suffix])
+}
+
+pub(crate) fn text_trim<'a>(source: &'a str, token: &str, leading: bool, trailing: bool) -> Result<&'a str> {
+    let mut characters = token.chars();
+    let character = characters.next().filter(|_| characters.next().is_none())
+        .ok_or_else(|| Anomaly::incorrect("xtdb.expression/data-exception", "Data Exception - trim error."))?;
+    let source = if leading { source.trim_start_matches(character) } else { source };
+    Ok(if trailing && character.len_utf16() == 1 { source.trim_end_matches(character) } else { source })
+}
+
+pub(crate) fn literal_replace_length(source: &str, target: &str, replacement: &str) -> Result<usize> {
+    let occurrences = source.matches(target).count();
+    let length = occurrences.checked_mul(target.len())
+        .and_then(|removed| source.len().checked_sub(removed))
+        .and_then(|remaining| remaining.checked_add(occurrences.checked_mul(replacement.len())?))
+        .ok_or_else(overflow)?;
+    check_size(length)?;
+    Ok(length)
 }
 
 pub(crate) fn binary_trim<'a>(source: &'a [u8], token: &[u8], leading: bool, trailing: bool) -> Result<&'a [u8]> {

@@ -191,6 +191,22 @@ pub fn binary_overlay_edges(source: &[u8], start: i64, length: i64) -> Result<[&
     crate::string::overlay_edges(source, start as i32, length as i32, false)
 }
 
+/// Borrows the source sides of UTF-8 OVERLAY using its character positions and signed index narrowing.
+pub fn text_overlay_edges(source: &str, start: i64, length: i64) -> Result<[&str; 2]> {
+    let [prefix, suffix] = crate::string::overlay_edges(source.as_bytes(), start as i32, length as i32, true)?;
+    Ok([&source[..prefix.len()], &source[source.len() - suffix.len()..]])
+}
+
+/// Borrows the retained UTF-8 TRIM span with the scalar one-character token and UTF-16 trailing rules.
+pub fn text_trim<'a>(source: &'a str, token: &str, leading: bool, trailing: bool) -> Result<&'a str> {
+    crate::string::text_trim(source, token, leading, trailing)
+}
+
+/// Sizes the nonempty-target literal REPLACE result with the scalar signed length bound.
+pub fn literal_replace_length(source: &str, target: &str, replacement: &str) -> Result<usize> {
+    crate::string::literal_replace_length(source, target, replacement)
+}
+
 /// Borrows the retained Binary span, using the first octet of a nonempty trim token.
 pub fn binary_trim<'a>(source: &'a [u8], token: &[u8], leading: bool, trailing: bool) -> Result<&'a [u8]> {
     crate::string::binary_trim(source, token, leading, trailing)

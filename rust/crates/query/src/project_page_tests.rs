@@ -160,6 +160,35 @@ async fn utf8_concat_supplies_grouping_top_k_and_spilling_sort_keys() {
 }
 
 #[tokio::test]
+async fn sql_concat_and_str_keep_empty_null_and_formatted_parts() {
+    use rtdb_sql::PrepareOptions;
+    use crate::PreparedQuery;
+
+    let execution = execution();
+    let sql = "SELECT CONCAT(s, 'β', NULL), CONCAT(s), STR(s), CONCAT(s, 42), s || 'β' \
+        FROM (VALUES (1, '🦀'), (2, NULL), (3, '')) AS t(i, s) ORDER BY i";
+    let prepared = rtdb_sql::prepare(sql, &execution.context.catalog, &PrepareOptions::default()).unwrap();
+    let query = PreparedQuery::from_prepared(prepared, &execution.context.memory).unwrap();
+    let mut cursor = query.execute_columns(Arc::clone(&execution.context), vec![]).await.unwrap();
+    let mut actual = Vec::new();
+    while let Some(output) = cursor.next_batch().await.unwrap() {
+        let batch = output.batch();
+        let schema = batch.schema();
+        for row in 0..batch.num_rows() {
+            actual.push(schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
+                rtdb_columnar::read_value(field, array.as_ref(), row).unwrap()
+            }).collect::<Vec<_>>());
+        }
+    }
+    let text = |value: &str| Value::Utf8(value.into());
+    assert_eq!(actual, [
+        vec![text("🦀β"), text("🦀"), text("🦀"), text("🦀42"), text("🦀β")],
+        vec![text("β"), text(""), text(""), text("42"), Value::Null],
+        vec![text("β"), text(""), text(""), text("42"), text("β")],
+    ]);
+}
+
+#[tokio::test]
 async fn projection_evaluates_every_row_of_the_first_column_before_the_second_column() {
     let execution = execution();
     let first = Expr::binary(BinaryOp::Divide,int(10),Expr::column(ColumnId(0),LogicalType::Scalar(ScalarType::I64)));

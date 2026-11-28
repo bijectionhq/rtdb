@@ -11,6 +11,7 @@ pub(crate) mod functions;
 mod patch;
 pub(crate) mod periods;
 pub(crate) mod search;
+mod text;
 pub(crate) mod window;
 
 use std::{borrow::Borrow, collections::{HashMap, HashSet}, ops::Range, sync::Arc};
@@ -5647,6 +5648,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_text_projections_write_borrowed_spans_with_observed_nulls() {
+        let memory = MemoryBudget::new(1 << 22);
+        let schema = Schema::new(vec![
+            field(0, ScalarType::Utf8), field(1, ScalarType::Utf8), field(2, ScalarType::I64),
+        ]).unwrap();
+        let columns: [ArrayRef; 3] = [
+            Arc::new(StringArray::from(vec![Some("🦀é🦀"), Some("ababa"), None, Some(""), Some(" e\u{301} ")])),
+            Arc::new(StringArray::from(vec!["🦀", "a", "invalid", "é", " "])),
+            Arc::new(Int64Array::from(vec![Some((1i64 << 32) + 2), Some(2), Some(0), Some(0), None])),
+        ];
+        let columns = columns.into_iter().zip(schema.fields()).map(|(array, field)| Column::Arrow {
+            array,
+            field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+            logical: Some(field.data_type.clone()),
+        }).collect();
+        let batch = ColumnBatch::settled(columns, 5, memory.reserve(4096).unwrap()).unwrap();
+        let source = schema.fields()[0].expression();
+        let token = schema.fields()[1].expression();
+        let length = schema.fields()[2].expression();
+        let literal = |text: &str| Expr::Literal(Value::Utf8(text.into()));
+        let call = |name: &str, args: Vec<Expr>| Expr::Call {
+            name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args,
+        };
+        let start = Expr::Literal(Value::I64((1i64 << 32) + 2));
+        let default_length = call("default_overlay_length", vec![token.clone()]);
+        let sql_concat_part = |expr| Expr::Coalesce(vec![call("str", vec![expr]), literal("")]);
+        let expressions = vec![
+            call("overlay", vec![source.clone(), token.clone(), start.clone(), length]),
+            call("overlay", vec![source.clone(), token.clone(), start, default_length]),
+            call("trim", vec![source.clone(), token.clone()]),
+            call("trim_leading", vec![source.clone(), token.clone()]),
+            call("trim_trailing", vec![source.clone(), token.clone()]),
+            call("replace", vec![source.clone(), literal("aba"), literal("β")]),
+            call("reverse", vec![source.clone()]),
+            call("str", vec![source.clone(), token.clone()]),
+            sql_concat_part(source.clone()),
+            call("concat", vec![sql_concat_part(source), sql_concat_part(token)]),
+        ];
+        let mut cursor = record_projection_cursor(batch, schema, expressions, &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let expected = [
+            [Some("🦀🦀"), Some("aaba"), None, Some("é"), None],
+            [Some("🦀🦀🦀"), Some("aaaba"), None, Some("é"), Some("  \u{301} ")],
+            [Some("é🦀"), Some("bab"), None, Some(""), Some("e\u{301}")],
+            [Some("é🦀"), Some("baba"), None, Some(""), Some("e\u{301} ")],
+            [Some("🦀é🦀"), Some("abab"), None, Some(""), Some(" e\u{301}")],
+            [Some("🦀é🦀"), Some("βba"), None, Some(""), Some(" e\u{301} ")],
+            [Some("🦀é🦀"), Some("ababa"), None, Some(""), Some(" \u{301}e ")],
+            [Some("🦀é🦀🦀"), Some("ababaa"), Some("invalid"), Some("é"), Some(" e\u{301}  ")],
+            [Some("🦀é🦀"), Some("ababa"), Some(""), Some(""), Some(" e\u{301} ")],
+            [Some("🦀é🦀🦀"), Some("ababaa"), Some("invalid"), Some("é"), Some(" e\u{301}  ")],
+        ];
+        assert_eq!(page.columns.len(), expected.len());
+        for (column, expected) in page.columns.iter().zip(expected) {
+            let Column::Arrow { array, field, .. } = column else { panic!("Expected packed text"); };
+            let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+            assert_eq!(field.is_nullable(), expected.iter().any(Option::is_none));
+        }
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        drop((page, cursor));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_text_projection_preserves_reached_errors_and_empty_replace() {
+        let memory = MemoryBudget::new(1 << 22);
+        let input = field(0, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let batch = |cells: Vec<Option<&str>>| {
+            let len = cells.len();
+            ColumnBatch::settled(vec![Column::Arrow {
+                array: Arc::new(StringArray::from(cells)),
+                field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+                logical: Some(input.data_type.clone()),
+            }], len, memory.reserve(4096).unwrap()).unwrap()
+        };
+        let literal = |text: &str| Expr::Literal(Value::Utf8(text.into()));
+        let call = |name: &str, args: Vec<Expr>| Expr::Call {
+            name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args,
+        };
+        let trim = call("trim", vec![input.expression(), literal("")]);
+        let mut cursor = record_projection_cursor(batch(vec![None]), schema.clone(), vec![trim.clone()], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(&page.columns[0], Column::Arrow { array, .. } if array.data_type() == &DataType::Null));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+
+        let overlay = call("overlay", vec![
+            input.expression(), literal("x"), Expr::Literal(Value::I64(1i64 << 32)), Expr::Literal(Value::I64(1)),
+        ]);
+        let mut cursor = record_projection_cursor(batch(vec![None, Some("🦀")]), schema.clone(), vec![trim, overlay.clone()], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/data-exception");
+        let mut cursor = record_projection_cursor(batch(vec![None, Some("🦀")]), schema.clone(), vec![overlay], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().message.as_deref(), Some("Negative substring length"));
+
+        let replace = call("replace", vec![input.expression(), literal(""), literal("-")]);
+        let mut cursor = record_projection_cursor(batch(vec![Some("🦀")]), schema, vec![replace], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Utf8("-?-?-".into()));
+        assert_eq!(cursor.scalar_fallbacks, Some(1));
+    }
+
+    #[tokio::test]
+    async fn native_text_projection_funds_the_output_within_the_query_grant() {
+        let memory = MemoryBudget::new(1 << 17);
+        let source_memory = MemoryBudget::new(1 << 22);
+        let input = field(0, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let batch = |value: &str| {
+            let column = Column::Arrow {
+                array: Arc::new(StringArray::from(vec![value])),
+                field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+                logical: Some(input.data_type.clone()),
+            };
+            ColumnBatch::settled(vec![column], 1, source_memory.reserve(1 << 19).unwrap()).unwrap()
+        };
+        let reverse = Expr::Call { name: "reverse".into(), args: vec![input.expression()], return_type: input.data_type.clone() };
+        let value = "a🦀".repeat(1 << 13);
+        let mut cursor = record_projection_cursor(batch(&value), schema.clone(), vec![reverse.clone()], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Utf8("🦀a".repeat(1 << 13)));
+        assert!(memory.used_bytes() >= value.len());
+        drop((page, cursor));
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(source_memory.used_bytes(), 0);
+
+        let mut cursor = record_projection_cursor(batch(&"a".repeat(1 << 18)), schema, vec![reverse], &memory);
+        assert!(cursor.next_batch().await.err().unwrap().is(rtdb_types::AnomalyKind::ResourceExhausted));
+        drop(cursor);
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(source_memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn binary_projections_write_reached_spans_and_observed_nulls() {
         use arrow_array::BinaryArray;
 
@@ -7167,6 +7307,11 @@ impl BatchCursor for BatchExpressions {
             }
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+            if let Some((column, owner)) = text::column(expression, invocation.data_type(), &self.schema, &batch, &self.execution)? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
             if let Some((column, owner)) = projection::list_subscript(
                 expression, invocation.data_type(), &self.schema, &batch, &self.execution,
             )? {
