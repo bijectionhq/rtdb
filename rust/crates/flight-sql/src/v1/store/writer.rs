@@ -2,7 +2,7 @@ use prost::Message;
 use rtdb_index::branches::store::{StoreWriterClaim, StoreWriterFence};
 use rtdb_auth::PlacementFence;
 use rtdb_node::{DatabaseAccess, SessionIdentity};
-use rtdb_tx::transact::{Outcome, Transact};
+use rtdb_tx::transact::{Outcome, Receipt, Transact};
 use tonic::Status;
 
 use super::{Call, Service, error, incarnation, proto};
@@ -10,6 +10,7 @@ use super::{Call, Service, error, incarnation, proto};
 pub(crate) const FENCE_WRITER: &str = "rtdb.store.v1.FenceWriter";
 pub(crate) const CLAIM_WRITER: &str = "rtdb.store.v1.ClaimWriter";
 pub(crate) const WRITER_FENCE_HEADER: &str = "x-rtdb-store-writer-fence";
+pub(crate) const CLOSE_RECEIPT_HEADER: &str = "x-rtdb-store-close-receipt";
 
 pub(super) fn fence(epoch: u64, writer: Option<Vec<u8>>) -> Result<StoreWriterFence, Status> {
     if epoch == 0 {
@@ -38,9 +39,27 @@ impl Service {
         }
         let expected = incarnation(&request.incarnation)?;
         let fence = fence(request.epoch, None)?;
-        self.order_store_writer(call, expected, PlacementFence::Close { epoch: fence.epoch },
+        let receipt = self.order_store_writer(call, expected, PlacementFence::Close { epoch: fence.epoch },
             Transact::set_store_writer(expected, fence)).await?;
-        Ok(proto::FenceWriterReply { incarnation: request.incarnation, epoch: fence.epoch, writer: None }.encode_to_vec())
+        let Outcome::StoreWriterClosed { epoch, final_cut, previous } = receipt.outcome else {
+            return Err(Status::internal("The fence did not return its ordered close receipt"));
+        };
+        if epoch != fence.epoch || final_cut.basis.incarnation() != expected
+            || final_cut.basis.position() >= receipt.basis.position()
+        {
+            return Err(Status::internal("The ordered closure belongs to another request or source"));
+        }
+        let previous = previous.map(|claim| -> Result<proto::WriterFence, Status> {
+            let writer = claim.fence.writer.ok_or_else(|| Status::internal("The previous writer claim has no assignment"))?;
+            Ok(proto::WriterFence { epoch: claim.fence.epoch, writer: writer.to_vec(),
+                generation: claim.generation, claim: claim.claim.to_vec() })
+        }).transpose()?;
+        Ok(proto::FenceWriterReply {
+            incarnation: request.incarnation, epoch,
+            fenced: Some(proto::Stamp { version: receipt.basis.position(), micros: receipt.system_time.0 }),
+            final_cut: Some(proto::Stamp { version: final_cut.basis.position(), micros: final_cut.system_time.0 }),
+            previous,
+        }.encode_to_vec())
     }
 
     pub(super) async fn store_claim_writer(
@@ -59,13 +78,16 @@ impl Service {
                 .ok_or_else(|| error::incorrect("The Store reading floor must allow a later clock sample"))?;
             command.window.not_before = Some(rtdb_types::Timestamp(first));
         }
-        let generation = self.order_store_writer(call, expected, permission, command).await?;
-        Ok(proto::ClaimWriterReply { claim: Some(request), generation }.encode_to_vec())
+        let receipt = self.order_store_writer(call, expected, permission, command).await?;
+        if receipt.outcome != Outcome::Then {
+            return Err(Status::internal("The Store did not confirm the exact writer claim"));
+        }
+        Ok(proto::ClaimWriterReply { claim: Some(request), generation: receipt.basis.position() }.encode_to_vec())
     }
 
     async fn order_store_writer(
         &self, call: &Call, expected: [u8; 16], permission: PlacementFence, mut command: Transact,
-    ) -> Result<u64, Status> {
+    ) -> Result<Receipt, Status> {
         if self.follower_only() || call.session.fresh_replica {
             return Err(error::unsupported(FENCE_WRITER));
         }
@@ -93,9 +115,9 @@ impl Service {
         let receipt = driver.transact(command, &call.cancellation).await.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         caller.principal.revalidate(self.0.node.now()).await.map_err(error::anomaly)?;
-        match receipt.outcome {
-            Outcome::Then if receipt.basis.incarnation() == expected => Ok(receipt.basis.position()),
-            Outcome::Refused { error: refusal } => Err(error::anomaly(refusal)),
+        match &receipt.outcome {
+            Outcome::Refused { error: refusal } => Err(error::anomaly(refusal.clone())),
+            _ if receipt.basis.incarnation() == expected => Ok(receipt),
             _ => Err(Status::internal("The store writer fence did not confirm its ordered request")),
         }
     }

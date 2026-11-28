@@ -56,7 +56,7 @@ pub(crate) const TIMED_APPEND_VERSION: &str = "timed-append-v1";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
 pub(crate) const RANK: &str = "rtdb.store.v1.Rank";
 pub(crate) use purge::{PURGE_FLOOR, PURGE_WRITER_HEADER};
-pub(crate) use writer::{CLAIM_WRITER, FENCE_WRITER, WRITER_FENCE_HEADER};
+pub(crate) use writer::{CLAIM_WRITER, CLOSE_RECEIPT_HEADER, FENCE_WRITER, WRITER_FENCE_HEADER};
 pub(super) use sizes::STORAGE_SIZES;
 pub(crate) const HOLD_VERSION: &str = "rtdb.store.v1.HoldVersion";
 #[cfg(feature = "multi")]
@@ -562,6 +562,8 @@ fn append_reply(
                         let first = failed.first().copied().ok_or_else(|| Status::internal("A failed append names no read"))?;
                         proto::append_reply::Outcome::Conflict(u32::try_from(first).map_err(|_| Status::internal("Read index overflow"))?)
                     }
+                    Outcome::StoreWriterClosed { .. } =>
+                        return Err(Status::internal("A Store append cannot close the writer")),
                     Outcome::StoreDenied => {
                         proto::append_reply::Outcome::ClaimDenied(proto::Stamp {
                             micros: receipt.store_reading.ok_or_else(|| Status::internal("The Store receipt has no clock reading"))?.0,

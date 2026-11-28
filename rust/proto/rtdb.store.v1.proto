@@ -242,10 +242,17 @@ message FenceWriterRequest {
   optional bytes writer = 3;
 }
 
+// x-rtdb-store-close-receipt: 1 requires the settled close receipt.
 message FenceWriterReply {
   bytes incarnation = 1;
   uint64 epoch = 2;
-  optional bytes writer = 3;
+  reserved 3;
+  // The control transaction that closed this placement epoch.
+  Stamp fenced = 4;
+  // The final settled transaction cut immediately before that fence.
+  Stamp final_cut = 5;
+  // The exact active prior claim, absent when no writer was admitted.
+  WriterFence previous = 6;
 }
 
 message ClaimWriterRequest {

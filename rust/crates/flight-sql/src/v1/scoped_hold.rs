@@ -138,7 +138,7 @@ impl Service {
         match receipt.outcome {
             Outcome::Then => Ok(()),
             Outcome::Refused { error } => Err(super::error::anomaly(error)),
-            Outcome::Otherwise { .. } | Outcome::StoreDenied => Err(hold_unavailable()),
+            Outcome::Otherwise { .. } | Outcome::StoreDenied | Outcome::StoreWriterClosed { .. } => Err(hold_unavailable()),
         }
     }
 

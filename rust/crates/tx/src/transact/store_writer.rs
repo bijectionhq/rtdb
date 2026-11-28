@@ -63,6 +63,12 @@ impl WriterCommand {
     }
 }
 
+pub(super) fn close_outcome(index: &BranchIndex, epoch: u64) -> Outcome {
+    let final_cut = index.head();
+    let previous = index.store_writer_claim_at(final_cut.basis.position());
+    Outcome::StoreWriterClosed { epoch, final_cut, previous }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_change(
     view: View<'_>, request: &Transact, command: WriterCommand,
@@ -79,12 +85,12 @@ pub(super) fn resolve_change(
         return Err(store_time_order());
     }
     let reading = reading_floor.map(|_| now);
-    let receipt = |cut: BranchCut| Receipt {
-        key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome: Outcome::Then,
+    let receipt = |cut: BranchCut, outcome| Receipt {
+        key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome,
         replayed: false, erasure: None, decision_clock: None, store_reading: reading,
     };
     let prior = view.receipts.get(&namespace).and_then(|receipts| receipts.get(&request.key));
-    let effect = if let Some(attempt) = attempt {
+    let (effect, outcome) = if let Some(attempt) = attempt {
         if attempt == [0; 16] {
             return Err(Anomaly::incorrect("rtdb.store/writer-attempt", "A store writer claim needs a nonzero attempt identity"));
         }
@@ -96,13 +102,19 @@ pub(super) fn resolve_change(
             return Ok((Resolution::Answer(replay(&prior.receipt)), None));
         }
         view.index.check_store_writer_claim(incarnation, fence)?;
-        BranchEffect::ClaimStoreWriter { incarnation, fence, attempt }
+        (BranchEffect::ClaimStoreWriter { incarnation, fence, attempt }, Outcome::Then)
     } else {
-        if !view.index.check_store_writer_fence(incarnation, fence)? {
-            let reply = prior.map_or_else(|| receipt(head), |prior| replay(&prior.receipt));
-            return Ok((Resolution::Answer(reply), None));
+        if fence.writer.is_some() {
+            return Err(Anomaly::incorrect("rtdb.store/writer-close", "A close command cannot claim the writer"));
         }
-        BranchEffect::StoreWriterFence { incarnation, fence }
+        if !view.index.check_store_writer_fence(incarnation, fence)? {
+            let owned = prior.filter(|prior| matches!(prior.receipt.outcome,
+                Outcome::StoreWriterClosed { epoch, .. } if epoch == fence.epoch))
+                .ok_or_else(|| Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/writer-close-unavailable",
+                    "The closed writer has no exact original closure receipt"))?;
+            return Ok((Resolution::Answer(replay(&owned.receipt)), None));
+        }
+        (BranchEffect::StoreWriterFence { incarnation, fence }, close_outcome(view.index, fence.epoch))
     };
     if position <= head.basis.position() || prior.is_some() {
         return Err(invalid_record());
@@ -115,7 +127,7 @@ pub(super) fn resolve_change(
     }
     after.apply(effect.clone())?;
     let record = TransactionRecord::Tx(ResolvedTransact {
-        fingerprint, receipt: receipt(cut), effects: vec![effect], before: None, receipt_namespace: namespace,
+        fingerprint, receipt: receipt(cut, outcome), effects: vec![effect], before: None, receipt_namespace: namespace,
         admitted_at: now, workload: None, workload_digest: None, request: Some(canonical_request),
         timed_store: None,
     });

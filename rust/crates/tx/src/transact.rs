@@ -12,7 +12,7 @@ pub use rtdb_index::branches::{
     store::{KeyRange, StoreBound, StoreWrite},
 };
 use rtdb_index::branches::store::{
-    StoreStamp, StoreWriterFence, VALUE_COLUMN, check_bounds, check_denial_derives, check_derives, check_placeholders, claim_refused, decode_bound_value, resolve_derives, stamp_writes,
+    StoreStamp, StoreWriterClaim, StoreWriterFence, VALUE_COLUMN, check_bounds, check_denial_derives, check_derives, check_placeholders, claim_refused, decode_bound_value, resolve_derives, stamp_writes,
     store_table,
 };
 use rtdb_types::{
@@ -512,6 +512,7 @@ pub enum Outcome {
     Otherwise { failed: Vec<usize> },
     Refused { error: Anomaly },
     StoreDenied,
+    StoreWriterClosed { epoch: u64, final_cut: BranchCut, previous: Option<StoreWriterClaim> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1289,6 +1290,20 @@ impl TransactState {
                 || stored.workload_digest.is_some() && stored.workload.is_none()
             {
                 return Err(invalid());
+            }
+            if let Outcome::StoreWriterClosed { epoch, final_cut, previous } = receipt.outcome {
+                let fence = StoreWriterFence { epoch, writer: None };
+                if epoch == 0 || stored.receipt_namespace != Some(store_writer::receipt_namespace())
+                    || receipt.key != Transact::set_store_writer(receipt.basis.incarnation(), fence).key
+                    || final_cut.basis.incarnation() != receipt.basis.incarnation()
+                    || final_cut.basis.position() >= receipt.basis.position()
+                    || final_cut.system_time >= receipt.system_time
+                    || state.index.before(receipt.basis)? != Some(final_cut)
+                    || !state.index.store_writer_closed_at(receipt.basis.position(), epoch)
+                    || state.index.store_writer_claim_at(final_cut.basis.position()) != previous
+                {
+                    return Err(invalid());
+                }
             }
             if let Some(timing) = stored.timed_store {
                 if stored.receipt_namespace.is_some() || stored.workload.is_some() || stored.installed.is_some() {
@@ -2129,6 +2144,11 @@ impl TransactState {
     fn publish(&mut self, receipt: Receipt, fingerprint: [u8; 32], receipt_namespace: Option<[u8; 32]>,
                workload: Option<WorkloadFamily>, workload_digest: Option<[u8; 32]>, effects: Vec<BranchEffect>,
                timed_store: Option<TimedStoreEvidence>) -> Result<Receipt> {
+        if matches!(receipt.outcome, Outcome::StoreWriterClosed { .. })
+            && !matches!(effects.as_slice(), [BranchEffect::StoreWriterFence { .. }])
+        {
+            return Err(invalid_record());
+        }
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         if let Some(reading) = receipt.store_reading {
@@ -2138,7 +2158,10 @@ impl TransactState {
             if let BranchEffect::StoreWriterFence { incarnation, fence } = &effect
                 && (receipt_namespace != Some(store_writer::receipt_namespace())
                     || receipt.key != Transact::set_store_writer(*incarnation, *fence).key
-                    || receipt.outcome != Outcome::Then || workload.is_some())
+                    || fence.writer.is_some() || workload.is_some()
+                    || receipt.erasure.is_some() || receipt.decision_clock.is_some() || receipt.store_reading.is_some()
+                    || timed_store.is_some()
+                    || receipt.outcome != store_writer::close_outcome(&self.index, fence.epoch))
             {
                 return Err(invalid_record());
             }

@@ -1079,7 +1079,8 @@ async fn write(
     };
     match receipt.outcome {
         Outcome::Then | Outcome::Otherwise { .. } => Ok(()),
-        Outcome::StoreDenied => Err(Anomaly::fault("rtdb/catalog", "A catalog transaction cannot select a Store denial")),
+        Outcome::StoreDenied | Outcome::StoreWriterClosed { .. } =>
+            Err(Anomaly::fault("rtdb/catalog", "A catalog transaction cannot settle a private Store decision")),
         Outcome::Refused { error } => Err(error),
     }
 }

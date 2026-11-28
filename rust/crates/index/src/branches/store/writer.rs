@@ -9,7 +9,7 @@ pub struct StoreWriterFence {
     pub writer: Option<[u8; 16]>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreWriterClaim {
     pub fence: StoreWriterFence,
     pub generation: u64,
@@ -44,6 +44,19 @@ impl BranchIndex {
 
     fn store_writer_fence(&self) -> Option<StoreWriterFence> {
         self.store_writer_fences.values().next_back().map(|state| state.fence())
+    }
+
+    /// The last admitted claim at a retained transaction cut.
+    pub fn store_writer_claim_at(&self, position: u64) -> Option<StoreWriterClaim> {
+        let (&generation, state) = self.store_writer_fences.range(..=position).next_back()?;
+        let claim = state.claim?;
+        state.writer?;
+        Some(StoreWriterClaim { fence: state.fence(), generation, claim })
+    }
+
+    pub fn store_writer_closed_at(&self, position: u64, epoch: u64) -> bool {
+        self.store_writer_fences.get(&position).is_some_and(|state|
+            state.epoch == epoch && state.writer.is_none() && state.claim.is_none())
     }
 
     pub fn require_store_writer(&self, writer: Option<([u8; 16], StoreWriterFence, u64, [u8; 16])>) -> Result<()> {

@@ -310,7 +310,7 @@ impl ResponseRelease<'_> {
         match receipt.outcome {
             Outcome::Then => Ok(receipt),
             Outcome::Refused { error } => Err(error),
-            Outcome::Otherwise { .. } | Outcome::StoreDenied => Err(Anomaly::fault(
+            Outcome::Otherwise { .. } | Outcome::StoreDenied | Outcome::StoreWriterClosed { .. } => Err(Anomaly::fault(
                 "rtdb/custody-release",
                 "Response release has no alternative arm",
             )),

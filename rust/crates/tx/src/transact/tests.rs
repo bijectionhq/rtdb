@@ -92,7 +92,11 @@ fn a_store_writer_close_orders_against_appends_and_survives_checkpoint_restore()
     assert_eq!(refused(&state, &append(1, None), 2, 20), stale);
     let applied = commit(&mut state, 2, &append(2, Some((first, 1))));
     let closed_at = commit(&mut state, 3, &claim(closed));
-    assert_eq!(closed_at.outcome, Outcome::Then);
+    let expected = Outcome::StoreWriterClosed {
+        epoch: 2, final_cut: BranchCut { basis: applied.basis, system_time: applied.system_time },
+        previous: Some(StoreWriterClaim { fence: first, generation: 1, claim: first.writer.unwrap() }),
+    };
+    assert_eq!(closed_at.outcome, expected);
     assert_eq!(refused(&state, &append(3, Some((first, 1))), 4, 40), stale);
     assert_eq!(refused(&state, &append(3, Some((second, 4))), 4, 40), stale);
     let Resolution::Answer(retry) = state.resolve(&claim(closed), 4, Timestamp(40), DEFAULT, &claims()).unwrap()
@@ -104,6 +108,10 @@ fn a_store_writer_close_orders_against_appends_and_survives_checkpoint_restore()
 
     let cut = state.index().head();
     let mut state = TransactState::decode_binary_checkpoint(&state.encode_binary_checkpoint().unwrap(), cut).unwrap();
+    let Resolution::Answer(retry) = state.resolve(&claim(closed), 4, Timestamp(40), DEFAULT, &claims()).unwrap()
+        else { panic!("expected the same close receipt after checkpoint"); };
+    assert_eq!(retry.outcome, expected);
+    assert_eq!(retry.basis, closed_at.basis);
     assert_eq!(refused(&state, &append(3, None), 4, 40), stale);
     assert_eq!(commit(&mut state, 4, &claim(second)).outcome, Outcome::Then);
     assert_eq!(refused(&state, &claim(closed), 5, 50), stale);
