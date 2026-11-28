@@ -13,6 +13,7 @@ fn purge_request_keeps_zero_versions_and_exact_guard_order_on_the_wire() {
             KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) },
         ],
         writer_fence: Some(WriterFence { epoch: 1, writer: vec![2; 16], generation: 3, claim: vec![4; 16] }),
+        retention_micros: Some(0),
     };
     let mut wire = vec![0x0a, 16];
     wire.extend(incarnation);
@@ -23,6 +24,7 @@ fn purge_request_keeps_zero_versions_and_exact_guard_order_on_the_wire() {
     wire.extend([2; 16]);
     wire.extend([0x18, 3, 0x22, 16]);
     wire.extend([4; 16]);
+    wire.extend([0x30, 0]);
     assert_eq!(request.encode_to_vec(), wire);
     assert_eq!(PurgeFloorRequest::decode(wire.as_slice()).unwrap(), request);
 }

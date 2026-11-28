@@ -16,6 +16,7 @@ fn request(incarnation: [u8; 16]) -> Bytes {
         incarnation: incarnation.to_vec(), since: Some(0), keep_from: Some(0),
         reads: vec![KeyRange { start: vec![1], end: None }],
         writer_fence: Some(WriterFence { epoch: 1, writer: vec![2; 16], generation: 3, claim: vec![4; 16] }),
+        retention_micros: Some(0),
     }.encode_to_vec().into()
 }
 

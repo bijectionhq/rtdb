@@ -690,7 +690,7 @@ impl FlightService for Service {
             reply.metadata_mut().insert(crate::v1::WRITER_FENCE_HEADER, tonic::metadata::MetadataValue::from_static("2"));
         }
         if fenced_purge {
-            reply.metadata_mut().insert(crate::v1::store::PURGE_WRITER_HEADER, tonic::metadata::MetadataValue::from_static("1"));
+            reply.metadata_mut().insert(crate::v1::store::PURGE_WRITER_HEADER, tonic::metadata::MetadataValue::from_static("2"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());

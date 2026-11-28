@@ -384,6 +384,10 @@ message PurgeFloorRequest {
   repeated KeyRange reads = 4;
   // Required. The exact current placement assignment, ordered generation and claim identity.
   WriterFence writer_fence = 5;
+  // Required, including zero. The census includes every live/draining entitlement
+  // at this retention time. Publication requires the writer's lower clock bound
+  // to have reached it.
+  optional int64 retention_micros = 6;
 }
 
 message PurgeFloorReply {

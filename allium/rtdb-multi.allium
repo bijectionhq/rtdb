@@ -1264,6 +1264,7 @@ contract EpochScopedStorage {
         -- Each remote manifest read registers with its original object provider before checking that exact name's retirement fence.
         -- The collector closes admission to the exact manifest and observes the provider's drain before deleting it.
         -- An interrupted or ambiguous provider body keeps its registration. An unavailable drain keeps reclamation pending.
+        -- The minimum wall time used by the planner's expiry census must be certified by the admitted writer's lower clock bound before floor publication.
         -- A reader refused by the retired publication re-anchors at an authenticated replay base.
         -- A replica that raced the trim loads the replacement base and applies its retained suffix.
         -- A follower returning a Store Read, Rank or Watch reply confirms its earliest consulted basis against floor advances at a current authenticated journal prefix.

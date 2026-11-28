@@ -1051,14 +1051,14 @@ impl ServingDriver for MultiServing {
     }
 
     async fn publish_store_purge_floor(
-        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, writer: StoreWriterClaim,
+        &self, since: Basis, keep_from: u64, retention_micros: i64, reads: Vec<KeyRange>, writer: StoreWriterClaim,
         memory: Arc<MemoryReservation>, cancellation: &CancellationToken,
     ) -> Result<()> {
         if self.classic_workload_fence.is_some() {
             return Err(workload::denied());
         }
         cancellation.run_until_cancelled(self.serve(
-            self.writes.publish_store_purge_floor(since, keep_from, reads, Some(writer), memory),
+            self.writes.publish_store_purge_floor(since, keep_from, retention_micros, reads, Some(writer), memory),
         )).await.ok_or_else(interrupted)?
     }
 
@@ -1600,7 +1600,7 @@ mod tests {
         assert!(changes.through >= floor);
 
         assert!(!follower.supports_store_purge_floor().await);
-        let refusal = follower.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
+        let refusal = follower.publish_store_purge_floor(floor, floor.position(), 0, guards(), first_writer, reserve(), &cancellation)
             .await.unwrap_err();
         assert_eq!(refusal.code, "rtdb/no-writer");
         assert!(writer.supports_store_purge_floor().await);
@@ -1609,11 +1609,11 @@ mod tests {
         writer.check_local_store_basis(first, &cancellation, Some(&active)).await.unwrap();
         assert_eq!(writer.check_local_store_basis(floor, &cancellation, Some(&active)).await.unwrap_err().code,
             "rtdb.store/stale-read-turn");
-        let retained = writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
+        let retained = writer.publish_store_purge_floor(floor, floor.position(), 0, guards(), first_writer, reserve(), &cancellation)
             .await.unwrap_err();
         assert_eq!(retained.code, "rtdb.store/purge-retention");
         drop(active);
-        writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
+        writer.publish_store_purge_floor(floor, floor.position(), 0, guards(), first_writer, reserve(), &cancellation)
             .await.unwrap();
 
         assert_eq!(writer.check_local_store_basis(first, &cancellation, None).await.unwrap_err().code, "rtdb/cursor-expired");
@@ -1629,11 +1629,11 @@ mod tests {
             .await.unwrap().basis;
         let current_writer = StoreWriterClaim { fence, generation: second_claim.position(), claim: second_attempt };
         for stale in [first_writer, StoreWriterClaim { claim: first_attempt, ..current_writer }] {
-            let refusal = writer.publish_store_purge_floor(floor, floor.position(), guards(), stale, reserve(), &cancellation)
+            let refusal = writer.publish_store_purge_floor(floor, floor.position(), 0, guards(), stale, reserve(), &cancellation)
                 .await.unwrap_err();
             assert_eq!(refusal.code, "rtdb.store/stale-writer");
         }
-        writer.publish_store_purge_floor(floor, floor.position(), guards(), current_writer, reserve(), &cancellation)
+        writer.publish_store_purge_floor(floor, floor.position(), 0, guards(), current_writer, reserve(), &cancellation)
             .await.unwrap();
 
         let expired = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap_err();
@@ -1648,7 +1648,7 @@ mod tests {
             incarnation, fence, generation: current_writer.generation, claim: current_writer.claim,
         });
         writer.transact(write, &cancellation).await.unwrap();
-        let refusal = writer.publish_store_purge_floor(floor, floor.position(), guards(), current_writer, reserve(), &cancellation)
+        let refusal = writer.publish_store_purge_floor(floor, floor.position(), 0, guards(), current_writer, reserve(), &cancellation)
             .await.unwrap_err();
         assert_eq!(refusal.code, "rtdb.store/purge-guard");
     }

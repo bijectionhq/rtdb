@@ -464,9 +464,9 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/hold-unsupported", "This route cannot order a Store Version hold"))
     }
 
-    /// Success confirms the durable floor after checking the retained basis, guards and current writer claim.
+    /// Success confirms the durable floor after checking the retained basis, census time, guards and current writer claim.
     async fn publish_store_purge_floor(
-        &self, _since: Basis, _keep_from: u64, _reads: Vec<KeyRange>, _writer: StoreWriterClaim,
+        &self, _since: Basis, _keep_from: u64, _retention_micros: i64, _reads: Vec<KeyRange>, _writer: StoreWriterClaim,
         _memory: Arc<MemoryReservation>, _cancellation: &CancellationToken,
     ) -> Result<()> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/purge-unsupported", "This route cannot order a store purge floor"))

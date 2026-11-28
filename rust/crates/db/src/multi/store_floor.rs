@@ -39,24 +39,24 @@ impl MultiDatabase {
     /// Advisory preflight at the settled Multi writer prefix. Durable
     /// publication must repeat admission under its fenced append authority.
     pub async fn check_store_purge_floor(
-        &mut self, since: Basis, keep_from: u64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
+        &mut self, since: Basis, keep_from: u64, retention_micros: i64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
     ) -> Result<()> {
-        self.admit_store_purge_floor(since, keep_from, reads, writer).await.map(|_| ())
+        self.admit_store_purge_floor(since, keep_from, retention_micros, reads, writer).await.map(|_| ())
     }
 
     /// Orders the exclusive upper bound on versions eligible for reclamation.
     /// Recovery and reader obligations can still retain versions below it.
     pub async fn publish_store_purge_floor(
-        &mut self, since: Basis, keep_from: u64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
+        &mut self, since: Basis, keep_from: u64, retention_micros: i64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
     ) -> Result<()> {
-        if let Some(lease) = self.admit_store_purge_floor(since, keep_from, reads, writer).await? {
+        if let Some(lease) = self.admit_store_purge_floor(since, keep_from, retention_micros, reads, writer).await? {
             self.append_control(lease, Record::StorePurgeReclaim { since, keep_from }).await?;
         }
         Ok(())
     }
 
     async fn admit_store_purge_floor(
-        &mut self, since: Basis, keep_from: u64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
+        &mut self, since: Basis, keep_from: u64, retention_micros: i64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
     ) -> Result<Option<Lease>> {
         self.stream.require_serving().await?;
         self.refresh().await?;
@@ -68,6 +68,11 @@ impl MultiDatabase {
         let index = state.transactions.index();
         index.require_store_writer(writer.map(|claim| (since.incarnation(), claim.fence, claim.generation, claim.claim)))?;
         index.check_store_purge_guards(since, keep_from, reads)?;
+        let lower = self.lower();
+        if !(0..=lower.max(0)).contains(&retention_micros) {
+            return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.store/purge-clock",
+                "The writer's lower clock bound has not certified the retention census"));
+        }
         if keep_from <= state.store_purge_floor && keep_from <= index.store_history_floor() {
             self.require_authority(lease)?;
             return Ok(None);
@@ -82,7 +87,6 @@ impl MultiDatabase {
         if self.authority()?.epoch != lease.epoch || self.state().head != head || self.state().floor != journal_floor {
             return Err(prefix_unsettled());
         }
-        let lower = self.lower();
         let generation = self.state().generation;
         self.store_reads.check_floor(keep_from)?;
         self.writer.as_mut().ok_or_else(no_writer)?.store_holds.check_floor(keep_from, lower, generation)?;

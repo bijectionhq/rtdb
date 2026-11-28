@@ -66,6 +66,7 @@ enum Command {
     PublishStorePurgeFloor {
         since: Basis,
         keep_from: u64,
+        retention_micros: i64,
         reads: Vec<KeyRange>,
         writer: Option<StoreWriterClaim>,
         request_memory: Arc<MemoryReservation>,
@@ -143,10 +144,10 @@ impl WritePipeline {
 
     /// Keeps an admitted publication in the writer's queue after the caller drops its reply.
     pub async fn publish_store_purge_floor(
-        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, writer: Option<StoreWriterClaim>,
+        &self, since: Basis, keep_from: u64, retention_micros: i64, reads: Vec<KeyRange>, writer: Option<StoreWriterClaim>,
         request_memory: Arc<MemoryReservation>,
     ) -> Result<()> {
-        self.request(|reply| Command::PublishStorePurgeFloor { since, keep_from, reads, writer, request_memory, reply }).await
+        self.request(|reply| Command::PublishStorePurgeFloor { since, keep_from, retention_micros, reads, writer, request_memory, reply }).await
     }
 
     pub async fn publish_ranked_catalog(
@@ -473,9 +474,9 @@ async fn run(
                 let result = Box::pin(async { database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await }).await;
                 let _ = reply.send(result);
             }
-            Command::PublishStorePurgeFloor { since, keep_from, reads, writer, request_memory: _request_memory, reply } => {
+            Command::PublishStorePurgeFloor { since, keep_from, retention_micros, reads, writer, request_memory: _request_memory, reply } => {
                 let result = Box::pin(async {
-                    database.lock().await.publish_store_purge_floor(since, keep_from, &reads, writer).await
+                    database.lock().await.publish_store_purge_floor(since, keep_from, retention_micros, &reads, writer).await
                 }).await;
                 let _ = reply.send(result);
             }
