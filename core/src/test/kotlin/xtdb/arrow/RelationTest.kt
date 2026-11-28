@@ -2,8 +2,12 @@ package xtdb.arrow
 
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.RootAllocator
+import org.apache.arrow.vector.types.DateUnit
 import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
+import org.apache.arrow.vector.types.TimeUnit.MILLISECOND
 import org.apache.arrow.vector.types.TimeUnit.NANOSECOND
+import org.apache.arrow.vector.types.TimeUnit.SECOND
+import org.apache.arrow.vector.types.pojo.ArrowType
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
@@ -207,6 +211,71 @@ class RelationTest {
                     assertEquals(0, dst["clock"].valueCount)
                     assertEquals(0, dst.rowCount)
                 }
+            }
+        }
+    }
+
+    @OptIn(InternalApi::class)
+    @Test
+    fun `matching bound records preserve small time and whole date milli ticks`() {
+        val types = linkedMapOf(
+            "seconds" to VectorType.Scalar(ArrowType.Time(SECOND, 32)),
+            "millis" to VectorType.Scalar(ArrowType.Time(MILLISECOND, 32)),
+            "micros" to maybe(VectorType.TIME_MICRO),
+            "day" to VectorType.Scalar(ArrowType.Date(DateUnit.MILLISECOND)),
+        )
+        Vector.open(allocator, "record", VectorType.structOf(types)).use { src ->
+            src["seconds"].writeInt(86_399)
+            src["millis"].writeInt(86_399_999)
+            src["micros"].writeLong(86_399_999_999L)
+            src["day"].writeLong(-86_400_000L)
+            src.endStruct()
+
+            src["seconds"].writeInt(0)
+            src["millis"].writeInt(0)
+            src["day"].writeLong(0)
+            src.endStruct()
+
+            Relation(allocator, types).use { dst ->
+                assertTrue(dst.tryCopyStructRow(src, 0))
+                assertTrue(dst.tryCopyStructRow(src, 1))
+                assertEquals(86_399, dst["seconds"].getInt(0))
+                assertEquals(86_399_999, dst["millis"].getInt(0))
+                assertEquals(86_399_999_999L, dst["micros"].getLong(0))
+                assertEquals(-86_400_000L, dst["day"].getLong(0))
+                assertTrue(dst["micros"].isNull(1))
+                assertEquals(types, dst.vectors.associate { it.name to it.type })
+            }
+
+            assertEquals(LocalTime.of(23, 59, 59), PositionedScalar.read(src["seconds"], 0))
+            assertEquals(LocalTime.of(23, 59, 59, 999_999_000), PositionedScalar.read(src["micros"], 0))
+            assertEquals(LocalDate.ofEpochDay(-1), PositionedScalar.read(src["day"], 0))
+        }
+    }
+
+    @Test
+    fun `noncanonical time and date bindings preserve object normalization and errors`() {
+        Time32Vector(allocator, "src", false, SECOND).use { src ->
+            Time32Vector(allocator, "dst", false, SECOND).use { dst ->
+                src.writeInt(86_400)
+                assertThrows<DateTimeException> { dst.writeScalarCell(src, 0) }
+                assertEquals(0, dst.valueCount)
+            }
+        }
+
+        Time64Vector(allocator, "src", false, MICROSECOND).use { src ->
+            Time64Vector(allocator, "dst", false, MICROSECOND).use { dst ->
+                src.writeLong(Long.MIN_VALUE)
+                dst.writeScalarCell(src, 0)
+                assertEquals(0L, dst.getLong(0))
+            }
+        }
+
+        DateMilliVector(allocator, "src", false).use { src ->
+            DateMilliVector(allocator, "dst", false).use { dst ->
+                src.writeLong(-1L)
+                dst.writeScalarCell(src, 0)
+                assertEquals(-86_400_000L, dst.getLong(0))
             }
         }
     }

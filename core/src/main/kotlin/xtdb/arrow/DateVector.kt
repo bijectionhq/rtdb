@@ -13,8 +13,8 @@ import xtdb.util.Hasher
 import java.time.Duration
 import java.time.LocalDate
 
-private val MILLIS_PER_DAY = Duration.ofDays(1).toMillis()
-private val SECONDS_PER_DAY = Duration.ofDays(1).toSeconds()
+internal val MILLIS_PER_DAY = Duration.ofDays(1).toMillis()
+internal val SECONDS_PER_DAY = Duration.ofDays(1).toSeconds()
 
 private inline fun <R> LocalDate.inRangeOf(vec: Vector, f: () -> R): R =
     try {

@@ -18,7 +18,7 @@
            (java.util Arrays Date List Map UUID)
            (java.util.regex Pattern)
            (org.apache.arrow.vector PeriodDuration)
-           (org.apache.arrow.vector.types.pojo ArrowType$Decimal)
+           (org.apache.arrow.vector.types.pojo ArrowType$Decimal ArrowType$Duration ArrowType$Timestamp)
            (org.apache.commons.codec.binary Hex)
            (xtdb.arrow KeywordVector ListValueReader ListVector RelationReader RowMask Utf8Vector ValueBox ValueReader VariableWidthVector Vector VectorReader VectorType VectorType$Listy VectorType$Maybe VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
            (xtdb.expression PgFormat TextSlices TextTransforms)
@@ -2893,7 +2893,9 @@
                           (if (or utf8-output?
                                   (= arrow-type #xt.arrow/type :uuid)
                                   (= arrow-type #xt.arrow/type :list)
-                                  (= arrow-type #xt.arrow/type [:date :day]))
+                                  (= arrow-type #xt.arrow/type [:date :day])
+                                  (instance? ArrowType$Timestamp arrow-type)
+                                  (instance? ArrowType$Duration arrow-type))
                             (VectorWriterKt/writeTableCell out value 0)
                             (.writeObject out (.getObject value 0)))))))}))
 

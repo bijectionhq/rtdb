@@ -280,6 +280,24 @@
                           {:args (assoc row :record (assoc row :clock LocalTime/MIDNIGHT))
                            :with-types? true})))))
 
+(t/deftest computed-values-preserve-microsecond-temporal-types
+  (let [^LocalDateTime local (LocalDateTime/parse "1970-01-01T00:00:00")
+        ^ZonedDateTime zoned (ZonedDateTime/parse "2025-11-02T01:30:00-05:00[America/New_York]")
+        step (Duration/ofNanos -1000)]
+    (t/is (= {:res [{:ts (.minusNanos local 1000), :at (.minusNanos zoned 1000),
+                     :elapsed (Duration/ofNanos -2000), :mixed (Duration/ofNanos -2000)}
+                    {:mixed 7}]
+              :types '{ts #xt/type [:? [:timestamp-local :micro]],
+                       at #xt/type [:? [:timestamp-tz :micro "America/New_York"]],
+                       elapsed #xt/type [:? [:duration :micro]],
+                       mixed #xt/type #{[:duration :micro] :i64}}}
+             (tu/query-ra '[:table {:rows [{:ts (+ ?local ?step), :at (+ ?zoned ?step),
+                                           :elapsed (+ ?step ?step), :mixed (+ ?step ?step)}
+                                          {:ts (cast ?absent #xt/type [:timestamp-local :micro]),
+                                           :mixed 7}]}]
+                          {:args {:local local, :zoned zoned, :step step, :absent nil}
+                           :with-types? true})))))
+
 (t/deftest values-text-cells-preserve-java-utf8-replacement
   (let [^bytes malformed (byte-array (map unchecked-byte [0xed 0xa0 0x80 0x61 0xf0 0x9f]))
         replaced (String. malformed StandardCharsets/UTF_8)]

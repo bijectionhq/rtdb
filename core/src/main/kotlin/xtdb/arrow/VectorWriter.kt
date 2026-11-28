@@ -4,11 +4,15 @@ import clojure.lang.IExceptionInfo
 import clojure.lang.IPersistentMap
 import clojure.lang.PersistentArrayMap
 import com.google.protobuf.UnsafeByteOperations
+import org.apache.arrow.vector.types.DateUnit
 import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
+import org.apache.arrow.vector.types.TimeUnit.MILLISECOND
+import org.apache.arrow.vector.types.TimeUnit.SECOND
 import org.apache.arrow.vector.types.pojo.ArrowType
 import xtdb.InternalApi
 import xtdb.arrow.extensions.UuidType
 import xtdb.kw
+import xtdb.time.hz
 import java.nio.ByteBuffer
 import java.time.LocalTime
 
@@ -92,6 +96,8 @@ fun VectorWriter.acceptsScalarProjection(resultType: VectorType, canonicalUuid: 
     this is Vector && arrowType == resultType.arrowType && when (this) {
         is DateDayVector -> resultType.encoding == Encoding.Plain
         is UuidVector -> resultType.encoding == Encoding.Plain && canonicalUuid && hasCanonicalWidth
+        is TimestampLocalVector, is TimestampTzVector, is DurationVector ->
+            resultType.encoding == Encoding.Plain && hasCanonicalTemporalLayout()
         else -> arrowType.hasScalarObjectIdentity()
     }
 
@@ -120,9 +126,25 @@ private tailrec fun unwrapCellSource(reader: VectorReader): VectorReader = when 
     else -> source
 }
 
+private fun VectorWriter.acceptsExactTemporalBinding(src: VectorReader, idx: Int): Boolean {
+    if (arrowType != src.arrowType || this::class != unwrapCellSource(src)::class) return false
+    return when (this) {
+        is Time32Vector -> (unit == SECOND || unit == MILLISECOND) &&
+            (src.isNull(idx) || src.getInt(idx).toLong() in 0L..<(SECONDS_PER_DAY * unit.hz))
+        is Time64Vector -> arrowType.unit == MICROSECOND &&
+            (src.isNull(idx) || src.getLong(idx) in 0L..<(SECONDS_PER_DAY * MICROSECOND.hz))
+        is DateMilliVector -> src.isNull(idx) || src.getLong(idx) % MILLIS_PER_DAY == 0L
+        else -> false
+    }
+}
+
 internal fun VectorWriter.scalarObjectTarget(src: VectorReader, idx: Int): VectorWriter? {
     val sourceType = src.arrowType
     if (src.type.encoding != Encoding.Plain) return null
+    if ((sourceType is ArrowType.Time && sourceType != VectorType.TIME_NANO.arrowType) ||
+        (sourceType is ArrowType.Date && sourceType.unit == DateUnit.MILLISECOND)
+    ) return takeIf { acceptsExactTemporalBinding(src, idx) }
+
     val hasIdentity = when (sourceType) {
         VectorType.DATE_DAY.arrowType -> unwrapCellSource(src) is DateDayVector
         UuidType -> (unwrapCellSource(src) as? UuidVector)?.hasCanonicalWidth == true
