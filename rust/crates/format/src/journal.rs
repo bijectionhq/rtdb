@@ -133,6 +133,9 @@ pub struct OrderedStoreHold {
     pub expires_at_micros: i64,
     /// Keep the exact ordered change suffix as well as snapshot bytes.
     pub change_history: bool,
+    /// An admitted reply's earlier watch receipt. Its admission deadline
+    /// ends new output. The ordered turn retains bytes until it drains.
+    pub watch_receipt: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

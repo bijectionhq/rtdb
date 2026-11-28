@@ -1038,11 +1038,8 @@ impl ServingDriver for MultiServing {
         if self.classic_workload_fence.is_some() {
             return Err(workload::denied());
         }
-        self.serve(async {
-            cancellation.run_until_cancelled(async {
-                self.database.lock().await.enter_held_store_watch(after, reader, hold).await
-            }).await.ok_or_else(interrupted)?
-        }).await
+        cancellation.run_until_cancelled(self.serve(self.writes.enter_held_store_watch(after, reader, hold)))
+            .await.ok_or_else(interrupted)?
     }
 
     async fn store_sizes(&self, epoch: Option<u64>, now: Timestamp, cancellation: &CancellationToken) -> Result<StorageSizes> {

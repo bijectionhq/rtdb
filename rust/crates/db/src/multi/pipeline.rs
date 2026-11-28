@@ -24,8 +24,9 @@ use crate::replay::JournalCoordinates;
 use crate::journal::{PreparedTimedAppend, TimedOriginalProof};
 
 use super::{
-    Entry, Lease, MultiDatabase, PinnedExport, Role, StoreVersionHoldReply, StoreVersionHoldRequest,
-    Stream, Uuid, missing_receipt, next, no_writer,
+    Entry, Lease, MultiDatabase, PinnedExport, Role, StoreReadTurn, StoreVersionHoldKey, StoreVersionHoldReply,
+    StoreVersionHoldRequest, Stream, Uuid, missing_receipt, next, no_writer,
+    store_hold::StoreWatchDrain,
 };
 use super::timed_store::{TimedStoreAppend, TimedStoreReceipt};
 
@@ -76,6 +77,18 @@ enum Command {
         reader: [u8; 32],
         request: StoreVersionHoldRequest,
         reply: Reply<StoreVersionHoldReply>,
+    },
+    EnterStoreWatch {
+        after: Basis,
+        reader: [u8; 32],
+        hold: StoreVersionHoldKey,
+        id: [u8; 16],
+        drain: StoreWatchDrain,
+        reply: Reply<StoreReadTurn>,
+    },
+    FinishStoreWatch {
+        key: StoreVersionHoldKey,
+        reader: [u8; 32],
     },
     BoundJournal { limit: u64, reply: Reply<Option<rtdb_format::journal::ObjectId>> },
     /// A deferred checkpoint built off the database lock, ready to announce.
@@ -140,6 +153,23 @@ impl WritePipeline {
         &self, reader: [u8; 32], request: StoreVersionHoldRequest,
     ) -> Result<StoreVersionHoldReply> {
         self.request(|reply| Command::StoreVersionHold { reader, request, reply }).await
+    }
+
+    pub async fn enter_held_store_watch(
+        &self, after: Basis, reader: [u8; 32], hold: StoreVersionHoldKey,
+    ) -> Result<StoreReadTurn> {
+        let id = *Uuid::new_v4().as_bytes();
+        let key = StoreVersionHoldKey { basis: hold.basis, id };
+        let input = self.input.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let drain = StoreWatchDrain::new(move || {
+            runtime.spawn(async move {
+                let _ = input.send(Command::FinishStoreWatch { key, reader }).await;
+            });
+        });
+        // The queue owns the drain before attempting the append. A lost
+        // append acknowledgement or a cancelled caller cannot lose it.
+        self.request(|reply| Command::EnterStoreWatch { after, reader, hold, id, drain, reply }).await
     }
 
     /// Keeps an admitted publication in the writer's queue after the caller drops its reply.
@@ -483,6 +513,23 @@ async fn run(
             Command::StoreVersionHold { reader, request, reply } => {
                 let result = Box::pin(async { database.lock().await.store_version_hold(reader, request).await }).await;
                 let _ = reply.send(result);
+            }
+            Command::EnterStoreWatch { after, reader, hold, id, drain, reply } => {
+                let result = Box::pin(async {
+                    database.lock().await.enter_held_store_watch(after, reader, hold, id).await
+                }).await.map(|mut turn| {
+                    turn.settle_watch_on_drop(drain);
+                    turn
+                });
+                let _ = reply.send(result);
+            }
+            Command::FinishStoreWatch { key, reader } => {
+                let result = Box::pin(async {
+                    database.lock().await.finish_held_store_watch(key, reader).await
+                }).await;
+                if let Err(error) = result {
+                    tracing::warn!(code = %error.code, "An ordered Store watch turn still needs settlement");
+                }
             }
             Command::BoundJournal { limit, reply } => {
                 let mut guard = database.lock().await;
