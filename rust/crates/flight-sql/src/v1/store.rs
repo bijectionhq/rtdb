@@ -435,7 +435,8 @@ fn append_reply(
                     }
                     Outcome::StoreDenied => {
                         proto::append_reply::Outcome::ClaimDenied(proto::Stamp {
-                            micros: receipt.system_time.0, version: receipt.basis.position(),
+                            micros: receipt.store_reading.ok_or_else(|| Status::internal("The Store receipt has no clock reading"))?.0,
+                            version: receipt.basis.position(),
                         })
                     }
                     Outcome::Refused { error } if error.code == STORE_BOUND => {
