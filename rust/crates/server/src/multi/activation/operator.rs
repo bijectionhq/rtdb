@@ -16,10 +16,14 @@ use crate::{
 pub(in crate::multi) mod attestation;
 #[cfg(unix)]
 mod broker;
+mod settlement;
 
 pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
        rtdb multi-activation lineage-proof DATABASE --authority-id UUID --authority-url URL --authority-tls-dir DIR
                  --expected-incarnation UUID --expected-revision N
+       rtdb multi-activation verify-settlement DATABASE --authority-id UUID --application-root HEX --control-root HEX
+                 --expected-incarnation UUID --expected-revision N --successor-incarnation UUID --successor-revision N
+                 --selected-end N --evidence FILE
        rtdb multi-activation bootstrap DATABASE AUTHORITY --incarnation UUID
        rtdb multi-activation upgrade-grants DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
        rtdb multi-activation freeze DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N
@@ -261,6 +265,7 @@ enum Command {
         tls: PathBuf,
         predecessor: Binding,
     },
+    VerifySettlement(settlement::Verification),
     Direct {
         authority: Authority,
         request: Request,
@@ -323,6 +328,12 @@ impl Options {
         }
         let database = arguments.next().ok_or_else(arguments_error)?;
         let (mut fields, immutable_streams) = fields(arguments)?;
+        if operation == "verify-settlement" {
+            if immutable_streams {
+                return Err(arguments_error());
+            }
+            return Ok(Self(Command::VerifySettlement(settlement::Verification::parse(database, fields)?)));
+        }
         #[cfg(unix)]
         if operation == "attest" {
             if !immutable_streams || database != DEVELOPMENT_DATABASE {
@@ -535,6 +546,7 @@ impl Options {
                 let proof = authority.lineage_publication_proof(&database, predecessor).await?;
                 serde_json::to_value(proof).map_err(|_| super::corrupt())
             }
+            Command::VerifySettlement(verification) => verification.run(),
             Command::Direct {
                 authority,
                 request,
@@ -1062,7 +1074,6 @@ fn destination(fields: &mut BTreeMap<String, String>) -> Result<Destination> {
     })
 }
 
-#[cfg(unix)]
 pub(in crate::multi) fn hex_digest(input: String) -> Result<[u8; 32]> {
     let bytes = input.as_bytes();
     if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
@@ -1340,6 +1351,28 @@ fn missing_installation() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_settlement_arguments_require_both_roots_and_a_selected_binding() {
+        let database = "lineagetest";
+        let authority = Uuid::from_u128(1);
+        let predecessor = Uuid::from_u128(2);
+        let successor = Uuid::from_u128(3);
+        let application_root = "aa".repeat(32);
+        let control_root = "bb".repeat(32);
+        let base = format!(
+            "verify-settlement {database} --authority-id {authority} --application-root {application_root} \
+             --expected-incarnation {predecessor} --expected-revision 7 --successor-incarnation {successor} \
+             --successor-revision 8 --selected-end 32 --evidence proof.json"
+        );
+        let parse = |arguments: &str| Options::parse(arguments.split_whitespace().map(str::to_owned));
+        assert!(parse(&base).is_err());
+        let complete = format!("{base} --control-root {control_root}");
+        assert!(matches!(parse(&complete).unwrap().0, Command::VerifySettlement(_)));
+        assert!(matches!(parse(&complete.replace("proof.json", "-")).unwrap().0, Command::VerifySettlement(_)));
+        assert!(parse(&format!("{complete} --authority-file state.json")).is_err());
+        assert!(parse(&format!("{complete} --control-root {application_root}")).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

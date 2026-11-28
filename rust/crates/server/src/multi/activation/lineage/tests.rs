@@ -168,6 +168,38 @@ fn lineage_capture_waits_for_publication() {
 }
 
 #[test]
+fn selected_settlement_waits_for_evidence_and_refuses_a_substituted_cut() {
+    let source = archive(SOURCE, STREAM, [leaf(1)]);
+    let inclusion = source.inclusion(Lsn(1)).unwrap();
+    let (publication, control_root) = publication(&source);
+    let application_root = source.history.genesis.root();
+    let cut = SettlementCut { predecessor: PREDECESSOR, successor: SUCCESSOR, end: Lsn(1) };
+    let verify = |cut, proof, inclusion| {
+        verify_settlement_at(
+            AUTHORITY, DATABASE, control_root, application_root, authorization(1),
+            proof, inclusion, Some(cut),
+        )
+    };
+
+    assert_eq!(verify(cut, None, Some(&inclusion)).unwrap(), Settlement::Pending);
+    assert_eq!(verify(cut, Some(&publication), None).unwrap(), Settlement::Pending);
+    assert_eq!(verify(cut, Some(&publication), Some(&inclusion)).unwrap(), Settlement::Capture);
+    for changed in [
+        SettlementCut { predecessor: Binding { revision: 3, ..PREDECESSOR },
+            successor: Binding { revision: 4, ..SUCCESSOR }, ..cut },
+        SettlementCut { successor: Binding { incarnation: Uuid::from_u128(9), ..SUCCESSOR }, ..cut },
+        SettlementCut { end: Lsn(0), ..cut },
+    ] {
+        let error = verify(changed, Some(&publication), Some(&inclusion)).unwrap_err();
+        assert_eq!(error.code, "rtdb/lineage-proof");
+    }
+
+    assert!(verify_settlement_at(
+        AUTHORITY, DATABASE, application_root, application_root, authorization(1), None, None, Some(cut),
+    ).is_err());
+}
+
+#[test]
 fn lineage_leaves_a_matching_untimed_record_pending() {
     let source = archive(SOURCE, STREAM, [Leaf { timing: None, ..leaf(1) }]);
     let inclusion = source.inclusion(Lsn(1)).unwrap();

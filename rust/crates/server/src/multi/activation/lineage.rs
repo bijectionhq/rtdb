@@ -160,6 +160,21 @@ pub enum Settlement {
     Release,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SettlementCut {
+    pub predecessor: Binding,
+    pub successor: Binding,
+    pub end: Lsn,
+}
+
+impl SettlementCut {
+    fn matches(self, segment: &LineageSegment) -> bool {
+        self.predecessor == segment.predecessor
+            && self.successor == segment.successor
+            && self.end == segment.end
+    }
+}
+
 pub fn verify_settlement(
     authority: Uuid,
     database: &str,
@@ -169,13 +184,48 @@ pub fn verify_settlement(
     publication: Option<&PublicationProof>,
     inclusion: Option<&Inclusion>,
 ) -> Result<Settlement> {
+    verify_settlement_at(
+        authority, database, control_root, application_root, authorization, publication, inclusion, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_settlement_at(
+    authority: Uuid,
+    database: &str,
+    control_root: CatalogRoot,
+    application_root: CatalogRoot,
+    authorization: Authorization,
+    publication: Option<&PublicationProof>,
+    inclusion: Option<&Inclusion>,
+    selected: Option<SettlementCut>,
+) -> Result<Settlement> {
     if !authorization.valid() {
         return Err(invalid("Invalid funded append authorization"));
+    }
+    if let Some(cut) = selected {
+        activation_stream_id(authority, database)?;
+        if authority.is_nil()
+            || control_root.0 == [0; 32]
+            || application_root.0 == [0; 32]
+            || control_root == application_root
+            || cut.predecessor.incarnation.is_nil()
+            || cut.successor.incarnation.is_nil()
+            || cut.predecessor.incarnation == cut.successor.incarnation
+            || cut.predecessor.revision == 0
+            || cut.predecessor.revision.checked_add(1) != Some(cut.successor.revision)
+            || authorization.stream != StreamId(cut.predecessor.incarnation.as_u128())
+        {
+            return Err(invalid("Invalid independently pinned catalogs or settlement binding"));
+        }
     }
     let Some(publication) = publication else {
         return Ok(Settlement::Pending);
     };
     let segment = publication.verify(authority, database, control_root)?;
+    if selected.is_some_and(|cut| !cut.matches(&segment)) {
+        return Err(invalid("The publication differs from the selected predecessor, successor, or end"));
+    }
     if segment.source_root == control_root
         || segment.source_catalog == publication.control_inclusion.signed_head.head.catalog
     {

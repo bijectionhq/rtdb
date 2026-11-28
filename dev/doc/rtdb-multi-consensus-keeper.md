@@ -518,9 +518,36 @@ An authenticated control binding requires an authenticated source cut and a comm
 Existing legacy control bindings continue to use ordinary recovery and their legacy archives.
 
 Use `rtdb multi-activation lineage-proof` with direct control-catalog reader credentials and the predecessor incarnation and revision to export the publication and its control inclusion.
-Once the settlement path is connected, the original Kernel verifies the publication's inclusion in the control catalog and the application's inclusion against the head root identified by the segment.
-The Kernel pins both catalog roots and verifies the signed history that identifies the quorum keys for each head.
 Use `rtdb multi-backup lineage-inclusion --archive FILE --catalog-root HEX --position N` to export an application inclusion from a saved portable cut without the source keepers.
+The Kernel pins each catalog's genesis root independently and can verify settlement evidence offline through the installed RTDB CLI.
+
+```sh
+rtdb multi-activation verify-settlement "$DATABASE" \
+  --authority-id "$ACTIVATION_AUTHORITY" \
+  --application-root "$APPLICATION_CATALOG_ROOT_HEX" \
+  --control-root "$CONTROL_CATALOG_ROOT_HEX" \
+  --expected-incarnation "$PREDECESSOR_INCARNATION" \
+  --expected-revision "$PREDECESSOR_REVISION" \
+  --successor-incarnation "$SUCCESSOR_INCARNATION" \
+  --successor-revision "$SUCCESSOR_REVISION" \
+  --selected-end "$SELECTED_JOURNAL_LSN" \
+  --evidence "$EVIDENCE_JSON"
+```
+
+Take both bindings and the exact selected journal LSN from the independently accepted recovery.
+The selected end is a journal position separate from the application Store version.
+Supply the catalog roots as 64 hexadecimal digits from trusted configuration.
+The evidence file is a JSON object with a required `authorization` and optional `publication` and `inclusion`.
+Use the original Kernel authorization with fields `catalog`, `stream`, `writer_epoch`, `at`, `payload_sha256` and `timing`.
+The catalog is a UUID string, the stream is its own unsigned 128-bit journal identity as a JSON integer and the digests are 32-byte integer arrays.
+The timing object contains the integer `exclusive_cutoff_micros` and the digest `receiver_certificate_sha256`.
+Use the unmodified JSON objects printed by `lineage-proof` and `lineage-inclusion` for `publication` and `inclusion`.
+Either missing proof may be omitted or set to `null`.
+Successful verification prints a versioned object such as `{"format":1,"settlement":"pending"}`.
+The other settlement values are `capture` and `release`.
+The command checks that any publication names the expected predecessor, successor and end, and rejects mismatches with a nonzero exit.
+The command reports evidence for the Kernel's decision without changing any booking or fate.
+
 For capture, verify a timed leaf at the authorized position that matches the authorization in full and binds a quorum durability bound strictly before the cutoff.
 For release, verify that the published segment of the authorized stream ends before the position, or that a different record occupies the position within that segment.
 For example, a replacement writer can fill an abandoned position, and an authorized leaf above the selected cut can exist in the old stream while remaining outside the published lineage.
