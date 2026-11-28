@@ -295,8 +295,10 @@ impl Authority {
     ) -> std::result::Result<[u8; 32], AttemptError> {
         self.stream.batch.as_ref().filter(|batch| batch.maximum_timed_original_bytes().is_some())
             .ok_or_else(|| AttemptError::Local(rtdb_tx::transact::funding_unsupported()))?;
-        if self.next != write.at { return Err(AttemptError::Local(order_error("The funded append must follow the acknowledged prefix"))); }
-        let bytes = self.stream.encode(write.at, &write.entry).await.map_err(AttemptError::Local)?;
+        if self.next != write.at || self.lease.epoch != write.entry.epoch {
+            return Err(AttemptError::Local(order_error("The funded append must follow the acknowledged prefix under the active writer epoch")));
+        }
+        let prepared = self.stream.prepare_timed_append(write.at, &write.entry, cutoff).await.map_err(AttemptError::Local)?;
         let upper = self.upper();
         if let Some((appointment, state)) = managed {
             appointment.check_current(state, upper).map_err(AttemptError::Local)?;
@@ -308,8 +310,8 @@ impl Authority {
             return Err(AttemptError::Local(Anomaly::new(AnomalyCategory::Conflict,
                 "rtdb/window-expired", "The original timed append missed its admission bounds")));
         }
-        let original = self.stream.timed_original(write.at, self.lease.epoch, &bytes, cutoff);
-        let proof = self.stream.append_timed_original(original, bytes)
+        let original = prepared.commitment();
+        let proof = self.stream.append_timed_original(prepared)
             .await.map_err(AttemptError::Journal)?;
         proof.verify_exact(original).map_err(AttemptError::Local)?;
         Ok(original.payload_sha256)

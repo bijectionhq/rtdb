@@ -25,6 +25,18 @@ pub struct TimedOriginal {
     pub cutoff: TimedJournalCutoff,
 }
 
+/// The immutable journal bytes named by a timed append commitment.
+pub(crate) struct PreparedTimedAppend {
+    original: TimedOriginal,
+    payload: Bytes,
+}
+
+impl PreparedTimedAppend {
+    pub(crate) fn commitment(&self) -> TimedOriginal {
+        self.original
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimedOriginalProof {
     pub original: TimedOriginal,
@@ -196,7 +208,7 @@ impl Stream {
         StreamId(u128::from_be_bytes(*self.database.as_bytes()))
     }
 
-    pub(crate) fn timed_original(&self, at: Lsn, epoch: Epoch, payload: &[u8], cutoff: TimedJournalCutoff) -> TimedOriginal {
+    fn timed_original(&self, at: Lsn, epoch: Epoch, payload: &[u8], cutoff: TimedJournalCutoff) -> TimedOriginal {
         TimedOriginal { stream: self.id(), epoch, at, payload_sha256: Sha256::digest(payload).into(), cutoff }
     }
 
@@ -541,6 +553,12 @@ impl Stream {
         )
     }
 
+    pub(crate) async fn prepare_timed_append(&self, lsn: Lsn, entry: &Entry, cutoff: TimedJournalCutoff) -> Result<PreparedTimedAppend> {
+        let payload = self.encode(lsn, entry).await?;
+        let original = self.timed_original(lsn, entry.epoch, &payload, cutoff);
+        Ok(PreparedTimedAppend { original, payload })
+    }
+
     pub(crate) async fn decode(&self, lsn: Lsn, bytes: &[u8]) -> Result<Entry> {
         let entry = self.decode_unproven(lsn, bytes).await?;
         if let Record::Tx { payload, .. } = &entry.record
@@ -663,8 +681,12 @@ impl Stream {
     }
 
     pub(crate) async fn append_timed_original(
-        &self, original: TimedOriginal, payload: Bytes,
+        &self, prepared: PreparedTimedAppend,
     ) -> journal_contract::Result<TimedOriginalProof> {
+        let PreparedTimedAppend { original, payload } = prepared;
+        if original.stream != self.id() {
+            return Err(JournalError::Corrupted);
+        }
         self.authorize_mutation().await?;
         let batch = self.batch.as_ref().ok_or(JournalError::Unsupported)?;
         match self.session_fence(original.epoch)? {
