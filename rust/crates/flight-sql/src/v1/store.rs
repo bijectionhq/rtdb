@@ -45,14 +45,16 @@ use crate::{rtdb::store::v1 as proto, service::{Call, Service}};
 mod hold_version;
 mod purge;
 mod sizes;
+mod writer;
 
 pub(crate) const READ: &str = "rtdb.store.v1.Read";
 pub(crate) const APPEND: &str = "rtdb.store.v1.Append";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
 pub(crate) const RANK: &str = "rtdb.store.v1.Rank";
 pub(crate) use purge::PURGE_FLOOR;
+pub(crate) use writer::WRITER_FENCE_HEADER;
 pub(super) use sizes::STORAGE_SIZES;
-pub(crate) const ACTIONS: [&str; 6] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR];
+pub(crate) const ACTIONS: [&str; 7] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR, writer::FENCE_WRITER];
 
 /// The `RANK_DIGEST` recorded with the vendored copy (vendor/bijection).
 const VENDORED_RANK_DIGEST: &str = include_str!("../../../../vendor/bijection/RANK_DIGEST");
@@ -168,6 +170,7 @@ impl Service {
             RANK => self.store_rank(call, decode(body)?).await,
             STORAGE_SIZES => self.store_storage_sizes(call, decode(body)?).await,
             PURGE_FLOOR => self.store_purge_floor(call, decode(body)?).await,
+            writer::FENCE_WRITER => self.store_fence_writer(call, decode(body)?).await,
             #[cfg(feature = "multi")]
             hold_version::ACTION if hold_version::AVAILABLE => self.store_hold_version(call, decode(body)?).await,
             _ => Err(error::unsupported("rtdb.store.v1")),
@@ -330,6 +333,12 @@ impl Service {
                 return Err(error::incorrect("The required basis cannot exceed the append predecessor"));
             }
             guards.push(Guard::RetainedStoreBasis { basis: Basis::new(incarnation, required) });
+        }
+        if let Some(binding) = request.writer_fence {
+            guards.push(Guard::StoreWriter {
+                incarnation,
+                fence: writer::fence(binding.epoch, Some(binding.writer))?,
+            });
         }
         let transaction = Transact {
             key: request.key,

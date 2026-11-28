@@ -194,6 +194,7 @@ pub enum BranchEffect {
     NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
     ScopedHold { command: ScopedHoldCommand, observed_at: Timestamp },
     NativeDependentCustody(NativeDependentCustodyOrder),
+    StoreWriterFence { incarnation: [u8; 16], fence: store::StoreWriterFence },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +251,8 @@ pub struct BranchIndex {
     classic_checkpoint: Option<Basis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     store_history_floor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    store_writer_fences: Map<u64, store::StoreWriterFence>,
     branches: Map<Branch, Arc<BranchData>>,
     #[serde(with = "entries")]
     catalog: Map<TableRef, Arc<Vec<(Basis, BranchTable)>>>,
@@ -296,11 +299,13 @@ impl BranchIndex {
             custody_transfers: Map::new(), inherited_custody: None,
             scoped_holds: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
             visibility_projection: false, used_custody_placements: imbl::OrdSet::new(),
-            store_sizes: Default::default(),
+            store_sizes: Default::default(), store_writer_fences: Map::new(),
         }
     }
 
     pub fn head(&self) -> BranchCut { self.head }
+
+    pub fn has_store_writer_fence(&self) -> bool { !self.store_writer_fences.is_empty() }
 
     pub fn oldest_retained_cut(&self) -> BranchCut {
         let floor = self.classic_checkpoint.map_or(0, Basis::position).max(self.store_history_floor());
@@ -335,7 +340,7 @@ impl BranchIndex {
 
     /// Reports canonical state that requires translation beyond the retained Classic rows.
     pub fn has_classic_migration_controls(&self) -> bool {
-        self.branches.len() != 1 || self.erased.is_some() || !self.custody.is_empty()
+        self.branches.len() != 1 || self.erased.is_some() || !self.custody.is_empty() || self.has_store_writer_fence()
             || !self.custody_transfers.is_empty() || self.inherited_custody.is_some()
             || self.latest_custody_revocation.is_some() || !self.used_custody_placements.is_empty()
             || !self.scoped_holds.is_empty()
@@ -372,6 +377,8 @@ impl BranchIndex {
         retained.store_sizes = Default::default();
         retained.writes = Arc::default();
         retained.times = self.times.range(..=at.position()).map(|(&position, &time)| (position, time)).collect();
+        retained.store_writer_fences = self.store_writer_fences.range(..=at.position())
+            .map(|(&position, &fence)| (position, fence)).collect();
         retained.catalog = self.catalog.iter().filter_map(|(table, definitions)| {
             let count = definitions.partition_point(|(written, _)| *written <= at);
             (count != 0).then(|| (table.clone(), Arc::new(definitions[..count].to_vec())))
@@ -399,6 +406,11 @@ impl BranchIndex {
 
     fn rebase_history(&mut self, incarnation: [u8; 16]) {
         let rebase = |basis: Basis| Basis::new(incarnation, basis.position());
+        if self.head.basis.incarnation() != incarnation {
+            self.store_writer_fences = self.store_writer_fences.values().next_back().map_or_else(Map::new, |fence| {
+                Map::unit(self.head.basis.position(), store::StoreWriterFence { writer: None, ..*fence })
+            });
+        }
         self.store_sizes = Default::default();
         self.head.basis = rebase(self.head.basis);
         self.classic_checkpoint = self.classic_checkpoint.map(rebase);
@@ -859,6 +871,7 @@ impl BranchIndex {
             BranchEffect::NativeCustodyTransfer { custody, destination } => self.apply_native_custody_transfer(custody, destination)?,
             BranchEffect::ScopedHold { command, observed_at } => self.apply_scoped_hold(command, observed_at),
             BranchEffect::NativeDependentCustody(order) => self.apply_native_dependent_custody(order)?,
+            BranchEffect::StoreWriterFence { incarnation, fence } => self.apply_store_writer_fence(incarnation, fence)?,
         }
         Ok(())
     }

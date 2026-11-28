@@ -593,9 +593,16 @@ impl FlightService for Service {
             && call.session.caller.principal.label_scope().is_none()
             && call.session.caller.principal.workload_grant().is_none()
             && !call.session.fresh_replica && !self.follower_only();
+        let fenced_append = call.minted && call.session.caller.verified_credential
+            && call.session.caller.principal.label_scope().is_none()
+            && call.session.caller.principal.workload_grant().is_none_or(|grant| grant.is_store_grant())
+            && !call.session.fresh_replica && !self.follower_only();
         let mut reply = result_stream(call, Vec::new())?;
         if retained_basis_append {
             reply.metadata_mut().insert("x-rtdb-store-retained-basis", tonic::metadata::MetadataValue::from_static("1"));
+        }
+        if fenced_append {
+            reply.metadata_mut().insert(crate::v1::WRITER_FENCE_HEADER, tonic::metadata::MetadataValue::from_static("1"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());

@@ -125,7 +125,7 @@ async fn store_reads_on_the_writer_route_request_a_new_handshake_for_an_unknown_
         assert_eq!(status.code(), tonic::Code::Unauthenticated, "{action}");
         assert_eq!(status.message(), "unknown session");
     }
-    for action in ["rtdb.store.v1.Append", "rtdb.store.v1.PurgeFloor"] {
+    for action in ["rtdb.store.v1.Append", "rtdb.store.v1.PurgeFloor", "rtdb.store.v1.FenceWriter"] {
         let status = client.action(action, Bytes::new()).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::PermissionDenied, "{action}");
     }
@@ -173,6 +173,7 @@ async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
 
     let reply = client.handshake(handshake()).await.unwrap();
     assert!(!reply.metadata().contains_key(RELEASE));
+    assert_eq!(reply.metadata().get("x-rtdb-store-writer-fence").unwrap(), "1");
     let bearer = reply.metadata().get("authorization").unwrap().clone();
     assert!(reply.into_inner().message().await.unwrap().is_none());
 
@@ -226,6 +227,45 @@ async fn a_forwarded_reader_checks_the_release_before_issuing_a_session() {
     for action in ["rtdb.store.v1.Read", "rtdb.store.v1.Watch", "rtdb.store.v1.Rank", "rtdb.store.v1.Append", "rtdb.store.v1.PurgeFloor"] {
         assert_eq!(replica.action(action, Bytes::new()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn store_fence_closes_the_previous_assignment() {
+    use rtdb_flight_sql::rtdb::store::v1 as store;
+    use rtdb_node::serving::NativeServingAuthority;
+
+    const FENCE: &str = "rtdb.store.v1.FenceWriter";
+    const APPEND: &str = "rtdb.store.v1.Append";
+    let incarnation = [53; 16];
+    let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
+        .with_native_serving_authority("xtdb", NativeServingAuthority { incarnation, checkpoints: None })));
+    let config = FlightConfig { store_only: true, ..Default::default() };
+    let running = Running::start_with_clocked_resources(
+        Some("secret"), config, &[], None, Default::default(), None, Some(resources),
+    ).await;
+    let mut status = running.node.catalog().database("xtdb").unwrap().watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+
+    let order = |epoch, writer| store::FenceWriterRequest { incarnation: incarnation.to_vec(), epoch, writer }.encode_to_vec().into();
+    let append = |key, writer_fence| store::AppendRequest {
+        key: vec![key; 16], incarnation: incarnation.to_vec(), writer_fence,
+        writes: vec![store::Write { key: vec![key], value: Some(vec![key]), ..Default::default() }],
+        ..Default::default()
+    }.encode_to_vec().into();
+    let writer = [3; 16].to_vec();
+    let attached = Some(store::WriterFence { epoch: 1, writer: writer.clone() });
+    client.action(FENCE, order(1, Some(writer))).await.unwrap();
+    client.action(APPEND, append(1, attached.clone())).await.unwrap();
+    let reply = client.action(FENCE, order(2, None)).await.unwrap();
+    assert_eq!(store::FenceWriterReply::decode(reply[0].body.clone()).unwrap(), store::FenceWriterReply {
+        incarnation: incarnation.to_vec(), epoch: 2, writer: None,
+    });
+    assert_eq!(client.action(APPEND, append(2, attached)).await.unwrap_err().code(), tonic::Code::Aborted);
+    assert_eq!(client.action(APPEND, append(2, None)).await.unwrap_err().code(), tonic::Code::Aborted);
     running.stop().await;
 }
 

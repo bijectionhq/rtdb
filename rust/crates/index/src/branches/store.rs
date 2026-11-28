@@ -16,6 +16,8 @@ use rtdb_types::{Anomaly, EntityId, Result, TableRef, Value, rtdb_v1::Basis};
 use super::{BranchCut, BranchEvent, BranchView};
 
 pub mod sizes;
+mod writer;
+pub use writer::StoreWriterFence;
 pub use store_derive;
 pub use store_filter::ValueFilter;
 

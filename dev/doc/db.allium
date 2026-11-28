@@ -69,6 +69,7 @@
 -- A terminal shared decision records its original source position and term-admitted replica position as evidence on the canonical receipt.
 -- A checkpoint covers only receipt positions within its authenticated source and replica prefix.
 -- A replayed reply preserves the original receipt position.
+-- The canonical fold checkpoints Store writer fence changes at their applied positions.
 -- Retained SQL cuts, table history and offline repair apply shared decision effects through the same projector as live replication.
 -- A sealed shared checkpoint requires its original read authority for replay.
 -- Offline repair authenticates the selected sealed image and verifies its receipts and fold against the admitted replica interval.

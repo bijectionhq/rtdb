@@ -12,7 +12,7 @@ pub use rtdb_index::branches::{
     store::{KeyRange, StoreBound, StoreWrite},
 };
 use rtdb_index::branches::store::{
-    StoreStamp, VALUE_COLUMN, check_bounds, check_derives, check_placeholders, claim_refused, decode_bound_value, resolve_derives, stamp_writes,
+    StoreStamp, StoreWriterFence, VALUE_COLUMN, check_bounds, check_derives, check_placeholders, claim_refused, decode_bound_value, resolve_derives, stamp_writes,
     store_table,
 };
 use rtdb_types::{
@@ -31,6 +31,7 @@ mod funding;
 mod operations;
 mod pipeline;
 mod store_clock;
+mod store_writer;
 pub mod workload;
 use workload::Family as WorkloadFamily;
 
@@ -136,6 +137,7 @@ impl Transact {
     pub fn receipt_namespace(&self, scope: Option<[u8; 32]>) -> Option<[u8; 32]> {
         scope.or_else(|| self.is_response_release().then_some(CUSTODY_RELEASE_NAMESPACE))
             .or_else(|| self.contains_native_custody_transfer().then(native_checkpoint_namespace))
+            .or_else(|| self.store_writer_change().map(|_| store_writer::receipt_namespace()))
     }
 
     pub fn contains_native_custody_transfer(&self) -> bool {
@@ -264,6 +266,8 @@ pub enum Guard {
     Unwritten { range: KeyRange, since: Basis },
     /// The store's final private guard names an exact retained dependency.
     RetainedStoreBasis { basis: Basis },
+    StoreWriter { incarnation: [u8; 16], fence: StoreWriterFence },
+    SetStoreWriter { incarnation: [u8; 16], fence: StoreWriterFence },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,6 +557,7 @@ const FUNDED_RECORD_VERSION: u8 = 7;
 const APPOINTMENT_RECORD_VERSION: u8 = 8;
 const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 9;
 const PRUNED_STORE_CHECKPOINT_VERSION: u8 = 10;
+const FENCED_STORE_CHECKPOINT_VERSION: u8 = 11;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -893,7 +898,8 @@ impl TransactState {
         if self.pending.is_some() { return Err(pending_error()); }
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }
         let unsupported_receipt = self.receipts.values().flat_map(|scope| scope.values()).any(|stored| {
-            stored.receipt_namespace.is_some() || stored.receipt.decision_clock.is_some()
+            stored.receipt_namespace.is_some_and(|namespace| namespace != store_writer::receipt_namespace())
+                || stored.receipt.decision_clock.is_some()
                 || stored.installed.is_some() || stored.workload.is_some()
         });
         if unsupported_receipt || self.index.has_custody_groups() || self.index.inherited_custody().is_some()
@@ -1010,7 +1016,11 @@ impl TransactState {
     pub fn restore_in(&mut self, incarnation: [u8; 16]) -> Result<()> {
         if self.pending.is_some() { return Err(pending_error()); }
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }
+        let new_incarnation = self.index.head().basis.incarnation() != incarnation;
         self.index.restore_in(incarnation)?;
+        if new_incarnation {
+            self.receipts.remove(&Some(store_writer::receipt_namespace()));
+        }
         self.appointment_addresses.clear();
         for receipts in self.receipts.values_mut() {
             *receipts = receipts.iter()
@@ -1046,6 +1056,7 @@ impl TransactState {
     }
 
     fn checkpoint_version<'a>(index: &BranchIndex, receipts: impl Iterator<Item = &'a StoredReceipt>) -> u8 {
+        if index.has_store_writer_fence() { return FENCED_STORE_CHECKPOINT_VERSION; }
         let floor_version = if index.store_history_floor() == 0 { RECORD_VERSION } else { PRUNED_STORE_CHECKPOINT_VERSION };
         receipts.map(|stored| stored.receipt.record_version(stored.receipt_namespace)).fold(floor_version, u8::max)
     }
@@ -1267,6 +1278,15 @@ impl TransactState {
         let canonical_request = request.canonical_request()?;
         let fingerprint = request.custody_request_digest
             .unwrap_or_else(|| Sha256::digest(canonical_request.as_bytes()).into());
+        if let Some((incarnation, fence)) = request.store_writer_change() {
+            if authority.is_some() || workload.is_some() || funded_request || hold.is_some()
+                || request.custody_request_digest.is_some()
+                || canonical_request != Transact::set_store_writer(incarnation, fence).canonical_request()?
+            {
+                return Err(store_append_shape());
+            }
+            return store_writer::resolve_change(view, request, incarnation, fence, position, now, fingerprint, canonical_request);
+        }
         let stored = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key));
         if let Some(stored) = stored && appointment.is_none() {
             let same_request = match workload_digest {
@@ -1458,9 +1478,13 @@ impl TransactState {
         view: View<'_>, request: &Transact, append: &StoreAppend, position: u64, now: Timestamp,
         claims: &dyn ClaimVerifier, fingerprint: [u8; 32], canonical_request: CanonicalRequest,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
-        let (read_guards, retained_basis) = match request.guards.split_last() {
-            Some((Guard::RetainedStoreBasis { basis }, reads)) => (reads, Some(*basis)),
+        let (guards, writer) = match request.guards.split_last() {
+            Some((Guard::StoreWriter { incarnation, fence }, guards)) => (guards, Some((*incarnation, *fence))),
             _ => (request.guards.as_slice(), None),
+        };
+        let (read_guards, retained_basis) = match guards.split_last() {
+            Some((Guard::RetainedStoreBasis { basis }, reads)) => (reads, Some(*basis)),
+            _ => (guards, None),
         };
         if !request.otherwise.is_empty() || !request.requires.is_empty() || !request.require.is_empty()
             || request.window != Window::default() || request.custody_request_digest.is_some()
@@ -1468,6 +1492,7 @@ impl TransactState {
         {
             return Err(store_append_shape());
         }
+        view.index.require_store_writer(writer)?;
         let Window { not_before, before } = append.window;
         if not_before.zip(before).is_some_and(|(start, end)| start >= end) {
             return Err(Anomaly::incorrect("rtdb.store/empty-window", "The store append's window is empty"));
@@ -1851,6 +1876,13 @@ impl TransactState {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects {
+            if let BranchEffect::StoreWriterFence { incarnation, fence } = &effect
+                && (receipt_namespace != Some(store_writer::receipt_namespace())
+                    || receipt.key != Transact::set_store_writer(*incarnation, *fence).key
+                    || receipt.outcome != Outcome::Then || workload.is_some())
+            {
+                return Err(invalid_record());
+            }
             if let BranchEffect::NativeDependentCustody(order) = &effect {
                 if receipt_namespace != Some(native_checkpoint_namespace())
                     || receipt.key != dependent_custody_key(order)
@@ -1950,7 +1982,8 @@ impl Guard {
             }
             Self::Version { branch, .. } | Self::CountAtMost { branch, .. } if branch != MAIN_BRANCH =>
                 Err(funding_invalid()),
-            Self::Unwritten { .. } | Self::RetainedStoreBasis { .. } => Err(funding_invalid()),
+            Self::Unwritten { .. } | Self::RetainedStoreBasis { .. }
+            | Self::StoreWriter { .. } | Self::SetStoreWriter { .. } => Err(funding_invalid()),
             _ => self.evaluate(history.index(), reading, claims, None),
         }
     }
@@ -1992,7 +2025,7 @@ impl Guard {
             Self::CountAtMost { branch, range, .. } => view(branch)?.count_at_most(range, time),
             Self::Unwritten { range, since } => Ok(index.view(MAIN_BRANCH, At::Latest, Layer::Merged, time)?
                 .store_written_since(range, *since)?.is_none()),
-            Self::RetainedStoreBasis { .. } => Err(store_append_shape()),
+            Self::RetainedStoreBasis { .. } | Self::StoreWriter { .. } | Self::SetStoreWriter { .. } => Err(store_append_shape()),
         }
     }
 }

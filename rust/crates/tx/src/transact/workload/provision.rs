@@ -57,7 +57,8 @@ impl LineProvision {
                     Guard::Version {
                         branch, table, id, ..
                     } => branch != MAIN_BRANCH || index.has_custody_address(table, id),
-                    Guard::CountAtMost { .. } | Guard::Unwritten { .. } | Guard::RetainedStoreBasis { .. } => true,
+                    Guard::CountAtMost { .. } | Guard::Unwritten { .. } | Guard::RetainedStoreBasis { .. }
+                    | Guard::StoreWriter { .. } | Guard::SetStoreWriter { .. } => true,
                     Guard::Unchanged(_) => false,
                 })
         {

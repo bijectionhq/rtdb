@@ -220,6 +220,17 @@ surface StatelessDatabase {
         -- A removed or unknown Basis refuses the append before it publishes any effects.
         -- The Basis is part of the request's idempotency identity.
 
+    @guarantee StoreWriterFence
+        -- A verified installation-wide writer orders fence changes at the same point as Store Append.
+        -- Each change names the current physical incarnation and a positive epoch.
+        -- The administrator may install the initial writer or close an installation at a higher epoch.
+        -- An opaque writer identity may claim the exact closed epoch.
+        -- An exact retry confirms the current fence, and a superseded or incompatible request refuses.
+        -- After the first fence, every new append requires the exact live writer identity and epoch.
+        -- An exact retry may recover a previously ordered append receipt.
+        -- Replay and checkpoints preserve the fence at their selected position.
+        -- A restore to a new incarnation carries the fence epoch in the closed state.
+
     @guarantee StorePurgeFloor
         -- PurgeFloor requires a verified credential with unscoped database write access to the attached Multi incarnation.
         -- The request names one retained basis, a minimum retained version at or below that basis, and the original ordered list of half-open guards.

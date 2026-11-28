@@ -137,6 +137,7 @@ pub(super) fn detail(native: Anomaly) -> Error {
         "rtdb/erased-under-view" | "rtdb/cursor-expired" | "rtdb/unknown-branch"
         | "rtdb.store/hold-deadline" | "rtdb.store/hold-quota" | "rtdb.store/hold-unavailable"
         | "rtdb.store/hold-unsupported"
+        | "rtdb.store/stale-writer"
         | "rtdb/default-serving-classic-history" | "rtdb/idempotency-key"
         | "rtdb/window-expired" | "rtdb/timed-transaction-refused"
         | "rtdb/funded-appointment" | "rtdb/funding-kernel-unavailable"

@@ -13,6 +13,7 @@ syntax = "proto3";
 //   rtdb.store.v1.Watch  WatchRequest  -> WatchReply
 //   rtdb.store.v1.Rank   RankRequest   -> RankReply
 //   rtdb.store.v1.StorageSizes StorageSizesRequest -> StorageSizesReply
+//   rtdb.store.v1.FenceWriter FenceWriterRequest -> FenceWriterReply
 //   rtdb.store.v1.PurgeFloor PurgeFloorRequest -> PurgeFloorReply (Multi writer)
 //
 // A version is a commit position within one store incarnation. A restore or a
@@ -173,6 +174,27 @@ message AppendRequest {
   // Inclusive oldest committed basis the ordered append requires to remain
   // available. It uses this request's incarnation and must be at or below since.
   optional uint64 required_basis = 11;
+  // The writer identity and epoch assigned for this incarnation.
+  optional WriterFence writer_fence = 12;
+}
+
+message WriterFence {
+  uint64 epoch = 1;
+  bytes writer = 2;
+}
+
+message FenceWriterRequest {
+  bytes incarnation = 1;
+  uint64 epoch = 2;
+  // Absent closes the installation at this epoch. Present claims the epoch
+  // with an opaque 16-byte writer identity.
+  optional bytes writer = 3;
+}
+
+message FenceWriterReply {
+  bytes incarnation = 1;
+  uint64 epoch = 2;
+  optional bytes writer = 3;
 }
 
 message AppendReply {
