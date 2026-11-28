@@ -1283,6 +1283,70 @@ async fn scalar_run_query_conversion_preserves_rows_and_tracked_claims() {
 }
 
 #[tokio::test]
+async fn all_byte_run_query_bindings_preserve_the_scalar_result_and_claim() {
+    use arrow_array::{Array, BinaryArray, Int32Array, RunArray, StringArray, types::Int32Type};
+    use rtdb_types::Value;
+
+    let running = Running::start(Some("secret"), FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    const UUID: &str = "aa353fc0-ba11-4e1c-a7b7-4bcd7cb8f3f6";
+    client.update(
+        &format!("INSERT INTO byte_run_claim_rows (_id, n) VALUES ('left', 10), ('right', 20), (UUID '{UUID}', 30)"),
+        None,
+    ).await;
+
+    let payload = &b"\0\xfe\xff"[..];
+    let parameters = |id, include_payload, annotate| {
+        let run_end = Int32Array::from(vec![1]);
+        let id = RunArray::<Int32Type>::try_new(&run_end, &StringArray::from(vec![id])).unwrap();
+        let mut id_field = Field::new("id", id.data_type().clone(), false);
+        if annotate {
+            id_field = id_field.with_metadata([("client".into(), "scalar".into())].into());
+        }
+        let mut fields = vec![id_field];
+        let mut arrays = vec![Arc::new(id) as arrow_array::ArrayRef];
+        if include_payload {
+            let run = RunArray::<Int32Type>::try_new(&run_end, &BinaryArray::from(vec![payload])).unwrap();
+            fields.push(Field::new("payload", run.data_type().clone(), false));
+            arrays.push(Arc::new(run));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+        rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap()
+    };
+    for (sql, id, n, include_payload) in [
+        ("SELECT n FROM byte_run_claim_rows WHERE _id = $1", "left", 10, false),
+        ("SELECT n, $2 AS payload FROM byte_run_claim_rows WHERE _id = $1", "left", 10, true),
+        ("SELECT n FROM byte_run_claim_rows WHERE _id = CAST($1 AS UUID)", UUID, 30, false),
+    ] {
+        for track in [false, true] {
+            let mut request = input(sql);
+            request.track = track;
+            request.source.as_mut().unwrap().at = Some(v1::At { selection: Some(Selection::Linearizable(())) });
+            request.params_ipc = Some(parameters(id, include_payload, true));
+            let (expected_rows, expected) = query(&mut client, request.clone()).await;
+            assert_eq!(ints(&expected_rows), [n]);
+            assert_eq!(expected.claim.is_some(), track);
+
+            request.source.as_mut().unwrap().at = Some(v1::At { selection: expected.basis.clone().map(Selection::Exactly) });
+            request.params_ipc = Some(parameters(id, include_payload, false));
+            let (rows, actual) = query(&mut client, request).await;
+            assert_eq!(ints(&rows), [n]);
+            assert_eq!(rows[0].schema_ref(), expected_rows[0].schema_ref());
+            if include_payload {
+                let read = |batch: &RecordBatch| {
+                    rtdb_columnar::read_value(batch.schema_ref().field(1), batch.column(1).as_ref(), 0).unwrap()
+                };
+                assert_eq!(read(&rows[0]), Value::Binary(payload.to_vec()));
+                assert_eq!(read(&rows[0]), read(&expected_rows[0]));
+            }
+            assert_eq!(actual.basis, expected.basis);
+            assert_eq!(actual.claim, expected.claim);
+        }
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;

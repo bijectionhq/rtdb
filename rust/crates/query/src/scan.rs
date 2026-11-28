@@ -1048,6 +1048,7 @@ fn uuid_constant(expr: &Expr, parameters: rtdb_expr::Parameters<'_>) -> Option<[
         _ => (expr, false),
     };
     if let Expr::Parameter { index, .. } = operand && let Some(cell) = parameters.arrow_cell(*index) {
+        let cell = identity_parameter_cell(cell)?;
         if cell.array.is_null(cell.row) { return None; }
         let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
         return match (cell.field.data_type(), extension, cast) {
@@ -1071,7 +1072,18 @@ fn keyword_iids(name: &str) -> (Iid, Option<Iid>) {
     (native, Some(reference))
 }
 
+fn identity_parameter_cell(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<rtdb_expr::ArrowParameterCell<'_>> {
+    if let DataType::RunEndEncoded(_, child) = cell.field.data_type()
+        && child.data_type() == &DataType::Utf8
+        && cell.field.metadata().is_empty() && child.metadata().is_empty()
+    {
+        return cell.physical().ok();
+    }
+    Some(cell)
+}
+
 fn arrow_parameter_iids(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<(Iid, Option<Iid>)> {
+    let cell = identity_parameter_cell(cell)?;
     if cell.array.is_null(cell.row) { return None; }
     let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
     match (cell.field.data_type(), extension) {

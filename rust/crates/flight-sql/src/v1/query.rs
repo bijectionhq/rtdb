@@ -925,22 +925,32 @@ impl Parameters {
                     return prepared.open_tracked_query_arrow(Arc::clone(context), &self.batch, types)
                         .await.map(Some).map_err(error::anomaly);
                 }
-                if !admit_collections || !self.can_bind_plain_scalar_runs() {
+                if !admit_collections {
+                    return Ok(None);
+                }
+                let only_byte_runs = self.can_bind_only_byte_runs();
+                if !only_byte_runs && !self.can_bind_plain_scalar_runs() {
                     return Ok(None);
                 }
                 let _row_admission = wire::reserve_first_query_row(self.batch.batch(), types.len(), &context.memory)
                     .map_err(error::map_status)?;
-                let _type_charge = context.memory.reserve(wire::mul(types.len(), size_of::<LogicalType>())?)
-                    .map_err(error::anomaly)?;
-                let observed = types.iter().map(|ty| {
-                    let ty = match ty { LogicalType::RunEndEncoded { value, .. } => value.as_ref(), ty => ty };
-                    match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty }.clone()
-                }).collect::<Vec<_>>();
+                let observed = if only_byte_runs {
+                    None
+                } else {
+                    let charge = context.memory.reserve(wire::mul(types.len(), size_of::<LogicalType>())?)
+                        .map_err(error::anomaly)?;
+                    let types = types.iter().map(|ty| {
+                        let ty = match ty { LogicalType::RunEndEncoded { value, .. } => value.as_ref(), ty => ty };
+                        match ty { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty }.clone()
+                    }).collect::<Vec<_>>();
+                    Some((types, charge))
+                };
+                let types = observed.as_ref().map_or(types, |(types, _)| types.as_slice());
                 if track {
-                    return prepared.open_tracked_query_arrow(Arc::clone(context), &self.batch, &observed)
+                    return prepared.open_tracked_query_arrow(Arc::clone(context), &self.batch, types)
                         .await.map(Some).map_err(error::anomaly);
                 }
-                return prepared.try_open_query_arrow(Arc::clone(context), &self.batch, &observed).await
+                return prepared.try_open_query_arrow(Arc::clone(context), &self.batch, types).await
                     .map(|cursor| cursor.map(|cursor| (cursor, ClaimFootprint::default()))).map_err(error::anomaly);
             }
             if !track {
@@ -1031,6 +1041,20 @@ impl Parameters {
             plain && (ArrowCell { field, array: array.as_ref(), row: 0 }).is_null().is_ok_and(|is_null| !is_null)
         });
         compatible && has_run && has_plain
+    }
+
+    fn can_bind_only_byte_runs(&self) -> bool {
+        let batch = self.batch.batch();
+        batch.num_columns() != 0
+            && batch.schema_ref().fields().iter().zip(batch.columns()).all(|(field, array)| {
+                let DataType::RunEndEncoded(_, child) = field.data_type() else { return false; };
+                field.metadata().is_empty()
+                    && child.metadata().is_empty()
+                    && matches!(child.data_type(), DataType::Utf8 | DataType::Binary)
+                    && (ArrowCell { field, array: array.as_ref(), row: 0 })
+                        .is_null()
+                        .is_ok_and(|is_null| !is_null)
+            })
     }
 
     fn signed_batch(&self) -> Option<OwnedBatch> {
@@ -1177,6 +1201,38 @@ mod tests {
             let parameters = Parameters { batch: OwnedBatch::new(batch, &memory).unwrap(), types };
             assert!(!parameters.can_bind_arrow(true, true, &memory));
             assert_eq!(parameters.binds_tracked_byte_arguments(), admit);
+        }
+    }
+
+    #[test]
+    fn all_byte_runs_require_plain_non_null_selected_values() {
+        use arrow_array::{Int16Array, RunArray};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let run_end = Int16Array::from(vec![1]);
+        let binary = BinaryArray::from(vec![&b"\0\xfe\xff"[..]]);
+        for (text, annotate, admit) in [
+            (Some("é"), false, true),
+            (Some("é"), true, false),
+            (None, false, false),
+        ] {
+            let text = StringArray::from(vec![text]);
+            let run_text = RunArray::<Int16Type>::try_new(&run_end, &text).unwrap();
+            let run_binary = RunArray::<Int16Type>::try_new(&run_end, &binary).unwrap();
+            let mut field = Field::new("p", run_text.data_type().clone(), false);
+            if annotate {
+                field = field.with_metadata([("client".into(), "annotation".into())].into());
+            }
+            let schema = Arc::new(Schema::new(vec![
+                field,
+                Field::new("q", run_binary.data_type().clone(), false),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(run_text), Arc::new(run_binary)]).unwrap();
+            let types = wire::ParameterTypes::from_batch(&batch, &memory).unwrap();
+            let parameters = Parameters { batch: OwnedBatch::new(batch, &memory).unwrap(), types };
+
+            assert!(!parameters.can_bind_plain_scalar_runs());
+            assert_eq!(parameters.can_bind_only_byte_runs(), admit);
         }
     }
 

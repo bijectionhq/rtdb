@@ -25,6 +25,8 @@
 -- A v1 Query can also bind a mixed parameter row in Arrow when each additional plain record or list has the declared type at its selected position.
 -- A tracked v1 Query can use the same Arrow bindings when their representation preserves claim identity.
 -- A v1 Query with non-null plain scalar arguments can retain the unchanged columns when run-end scalar cells need conversion.
+-- A v1 Query whose arguments are all unannotated run-end Text or Binary cells can bind their selected non-null values in Arrow under the original parameter admission.
+-- A matching single-row result can retain the run-end parameter under its source charge.
 -- Tracked v1 queries with non-null plain text and Binary arguments can retain the uploaded cells through execution and footprint calculation even when the fields carry client annotations.
 -- Unsigned scalar columns share their value and validity buffers with signed columns at the same width during execution.
 -- Other parameter layouts and plans that decline direct binding use the scalar binding path.

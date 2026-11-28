@@ -3563,7 +3563,20 @@ fn copyable(scalar: &rtdb_types::ScalarType) -> bool {
 /// The column's array where it already holds exactly what copying its cells into `field`, the layout of `target`,
 /// would build; `None` where the cells must be copied.
 pub(crate) fn conform(column: &Column, target: &LogicalType, field: &ArrowField) -> Option<ArrayRef> {
-    let Column::Arrow { array, logical: Some(logical), .. } = column else { return None };
+    let Column::Arrow { array, field: source, logical: Some(logical) } = column else { return None };
+    if array.len() == 1
+        && logical == target
+        && array.data_type() == field.data_type()
+        && source.metadata().is_empty()
+        && field.metadata().is_empty()
+        && let DataType::RunEndEncoded(_, child) = field.data_type()
+        && child.metadata().is_empty()
+        && matches!(child.data_type(), DataType::Utf8 | DataType::Binary)
+        && (rtdb_columnar::ArrowCell { field: source, array: array.as_ref(), row: 0 })
+            .is_null().is_ok_and(|is_null| !is_null)
+    {
+        return Some(Arc::clone(array));
+    }
     conform_array(array, logical, target, field)
 }
 
@@ -5716,6 +5729,46 @@ mod tests {
             drop((selected, owner));
             assert!(charge.upgrade().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn a_single_output_row_can_keep_a_bound_byte_run() {
+        use arrow_array::{BinaryArray, Int16Array, RecordBatch, RunArray, types::Int16Type};
+        use arrow_schema::Schema as ArrowSchema;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let ends = Int16Array::from(vec![1]);
+        let payload = &b"\0\xfe\xff"[..];
+        let values = BinaryArray::from(vec![payload]);
+        let run = RunArray::<Int16Type>::try_new(&ends, &values).unwrap();
+        let field = ArrowField::new("p", run.data_type().clone(), false);
+        let logical = rtdb_columnar::from_field(&field).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![field])), vec![Arc::new(run)],
+        ).unwrap();
+        let source = rtdb_columnar::OwnedBatch::new(batch, &memory).unwrap();
+        let source_charge = Arc::downgrade(source.reservation());
+        let array = Arc::clone(source.batch().column(0));
+        let input = ColumnBatch::settled(vec![], 1, memory.reserve(4096).unwrap()).unwrap();
+        let target = rtdb_columnar::to_field("output", &logical).unwrap();
+        let expr = Expr::Parameter { index: 0, data_type: logical.clone() };
+        let mut cursor = record_projection_cursor(input, Schema::default(), vec![expr], &memory);
+        cursor.execution.parameters = Arc::new(
+            crate::parameters::BoundParameters::from_arrow(source, 0, vec![logical.clone()], &memory).unwrap(),
+        );
+        cursor.scalar_fallbacks = Some(0);
+
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let cell = page.columns[0].funded_arrow_cell(0, page.column_reservation(0)).unwrap().unwrap();
+        assert!(Arc::ptr_eq(cell.array, &array));
+        assert!(Arc::ptr_eq(&conform(&page.columns[0], &logical, &target).unwrap(), &array));
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Binary(payload.to_vec()));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+
+        drop((cursor, array));
+        assert!(source_charge.upgrade().is_some());
+        drop(page);
+        assert!(source_charge.upgrade().is_none());
     }
 
     #[tokio::test]
@@ -7904,6 +7957,14 @@ impl BatchCursor for BatchExpressions {
                 owners[index] = Some(owner);
                 continue;
             }
+            if batch.len == 1
+                && let Some((column, owner)) =
+                    projection::byte_run_parameter(kernel, &self.execution.parameters, memory)?
+            {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
             if let Some((column, owner)) = projection::computed_record(kernel, &self.schema, &batch, parameters, &self.execution.context)? {
                 columns.push(column);
                 owners[index] = Some(owner);
@@ -8547,6 +8608,44 @@ pub(crate) mod projection {
     use rtdb_plan::{CastTarget, Expr, Schema};
     use rtdb_types::{LogicalType, Result, StructFields, Value};
     use super::{Column, ColumnBatch, MemoryBudget, MemoryReservation, ProjectionInput, SelectedColumn, StoredVector};
+
+    pub(super) fn byte_run_parameter(
+        expr: &Expr,
+        parameters: &crate::parameters::BoundParameters,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+        let Expr::Parameter { index, data_type } = expr else { return Ok(None); };
+        let LogicalType::RunEndEncoded { value, .. } = data_type else { return Ok(None); };
+        if !matches!(super::plain_scalar(value), Some(rtdb_types::ScalarType::Utf8 | rtdb_types::ScalarType::Binary)) {
+            return Ok(None);
+        }
+        let Some((source, 0)) = parameters.arrow_input(*index) else { return Ok(None); };
+        let batch = source.batch();
+        if batch.num_rows() != 1 {
+            return Ok(None);
+        }
+        let field = &batch.schema_ref().fields()[*index];
+        let array = batch.column(*index);
+        let DataType::RunEndEncoded(_, child) = field.data_type() else { return Ok(None); };
+        if !field.metadata().is_empty()
+            || !child.metadata().is_empty()
+            || !rtdb_columnar::from_field(field).is_ok_and(|observed| observed == *data_type)
+            || (rtdb_columnar::ArrowCell { field, array: array.as_ref(), row: 0 }).is_null()?
+        {
+            return Ok(None);
+        }
+        let bytes = field.size().checked_add(data_type.retained_bytes()?)
+            .and_then(|bytes| bytes.checked_add(128)).ok_or_else(super::size_error)?;
+        let owner = match memory.reserve_with_backing(bytes, std::iter::once(Arc::clone(source.reservation()))) {
+            Ok(owner) => owner,
+            Err(error) if error.is(rtdb_types::AnomalyKind::ResourceExhausted) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let column = Column::Arrow {
+            array: Arc::clone(array), field: Arc::clone(field), logical: Some(data_type.clone()),
+        };
+        Ok(Some((column, owner)))
+    }
 
     /// A bare column or parameter of a projection over one bound row, shared rather than computed.
     pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], parameters: &[Column]) -> Option<Column> {
