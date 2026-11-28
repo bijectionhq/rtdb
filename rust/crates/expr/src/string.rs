@@ -50,8 +50,7 @@ pub(crate) enum StringFunction {
 
 impl StringFunction {
     pub(crate) fn position(self, needle: &[u8], haystack: &[u8]) -> Result<Value> {
-        let found = if needle.is_empty() { Some(0) } else { haystack.windows(needle.len()).position(|candidate| candidate == needle) };
-        count(found.map_or(0, |index| if self == Self::Position { utf8_length(&haystack[..index]) + 1 } else { index + 1 }))
+        position(needle, haystack, self == Self::Position).map(Value::I32)
     }
 
     pub(crate) fn from_canonical(name: &str) -> Option<Self> {
@@ -154,7 +153,7 @@ impl StringFunction {
             Self::Position | Self::OctetPosition => self.position(bytes(&args[0])?, bytes(&args[1])?)?,
             Self::CharacterLength => count(utf8_length(bytes(&args[0])?))?,
             Self::DefaultOverlayLength => count(if binary { bytes(&args[0])?.len() } else { utf8_length(bytes(&args[0])?) })?,
-            Self::OctetLength => count(bytes(&args[0])?.len())?,
+            Self::OctetLength => Value::I32(octet_length(bytes(&args[0])?)?),
             Self::Trim | Self::TrimLeading | Self::TrimTrailing => {
                 if binary {
                     let source = bytes(&args[0])?;
@@ -226,6 +225,17 @@ pub(crate) fn binary_substring(source: &[u8], position: i64, length: Option<i64>
     substring(source, position as i32, length.map(|length| length as i32), false)
 }
 
+pub(crate) fn octet_position(needle: &[u8], haystack: &[u8]) -> Result<i32> {
+    position(needle, haystack, false)
+}
+
+fn position(needle: &[u8], haystack: &[u8], characters: bool) -> Result<i32> {
+    let found = if needle.is_empty() { Some(0) } else { haystack.windows(needle.len()).position(|candidate| candidate == needle) };
+    count_i32(found.map_or(0, |index| if characters { utf8_length(&haystack[..index]) + 1 } else { index + 1 }))
+}
+
+pub(crate) fn octet_length(bytes: &[u8]) -> Result<i32> { count_i32(bytes.len()) }
+
 fn substring(source: &[u8], position: i32, length: Option<i32>, utf8: bool) -> Result<&[u8]> {
     if length.is_some_and(|length| length < 0) { return Err(illegal("Negative substring length")); }
     let zero = position.wrapping_sub(1);
@@ -289,7 +299,8 @@ fn numeric_octet(value: &Value) -> Result<u8> {
     if value < -128.0 || value > 127.0 { return Err(illegal(&format!("Value out of range for byte: {value}"))); }
     Ok(value as i8 as u8)
 }
-fn count(value: usize) -> Result<Value> { Ok(Value::I32(i32::try_from(value).map_err(|_| overflow())?)) }
+fn count_i32(value: usize) -> Result<i32> { i32::try_from(value).map_err(|_| overflow()) }
+fn count(value: usize) -> Result<Value> { count_i32(value).map(Value::I32) }
 fn from_bytes(bytes: Vec<u8>, binary: bool) -> Result<Value> { if binary { Ok(Value::Binary(bytes)) } else { String::from_utf8(bytes).map(Value::Utf8).map_err(|_| illegal("String operation produced invalid UTF-8")) } }
 fn concat_text(parts: &[String]) -> Result<String> { let size = parts.iter().try_fold(0, |size, part| add(size, part.len()))?; let mut result = String::with_capacity(size); for part in parts { result.push_str(part); } Ok(result) }
 pub(crate) fn concat_utf8<'a>(parts: impl Iterator<Item = &'a str> + Clone, context: &EvalContext<'_>) -> Result<Value> {

@@ -186,6 +186,16 @@ pub fn binary_substring(source: &[u8], position: i64, length: Option<i64>) -> Re
     crate::string::binary_substring(source, position, length)
 }
 
+/// Counts the octets of a borrowed Binary cell with the scalar result width.
+pub fn binary_octet_length(source: &[u8]) -> Result<i32> {
+    crate::string::octet_length(source)
+}
+
+/// Searches borrowed Binary cells with the scalar one-based index and zero for no match.
+pub fn binary_octet_position(needle: &[u8], haystack: &[u8]) -> Result<i32> {
+    crate::string::octet_position(needle, haystack)
+}
+
 /// LENGTH in characters over text; a text vector's `i32` offsets bound every count.
 pub fn text_lengths(values: &StringArray) -> Int32Array {
     values.iter().map(|text| text.map(|text| text.chars().count() as i32)).collect()

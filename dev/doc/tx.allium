@@ -136,6 +136,7 @@
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
 -- A native Binary SUBSTRING with signed literal indices can write reached byte slices into a bounded Binary result.
 -- Its byte slicing retains the scalar index narrowing, null behavior, and errors.
+-- Native Binary OCTET_LENGTH and OCTET_POSITION can read reached bytes from plain Arrow cells and write the scalar counts into a funded integer result.
 -- A bounded native UTF-8 NULLIF, LEAST, or GREATEST result can write reached text directly from its Arrow input while preserving operand demand and byte ordering.
 -- A direct Arrow parameter projection chooses retention or detachment for each result column independently.
 -- A compatible first-cell view keeps its source backing charge when the retained storage is proportionate to the cell.

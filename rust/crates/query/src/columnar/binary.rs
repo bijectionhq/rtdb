@@ -1,6 +1,9 @@
 use std::{mem::size_of, sync::Arc};
 
-use arrow_array::{Array, BinaryArray, builder::BinaryBuilder};
+use arrow_array::{
+    Array, BinaryArray,
+    builder::{BinaryBuilder, Int32Builder},
+};
 use arrow_schema::DataType;
 use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_plan::{Expr, Schema, UnaryOp};
@@ -79,27 +82,29 @@ pub(super) fn column(
     batch: &ColumnBatch,
     execution: &Execution,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    match substring(expr, output, schema, batch, execution) {
+    let Expr::Call { name, args, .. } = expr else {
+        return Ok(None);
+    };
+    let result = match plain_scalar(output) {
+        Some(ScalarType::Binary) if name.eq_ignore_ascii_case("substring") => {
+            substring(args, schema, batch, execution)
+        }
+        Some(ScalarType::I32) => octets(name, args, schema, batch, execution),
+        _ => Ok(None),
+    };
+    match result {
         Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
         result => result,
     }
 }
 
 fn substring(
-    expr: &Expr,
-    output: &LogicalType,
+    args: &[Expr],
     schema: &Schema,
     batch: &ColumnBatch,
     execution: &Execution,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    let Expr::Call { name, args, .. } = expr else {
-        return Ok(None);
-    };
-    if !name.eq_ignore_ascii_case("substring") || plain_scalar(output) != Some(&ScalarType::Binary)
-    {
-        return Ok(None);
-    }
-    let (input, position, length) = match args.as_slice() {
+    let (input, position, length) = match args {
         [input, position] => (input, position, None),
         [input, position, length] => (input, position, Some(length)),
         _ => return Ok(None),
@@ -149,13 +154,80 @@ fn substring(
         .and_then(|bytes| bytes.checked_add(payload))
         .and_then(|bytes| bytes.checked_add(len.div_ceil(8) + 1024))
         .ok_or_else(size_error)?;
-    let mut charge = context.memory.reserve(bound)?;
+    let charge = context.memory.reserve(bound)?;
     let mut builder = BinaryBuilder::with_capacity(len, payload);
     for (row, slice) in slices.into_iter().enumerate() {
         context.check_cancelled_at(row)?;
         builder.append_option(slice);
     }
-    let column = observed_scalar_column(builder.finish())?;
+    finish(builder.finish(), charge).map(Some)
+}
+
+fn octets(
+    name: &str,
+    args: &[Expr],
+    schema: &Schema,
+    batch: &ColumnBatch,
+    execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let (input, haystack) = match args {
+        [input]
+            if name.eq_ignore_ascii_case("octet_length")
+                || name.eq_ignore_ascii_case("octet-length") =>
+        {
+            (input, None)
+        }
+        [needle, haystack]
+            if name.eq_ignore_ascii_case("octet_position")
+                || name.eq_ignore_ascii_case("octet-position") =>
+        {
+            let Some(haystack) = BinaryInput::bind(haystack, schema, batch, execution) else {
+                return Ok(None);
+            };
+            (needle, Some(haystack))
+        }
+        _ => return Ok(None),
+    };
+    let Some(input) = BinaryInput::bind(input, schema, batch, execution) else {
+        return Ok(None);
+    };
+    let len = batch.len;
+    let context = &execution.context;
+    let bound = len
+        .checked_mul(size_of::<i32>())
+        .and_then(|bytes| bytes.checked_add(len.div_ceil(8) + 1024))
+        .ok_or_else(size_error)?;
+    let charge = context.memory.reserve(bound)?;
+    let mut builder = Int32Builder::with_capacity(len);
+    for row in 0..len {
+        context.check_cancelled_at(row)?;
+        let Some(cell) = input.cell(row) else {
+            return Ok(None);
+        };
+        let Some(cell) = cell else {
+            builder.append_null();
+            continue;
+        };
+        let result = if let Some(haystack) = &haystack {
+            let Some(haystack) = haystack.cell(row) else {
+                return Ok(None);
+            };
+            haystack
+                .map(|haystack| rtdb_expr::kernels::binary_octet_position(cell, haystack))
+                .transpose()?
+        } else {
+            Some(rtdb_expr::kernels::binary_octet_length(cell)?)
+        };
+        builder.append_option(result);
+    }
+    finish(builder.finish(), charge).map(Some)
+}
+
+fn finish(
+    array: impl Array + 'static,
+    mut charge: Arc<MemoryReservation>,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let column = observed_scalar_column(array)?;
     let bytes = owned_projection_bytes(&column)?;
     let reservation = Arc::get_mut(&mut charge).expect("The Binary writer owns its reservation");
     if bytes <= reservation.bytes() {
@@ -163,7 +235,7 @@ fn substring(
     } else {
         reservation.grow_to(bytes)?;
     }
-    Ok(Some((column, charge)))
+    Ok((column, charge))
 }
 
 fn signed_literal(expr: &Expr) -> Option<i64> {

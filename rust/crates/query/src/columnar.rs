@@ -5358,6 +5358,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_octet_functions_read_funded_bytes_under_a_smaller_projection_budget() {
+        use arrow_array::{BinaryArray, RecordBatch};
+
+        let memory = MemoryBudget::new(1 << 17);
+        let source_memory = MemoryBudget::new(1 << 23);
+        let schema = Schema::new(vec![field(0, ScalarType::Binary), field(1, ScalarType::Binary)]).unwrap();
+        let fields = schema.fields().iter().map(|field| rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()).collect::<Vec<_>>();
+        let mut large = vec![0u8; 1 << 20];
+        *large.last_mut().unwrap() = 255;
+        let needles = BinaryArray::from_iter([Some(&[255][..]), Some(&[][..]), Some(&[255][..]), None, Some(&[255][..])]);
+        let haystacks = BinaryArray::from_iter([Some(large.as_slice()), Some(&[1][..]), Some(&[1][..]), Some(&[1][..]), None]);
+        let record = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)),
+            vec![Arc::new(needles), Arc::new(haystacks)]).unwrap();
+        let batch = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(record, &source_memory).unwrap()).unwrap();
+        let call = |name: &str, args: Vec<Expr>| Expr::Call {
+            name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args,
+        };
+        let [needle, haystack] = [schema.fields()[0].expression(), schema.fields()[1].expression()];
+        let expressions = vec![call("octet_length", vec![haystack.clone()]), call("octet_position", vec![needle, haystack])];
+        let mut cursor = record_projection_cursor(batch, schema, expressions, &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        for (column, expected) in page.columns.iter().zip([
+            [Some(1 << 20), Some(1), Some(1), Some(1), None],
+            [Some(1 << 20), Some(1), Some(0), None, None],
+        ]) {
+            let Column::Arrow { array, .. } = column else { panic!("Expected Arrow Int32"); };
+            let values = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn scalar_length_over_a_computed_argument_writes_an_i32_column() {
         let memory = MemoryBudget::new(1 << 22);
         let len = 256;
