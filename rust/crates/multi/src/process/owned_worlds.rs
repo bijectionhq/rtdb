@@ -391,7 +391,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPageOutput>> {
         Box::pin(async move {
-            if let Some(page) = self.local_overlay_identity_page(relation, valid, after, limit).await? {
+            if let Some(page) = self.local_overlay_identity_page(relation, valid, after, limit, None).await? {
                 return Ok(WorldIdentityPageOutput::Local(page));
             }
             OwnedWorldRead::overlay_identities(self, relation, valid, after, limit).await.map(WorldIdentityPageOutput::Rows)
@@ -405,6 +405,18 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         Box::pin(async move {
             let page = HeldCheckpointWorld::overlay_identities_at(self, relation, valid, after, limit, system).await?;
             Ok(WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations })
+        })
+    }
+
+    fn overlay_identities_at_output<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>,
+        limit: usize, system: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldIdentityPageOutput>> {
+        Box::pin(async move {
+            if let Some(page) = self.local_overlay_identity_page(relation, valid, after, limit, Some(system)).await? {
+                return Ok(WorldIdentityPageOutput::Local(page));
+            }
+            OwnedWorldRead::overlay_identities_at(self, relation, valid, after, limit, system).await.map(WorldIdentityPageOutput::Rows)
         })
     }
 

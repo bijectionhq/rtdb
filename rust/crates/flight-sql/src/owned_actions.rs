@@ -5107,7 +5107,7 @@ impl Service {
             (WorldIdentityRead::EffectiveAt, Some(system)) =>
                 held.snapshot.identity_page_at(&relation, valid, &after, limit, system, parent_only).await.map(WorldIdentityPageOutput::Rows),
             (WorldIdentityRead::OverlayAt, Some(system)) =>
-                held.snapshot.overlay_identities_at(&relation, valid, &after, limit, system).await.map(WorldIdentityPageOutput::Rows),
+                held.snapshot.overlay_identities_at_output(&relation, valid, &after, limit, system).await,
             (WorldIdentityRead::Effective, None) =>
                 held.snapshot.identity_page(&relation, valid, &after, limit).await.map(WorldIdentityPageOutput::Rows),
             _ => return Err(invalid("Invalid held world identity coordinates")),

@@ -300,29 +300,16 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
         after: &OwnedIdentityScan<'_>, limit: usize,
     ) -> Result<OwnedIdentityPageOutput> {
+        self.world_identity_page_output_at(world, relation, self.present.system_time, valid, after, limit).await
+    }
+
+    pub(super) async fn world_identity_page_output_at(
+        &self, world: rtdb_types::Iid, relation: &OwnedRelation, system: Timestamp, valid: Timestamp,
+        after: &OwnedIdentityScan<'_>, limit: usize,
+    ) -> Result<OwnedIdentityPageOutput> {
         if !(1..=MAX_PAGE_ROWS).contains(&limit) { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let (context, relation, _registration) = self.world_identity_context(world, relation).await?;
-        let mut more = false;
-        let (keys, charges) = rtdb_query::collect_owned_identity_candidates(
-            Arc::clone(&context), &self.owner, &relation, self.present.system_time, valid, after, limit + 1, None,
-            || PageKeys::new(Some(after), limit),
-            PageKeys::compare_last,
-            |keys, key| {
-                if keys.len() == limit {
-                    more = true;
-                } else {
-                    keys.push(key, limit);
-                }
-            },
-        ).await?;
-        context.check_cancelled()?;
-        let mut charges = charges.into_iter();
-        let mut charge = charges.next().expect("Identity candidates own their initial reservation");
-        let grant = Arc::get_mut(&mut charge).expect("Identity candidates own their reservations");
-        for mut part in charges {
-            grant.absorb(Arc::get_mut(&mut part).expect("Identity candidates own their reservations"))?;
-        }
-        keys.finish(more, charge)
+        collect_world_identity_page(&context, &self.owner, &relation, system, valid, after, limit).await
     }
 
     async fn world_identity_context(
@@ -518,6 +505,33 @@ impl OwnedReadSession {
     }
 }
 
+async fn collect_world_identity_page(
+    context: &Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp, valid: Timestamp,
+    after: &OwnedIdentityScan<'_>, limit: usize,
+) -> Result<OwnedIdentityPageOutput> {
+    let mut more = false;
+    let (keys, charges) = rtdb_query::collect_owned_identity_candidates(
+        Arc::clone(context), owner, relation, system, valid, after, limit + 1, None,
+        || PageKeys::new(Some(after), limit),
+        PageKeys::compare_last,
+        |keys, key| {
+            if keys.len() == limit {
+                more = true;
+            } else {
+                keys.push(key, limit);
+            }
+        },
+    ).await?;
+    context.check_cancelled()?;
+    let mut charges = charges.into_iter();
+    let mut charge = charges.next().expect("Identity candidates own their initial reservation");
+    let grant = Arc::get_mut(&mut charge).expect("Identity candidates own their reservations");
+    for mut part in charges {
+        grant.absorb(Arc::get_mut(&mut part).expect("Identity candidates own their reservations"))?;
+    }
+    keys.finish(more, charge)
+}
+
 fn remaining_page_bytes(remaining: usize, bytes: usize, rows: usize) -> Result<Option<usize>> {
     match remaining.checked_sub(bytes) {
         None if rows == 0 => Err(Anomaly::new(
@@ -583,6 +597,86 @@ fn protected_page_unavailable() -> Anomaly {
         "rtdb.owned/protected-equality",
         "The installed protected equality partition is unavailable",
     )
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn historical_world_identity_output_keeps_its_proved_lookahead_grant() -> Result<()> {
+    use std::collections::BTreeMap;
+
+    use rtdb_format::data::{StoredEvent, StoredOperation};
+    use rtdb_index::{PartitionState, TransactionBuffer};
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, owned_identity_candidates};
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_trie::TrieConfig;
+    use rtdb_types::{Iid, Interval, TransactionKey, TxId, WorldShadow};
+    use tokio_util::sync::CancellationToken;
+
+    let state = PartitionState::empty(TrieConfig::default())?;
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 26);
+    let relation = OwnedRelation::new("overlay-page")?.in_world(Iid([7; 16]))?;
+    let table = relation.table("alice");
+    let old = Timestamp(100);
+    let head = Timestamp(200);
+    let first = EntityId::Binary(vec![0, 255]);
+    let second = EntityId::Binary(vec![0, 255, 0]);
+    let event = |id: &EntityId, iid, system, valid_time| -> Result<StoredEvent> {
+        Ok(StoredEvent {
+            position: None, origin: None, commit_position: 0, entity_key: Some(id.handle_bytes().into()),
+            iid, system_from: system, valid_time,
+            operation: StoredOperation::Put(WorldShadow::Deleted.record(id)?), recency: None,
+        })
+    };
+    let mut write = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(0), system_time: old }, Arc::clone(&memory))?;
+    write.append(table.clone(), event(&second, second.iid(), old, Interval::ALL)?)?;
+    write.append(table.clone(), event(&first, first.iid(), old, Interval::ALL)?)?;
+    let broken = EntityId::Binary(vec![255]);
+    write.append(table.clone(), event(&broken, Iid::MIN, old, Interval::from_micros(11, 12)?)?)?;
+    state.apply(&write.stage()?)?;
+    let mut write = TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(1), system_time: head }, Arc::clone(&memory))?;
+    let added = EntityId::Binary(vec![0]);
+    write.append(table, event(&added, added.iid(), head, Interval::ALL)?)?;
+    state.apply(&write.stage()?)?;
+
+    let snapshot = state.value().snapshot().with_system_time_cap(Some(head))?;
+    let database = DatabaseSnapshot {
+        partitions: vec![snapshot],
+        storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 24)),
+    };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false)?;
+    let context = QueryContext::new(catalog, Arc::clone(&memory), head, "UTC",
+        QueryOptions::default(), &CancellationToken::new())?;
+    let bound = OwnedIdentityScan::binary(None);
+    let valid = Timestamp(10);
+    let (rows, charges) = owned_identity_candidates(Arc::clone(&context), "alice", &relation, old, valid, &bound, 2)
+        .await?.into_parts();
+    assert_eq!(rows, [first.clone(), second.clone()]);
+    assert_eq!(charges.len(), 3);
+    let grant = charges.iter().map(|charge| charge.bytes()).sum::<usize>();
+    drop(charges);
+
+    let output = collect_world_identity_page(&context, "alice", &relation, old, valid, &bound, 1).await?;
+    let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
+    let ids = Arc::clone(page.ids());
+    let keys = ids.as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(keys.iter().collect::<Vec<_>>(), [Some(&[0u8, 255][..])]);
+    assert!(page.more);
+    let reserved = memory.used_bytes();
+    drop(page);
+    assert_eq!(memory.used_bytes(), reserved);
+    drop(ids);
+    assert_eq!(memory.used_bytes(), reserved - grant);
+
+    let bound = OwnedIdentityScan::seek(&first)?;
+    let output = collect_world_identity_page(&context, "alice", &relation, old, valid, &bound, 1).await?;
+    let OwnedIdentityPageOutput::Arrow(page) = output else { panic!("Expected funded Arrow keys"); };
+    let keys = page.ids().as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(keys.iter().collect::<Vec<_>>(), [Some(&[0u8, 255, 0][..])]);
+    assert!(!page.more);
+    let error = collect_world_identity_page(&context, "alice", &relation, old, Timestamp(11), &bound, 1)
+        .await.err().expect("The historical lookahead has no exact point");
+    assert_eq!(error.code, "rtdb.owned/world-identities");
+    Ok(())
 }
 
 #[cfg(test)]

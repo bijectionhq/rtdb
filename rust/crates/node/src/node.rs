@@ -3370,6 +3370,12 @@ impl OwnedWorldAcceptedCut<'_> {
         self.held.world_identity_candidates_at(self.world, self.relation, self.system, valid, after, fetch).await
     }
 
+    pub async fn overlay_identity_page_output(
+        &self, valid: Timestamp, after: &rtdb_types::OwnedIdentityScan<'_>, limit: usize,
+    ) -> Result<OwnedIdentityPageOutput> {
+        self.held.world_identity_page_output_at(self.world, self.relation, self.system, valid, after, limit).await
+    }
+
     pub async fn shadow(
         &self, id: &rtdb_types::EntityId, valid: Timestamp,
     ) -> Result<OwnedWorldShadowRead> {

@@ -1977,14 +1977,20 @@ impl HeldCheckpointWorld {
 
     pub(crate) async fn local_overlay_identity_page(
         &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
+        system: Option<Timestamp>,
     ) -> Result<Option<rtdb_node::OwnedIdentityPageOutput>> {
         if self.ancestor().is_some() || !self.clock_mode().is_writable() || matches!(after, OwnedIdentityScan::Unbounded) {
             return Ok(None);
         }
         self.check_relation(relation)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
-        self.require_overlay_identity_coverage(relation).await?;
-        let page = self.open.snapshot.world_identity_page_output(self.open.record.id, relation, valid, after, limit).await?;
+        let page = if let Some(system) = system {
+            let cut = self.certify_overlay_identity_cut(relation, system).await?;
+            cut.overlay_identity_page_output(valid, after, limit).await?
+        } else {
+            self.require_overlay_identity_coverage(relation).await?;
+            self.open.snapshot.world_identity_page_output(self.open.record.id, relation, valid, after, limit).await?
+        };
         self.check_relation(relation)?;
         Ok(Some(page))
     }
@@ -2007,10 +2013,17 @@ impl HeldCheckpointWorld {
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
         }
-        let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
-        self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
+        let cut = self.certify_overlay_identity_cut(relation, system).await?;
         let candidates = cut.overlay_identities(valid, after, limit + 1).await?;
         self.merge_overlay_identities(relation, valid, after, limit, candidates, None).await
+    }
+
+    async fn certify_overlay_identity_cut<'a>(
+        &'a self, relation: &'a OwnedRelation, system: Timestamp,
+    ) -> Result<rtdb_node::OwnedWorldAcceptedCut<'a>> {
+        let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
+        self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
+        Ok(cut)
     }
 
     async fn merge_overlay_identities(
