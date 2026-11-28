@@ -919,6 +919,12 @@ impl Parameters {
                 return Ok(None);
             }
             if !self.can_bind_arrow(track, admit_collections, &context.memory) {
+                if track && self.binds_tracked_byte_arguments() {
+                    let _row_admission = wire::reserve_first_query_row(self.batch.batch(), types.len(), &context.memory)
+                        .map_err(error::map_status)?;
+                    return prepared.open_tracked_query_arrow(Arc::clone(context), &self.batch, types)
+                        .await.map(Some).map_err(error::anomaly);
+                }
                 if !admit_collections || !self.can_bind_plain_scalar_runs() {
                     return Ok(None);
                 }
@@ -990,6 +996,15 @@ impl Parameters {
                 .await
         };
         result.map(|cursor| cursor.map(|cursor| (cursor, ClaimFootprint::default()))).map_err(error::anomaly)
+    }
+
+    fn binds_tracked_byte_arguments(&self) -> bool {
+        let batch = self.batch.batch();
+        batch.num_columns() != 0 && batch.schema_ref().fields().iter().zip(batch.columns()).all(|(field, array)| {
+            matches!(field.data_type(), DataType::Utf8 | DataType::Binary)
+                && !field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)
+                && array.is_valid(0)
+        })
     }
 
     fn can_bind_plain_scalar_runs(&self) -> bool {
@@ -1143,6 +1158,26 @@ mod tests {
         let _remaining = memory.reserve(memory.available_bytes()).unwrap();
 
         parameters.validate_columns(&memory).unwrap();
+    }
+
+    #[test]
+    fn tracked_byte_binding_admits_annotations_but_needs_plain_present_cells() {
+        let memory = MemoryBudget::new(1 << 20);
+        for (column, metadata, admit) in [
+            (Arc::new(BinaryArray::from(vec![&b"payload"[..]])) as ArrayRef,
+                [("client".into(), "annotation".into())].into(), true),
+            (Arc::new(BinaryArray::from(vec![None::<&[u8]>])) as ArrayRef,
+                [("client".into(), "annotation".into())].into(), false),
+            (Arc::new(BinaryArray::from(vec![&b"payload"[..]])) as ArrayRef,
+                [(rtdb_columnar::EXTENSION_NAME_KEY.into(), "xt/transit+msgpack".into())].into(), false),
+        ] {
+            let field = Field::new("p", DataType::Binary, true).with_metadata(metadata);
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![column]).unwrap();
+            let types = wire::ParameterTypes::from_batch(&batch, &memory).unwrap();
+            let parameters = Parameters { batch: OwnedBatch::new(batch, &memory).unwrap(), types };
+            assert!(!parameters.can_bind_arrow(true, true, &memory));
+            assert_eq!(parameters.binds_tracked_byte_arguments(), admit);
+        }
     }
 
     #[test]

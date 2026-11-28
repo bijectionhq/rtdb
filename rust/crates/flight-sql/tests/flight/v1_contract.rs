@@ -928,6 +928,42 @@ async fn tracked_query_retains_mixed_integer_list_parameters_without_changing_cl
 }
 
 #[tokio::test]
+async fn tracked_query_keeps_plain_byte_arguments_with_client_annotations() {
+    use arrow_array::{BinaryArray, StringArray};
+
+    let running = Running::start(Some("secret"), FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    client.update("INSERT INTO byte_claim_rows (_id, n) VALUES ('left', 10), ('right', 20)", None).await;
+    let payload = &b"\0\xfe\xff"[..];
+    let parameters = |annotate| {
+        let fields = [("id", DataType::Utf8), ("payload", DataType::Binary)].map(|(name, data_type)| {
+            let field = Field::new(name, data_type, false);
+            if annotate { field.with_metadata([("client".into(), "annotation".into())].into()) }
+            else { field }
+        });
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.to_vec())),
+            vec![Arc::new(StringArray::from(vec!["left"])), Arc::new(BinaryArray::from(vec![payload]))]).unwrap();
+        rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap()
+    };
+    let mut request = input("SELECT n, $2 AS payload FROM byte_claim_rows WHERE _id = $1");
+    request.source.as_mut().unwrap().at = Some(v1::At { selection: Some(Selection::Linearizable(())) });
+    request.track = true;
+    request.params_ipc = Some(parameters(false));
+    let (reference, reference_trailer) = query(&mut client, request.clone()).await;
+    assert!(reference_trailer.claim.is_some());
+
+    request.source.as_mut().unwrap().at = Some(v1::At { selection: reference_trailer.basis.clone().map(Selection::Exactly) });
+    request.params_ipc = Some(parameters(true));
+    let (actual, trailer) = query(&mut client, request).await;
+    assert_eq!(ints(&actual), [10]);
+    assert_eq!(actual[0].schema_ref(), reference[0].schema_ref());
+    assert_eq!(actual[0].column(1).as_any().downcast_ref::<BinaryArray>().unwrap().value(0), payload);
+    assert_eq!(trailer.basis, reference_trailer.basis);
+    assert_eq!(trailer.claim, reference_trailer.claim);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn scalar_run_query_conversion_preserves_rows_and_tracked_claims() {
     use arrow_array::{Array, Int32Array, Int64Array, RunArray, types::Int32Type};
 
