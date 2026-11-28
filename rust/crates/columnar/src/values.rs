@@ -1164,6 +1164,73 @@ fn copy_float_components<T: arrow_array::types::ArrowPrimitiveType>(
     arrow_array::PrimitiveArray::new(values.into(), nulls)
 }
 
+/// Measures the detached numeric-list payload for an exact integer or Float16 child span.
+/// Returns `None` for layouts that require the checked list decoder.
+pub fn plain_numeric_list_layout(
+    field: &Field,
+    array: &dyn Array,
+    rows: std::ops::Range<usize>,
+    element: &LogicalType,
+) -> Result<Option<(usize, LogicalType)>> {
+    if field.data_type() != array.data_type()
+        || !field.metadata().is_empty()
+        || rows.start > rows.end
+        || rows.end > array.len()
+    {
+        return Ok(None);
+    }
+    let header = match field.data_type() {
+        DataType::Int8 => size_of::<Int8Array>(),
+        DataType::Int16 => size_of::<Int16Array>(),
+        DataType::Int32 => size_of::<Int32Array>(),
+        DataType::Int64 => size_of::<Int64Array>(),
+        DataType::UInt8 => size_of::<UInt8Array>(),
+        DataType::UInt16 => size_of::<UInt16Array>(),
+        DataType::UInt32 => size_of::<UInt32Array>(),
+        DataType::UInt64 => size_of::<UInt64Array>(),
+        DataType::Float16 => size_of::<Float16Array>(),
+        _ => return Ok(None),
+    };
+    if !crate::schema::numeric_field_matches(field, element)? {
+        return Ok(None);
+    }
+    let length = rows.len();
+    i32::try_from(length).map_err(|_| layout_error())?;
+    let nulls = array
+        .nulls()
+        .map_or(0, |nulls| nulls.slice(rows.start, length).null_count());
+    let width = field
+        .data_type()
+        .primitive_width()
+        .expect("Plain numeric width");
+    // MutableArrayData rounds the values capacity to 64 bytes and keeps the validity capacity exact.
+    let values_bytes = length
+        .checked_mul(width)
+        .and_then(|bytes| bytes.checked_next_multiple_of(64));
+    let validity_bytes = if nulls == 0 { 0 } else { length.div_ceil(8) };
+    let Some(bytes) = values_bytes
+        .and_then(|bytes| bytes.checked_add(validity_bytes))
+        .and_then(|bytes| bytes.checked_add(header)?.checked_add(field.size()))
+        .filter(|bytes| bytes.checked_add(size_of::<Value>()).is_some())
+    else {
+        return Ok(None);
+    };
+    let observed = if length == 0 {
+        LogicalType::Nothing
+    } else if nulls == length {
+        LogicalType::Null
+    } else if nulls == 0 {
+        match element {
+            LogicalType::Maybe(inner) => inner.as_ref(),
+            ty => ty,
+        }
+        .clone()
+    } else {
+        element.clone().maybe()
+    };
+    Ok(Some((bytes, observed)))
+}
+
 fn copy_numeric_components(values: &dyn Array) -> Result<ArrayRef> {
     let length = values.len();
     i32::try_from(length).map_err(|_| layout_error())?;

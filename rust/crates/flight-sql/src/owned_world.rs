@@ -156,6 +156,7 @@ enum PointStorage<'a> {
     EmptySequence,
     Slice(ArrowCell<'a>),
     Compact { cell: ArrowCell<'a>, validate_uri: bool },
+    NumericList(ArrowCell<'a>),
     FloatList { values: &'a dyn Array, rows: Range<usize> },
     ByteList { values: &'a dyn Array, rows: Range<usize>, payload_bytes: usize },
     Struct(Vec<PointCell<'a>>),
@@ -269,6 +270,13 @@ impl<'a> PointCell<'a> {
             }
             LogicalType::List { kind: kind @ (ListKind::List | ListKind::FixedSizeList(_)), element } => {
                 let Some((item, values, rows)) = selected.sequence_range() else { return Ok(None); };
+                if let Some((bytes, observed)) = rtdb_columnar::plain_numeric_list_layout(item, values, rows.clone(), element)? {
+                    return Ok(Some(Self {
+                        logical: LogicalType::List { kind: kind.clone(), element: Box::new(observed) },
+                        bytes,
+                        storage: PointStorage::NumericList(selected),
+                    }));
+                }
                 if rows.is_empty() || !item.metadata().is_empty() {
                     return Ok(None);
                 }
@@ -367,6 +375,10 @@ impl<'a> PointCell<'a> {
                     DataType::Binary => Arc::new(BinaryArray::from(vec![Some(cell.array.as_binary::<i32>().value(cell.row))])),
                     _ => rtdb_columnar::copy_selected_cells(&[cell.array], &[(0, cell.row)])?,
                 }
+            }
+            PointStorage::NumericList(cell) => {
+                let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
+                rtdb_columnar::build_array(&self.logical, &[value])?
             }
             PointStorage::FloatList { values, rows } => compact_float_list(field, values, rows)?,
             PointStorage::ByteList { values, rows, payload_bytes } => match values.data_type() {
@@ -480,6 +492,99 @@ fn compact_byte_list<T: ByteArrayType<Offset = i32>>(
 
 fn point_arrow(error: arrow_schema::ArrowError) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn held_history_numeric_list_sizing_borrows_the_child_and_keeps_the_legacy_charge() {
+    use arrow_ipc::writer::IpcWriteOptions;
+    use arrow_schema::Schema;
+
+    for sample in [
+        Value::I8(-7),
+        Value::I16(-337),
+        Value::I32(-70001),
+        Value::I64(i64::MIN),
+        Value::U8(u8::MAX),
+        Value::U16(u16::MAX),
+        Value::U32(u32::MAX),
+        Value::U64(u64::MAX),
+        Value::F16(0x7e42),
+    ] {
+        let length = 513;
+        let element = sample.logical_type().maybe();
+        let samples = (0..length + 6)
+            .map(|row| {
+                if row < length + 3 && (row < 4 || row % 3 == 0) {
+                    sample.clone()
+                } else {
+                    Value::Null
+                }
+            })
+            .collect::<Vec<_>>();
+        let values = rtdb_columnar::build_array(&element, &samples)
+            .unwrap()
+            .slice(1, length + 5);
+        let mut name = String::with_capacity(80);
+        name.push_str("numeric_child");
+        let item = Arc::new(Field::new(name, values.data_type().clone(), true));
+        let mixed_end = 2 + length as i32;
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 1, mixed_end, mixed_end, mixed_end + 2].into()),
+            Arc::clone(&values),
+            None,
+        );
+        let fixed = FixedSizeListArray::new(item, length as i32, values.slice(2, length), None);
+        let list_field = Field::new("items", list.data_type().clone(), false);
+        let fixed_field = Field::new("items", fixed.data_type().clone(), false);
+        let list = Arc::new(list) as ArrayRef;
+        let fixed = Arc::new(fixed) as ArrayRef;
+        for (field, array, row) in [
+            (&list_field, &list, 0),
+            (&list_field, &list, 1),
+            (&list_field, &list, 2),
+            (&list_field, &list, 3),
+            (&fixed_field, &fixed, 0),
+        ] {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field.clone()])),
+                vec![array.slice(row, 1)],
+            )
+            .unwrap();
+            let cell = ArrowCell::named(&batch, "items", 0).unwrap();
+            let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row).unwrap();
+            let expected_heap = value.retained_bytes().unwrap() - size_of::<Value>();
+            let logical = value.logical_type();
+            let plan = PointCell::prepare(cell).unwrap();
+            let PointStorage::NumericList(borrowed) = &plan.storage else {
+                panic!("Expected a borrowed numeric list");
+            };
+            assert!(std::ptr::addr_eq(borrowed.array, cell.array));
+            assert_eq!(plan.heap_bytes(), expected_heap);
+            assert_eq!(
+                WorldPointRow::document_bytes(&batch).unwrap(),
+                Value::document_retained_bytes(&StructFields::from([(
+                    "items".into(),
+                    value.clone()
+                )]))
+                .unwrap()
+            );
+            let (output_field, output) = plan.write("items").unwrap();
+            assert_eq!(
+                output_field,
+                rtdb_columnar::to_field("items", &logical).unwrap()
+            );
+            let expected = rtdb_columnar::build_array(&logical, &[value]).unwrap();
+            let schema = Arc::new(Schema::new(vec![output_field]));
+            let ipc = |array| {
+                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+                rtdb_format::ipc::write_arrow_stream(&schema, &[batch], IpcWriteOptions::default())
+                    .unwrap()
+            };
+            assert_eq!(ipc(output), ipc(expected));
+        }
+    }
 }
 
 #[cfg(test)]

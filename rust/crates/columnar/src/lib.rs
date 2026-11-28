@@ -33,7 +33,7 @@ pub use memory::{BatchBuilder, BufferIdentity, FundedColumn, MemoryBudget, Memor
     shared_allocation_size_excluding, shared_batches_allocation_size, new_buffer_backing_bytes, visible_buffer_bytes};
 pub use schema::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY, from_field, leg_name, to_field};
 pub use text::{TextCell, binary_cell, owned_text_cell, selected_cell, text_cell, utf8_list};
-pub use values::{ColumnReader, build_array, build_array_refs, build_list_array, build_struct_array, copy_array, copy_array_refs, copy_evaluated_cells, pack_runs, read_execution_entity_id_as, read_execution_owned_entity_id, read_value, read_value_as, repack_numeric_list, repack_scalar_list, struct_field_cell};
+pub use values::{ColumnReader, build_array, build_array_refs, build_list_array, build_struct_array, copy_array, copy_array_refs, copy_evaluated_cells, pack_runs, plain_numeric_list_layout, read_execution_entity_id_as, read_execution_owned_entity_id, read_value, read_value_as, repack_numeric_list, repack_scalar_list, struct_field_cell};
 
 use rtdb_types::Anomaly;
 
