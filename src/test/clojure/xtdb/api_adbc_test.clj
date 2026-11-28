@@ -6,12 +6,18 @@
             [next.jdbc :as jdbc]
             [xtdb.api :as xt]
             [xtdb.serde :as serde]
+            [xtdb.sql :as sql]
             [xtdb.test-util :as tu :refer [*node*]]
             [xtdb.time :as time]
-            [xtdb.util :as util])
+            [xtdb.util :as util]
+            [xtdb.vector.writer :as vw])
   (:import (com.github.benmanes.caffeine.cache Cache)
+           (java.time ZoneId)
            (org.antlr.v4.runtime ParserRuleContext)
-           (xtdb.query PlanCacheKey)))
+           (xtdb.api.error Incorrect)
+           (xtdb.arrow Relation)
+           (xtdb.query PlanCacheKey)
+           (xtdb.tx TxOp$PatchDocs TxOp$PutDocs TxWriter)))
 
 (t/use-fixtures :each tu/with-mock-clock tu/with-node)
 
@@ -62,6 +68,113 @@
     (t/is (= #{{:xt/id 3, :n 30}}
              (set (xt/q conn "SELECT _id, n FROM docs")))
           "delete-docs with several ids removes them all")))
+
+(deftest prepared-static-insert-and-patch
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (let [al (.getAllocator conn)]
+      (doseq [[sql rows] [["INSERT INTO docs (_id, title, tally, _valid_from, _valid_to)
+                           VALUES (?, ?, ?, DATE '2019-01-01', DATE '2021-01-01')"
+                          [[1 "one" (int 10)] [2 "two" (int 20)]]]
+                         ["PATCH INTO docs FOR PORTION OF VALID_TIME FROM DATE '2019-06-01' TO DATE '2020-06-01'
+                           RECORDS {_id: ?, title: ?}"
+                          [[2 "patched"]]]]]
+        (with-open [stmt (.createStatement conn sql)]
+          (.prepare stmt)
+          (with-open [args (apply vw/open-args al rows)]
+            (.bind stmt args))
+          (.executeUpdate stmt))))
+
+    (t/is (= [{:xt/id 1, :title "one", :tally 10}
+              {:xt/id 2, :title "patched", :tally 20}]
+             (xt/q conn "SELECT _id, title, tally FROM docs
+                         FOR VALID_TIME AS OF DATE '2020-01-01' ORDER BY _id")))
+    (t/is (= [{:title "two"}]
+             (xt/q conn "SELECT title FROM docs FOR VALID_TIME AS OF DATE '2019-01-01' WHERE _id = 2")))))
+
+(defn- open-row-static-ops [al sql args tz]
+  (util/safe-mapv
+   (fn [{:keys [op docs valid-from valid-to]}]
+     (let [vf (time/->instant valid-from {:default-tz tz})
+           vt (time/->instant valid-to {:default-tz tz})]
+       (case op
+         :put-docs (TxOp$PutDocs/openFromRows al "public" "docs" docs vf vt)
+         :patch-docs (TxOp$PatchDocs/openFromRows al "public" "docs" docs vf vt))))
+   (sql/sql->static-ops sql args)))
+
+(deftest prepared-static-dml-source-bytes
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (let [al (.getAllocator conn)
+          tz (ZoneId/of "America/New_York")
+          payload (byte-array [0 42 -1])]
+      (doseq [[sql rows] [["INSERT INTO docs (_id, title, payload, score, _valid_from, _valid_to)
+                           VALUES ($1, $2, $3, $4, $5, NULL), ($6, $7, $8, $9, $10, DATE '2021-01-01')"
+                          [[1 "héllo" payload nil #xt/date "2020-01-01" 2 "" payload (int 20) #xt/date "2020-03-01"]
+                           [3 "world" nil (short 30) #xt/date "2020-01-01" 4 "later" nil (int 40) #xt/date "2020-04-01"]]]
+                         ["PATCH INTO docs FOR PORTION OF VALID_TIME FROM ? TO NULL
+                           RECORDS {_id: ?, title: ?, score: ?}, {_id: ?, payload: ?}"
+                          [[#xt/date "2020-01-01" 1 "héllo" -0.0 2 payload]
+                           [#xt/date "2020-01-01" 3 nil nil 4 nil]
+                           [#xt/date "2020-03-01" 5 "later" 10.0 6 payload]]]
+                         ["INSERT INTO docs (_id, bool_val, i8, i16, i32, i64, f32, f64, title, payload, birthday, token)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                          [[1 true (byte 8) (short 16) (int 32) (long 64) (float -0.0) 0.5 "wide" payload
+                            #xt/date "2020-01-01" #uuid "00000000-1234-4567-89ab-123456789abc"]]]
+                         ["INSERT INTO docs (_id, value) VALUES (?, ?), (?, ?)"
+                          [[1 #xt/clj-form :first 2 "second"]]]
+                         ["INSERT INTO docs (_id, score) VALUES (?, ?), (?, ?), (?, ?), (?, ?)"
+                          [[1 (int 1) 2 (long 2) 3 (int 3) 4 4.0]]]]]
+        (util/with-open [expected (with-open [args (apply vw/open-args al rows)]
+                                    (open-row-static-ops al sql args tz))
+                         actual (with-open [args (apply vw/open-args al rows)]
+                                  (sql/sql->tx-ops sql args al tz {}))]
+          (t/is (seq actual))
+          (t/is (= (TxWriter/toArrowBytes expected al)
+                   (TxWriter/toArrowBytes actual al))))))))
+
+(deftest prepared-static-dml-decodes-malformed-utf8
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (let [al (.getAllocator conn)
+          sql "INSERT INTO docs (_id, title) VALUES (?, ?)"]
+      (with-open [args (Relation. al)]
+        (.writeLong (.vectorFor args "?_0" #xt.arrow/type :i64 false) 1)
+        (.writeBytes (.vectorFor args "?_1" #xt.arrow/type :utf8 false) (byte-array [-61 40]))
+        (.endRow args)
+        (util/with-open [expected (open-row-static-ops al sql args time/utc)
+                         actual (sql/sql->tx-ops sql args al time/utc {})]
+          (t/is (seq actual))
+          (t/is (= (TxWriter/toArrowBytes expected al)
+                   (TxWriter/toArrowBytes actual al))))))))
+
+(deftest prepared-static-insert-missing-id-diagnostic
+  (with-open [conn (xt/open-adbc-conn *node*)
+              stmt (.createStatement conn "INSERT INTO docs (_id, title) VALUES (?, ?)")]
+    (.prepare stmt)
+    (with-open [args (vw/open-args (.getAllocator conn) [nil "first"] [nil "second"])]
+      (.bind stmt args))
+    (let [failure (try (.executeUpdate stmt) nil (catch Incorrect e e))
+          doc (:doc (ex-data failure))]
+      (t/is (= "missing '_id'" (some-> failure ex-message)))
+      (t/is (map? doc))
+      (t/is (= {"_id" nil, "title" "first"} doc)))))
+
+(deftest prepared-static-insert-closes-earlier-valid-time-groups-on-failure
+  (with-open [conn (xt/open-adbc-conn *node*)
+              al (.newChildAllocator (.getAllocator conn) "static-insert" 0 Long/MAX_VALUE)
+              args (vw/open-args al [1 "ok" #xt/date "2020-01-01"]
+                                   [nil "missing" #xt/date "2020-02-01"])]
+    (let [before (.getAllocatedMemory al)]
+      (t/is (thrown-with-msg? Incorrect #"missing '_id'"
+                              (sql/sql->tx-ops "INSERT INTO docs (_id, title, _valid_from) VALUES (?, ?, ?)"
+                                               args al time/utc {})))
+      (t/is (= before (.getAllocatedMemory al))))))
+
+(deftest prepared-static-insert-converts-valid-time-before-checking-id
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (let [al (.getAllocator conn)]
+      (with-open [args (vw/open-args al [nil "missing" 1])]
+        (t/is (thrown-with-msg? IllegalArgumentException #"No implementation of method: :->instant"
+                                (sql/sql->tx-ops "INSERT INTO docs (_id, title, _valid_from) VALUES (?, ?, ?)"
+                                                 args al time/utc {})))))))
 
 (deftest query-args-and-plan-q
   (with-open [conn (xt/open-adbc-conn *node*)]

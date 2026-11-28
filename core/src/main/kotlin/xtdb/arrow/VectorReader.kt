@@ -31,7 +31,7 @@ interface VectorReader : ILookup, AutoCloseable {
 
     val type: VectorType
 
-    private class RenamedVector(private val inner: VectorReader, override val name: String) : VectorReader by inner {
+    private class RenamedVector(val inner: VectorReader, override val name: String) : VectorReader by inner {
         override fun withName(newName: String) = RenamedVector(inner, newName)
 
         override fun select(idxs: IntArray) = inner.select(idxs).closeOnCatch { RenamedVector(it, name) }
@@ -152,6 +152,9 @@ interface VectorReader : ILookup, AutoCloseable {
     fun rowCopier(dest: VectorWriter): RowCopier
 
     companion object {
+        internal tailrec fun unwrapRenamed(reader: VectorReader): VectorReader =
+            if (reader is RenamedVector) unwrapRenamed(reader.inner) else reader
+
         fun toString(reader: VectorReader): String = reader.run {
             val content = when {
                 valueCount == 0 -> ""

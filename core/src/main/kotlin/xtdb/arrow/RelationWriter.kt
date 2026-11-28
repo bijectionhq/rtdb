@@ -4,6 +4,7 @@ import clojure.lang.Keyword
 import clojure.lang.Symbol
 import org.apache.arrow.vector.types.pojo.ArrowType
 import org.apache.arrow.vector.types.pojo.FieldType
+import xtdb.InternalApi
 import xtdb.util.closeAll
 import xtdb.util.normalForm
 
@@ -25,8 +26,9 @@ interface RelationWriter : RelationReader {
         rowCount += rel.rowCount
     }
 
+    @OptIn(InternalApi::class)
     fun writeRow(row: Map<*, *>) {
-        row.forEach { (k, v) ->
+        for ((k, v) in row) {
             val normalKey = when (k) {
                 is String -> k
                 is Symbol -> normalForm(k).toString()
@@ -34,12 +36,14 @@ interface RelationWriter : RelationReader {
                 else -> throw IllegalArgumentException("Column name must be a string, keyword or symbol")
             }
 
-            val vector = vectorForOrNull(normalKey) ?: vectorFor(normalKey, v.toArrowType(), v == null)
+            if (v is PositionedScalar && v.tryWriteTo(this, normalKey)) continue
+            val value = if (v is PositionedScalar) v.readObject() else v
+            val vector = vectorForOrNull(normalKey) ?: vectorFor(normalKey, value.toArrowType(), value == null)
 
             try {
-                vector.writeObject(v)
+                vector.writeObject(value)
             } catch (_: InvalidWriteObjectException) {
-                vectorFor(normalKey, v.toArrowType(), v == null).writeObject(v)
+                vectorFor(normalKey, value.toArrowType(), value == null).writeObject(value)
             }
         }
 

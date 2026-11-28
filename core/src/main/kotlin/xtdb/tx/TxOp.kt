@@ -1,8 +1,11 @@
 package xtdb.tx
 
+import clojure.lang.IPersistentMap
 import clojure.lang.Keyword
 import org.apache.arrow.memory.BufferAllocator
+import xtdb.InternalApi
 import xtdb.api.error.Incorrect
+import xtdb.arrow.PositionedScalar
 import xtdb.arrow.Relation
 import xtdb.arrow.RelationReader
 import xtdb.arrow.VectorReader
@@ -25,6 +28,20 @@ sealed interface TxOp : AutoCloseable {
         companion object {
             private val XT_ID = Keyword.intern("xt", "id")
 
+            @OptIn(InternalApi::class)
+            private fun diagnosticDoc(doc: Map<*, *>): Any {
+                if (doc is IPersistentMap) {
+                    val original: IPersistentMap = doc
+                    return doc.entries.fold(original) { result, (key, value) ->
+                        if (value is PositionedScalar) result.assoc(key, value.readObject()) else result
+                    }
+                }
+
+                return if (doc.values.any { it is PositionedScalar })
+                    doc.mapValues { (_, value) -> if (value is PositionedScalar) value.readObject() else value }
+                else doc
+            }
+
             @JvmStatic
             fun openFromRows(
                 al: BufferAllocator, schema: SchemaName, table: TableName,
@@ -32,7 +49,7 @@ sealed interface TxOp : AutoCloseable {
             ): PutDocs {
                 for (doc in docs)
                     if (doc[XT_ID] == null && doc["_id"] == null)
-                        throw Incorrect("missing '_id'", "missing-id", mapOf("doc" to doc))
+                        throw Incorrect("missing '_id'", "missing-id", mapOf("doc" to diagnosticDoc(doc)))
                 return PutDocs(schema, table, validFrom, validTo, Relation.openFromRows(al, docs))
             }
         }

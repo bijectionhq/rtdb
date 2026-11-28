@@ -28,7 +28,7 @@
            (org.apache.commons.codec.binary Hex)
            (xtdb.tx TxOp$PatchDocs TxOp$PutDocs)
            (xtdb.antlr Sql$DirectlyExecutableStatementContext Sql$DynamicParameterContext Sql$XtqlQueryContext Sql$GroupByClauseContext Sql$HavingClauseContext Sql$JoinSpecificationContext Sql$JoinTypeContext Sql$ObjectNameAndValueContext Sql$OrderByClauseContext Sql$QualifiedRenameColumnContext Sql$QuerySpecificationContext Sql$QueryTailContext Sql$RenameColumnContext Sql$RowValueListContext Sql$SearchedWhenClauseContext Sql$SelectClauseContext Sql$SetClauseContext Sql$SimpleWhenClauseContext Sql$SortSpecificationContext Sql$SortSpecificationListContext Sql$WhenOperandContext Sql$WhereClauseContext Sql$WithTimeZoneContext SqlLexer SqlVisitor)
-           (xtdb.arrow RelationReader VectorReader)
+           (xtdb.arrow PositionedScalar RelationReader VectorReader)
            (xtdb.query DmlCacheKey ParsedStatement$Dml SqlParser SqlPlanner)
            (xtdb.xtql QueryWithParams)
            xtdb.api.TableRef
@@ -3532,11 +3532,15 @@
       (throw (err/incorrect :xtdb/missing-arg (str "missing arg: " expr) {})))
     expr))
 
-(declare sql->static-ops)
+(declare ^:private sql->static-ops*)
 
-;; materialises sql->static-ops' neutral ops into core TxOps (via safe-mapv, closing partials on throw)
+(defn- ->static-arg-rows [^RelationReader args]
+  (let [cols (vec (.getVectors args))]
+    (mapv (fn [idx] (mapv #(PositionedScalar/read % idx) cols))
+          (range (.getRowCount args)))))
+
 (defn sql->tx-ops [sql args ^BufferAllocator al default-tz opts]
-  (when-let [static-ops (seq (sql->static-ops sql args opts))]
+  (when-let [static-ops (seq (sql->static-ops* sql args opts ->static-arg-rows))]
     (let [opts {:default-tz default-tz}]
       (util/safe-mapv
        (fn [{:keys [op table-name docs valid-from valid-to]}]
@@ -3596,19 +3600,32 @@
   "Resolves a planned value (symbols, collections, maps) to a concrete value
    by substituting parameter symbols from `arg-row`.
    Throws RuntimeException for unresolvable expressions (seqs)."
-  [v arg-row]
-  (letfn [(->const* [obj]
-            (cond
-              (symbol? obj) (->const* (val (or (find arg-row obj) (throw (RuntimeException.)))))
-              (seq? obj) (throw (RuntimeException.))
-              (vector? obj) (mapv ->const* obj)
-              (set? obj) (into #{} (map ->const*) obj)
-              (instance? Map obj) (->> obj
-                                       (into {} (map (fn [[k v]]
-                                                       (MapEntry/create (str (symbol k))
-                                                                        (->const* v))))))
-              :else obj))]
-    (->const* v)))
+  ([v arg-row] (->const v arg-row nil))
+
+  ([v arg-row positioned-field?]
+   (letfn [(param-value [sym]
+             (val (or (find arg-row sym) (throw (RuntimeException.)))))
+           (->map [obj positioned-field?]
+             (into {} (map (fn [[k v]]
+                             (let [field (str (symbol k))]
+                               (MapEntry/create field
+                                                (if (and positioned-field? (positioned-field? field) (symbol? v))
+                                                  (let [arg (param-value v)]
+                                                    (if (instance? PositionedScalar arg) arg (->const* arg)))
+                                                  (->const* v))))))
+                   obj))
+           (->const* [obj]
+             (cond
+               (symbol? obj) (->const* (param-value obj))
+               (instance? PositionedScalar obj) (->const* (.readObject ^PositionedScalar obj))
+               (seq? obj) (throw (RuntimeException.))
+               (vector? obj) (mapv ->const* obj)
+               (set? obj) (into #{} (map ->const*) obj)
+               (instance? Map obj) (->map obj nil)
+               :else obj))]
+     (if (instance? Map v)
+       (->map v positioned-field?)
+       (->const* v)))))
 
 (defn- ->param-row [arg-row]
   (->> arg-row
@@ -3622,7 +3639,7 @@
       (when-let [rows (-> (.insertColumnsAndSource ctx) (.accept this))]
         (->> (for [arg-row (or arg-rows [[]])
                    row rows]
-               (->const row (->param-row arg-row)))
+               (->const row (->param-row arg-row) #(not (#{"_valid_from" "_valid_to"} %))))
 
              (group-by (juxt #(get % "_valid_from")
                              #(get % "_valid_to")))
@@ -3669,7 +3686,7 @@
                          vf (some-> vf-expr (->const param-row))
                          vt (some-> vt-expr (->const param-row))]
                    row rows]
-               [(->const row param-row) vf vt])
+               [(->const row param-row (constantly true)) vf vt])
 
              (group-by (fn [[_ vf vt]] [vf vt]))
 
@@ -3694,34 +3711,39 @@
   (visitRevokeRoleStatement [_ _])
   (visitCreateTableStatement [_ _]))
 
+(defn- sql->static-ops*
+  [sql ^RelationReader args-rel {:keys [scope ^LoadingCache dml-cache default-db db-names tx-scoped? table-info] :as opts}
+   read-args]
+  ;; classified outside the catch below: a syntax error is the caller's, so it propagates to whoever is
+  ;; expanding (which surfaces and counts it) rather than being swallowed into an op that reaches the
+  ;; log and only fails in the indexer.
+  ;;
+  ;; Only DML reduces to static ops, so the visitor's obligation is the DML alternatives rather than
+  ;; every `directlyExecutableStatement` in the grammar. Without the gate an unimplemented alternative
+  ;; is an AbstractMethodError — an Error, so it escapes the catch below rather than falling back to a
+  ;; raw Sql op (#5856).
+  (let [parsed (SqlParser/parseStatement sql)]
+    (when (instance? ParsedStatement$Dml parsed)
+      (try
+        (let [ast (.getAst parsed)
+              arg-rows (some-> args-rel read-args)
+              arg-fields (mapv VectorReader/.getField (or args-rel []))
+
+              skeleton (if dml-cache
+                         (.get dml-cache (DmlCacheKey. ast default-db db-names (boolean tx-scoped?) arg-fields table-info))
+                         (->env-skeleton ast (assoc opts :arg-fields arg-fields)))
+
+              {:keys [!errors !warnings] :as env} (skeleton->env skeleton)
+              tx-ops (.accept ast (->SqlToStaticOpsVisitor env scope arg-rows))]
+          (when (and (empty? @!errors) (empty? @!warnings))
+            tx-ops))
+
+        ;; DML this visitor can't reduce to static ops is indexed as SQL instead
+        (catch IllegalArgumentException _)
+        (catch RuntimeException _)))))
+
 (defn sql->static-ops
   ([sql args-rel] (sql->static-ops sql args-rel {}))
 
-  ([sql ^RelationReader args-rel {:keys [scope ^LoadingCache dml-cache default-db db-names tx-scoped? table-info] :as opts}]
-   ;; classified outside the catch below: a syntax error is the caller's, so it propagates to whoever is
-   ;; expanding (which surfaces and counts it) rather than being swallowed into an op that reaches the
-   ;; log and only fails in the indexer.
-   ;;
-   ;; Only DML reduces to static ops, so the visitor's obligation is the DML alternatives rather than
-   ;; every `directlyExecutableStatement` in the grammar. Without the gate an unimplemented alternative
-   ;; is an AbstractMethodError — an Error, so it escapes the catch below rather than falling back to a
-   ;; raw Sql op (#5856).
-   (let [parsed (SqlParser/parseStatement sql)]
-     (when (instance? ParsedStatement$Dml parsed)
-       (try
-         (let [ast (.getAst parsed)
-               arg-rows (some-> args-rel (.toTuples #xt/key-fn :snake-case-string))
-               arg-fields (mapv VectorReader/.getField (or args-rel []))
-
-               skeleton (if dml-cache
-                          (.get dml-cache (DmlCacheKey. ast default-db db-names (boolean tx-scoped?) arg-fields table-info))
-                          (->env-skeleton ast (assoc opts :arg-fields arg-fields)))
-
-               {:keys [!errors !warnings] :as env} (skeleton->env skeleton)
-               tx-ops (.accept ast (->SqlToStaticOpsVisitor env scope arg-rows))]
-           (when (and (empty? @!errors) (empty? @!warnings))
-             tx-ops))
-
-         ;; DML this visitor can't reduce to static ops is indexed as SQL instead
-         (catch IllegalArgumentException _)
-         (catch RuntimeException _))))))
+  ([sql args-rel opts]
+   (sql->static-ops* sql args-rel opts #(.toTuples ^RelationReader % #xt/key-fn :snake-case-string))))
