@@ -1742,14 +1742,92 @@ async fn uri_extrema_compare_raw_spellings_and_validate_losing_inputs() {
     assert_eq!(primitive_result(primitive_cursor(&execution, AggregateFunction::Min, ty.clone(), ty.clone(),
         vec![vec![other, valid.clone()]], None)).await, valid);
 
-    let field = Arc::new(rtdb_columnar::to_field("arg", &ty).unwrap());
-    let array = Arc::new(StringArray::from(vec!["https://a/", "z invalid"]));
-    let expected = rtdb_columnar::read_value(&field, array.as_ref(), 1).unwrap_err().code;
-    let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(ty.clone()) }],
-        2, memory.reserve(4096).unwrap()).unwrap();
-    let mut cursor = primitive_cursor(&execution, AggregateFunction::Min, ty.clone(), ty, vec![], None);
-    cursor.input = Some(AggregateInput { batches: Box::new(Batches(Some(batch))), projected: false });
-    assert_eq!(cursor.next_batch().await.err().unwrap().code, expected);
+    for (function, invalid) in [(AggregateFunction::Min, "z invalid"), (AggregateFunction::Max, " invalid")] {
+        for filter in [None, Some(Expr::Literal(Value::Bool(false)))] {
+            let field = Arc::new(rtdb_columnar::to_field("arg", &ty).unwrap());
+            let array = Arc::new(StringArray::from(vec!["https://a/", invalid]));
+            let expected = rtdb_columnar::read_value(&field, array.as_ref(), 1).unwrap_err();
+            let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(ty.clone()) }],
+                2, memory.reserve(4096).unwrap()).unwrap();
+            let mut cursor = primitive_cursor(&execution, function.clone(), ty.clone(), ty.clone(), vec![], filter);
+            cursor.input = Some(AggregateInput { batches: Box::new(Batches(Some(batch))), projected: false });
+            let error = cursor.next_batch().await.err().unwrap();
+            assert_eq!(error.code, expected.code);
+            assert_eq!(error.message, expected.message);
+        }
+    }
+}
+
+#[test]
+fn uri_extrema_fund_replacements_and_borrow_losing_and_equal_spellings() {
+    use arrow_array::StringArray;
+
+    let execution = execution(8);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let baseline = memory.used_bytes();
+    let scope = execution.scope().unwrap();
+    let ty = LogicalType::Scalar(ScalarType::Uri).maybe();
+    let loser = format!("https://example.test/{}", "m".repeat(32 * 1024));
+    for (function, winner, replacement) in [
+        (AggregateFunction::Min, "HTTP://EXAMPLE.test/%ab", "A:late"),
+        (AggregateFunction::Max, "https://example.test/ω", "z:late"),
+    ] {
+        let array = Arc::new(StringArray::from(vec![Some(winner), Some(loser.as_str()), None, Some(winner), Some(replacement)]));
+        let field_type = Arc::new(rtdb_columnar::to_field("arg", &ty).unwrap());
+        let batch = ColumnBatch::settled(vec![Column::Arrow { array, field: field_type, logical: Some(ty.clone()) }],
+            5, memory.reserve(1 << 17).unwrap()).unwrap();
+        let page = Rows::columns(&batch, &[0], false, context).unwrap();
+        let aggregate = AggregateExpr {
+            field: field(1, ty.clone()), function, argument: Some(field(0, ty.clone()).expression()),
+            distinct: false, filter: None, order_by: vec![],
+        };
+        let types = AggregateTypes::derive(&aggregate, ty.clone(), false, EmissionMode::Execution).unwrap();
+        let mut states = ScalarGroups::new(&execution).unwrap();
+        states.ensure(1).unwrap();
+        let winner = Value::Uri(winner.to_owned());
+        let winner_charge = winner.retained_bytes().unwrap() + 256;
+        let pressure = memory.reserve(memory.available_bytes() - winner_charge).unwrap();
+        let groups = GroupMapping::Global(batch.len);
+        states.aggregate(page, groups, |row| row < 4, 1, Some(0), &aggregate, &types, &scope, &execution).unwrap();
+        assert_eq!(memory.available_bytes(), 0);
+        let refused = memory.reserve(1).err().unwrap().code;
+        assert_eq!(states.aggregate(page, groups, |row| row == 4, 1, Some(0), &aggregate, &types, &scope, &execution)
+            .unwrap_err().code, refused);
+        drop((pressure, batch));
+        assert_eq!(states.values[0].accumulator.retained(), Some(&winner));
+    }
+    drop(scope);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn uri_extrema_keep_utf8_casts_and_all_null_result_layout() {
+    use arrow_array::StringArray;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let ty = LogicalType::Scalar(ScalarType::Uri).maybe();
+    let page = |ty: &LogicalType, text| {
+        let array = Arc::new(StringArray::from(vec![text]));
+        let field = Arc::new(rtdb_columnar::to_field("arg", ty).unwrap());
+        ColumnBatch::settled(vec![Column::Arrow { array, field, logical: None }], 1, memory.reserve(4096).unwrap()).unwrap()
+    };
+    let plain = LogicalType::Scalar(ScalarType::Utf8);
+    let mut mixed = primitive_cursor(&execution, AggregateFunction::Min, ty.clone(), ty.clone(), vec![], None);
+    mixed.input = Some(AggregateInput { batches: Box::new(Pages([
+        page(&ty, Some("https://example.test/z")),
+        page(&plain, Some("HTTP://EXAMPLE.test/%ab")),
+    ].into())), projected: false });
+    assert_eq!(primitive_result(mixed).await, Value::Uri("HTTP://EXAMPLE.test/%ab".into()));
+
+    let mut nulls = primitive_cursor(&execution, AggregateFunction::Max, ty.clone(), ty.clone(), vec![], None);
+    nulls.input = Some(AggregateInput { batches: Box::new(Batches(Some(page(&ty, None)))), projected: false });
+    let result = nulls.next_batch().await.unwrap().unwrap();
+    let Column::Arrow { field, logical, .. } = &result.columns[0] else { panic!("Expected Arrow Null"); };
+    assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", &LogicalType::Null).unwrap());
+    assert_eq!(logical.as_ref(), Some(&LogicalType::Null));
+    assert_eq!(result.columns[0].value(0).unwrap(), Value::Null);
 }
 
 #[tokio::test]

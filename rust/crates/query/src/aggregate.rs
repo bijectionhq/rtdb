@@ -910,13 +910,14 @@ fn admits_byte_extremum(column: &Column, output: &LogicalType) -> bool {
     match output {
         LogicalType::Scalar(S::Utf8) => accepts_typed_column(column, |ty| *ty == DataType::Utf8),
         LogicalType::Scalar(S::Binary) => accepts_typed_column(column, |ty| *ty == DataType::Binary),
-        LogicalType::Scalar(S::Keyword) => admits_reduction_column(column, |field, logical| {
+        LogicalType::Scalar(scalar @ (S::Keyword | S::Uri)) => admits_reduction_column(column, |field, logical| {
             if field.data_type() == &DataType::Null {
                 return admits_plain_leaf(field, logical, |_| false);
             }
+            let extension = if *scalar == S::Uri { "uri" } else { "xt/clj-keyword" };
             let metadata = field.metadata();
             field.data_type() == &DataType::Utf8 && metadata.len() == 2
-                && metadata.get(EXTENSION_NAME_KEY).is_some_and(|name| name == "xt/clj-keyword")
+                && metadata.get(EXTENSION_NAME_KEY).is_some_and(|name| name == extension)
                 && metadata.get(EXTENSION_METADATA_KEY).is_some_and(String::is_empty)
                 && logical.is_none_or(|ty| without_nullability(ty) == output
                     && matches!(ty, LogicalType::Maybe(_)) == field.is_nullable())
@@ -1945,6 +1946,13 @@ impl ScalarGroups {
                                             .value(offset);
                                         state.byte_extremum(text.as_bytes(), minimum, &self.state, || Value::Keyword(rtdb_types::Keyword::from_name(text)))?;
                                     }
+                                    LogicalType::Scalar(ScalarType::Uri) => {
+                                        // Rows::columns validates URI syntax in page order before the aggregate filter runs.
+                                        let text = array.as_string_opt::<i32>()
+                                            .ok_or_else(|| rtdb_types::Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree"))?
+                                            .value(offset);
+                                        state.byte_extremum(text.as_bytes(), minimum, &self.state, || Value::Uri(text.to_owned()))?;
+                                    }
                                     _ => unreachable!(),
                                 }
                             }
@@ -2124,10 +2132,10 @@ impl ScalarAccumulator {
     fn byte_extremum(&mut self, bytes: &[u8], minimum: bool, memory: &Arc<rtdb_columnar::MemoryBudget>, winner: impl FnOnce() -> Value) -> Result<()> {
         if let Some(previous) = self.accumulator.retained() {
             let previous = match previous {
-                Value::Utf8(text) => text.as_bytes(),
+                Value::Utf8(text) | Value::Uri(text) => text.as_bytes(),
                 Value::Binary(bytes) => bytes,
                 Value::Keyword(keyword) => keyword.as_str().as_bytes(),
-                _ => return Err(invalid("aggregate-state", "Expected a text, binary or keyword extremum")),
+                _ => return Err(invalid("aggregate-state", "Expected a text, binary, keyword or URI extremum")),
             };
             if bytes.cmp(previous) != if minimum { Ordering::Less } else { Ordering::Greater } {
                 return Ok(());
