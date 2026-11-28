@@ -498,9 +498,11 @@ Commissioned funded dispatch remains fenced.
 The original Kernel still needs to bind each exact timed append to its booking and stage before dispatch, consume lineage proofs after recovery, and update the original task and obligation fates.
 The authorization binds the application catalog, original stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
 The receiver clock supplies the journal clock scale, and the source quorum authenticates the durable timing bound.
+The commissioned Store path must reserve two adjacent positions under the current writer. It must prepare the final sealed effect for the second position, commit the Kernel's authorization at the first, and dispatch those exact effect bytes only after the authorization is durable. The authorization must remain discoverable through the original obligation until settlement, including after the slot expires.
 The current Store path orders the Kernel's commit window and reports the application version.
 A plain Store receipt alone leaves a predecessor authorization pending.
 For an included record at the authorized position that matches the append's identity, missing timing evidence also leaves the authorization pending.
+Conflicting timing evidence rejects the proof and leaves the authorization unsettled.
 
 The activation authority publishes one segment when it selects the surviving history of a predecessor incarnation and installs the successor binding.
 The publication names the exact application catalog and stream, the signed application head, the inclusive segment end, the successor and the previous lineage publication.
