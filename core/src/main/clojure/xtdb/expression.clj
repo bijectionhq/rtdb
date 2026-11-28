@@ -20,7 +20,7 @@
            (org.apache.arrow.vector PeriodDuration)
            (org.apache.arrow.vector.types.pojo ArrowType$Decimal)
            (org.apache.commons.codec.binary Hex)
-           (xtdb.arrow ListValueReader RelationReader RowMask Utf8Vector ValueBox ValueReader Vector VectorReader VectorType VectorType$Listy VectorType$Maybe VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
+           (xtdb.arrow KeywordVector ListValueReader RelationReader RowMask Utf8Vector ValueBox ValueReader VariableWidthVector Vector VectorReader VectorType VectorType$Listy VectorType$Maybe VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
            (xtdb.expression PgFormat)
            (xtdb.operator ProjectionSpec ProjectionSpec$Factory SelectionSpec SelectionSpec$Factory)
            (xtdb.pgwire PgTypes)
@@ -226,7 +226,8 @@
 (defmulti codegen-cast
   "Returns a map containing
     * `:return-type` (VectorType)
-    * `:->call-code` :: emitted-args -> code"
+    * `:->call-code` :: emitted-args -> code
+    * optional `:->write-code` as for `codegen-call`"
   (fn [{:keys [^VectorType source-type, ^VectorType target-type]}]
     [(types/col-type-head (types/vec-type->col-type source-type))
      (types/col-type-head (types/vec-type->col-type target-type))])
@@ -644,6 +645,9 @@
    Returns a map containing
     * `:return-type` (VectorType)
     * optional `:valid-utf8?` when all non-null results are valid UTF-8
+    * optional `:->write-code` :: plain-output, emitted-args -> code
+      for a root call writing one cell to a plain projection result.
+      The writer is a VariableWidthVector for UTF-8 or Binary and a KeywordVector for Keyword.
     and one of the following
     * for monomorphic return types: `:->call-code` :: emitted-args -> code
     * for polymorphic return types: `:continue-call` :: f, emitted-args -> code
@@ -752,7 +756,7 @@
              (contains? (nth ea 1) :literal))
         (coerce 1 0)))))
 
-(defn- codegen-call* [{:keys [f emitted-args] :as expr}]
+(defn- codegen-call* [{:keys [f emitted-args ::projection-root?] :as expr}]
   (let [shortcut-null? (shortcut-null-args? f)
 
         all-arg-types (reduce (fn [acc {:keys [^VectorType return-type]}]
@@ -777,36 +781,37 @@
                          (into [] (map :return-type))
                          (apply types/merge-types))]
 
-    {:return-type return-type
-     :valid-utf8? (every? (fn [{:keys [return-type valid-utf8?]}]
-                           (or (= #xt/type :null return-type) valid-utf8?))
-                         (vals emitted-calls))
-     :children (vals emitted-calls)
-     :continue (fn continue-call-expr [handle-emitted-expr]
-                 (let [build-args-then-call
-                       (reduce (fn step [build-next-arg {continue-this-arg :continue}]
-                                 ;; step: emit this arg, and pass it through to the inner build-fn
-                                 (fn continue-building-args [arg-types emitted-args]
-                                   (continue-this-arg (fn [arg-type emitted-arg]
-                                                        (if (and shortcut-null? (= #xt/type :null arg-type))
-                                                          (handle-emitted-expr #xt/type :null nil)
-                                                          (build-next-arg (conj arg-types arg-type)
-                                                                          (conj emitted-args emitted-arg)))))))
-
-                               ;; innermost fn - we're done, call continue-call for these types
-                               (fn call-with-built-args [arg-types emitted-args]
-                                 (let [{:keys [return-type continue-call ->call-code]} (get emitted-calls arg-types)]
-                                   (cond
-                                     continue-call (continue-call handle-emitted-expr emitted-args)
-                                     ->call-code (handle-emitted-expr return-type (->call-code emitted-args))
-                                     :else (throw (err/fault ::invalid-call-definition
-                                                             (str "internal error: invalid call definition: "
-                                                             (pr-str {:f f, :arg-types arg-types
-                                                                      :emitted-calls (keys emitted-calls)})))))))
-
-                               ;; reverse because we're working inside-out
-                               (reverse emitted-args))]
-                   (build-args-then-call [] [])))}))
+    (letfn [(continue-call-expr [handle-emitted-expr out]
+              (let [build-args-then-call
+                    (reduce (fn step [build-next-arg {continue-this-arg :continue}]
+                              (fn continue-building-args [arg-types emitted-args]
+                                (continue-this-arg (fn [arg-type emitted-arg]
+                                                     (if (and shortcut-null? (= #xt/type :null arg-type))
+                                                       (handle-emitted-expr #xt/type :null nil)
+                                                       (build-next-arg (conj arg-types arg-type)
+                                                                       (conj emitted-args emitted-arg)))))))
+                            (fn call-with-built-args [arg-types emitted-args]
+                              (let [{:keys [return-type continue-call ->call-code ->write-code]} (get emitted-calls arg-types)]
+                                (cond
+                                  (and out ->write-code) (->write-code out emitted-args)
+                                  continue-call (continue-call handle-emitted-expr emitted-args)
+                                  ->call-code (handle-emitted-expr return-type (->call-code emitted-args))
+                                  :else (throw (err/fault ::invalid-call-definition
+                                                          (str "internal error: invalid call definition: "
+                                                               (pr-str {:f f, :arg-types arg-types
+                                                                        :emitted-calls (keys emitted-calls)})))))))
+                            (reverse emitted-args))]
+                (build-args-then-call [] [])))]
+      {:return-type return-type
+       :valid-utf8? (every? (fn [{:keys [return-type valid-utf8?]}]
+                             (or (= #xt/type :null return-type) valid-utf8?))
+                           (vals emitted-calls))
+       :children (vals emitted-calls)
+       :continue #(continue-call-expr % nil)
+       :continue-projection (when (and projection-root?
+                                       (not (instance? VectorType$Poly return-type))
+                                       (some :->write-code (vals emitted-calls)))
+                              continue-call-expr)})))
 
 (declare codegen-concat codegen-format)
 
@@ -1296,26 +1301,33 @@
       (sql-trim-leading trim-char)
       (sql-trim-trailing trim-char)))
 
-(defmethod codegen-call [:trim_leading :utf8 :utf8] [_]
-  {:return-type #xt/type :utf8
-   :->call-code (fn [[s trim-char]]
-                  `(-> (sql-trim-leading (resolve-string ~s) (resolve-string ~trim-char))
-                       (.getBytes StandardCharsets/UTF_8)
-                       ByteBuffer/wrap))})
+(defn ascii-trim-view ^ByteBuffer [source token leading? trailing?]
+  (when (and (instance? ByteBuffer source)
+             (instance? ByteBuffer token))
+    (let [^ByteBuffer token token]
+      (when (= 1 (.remaining token))
+        (let [octet (.get token (.position token))]
+          (when (and (not (neg? (long octet))) (VectorWriterKt/isWellFormedUtf8 source))
+            (StringUtil/trimBytes source octet leading? trailing?)))))))
 
-(defmethod codegen-call [:trim_trailing :utf8 :utf8] [_]
-  {:return-type #xt/type :utf8
-   :->call-code (fn [[s trim-char]]
-                  `(-> (sql-trim-trailing (resolve-string ~s) (resolve-string ~trim-char))
-                       (.getBytes StandardCharsets/UTF_8)
-                       ByteBuffer/wrap))})
-
-(defmethod codegen-call [:trim :utf8 :utf8] [_]
-  {:return-type #xt/type :utf8
-   :->call-code (fn [[s trim-char]]
-                  `(-> (sql-trim-both (resolve-string ~s) (resolve-string ~trim-char))
-                       (.getBytes StandardCharsets/UTF_8)
-                       ByteBuffer/wrap))})
+(doseq [[f trim-fn leading? trailing?] [[:trim_leading `sql-trim-leading true false]
+                                        [:trim_trailing `sql-trim-trailing false true]
+                                        [:trim `sql-trim-both true true]]
+        :let [->call-code (fn [[s trim-char]]
+                            `(-> (~trim-fn (resolve-string ~s) (resolve-string ~trim-char))
+                                 (.getBytes StandardCharsets/UTF_8)
+                                 ByteBuffer/wrap))]]
+  (defmethod codegen-call [f :utf8 :utf8] [_]
+    {:return-type #xt/type :utf8
+     :->call-code ->call-code
+     :->write-code (fn [out [s trim-char]]
+                     (let [source (gensym 'source)
+                           token (gensym 'token)]
+                       `(let [~source ~s
+                              ~token ~trim-char
+                              ^ByteBuffer trimmed# (or (ascii-trim-view ~source ~token ~leading? ~trailing?)
+                                                       ~(->call-code [source token]))]
+                          (.writeBytes ~out trimmed#))))}))
 
 ;;;; SQL Trim function on binary.
 ;; trim-octet is the byte value to trim.
@@ -1350,50 +1362,41 @@
       (binary-trim-leading trim-octet)
       (binary-trim-trailing trim-octet)))
 
-(defmethod codegen-call [:trim_leading :varbinary :varbinary] [_]
-  {:return-type #xt/type :varbinary
-   :->call-code (fn [[s trim-octet]]
-                  `(-> (resolve-bytes ~s)
-                       (binary-trim-leading (first (resolve-bytes ~trim-octet)))
-                       ByteBuffer/wrap))})
+(defn binary-trim-input ^ByteBuffer [value]
+  (if (bytes? value)
+    (ByteBuffer/wrap ^bytes value)
+    (let [^ByteBuffer buf value]
+      (if (.hasArray buf)
+        (ByteBuffer/wrap (.array buf))
+        (let [view (.duplicate buf)]
+          (.position buf (.limit buf))
+          view)))))
 
-(defmethod codegen-call [:trim_trailing :varbinary :varbinary] [_]
-  {:return-type #xt/type :varbinary
-   :->call-code (fn [[s trim-octet]]
-                  `(-> (resolve-bytes ~s)
-                       (binary-trim-trailing (first (resolve-bytes ~trim-octet)))
-                       ByteBuffer/wrap))})
+(defn first-trim-octet [value]
+  (let [buf (binary-trim-input value)]
+    (when (.hasRemaining buf)
+      (.get buf (.position buf)))))
 
-(defmethod codegen-call [:trim :varbinary :varbinary] [_]
-  {:return-type #xt/type :varbinary
-   :->call-code (fn [[s trim-octet]]
-                  `(-> (resolve-bytes ~s)
-                       (binary-trim-both (first (resolve-bytes ~trim-octet)))
-                       ByteBuffer/wrap))})
-
-(defmethod codegen-call [:trim_leading :varbinary :num] [_]
-  {:return-type #xt/type :varbinary
-   :->call-code (fn [[s trim-octet]]
-                  ;; should we throw an explicit error if no good cast to byte is possible?
-                  `(-> (resolve-bytes ~s)
-                       (binary-trim-leading (byte ~trim-octet))
-                       ByteBuffer/wrap))})
-
-(defmethod codegen-call [:trim_trailing :varbinary :num] [_]
-  {:return-type #xt/type :varbinary
-   :->call-code (fn [[s trim-octet]]
-                  ;; should we throw an explicit error if no good cast to byte is possible?
-                  `(-> (resolve-bytes ~s)
-                       (binary-trim-trailing (byte ~trim-octet))
-                       ByteBuffer/wrap))})
-
-(defmethod codegen-call [:trim :varbinary :num] [_]
-  {:return-type #xt/type :varbinary
-   :->call-code (fn [[s trim-octet]]
-                  ;; should we throw an explicit error if no good cast to byte is possible?
-                  `(-> (resolve-bytes ~s)
-                       (binary-trim-both (byte ~trim-octet))
-                       ByteBuffer/wrap))})
+(doseq [[f trim-fn leading? trailing?] [[:trim_leading `binary-trim-leading true false]
+                                        [:trim_trailing `binary-trim-trailing false true]
+                                        [:trim `binary-trim-both true true]]
+        token-type [:varbinary :num]
+        :let [binary-token? (= :varbinary token-type)]]
+  (defmethod codegen-call [f :varbinary token-type] [_]
+    {:return-type #xt/type :varbinary
+     :->call-code (fn [[s token]]
+                    `(-> (resolve-bytes ~s)
+                         (~trim-fn ~(if binary-token?
+                                      `(first (resolve-bytes ~token))
+                                      `(byte ~token)))
+                         ByteBuffer/wrap))
+     :->write-code (fn [out [s token]]
+                     `(.writeBytes ~out
+                                   (StringUtil/trimBytes (binary-trim-input ~s)
+                                                         (byte ~(if binary-token?
+                                                                  `(first-trim-octet ~token)
+                                                                  token))
+                                                         ~leading? ~trailing?)))}))
 
 (defmethod codegen-call [:upper :utf8] [_]
   {:return-type #xt/type :utf8
@@ -1431,19 +1434,48 @@
   {:return-type #xt/type :keyword
    :->call-code first})
 
+(defn- canonical-keyword-cast-bytes? [^ByteBuffer buf]
+  (and (= (Charset/defaultCharset) StandardCharsets/UTF_8)
+       (VectorWriterKt/isWellFormedUtf8 buf)))
+
+(def ^:private keyword-colon
+  (.asReadOnlyBuffer (ByteBuffer/wrap (byte-array [58]))))
+
+(defn keyword-text-parts [^ByteBuffer buf]
+  (when (canonical-keyword-cast-bytes? buf)
+    [keyword-colon buf]))
+
+(defn text-keyword-view ^ByteBuffer [^ByteBuffer buf]
+  (when (canonical-keyword-cast-bytes? buf)
+    (let [start (.position buf)]
+      (if (and (.hasRemaining buf) (= 58 (.get buf start)))
+        (.position (.duplicate buf) (unchecked-inc-int start))
+        buf))))
+
 (defmethod codegen-cast [:keyword :utf8] [_]
-  {:return-type #xt/type :utf8
-   :->call-code (fn [[code]]
-                  `(-> (str ":" (buf->str ~code))
-                       str->buf))})
+  (let [->call-code (fn [[code]] `(str->buf (str ":" (buf->str ~code))))]
+    {:return-type #xt/type :utf8
+     :->call-code ->call-code
+     :->write-code (fn [out [code]]
+                     (let [value (gensym 'keyword-bytes)]
+                       `(let [~value ~code]
+                          (if-let [parts# (keyword-text-parts ~value)]
+                            (.writeByteParts ~out parts#)
+                            (.writeBytes ~out ~(->call-code [value]))))))}))
 
 (defmethod codegen-cast [:utf8 :keyword] [_]
-  {:return-type #xt/type :keyword
-   :->call-code (fn [[code]]
-                  `(let [kw# (buf->str ~code)]
-                     (if (= \: (first kw#))
-                       (str->buf (subs kw# 1))
-                       (str->buf kw#))))})
+  (let [->call-code (fn [[code]]
+                      `(let [kw# (buf->str ~code)]
+                         (if (= \: (first kw#))
+                           (str->buf (subs kw# 1))
+                           (str->buf kw#))))]
+    {:return-type #xt/type :keyword
+     :->call-code ->call-code
+     :->write-code (fn [out [code]]
+                     (let [value (gensym 'text-bytes)]
+                       `(let [~value ~code
+                              ^ByteBuffer keyword# (or (text-keyword-view ~value) ~(->call-code [value]))]
+                          (.writeBytes ~out keyword#))))}))
 
 (defmethod codegen-call [:str :utf8] [_]
   {:return-type #xt/type :utf8
@@ -1577,7 +1609,7 @@
                  (build-args-then-call [])))})
 
 ;; concat is not a simple mono-call, as it permits a variable number of arguments so we can avoid intermediate alloc
-(defn- codegen-concat [{:keys [emitted-args] :as expr}]
+(defn- codegen-concat [{:keys [emitted-args ::projection-root?] :as expr}]
   (when (< (count emitted-args) 2)
     (throw (err/incorrect :xtdb.expression/arity-error "Arity error, concat requires at least two arguments"
                           {:expr (dissoc expr :emitted-args)})))
@@ -1588,23 +1620,28 @@
             (throw (err/incorrect :xtdb.expression/type-error "All arguments to `concat` must be of the same type."
                                   {:types value-types})))
         value-type (first value-types)
-        ->concat-code (condp = value-type
-                        #xt/type :utf8 #(do `(buf-concat (mapv resolve-utf8-buf [~@%])))
-                        #xt/type :varbinary #(do `(buf-concat (mapv resolve-buf [~@%])))
-                        nil nil)]
-    {:return-type return-type
-     :continue (fn continue-call-expr [handle-emitted-expr]
-                 (let [build-args-then-call
-                       (reduce (fn step [build-next-arg {continue-this-arg :continue}]
-                                 (fn continue-building-args [emitted-args]
-                                   (continue-this-arg (fn [arg-type emitted-arg]
-                                                        (if (= arg-type #xt/type :null)
-                                                          (handle-emitted-expr #xt/type :null nil)
-                                                          (build-next-arg (conj emitted-args emitted-arg)))))))
-                               (fn call-with-built-args [emitted-args]
-                                 (handle-emitted-expr value-type (->concat-code emitted-args)))
-                               (reverse emitted-args))]
-                   (build-args-then-call [])))}))
+        resolve-part (condp = value-type
+                       #xt/type :utf8 `resolve-utf8-buf
+                       #xt/type :varbinary `resolve-buf
+                       nil nil)]
+    (letfn [(continue-concat [handle-emitted-expr out]
+              (let [build-args-then-call
+                    (reduce (fn step [build-next-arg {continue-this-arg :continue}]
+                              (fn continue-building-args [emitted-args]
+                                (continue-this-arg (fn [arg-type emitted-arg]
+                                                     (if (= arg-type #xt/type :null)
+                                                       (handle-emitted-expr #xt/type :null nil)
+                                                       (build-next-arg (conj emitted-args emitted-arg)))))))
+                            (fn call-with-built-args [emitted-args]
+                              (let [parts `(mapv ~resolve-part [~@emitted-args])]
+                                (if out
+                                  `(.writeByteParts ~out ~parts)
+                                  (handle-emitted-expr value-type `(buf-concat ~parts)))))
+                            (reverse emitted-args))]
+                (build-args-then-call [])))]
+      {:return-type return-type
+       :continue #(continue-concat % nil)
+       :continue-projection (when (and projection-root? resolve-part) continue-concat)})))
 
 (defmethod codegen-call [:substring :utf8 :int] [_]
   {:return-type #xt/type :utf8
@@ -1653,10 +1690,22 @@
    :->call-code (fn [[needle haystack]]
                   `(StringUtil/SqlBinPosition (resolve-buf ~needle) (resolve-buf ~haystack)))})
 
-(defmethod codegen-call [:overlay :utf8 :utf8 :int :int] [_]
-  {:return-type #xt/type :utf8
+(defn overlay-parts-fit? [parts]
+  (<= (long (reduce (fn [^long size ^ByteBuffer part] (+ size (.remaining part))) 0 parts))
+      Integer/MAX_VALUE))
+
+(defn- codegen-overlay [return-type resolve-part assemble parts]
+  {:return-type return-type
    :->call-code (fn [[target replacement from len]]
-                  `(StringUtil/sqlUtf8Overlay (resolve-utf8-buf ~target) (resolve-utf8-buf ~replacement) ~from ~len))})
+                  `(~assemble (~resolve-part ~target) (~resolve-part ~replacement) ~from ~len))
+   :->write-code (fn [out [target replacement from len]]
+                   `(let [parts# (~parts (~resolve-part ~target) (~resolve-part ~replacement) ~from ~len)]
+                      (if (overlay-parts-fit? parts#)
+                        (.writeByteParts ~out parts#)
+                        (.writeBytes ~out (StringUtil/assembleOverlayParts parts#)))))})
+
+(defmethod codegen-call [:overlay :utf8 :utf8 :int :int] [_]
+  (codegen-overlay #xt/type :utf8 `resolve-utf8-buf `StringUtil/sqlUtf8Overlay `StringUtil/sqlUtf8OverlayParts))
 
 (defmethod codegen-call [:replace :utf8 :utf8 :utf8] [_]
   {:return-type #xt/type :utf8
@@ -1802,9 +1851,7 @@
                   `(parse-ident (resolve-string ~s)))})
 
 (defmethod codegen-call [:overlay :varbinary :varbinary :int :int] [_]
-  {:return-type #xt/type :varbinary
-   :->call-code (fn [[target replacement from len]]
-                  `(StringUtil/sqlBinOverlay (resolve-buf ~target) (resolve-buf ~replacement) ~from ~len))})
+  (codegen-overlay #xt/type :varbinary `resolve-buf `StringUtil/sqlBinOverlay `StringUtil/sqlBinOverlayParts))
 
 (defmethod codegen-call [:default_overlay_length :utf8] [_]
   {:return-type #xt/type :i32
@@ -2596,22 +2643,36 @@
    assumption wouldn't hold if macroexpansion created new variable exprs, for example.
    macroexpansion is non-deterministic (gensym), so busts the memo cache."
   (-> (fn [expr opts]
-        (let [{:keys [return-type continue valid-utf8?] :as emitted-expr} (emit-row-expr expr (assoc opts :projection? true))
+        (let [{:keys [^VectorType return-type continue continue-projection valid-utf8?] :as emitted-expr}
+              (emit-row-expr expr (assoc opts :projection? true))
               {:keys [writer-bindings write-value-out!]} (write-value-out-code return-type)]
           {:!projection-fn (delay
-                             (-> `(fn [~(-> rel-sym (with-tag RelationReader))
+                             (let [row-count (gensym 'row-count)
+                                   write-rows (fn [body] `(dotimes [~idx-sym ~row-count] ~body))
+                                   scalar-loop (write-rows (continue write-value-out!))
+                                   projection-writer (when continue-projection
+                                                       (if (= #xt.arrow/type :keyword (.getArrowType return-type))
+                                                         KeywordVector
+                                                         VariableWidthVector))
+                                   projection-loop (when continue-projection
+                                                     (write-rows
+                                                      (continue-projection write-value-out!
+                                                                           (with-tag out-vec-sym projection-writer))))]
+                               (-> `(fn [~(-> rel-sym (with-tag RelationReader))
                                        ~(-> schema-sym (with-tag IPersistentMap))
                                        ~(-> args-sym (with-tag RelationReader))
                                        ~(-> out-vec-sym (with-tag Vector))]
                                     (let [~@(batch-bindings emitted-expr)
                                           ~@writer-bindings
-                                          row-count# (.getRowCount ~rel-sym)]
-                                      (dotimes [~idx-sym row-count#]
-                                        ~(continue (fn [t c]
-                                                     (write-value-out! t c))))))
-                                 #_(doto clojure.pprint/pprint) ; <<no-commit>>
-                                 #_(->> (binding [*print-meta* true]))
-                                 eval))
+                                          ~row-count (.getRowCount ~rel-sym)]
+                                      ~(if projection-loop
+                                         `(if (instance? ~projection-writer ~out-vec-sym)
+                                            ~projection-loop
+                                            ~scalar-loop)
+                                         scalar-loop)))
+                                   #_(doto clojure.pprint/pprint) ; <<no-commit>>
+                                   #_(->> (binding [*print-meta* true]))
+                                   eval)))
 
            :return-type return-type
            :valid-utf8? valid-utf8?}))

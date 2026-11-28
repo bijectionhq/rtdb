@@ -18,9 +18,11 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.extension.ExtendWith
+import xtdb.InternalApi
 import xtdb.test.AllocatorResolver
 import xtdb.arrow.Vector.Companion.openVector
 import xtdb.arrow.VectorType.Companion.ofType
+import java.nio.ByteBuffer
 import kotlin.random.Random
 
 @ExtendWith(AllocatorResolver::class)
@@ -50,6 +52,42 @@ class VariableWidthVectorTest {
             }
 
             assertEquals(listOf("abc", "de"), vec.asList, "the vector it was taken from is unchanged")
+        }
+    }
+
+    @OptIn(InternalApi::class)
+    @Test
+    fun `byte parts append one cell and a failed fill leaves the next cell available`() {
+        Utf8Vector(allocator, "v", true).use { vec ->
+            val source = ByteBuffer.wrap("abcd".toByteArray()).position(1).limit(3)
+            vec.writeByteParts(listOf(source, ByteBuffer.wrap("e".toByteArray())))
+            vec.writeNull()
+
+            assertThrows<IllegalStateException> {
+                vec.writeBytes(2) { dest, start ->
+                    dest.setByte(start, 'x'.code)
+                    error("partial fill")
+                }
+            }
+
+            vec.writeByteParts(emptyList())
+            vec.writeByteParts(listOf(source))
+            assertEquals(listOf("bce", null, "", "bc"), vec.asList)
+            assertEquals(1, source.position())
+            assertEquals(3, source.limit())
+        }
+    }
+
+    @Test
+    fun `a byte append rejects an unrepresentable end offset before reserving data`() {
+        allocator.newChildAllocator("byte-append", 0, 1024).use { bounded ->
+            Utf8Vector(bounded, "v", false).use { vec ->
+                vec.writeObject("a")
+                assertThrows<ArithmeticException> {
+                    vec.writeBytes(Int.MAX_VALUE) { _, _ -> error("unrepresentable cell") }
+                }
+                assertEquals(listOf("a"), vec.asList)
+            }
         }
     }
 

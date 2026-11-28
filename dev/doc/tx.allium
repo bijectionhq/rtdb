@@ -147,6 +147,11 @@
 -- Native Binary NULLIF, LEAST, and GREATEST can compare reached plain Binary operands and write the selected span into a funded result.
 -- A null left operand ends NULLIF before it reads the right operand, and a null right operand selects the left operand.
 -- Binary extrema stop at the first null and select the later position on equal bytes.
+-- JVM CONCAT and OVERLAY projections can write ordered UTF-8 or Binary spans into one plain Arrow result cell.
+-- JVM Binary TRIM can write the retained span with the original first-octet behavior.
+-- JVM UTF-8 TRIM can write the retained span when the source is well-formed UTF-8 and the token is one ASCII byte.
+-- JVM casts between UTF-8 and Keyword can write their canonical byte spans when the input is well-formed UTF-8 and the default charset is UTF-8.
+-- These projections preserve operand demand, nulls and the scalar functions' reached errors.
 -- A direct Arrow parameter projection chooses retention or detachment for each result column independently.
 -- A compatible first-cell view keeps its source backing charge when the retained storage is proportionate to the cell.
 -- A detached result column holds its own backing charge, and the projected page admits its descriptors and schema separately.

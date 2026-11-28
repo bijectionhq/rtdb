@@ -80,6 +80,32 @@ sealed class VariableWidthVector : MonoVector() {
         dataBuffer.writeBytes(v)
     }
 
+    // The callback fills exactly size bytes at the supplied offset and borrows the buffer only until it returns.
+    internal inline fun writeBytes(size: Int, write: (ArrowBuf, Long) -> Unit) {
+        val endOffset = Math.addExact(lastOffset, size)
+        val start = dataBuffer.writerIndex
+        offsetBuffer.ensureWritable((if (valueCount == 0) 2L else 1L) * Int.SIZE_BYTES)
+        validityBuffer?.ensureWritable(1)
+        write(dataBuffer.ensureWritable(size.toLong()), start)
+        endValue(endOffset)
+        dataBuffer.writerIndex = start + size
+    }
+
+    /** @suppress */
+    @InternalApi
+    fun writeByteParts(parts: List<ByteBuffer>) {
+        val size = parts.fold(0) { size, part -> Math.addExact(size, part.remaining()) }
+        writeBytes(size) { dest, start ->
+            var offset = start
+            for (part in parts) {
+                if (part.hasRemaining()) {
+                    dest.setBytes(offset, part.duplicate())
+                    offset += part.remaining()
+                }
+            }
+        }
+    }
+
     internal fun writeBytes(v: ByteString) {
         val len = v.size()
         val endOffset = Math.addExact(lastOffset, len)

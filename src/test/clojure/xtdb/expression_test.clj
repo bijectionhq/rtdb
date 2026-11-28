@@ -420,6 +420,63 @@
       {:res (.toList out-ivec #xt/key-fn :kebab-case-keyword)
        :res-type (.getType out-ivec)})))
 
+(t/deftest byte-span-projections-preserve-row-demand-and-nested-values
+  (with-open [rel (tu/open-rel {:a [nil "é" ""], :n [-1 2 0]})]
+    (t/is (= {:res [nil "éxy!" "!"], :res-type #xt/type [:? :utf8]}
+             (run-projection rel '(concat a (substring "xyz" 1 n) "!")))))
+
+  (with-open [rel (tu/open-rel {:a ["A😀B" "" nil], :b ["東京" "" "unused"]})]
+    (t/is (= {:res ["A東京B" "" nil], :res-type #xt/type [:? :utf8]}
+             (run-projection rel '(overlay a b 2 1))))
+    (t/is (= {:res ["_A東京B_" "__" nil], :res-type #xt/type [:? :utf8]}
+             (run-projection rel '(concat "_" (overlay a b 2 1) "_")))))
+
+  (with-open [rel (tu/open-rel {:a [(byte-array [0 -128 0]) (byte-array [0]) nil],
+                               :b [(byte-array [0 -128]) (byte-array [0]) (byte-array [])]})]
+    (let [{:keys [res res-type]} (run-projection rel '(trim a b))]
+      (t/is (= #xt/type [:? :varbinary] res-type))
+      (t/is (= [[-128] [] nil] (mapv #(some-> % expr/resolve-bytes vec) res)))))
+
+  (with-open [rel (tu/open-rel {:a [(byte-array [0])], :b [(byte-array [])]})]
+    (t/is (thrown? NullPointerException (run-projection rel '(trim a b))))
+    (let [form (list 'trim (list 'substring (byte-array [0 4 9 0]) 2 1) (byte-array [0]))
+          {:keys [res]} (run-projection rel form)]
+      (t/is (= [4 9] (vec (expr/resolve-bytes (first res)))))))
+
+  (with-open [rel (tu/open-rel {:a [(byte-array [9 0 -128 8])], :b [(byte-array [4 7 5])]})]
+    (let [{:keys [res res-type]} (run-projection rel '(concat (substring a 2 2) (overlay b a 2 1)))]
+      (t/is (= #xt/type :varbinary res-type))
+      (t/is (= [0 -128 4 9 0 -128 8 5] (vec (expr/resolve-bytes (first res))))))))
+
+(t/deftest byte-span-projections-preserve-canonical-text-and-keyword-bytes
+  (with-open [^Vector text (tu/open-vec "text" #xt/type :utf8 [])
+              ^Vector kw (tu/open-vec "kw" #xt/type :keyword [])]
+    (let [utf8 (fn [^String s] (.getBytes s java.nio.charset.StandardCharsets/UTF_8))
+          text-inputs [(utf8 ":a/東京") (utf8 "::bar") (byte-array [58 -61 40 58])]
+          keyword-inputs [(utf8 "a/東京") (byte-array []) (byte-array [-61 40])]
+          input-types {:var-types '{text #xt/type :utf8, kw #xt/type :keyword}}]
+      (doseq [^bytes input text-inputs]
+        (.writeBytes text input))
+      (doseq [^bytes input keyword-inputs]
+        (.writeBytes kw input))
+      (let [rel (vr/rel-reader [text kw])
+            project-bytes (fn [form]
+                            (let [expr (expr/form->expr form input-types)
+                                  factory (expr/->expression-projection-spec "out" expr input-types)]
+                              (with-open [^xtdb.operator.ProjectionSpec projection (.open factory tu/*allocator* {} vw/empty-args)
+                                          out (.project projection rel)]
+                                [(.getType out) (mapv #(vec (expr/resolve-bytes (.getBytes out (int %)))) (range 3))])))
+            expected-keywords (mapv (fn [^bytes input]
+                                      (let [s (String. input)]
+                                        (vec (utf8 (if (str/starts-with? s ":") (subs s 1) s)))))
+                                    text-inputs)
+            expected-text (mapv (fn [^bytes input] (vec (utf8 (str ":" (String. input)))))
+                                keyword-inputs)]
+        (t/is (= [#xt/type :keyword expected-keywords] (project-bytes '(cast text #xt/type :keyword))))
+        (t/is (= [#xt/type :utf8 expected-text] (project-bytes '(cast kw #xt/type :utf8))))
+        (t/is (= [#xt/type :utf8 (mapv (comp vec utf8) ["a/東京" "bar" "�("])]
+                 (project-bytes '(trim text ":"))))))))
+
 (t/deftest test-nils
   (with-open [rel (tu/open-rel {:x [1 1 nil nil]
                                 :y [2 nil 2 nil]})]

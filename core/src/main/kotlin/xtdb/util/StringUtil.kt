@@ -3,6 +3,7 @@ package xtdb.util
 import java.lang.Integer.toUnsignedString
 import java.lang.Long.toUnsignedString
 import java.nio.ByteBuffer
+import xtdb.InternalApi
 import kotlin.math.max
 import kotlin.math.min
 
@@ -120,30 +121,62 @@ object StringUtil {
         }
     }
 
-    @JvmStatic
-    fun sqlUtf8Overlay(target: ByteBuffer, placing: ByteBuffer, start: Int, replaceLength: Int): ByteBuffer {
-        val s1 = sqlUtf8Substring(target, 1, start - 1, true)
-        val s2 = sqlUtf8Substring(target, start + replaceLength, -1, false)
-
-        return ByteBuffer.allocate(s1.remaining() + s2.remaining() + placing.remaining()).apply {
-            put(s1)
-            put(placing.duplicate())
-            put(s2)
-            position(0)
-        }
+    private inline fun <T> sqlOverlay(
+        target: ByteBuffer, placing: ByteBuffer, start: Int, replaceLength: Int,
+        substring: (ByteBuffer, Int, Int, Boolean) -> ByteBuffer,
+        finish: (ByteBuffer, ByteBuffer, ByteBuffer) -> T
+    ): T {
+        val prefix = substring(target, 1, start - 1, true)
+        val suffix = substring(target, start + replaceLength, -1, false)
+        return finish(prefix, placing, suffix)
     }
 
-    @JvmStatic
-    fun sqlBinOverlay(target: ByteBuffer, placing: ByteBuffer, start: Int, replaceLength: Int): ByteBuffer {
-        val s1 = sqlBinSubstring(target, 1, start - 1, true)
-        val s2 = sqlBinSubstring(target, start + replaceLength, -1, false)
-
-        return ByteBuffer.allocate(s1.remaining() + s2.remaining() + placing.remaining()).apply {
-            put(s1)
+    private fun assembleOverlay(prefix: ByteBuffer, placing: ByteBuffer, suffix: ByteBuffer): ByteBuffer =
+        ByteBuffer.allocate(prefix.remaining() + suffix.remaining() + placing.remaining()).apply {
+            put(prefix)
             put(placing.duplicate())
-            put(s2)
+            put(suffix)
             position(0)
         }
+
+    @JvmStatic
+    fun sqlUtf8Overlay(target: ByteBuffer, placing: ByteBuffer, start: Int, replaceLength: Int): ByteBuffer =
+        sqlOverlay(target, placing, start, replaceLength, ::sqlUtf8Substring, ::assembleOverlay)
+
+    @JvmStatic
+    fun sqlBinOverlay(target: ByteBuffer, placing: ByteBuffer, start: Int, replaceLength: Int): ByteBuffer =
+        sqlOverlay(target, placing, start, replaceLength, ::sqlBinSubstring, ::assembleOverlay)
+
+    /** @suppress */
+    @InternalApi
+    @JvmStatic
+    fun sqlUtf8OverlayParts(target: ByteBuffer, placing: ByteBuffer, start: Int, replaceLength: Int): List<ByteBuffer> =
+        sqlOverlay(target, placing, start, replaceLength, ::sqlUtf8Substring, ::listOfOverlayParts)
+
+    /** @suppress */
+    @InternalApi
+    @JvmStatic
+    fun sqlBinOverlayParts(target: ByteBuffer, placing: ByteBuffer, start: Int, replaceLength: Int): List<ByteBuffer> =
+        sqlOverlay(target, placing, start, replaceLength, ::sqlBinSubstring, ::listOfOverlayParts)
+
+    /** @suppress */
+    @InternalApi
+    @JvmStatic
+    fun assembleOverlayParts(parts: List<ByteBuffer>): ByteBuffer =
+        assembleOverlay(parts[0], parts[1], parts[2])
+
+    private fun listOfOverlayParts(prefix: ByteBuffer, placing: ByteBuffer, suffix: ByteBuffer) =
+        listOf(prefix, placing, suffix)
+
+    /** @suppress */
+    @InternalApi
+    @JvmStatic
+    fun trimBytes(source: ByteBuffer, octet: Byte, leading: Boolean, trailing: Boolean): ByteBuffer {
+        var start = source.position()
+        var end = source.limit()
+        if (leading) while (start < end && source[start] == octet) start++
+        if (trailing) while (end > start && source[end - 1] == octet) end--
+        return source.duplicate().apply { position(start); limit(end) }
     }
 
     @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
