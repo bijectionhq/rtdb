@@ -273,7 +273,12 @@ impl Call {
     }
 
     pub async fn close_session(&self) {
-        self.service.retire_session(&self.session);
+        self.service.fence_session(&self.session);
+        // Keep the closed session's identity through the normal idle bound.
+        // A retry can confirm its drain without reopening admission.
+        if self.minted {
+            let _ = self.service.0.sessions.take(&self.session.id);
+        }
         self.session.wait_store_reads().await;
     }
     pub fn error(&self, mut error: Status) -> Status {
@@ -309,12 +314,15 @@ impl Service {
         pub(crate) fn ticket_binding<'a>(&self, call: &'a Call) -> crate::ticket::Binding<'a> {
         crate::ticket::Binding { mac: self.0.auth.ticket_mac(), session: &call.session.id, owner: call.session.caller.owner }
     }
-    fn retire_session(&self, session: &Session) {
+    fn fence_session(&self, session: &Session) {
         session.close();
-        let _ = self.0.sessions.take(&session.id);
         self.0.owned_reads.close_where(|read| read.session == session.id);
         self.0.owned_world_reads.close_where(|read| read.session == session.id);
         self.0.exact_reads.close_where(|read| read.session == session.id);
+    }
+    fn retire_session(&self, session: &Session) {
+        self.fence_session(session);
+        let _ = self.0.sessions.take(&session.id);
     }
     pub fn sweep(&self) {
         self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
@@ -455,6 +463,9 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
+            if session.closed() && !matches!(kind, CallKind::SessionClose) {
+                return Err(session_error(bearer.is_some(), "session closed"));
+            }
             if store_handshake {
                 return Err(Status::failed_precondition("A store release handshake opens a new Flight session"));
             }
