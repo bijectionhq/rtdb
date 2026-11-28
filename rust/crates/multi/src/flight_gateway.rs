@@ -24,6 +24,10 @@ use crate::{admin, capability::CellSecret, cipher::Cipher, classic_flight, contr
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
 const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v6";
+const DRAIN_CONTEXT: &str = "rtdb.multi/flight-store-drain/v1";
+const REQUEST_DRAIN_HEADER: &str = "x-rtdb-request-store-drain";
+const DRAIN_HEADER: &str = "x-rtdb-store-drain-ticket";
+const CLOSE_SESSION_FRAME: &[u8] = b"\x00\x00\x00\x00\x0e\x0a\x0cCloseSession";
 const FRESH_HEADER: &str = "x-rtdb-fresh-read";
 const HANDSHAKE: &str = "/arrow.flight.protocol.FlightService/Handshake";
 const DO_ACTION: &str = "/arrow.flight.protocol.FlightService/DoAction";
@@ -85,6 +89,7 @@ struct RoutedBody {
     _call: OwnedSemaphorePermit,
     _deployment: DeploymentConnection,
     deadline: Option<DeliveryDeadline>,
+    close_only: bool,
 }
 
 impl Body for RoutedBody {
@@ -94,7 +99,15 @@ impl Body for RoutedBody {
         if self.deadline.is_some_and(|deadline| !deadline.is_live()) {
             return Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::TimedOut, "The routed Flight answer expired"))));
         }
-        Pin::new(&mut self.body).poll_frame(cx).map(|frame| frame.map(|result| result.map_err(io::Error::other)))
+        let close_only = self.close_only;
+        Pin::new(&mut self.body).poll_frame(cx).map(|frame| frame.map(|result| {
+            result.map(|mut frame| {
+                if close_only && let Some(trailers) = frame.trailers_mut() {
+                    strip_session_credentials(trailers);
+                }
+                frame
+            }).map_err(io::Error::other)
+        }))
     }
     fn is_end_stream(&self) -> bool { self.body.is_end_stream() }
     fn size_hint(&self) -> SizeHint { self.body.size_hint() }
@@ -186,17 +199,17 @@ async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, r
 }
 
 impl Router {
-    fn decode(&self, token: &str) -> std::result::Result<SessionRoute, Status> {
+    fn decode(&self, context: &str, token: &str) -> std::result::Result<SessionRoute, Status> {
         let invalid = || Status::unauthenticated("Invalid Flight SQL session route");
         if token.len() > MAXIMUM_ROUTE_BYTES { return Err(invalid()); }
         let bytes = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
-        let opened = self.routes.open(ROUTE_CONTEXT, &bytes).map_err(|_| invalid())?;
+        let opened = self.routes.open(context, &bytes).map_err(|_| invalid())?;
         serde_json::from_slice(&opened).map_err(|_| invalid())
     }
 
-    fn encode(&self, route: &SessionRoute) -> std::result::Result<String, Status> {
+    fn encode(&self, context: &str, route: &SessionRoute) -> std::result::Result<String, Status> {
         let bytes = serde_json::to_vec(route).map_err(|_| Status::internal("Invalid Flight SQL route"))?;
-        let sealed = self.routes.seal(ROUTE_CONTEXT, &bytes).map_err(|_| Status::internal("Could not seal the Flight SQL route"))?;
+        let sealed = self.routes.seal(context, &bytes).map_err(|_| Status::internal("Could not seal the Flight SQL route"))?;
         let token = URL_SAFE_NO_PAD.encode(sealed);
         if token.len() > MAXIMUM_ROUTE_BYTES { return Err(Status::internal("The Flight SQL route exceeds its size limit")); }
         Ok(token)
@@ -373,7 +386,19 @@ impl Router {
         if let (Some(cookie), Some(bearer)) = (cookie, bearer)
             && cookie != bearer { return Err(Status::unauthenticated("Flight SQL cookie and bearer route disagree")); }
         let selector = single_header(request.headers(), DATABASE_HEADER)?;
-        let route = bearer.or(cookie).map(|token| self.decode(token)).transpose()?;
+        let drain = single_header(request.headers(), DRAIN_HEADER)?;
+        let route = match drain {
+            Some(token) if authorization.is_none() && cookie.is_none() && request.uri().path() == DO_ACTION => {
+                Some(self.decode(DRAIN_CONTEXT, token)?)
+            }
+            Some(_) => return Err(Status::permission_denied("A drain ticket only closes its original session")),
+            None => bearer.or(cookie).map(|token| self.decode(ROUTE_CONTEXT, token)).transpose()?,
+        };
+        let issue_drain = match single_header(request.headers(), REQUEST_DRAIN_HEADER)? {
+            Some("1") if route.is_none() && request.uri().path() == HANDSHAKE => true,
+            Some(_) => return Err(Status::invalid_argument("Request a drain ticket at the Flight handshake")),
+            None => false,
+        };
         let fresh = match single_header(request.headers(), FRESH_HEADER)? {
             Some("1") if route.is_none() && request.uri().path() == HANDSHAKE => true,
             Some(_) => return Err(Status::permission_denied("A fresh Flight route is fixed at its handshake")),
@@ -409,12 +434,15 @@ impl Router {
         let (target, session, classic) = tokio::time::timeout(self.timeout, routing).await
             .map_err(|_| Status::deadline_exceeded("Timed out resolving the Flight SQL route"))??;
 
-        let has_bearer = bearer.is_some();
+        let draining = drain.is_some();
+        let has_bearer = bearer.is_some() || draining;
         let headers = request.headers_mut();
         headers.remove(header::HOST);
         headers.remove(header::COOKIE);
         headers.remove(FORWARDED_PEER_HEADER);
         headers.remove(FRESH_HEADER);
+        headers.remove(REQUEST_DRAIN_HEADER);
+        headers.remove(DRAIN_HEADER);
         headers.insert(GATEWAY_ANSWER_DEADLINE_HEADER, HeaderValue::from_static("forward"));
         headers.insert(DATABASE_HEADER, header_value(&target.name)?);
         if let Some(session) = session {
@@ -437,10 +465,15 @@ impl Router {
         *request.uri_mut() = Uri::builder().scheme("http").authority(target.address.as_str()).path_and_query(path)
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
         let (parts, body) = request.into_parts();
-        let body = match classic {
-            Some(record) if parts.uri.path() == DO_ACTION =>
-                self.inspect_classic_action(&record, &parts.headers, session, body).await?,
-            _ => body.map_err(io::Error::other).boxed_unsync(),
+        let body = if draining {
+            tokio::time::timeout(self.timeout, inspect_drain_action(body)).await
+                .map_err(|_| Status::deadline_exceeded("Timed out reading the Flight session close"))??
+        } else {
+            match classic {
+                Some(record) if parts.uri.path() == DO_ACTION =>
+                    self.inspect_classic_action(&record, &parts.headers, session, body).await?,
+                _ => body.map_err(io::Error::other).boxed_unsync(),
+            }
         };
         let request = Request::from_parts(parts, body);
         let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL attachment disconnected"))?;
@@ -451,8 +484,13 @@ impl Router {
         if let Some(deadline) = deadline {
             egress.restrict(deadline).map_err(|_| Status::unavailable("The Flight answer cannot reach this socket before expiry"))?;
         }
-        self.rewrite_response(response.headers_mut(), target)?;
-        Ok(response.map(|body| Either::Right(RoutedBody { body, _call: call, _deployment: deployment, deadline })))
+        if draining {
+            // A close-only client never receives credentials from the node.
+            strip_session_credentials(response.headers_mut());
+        } else {
+            self.rewrite_response(response.headers_mut(), target, issue_drain)?;
+        }
+        Ok(response.map(|body| Either::Right(RoutedBody { body, _call: call, _deployment: deployment, deadline, close_only: draining })))
     }
 
     async fn inspect_classic_action(
@@ -496,7 +534,8 @@ impl Router {
         Ok(Full::new(wire).map_err(|never| -> io::Error { match never {} }).boxed_unsync())
     }
 
-    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target) -> std::result::Result<(), Status> {
+    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, issue_drain: bool) -> std::result::Result<(), Status> {
+        headers.remove(DRAIN_HEADER);
         let Some(cookie) = headers.remove(header::SET_COOKIE) else { return Ok(()); };
         let cookie = cookie.to_str().map_err(|_| Status::internal("Invalid private Flight SQL cookie"))?;
         if cookie.contains("Max-Age=0") {
@@ -507,13 +546,37 @@ impl Router {
         let session = cookie.strip_prefix("arrow_flight_session_id=").and_then(|id| Uuid::parse_str(id).ok())
             .ok_or_else(|| Status::internal("Invalid private Flight SQL session"))?;
         target.acknowledge_fresh(headers);
-        let route = self.encode(&SessionRoute { target, session })?;
+        let session = SessionRoute { target, session };
+        let route = self.encode(ROUTE_CONTEXT, &session)?;
+        if issue_drain && headers.contains_key(header::AUTHORIZATION) {
+            let mut ticket = header_value(&self.encode(DRAIN_CONTEXT, &session)?)?;
+            ticket.set_sensitive(true);
+            headers.insert(DRAIN_HEADER, ticket);
+        }
         headers.insert(header::SET_COOKIE, header_value(&format!("{COOKIE}={route}"))?);
         if headers.contains_key(header::AUTHORIZATION) {
             headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {route}"))?);
         }
         Ok(())
     }
+}
+
+fn strip_session_credentials(headers: &mut HeaderMap) {
+    headers.remove(header::SET_COOKIE);
+    headers.remove(header::AUTHORIZATION);
+    headers.remove(DRAIN_HEADER);
+}
+
+async fn inspect_drain_action(mut body: impl Body<Data = Bytes> + Unpin) -> std::result::Result<RequestBody, Status> {
+    let invalid = || Status::permission_denied("A drain ticket requires one uncompressed Flight CloseSession action");
+    let mut remaining = CLOSE_SESSION_FRAME;
+    while let Some(frame) = body.frame().await {
+        let data = frame.map_err(|_| invalid())?.into_data().map_err(|_| invalid())?;
+        remaining = remaining.strip_prefix(data.as_ref()).ok_or_else(invalid)?;
+    }
+    if !remaining.is_empty() { return Err(invalid()); }
+    Ok(Full::new(Bytes::from_static(CLOSE_SESSION_FRAME))
+        .map_err(|never| -> io::Error { match never {} }).boxed_unsync())
 }
 
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> std::result::Result<Option<&'a str>, Status> {
@@ -585,6 +648,35 @@ fn classic_action_inspection_matches_the_receiver_action_type() {
     frame.pop();
     frame[0] = 1;
     assert!(decode_classic_action(&Bytes::from(frame)).is_err());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn drain_tickets_admit_only_one_canonical_close_action() {
+    let close = Bytes::from_static(CLOSE_SESSION_FRAME);
+    let action = decode_classic_action(&close).unwrap();
+    assert_eq!(action.r#type, "CloseSession");
+    assert!(action.body.is_empty());
+    assert!(inspect_drain_action(Full::new(close.clone())).await.is_ok());
+    assert!(inspect_drain_action(Full::new(close.slice(..close.len() - 1))).await.is_err());
+    let mut doubled = close.to_vec();
+    doubled.extend_from_slice(&close);
+    assert!(inspect_drain_action(Full::new(Bytes::from(doubled))).await.is_err());
+    let mut read = close.to_vec();
+    read[7] = b'X';
+    assert!(inspect_drain_action(Full::new(Bytes::from(read))).await.is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn flight_drain_and_data_routes_use_disjoint_cipher_domains() {
+    let cipher = CellSecret::generate().unwrap().flight_session_cipher().unwrap();
+    let drain = cipher.seal(DRAIN_CONTEXT, b"same session binding").unwrap();
+    let route = cipher.seal(ROUTE_CONTEXT, b"same session binding").unwrap();
+    assert!(cipher.open(DRAIN_CONTEXT, &drain).is_ok());
+    assert!(cipher.open(ROUTE_CONTEXT, &route).is_ok());
+    assert!(cipher.open(ROUTE_CONTEXT, &drain).is_err());
+    assert!(cipher.open(DRAIN_CONTEXT, &route).is_err());
 }
 
 fn directory_error(_: Anomaly) -> Status { Status::unavailable("The Flight SQL directory is unavailable") }
