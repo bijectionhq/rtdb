@@ -398,7 +398,7 @@ fn pad(bytes: usize, alignment: usize) -> Result<usize> {
 mod tests {
     use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Int32Array, ListArray, StringArray, types::Int32Type};
-    use arrow_ipc::writer::CompressionContext;
+    use arrow_ipc::{MetadataVersion, writer::CompressionContext};
 
     #[test]
     fn exact_spans_borrow_zero_based_nested_offsets_and_rebase_other_slices() {
