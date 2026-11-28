@@ -487,7 +487,7 @@ A listener serving RTDB v1 also omits the legacy funded feature names from `Capa
 For a dedicated commissioned Multi writer, enable `flightSql.kernelTimedStore` on its private loopback TLS listener.
 Set `flightSql.ownedNativeActions`, install the hosted control owner and relations, and provide the source-bound `fundedReceiverClock` and authenticated timed journal.
 The installed node command loads `certificate.pem` and `key.pem` from the absolute `flightSql.kernelTimedStoreTlsDirectory`. Keep both files private.
-On the Kernel, enroll the direct TLS writer and pin the application's catalog identity and genesis digest in the hosted Store binding's `timed_store_application_catalog`.
+On the Kernel, use `timed_store_application_catalog` in the hosted Store binding to install the direct TLS `writer_url`, the catalog UUID in `catalog`, and its genesis digest in `root_sha256`.
 The timed writer negotiates its exact incarnation before the Kernel requests a slot. A writer without this capability cannot book a fresh timed call.
 The exchange prepares one exact journal leaf, orders the Kernel's authorization, and then dispatches the prepared leaf against its original cutoff.
 The activation authority refuses the former signed-import protocols 9 through 11.
@@ -531,7 +531,9 @@ It uses the installed activation reader and the pinned application catalog root 
 The proof remains held when the successor replaces its staged checkpoint and releases the temporary destination-object holds.
 Abandonment retires the proof with the original acquisition.
 Published proof retention has no automatic release while the Kernel can still need the historical proof.
-The Kernel pins each catalog's genesis root independently and can verify settlement evidence offline through the installed RTDB CLI.
+The Kernel's `BIJECTION_RTDB_RECOVERY_SOURCE` binding supplies `funded_settlement_roots` with independent `application` and `control` digests.
+Set `funded_settlement_provider` with the selected destination's `bucket` and its optional `region` and `endpoint`.
+The Kernel uses the installed RTDB CLI to verify the fetched evidence offline before ordering a funding fate.
 
 ```sh
 rtdb multi-activation verify-settlement "$DATABASE" \

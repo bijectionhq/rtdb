@@ -397,6 +397,10 @@ mod tests {
     }
 
     impl CommissionedSource {
+        async fn shutdown(self) {
+            self.keepers.shutdown().await;
+        }
+
         async fn export(&self, archive: &Path) -> Result<()> {
             let options = MultiBackupOptions::parse([
                 "export-hosted".into(), "--archive".into(), archive.display().to_string(),
@@ -414,11 +418,12 @@ mod tests {
 
     async fn commissioned_source(
         home: &Path, authority: &Arc<ActivationAuthority>, source: Uuid, config: &rtdb_s3::S3Config,
-        vault: &Path,
+        vault: &Path, authenticated: bool,
     ) -> CommissionedSource {
         const WRITER: &str = "urn:logkeeper:client:backup-source-writer";
         const READER: &str = "urn:logkeeper:client:backup-source-reader";
-        let mut keepers = LocalCluster::start_independent_catalog(&[WRITER]).await.unwrap();
+        let mut keepers = if authenticated { LocalCluster::start_authenticated(&[WRITER]).await }
+            else { LocalCluster::start_independent_catalog(&[WRITER]).await }.unwrap();
         let placement = keepers.journal_config(64 << 20, 4 << 20);
         let journal = Arc::new(keepers.journal(WRITER, &placement).unwrap());
         journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
@@ -436,6 +441,9 @@ mod tests {
             .with_immutable_journal()
             .with_activation_scope(authority.scope(DATABASE).unwrap()).unwrap()
             .with_serving_authority(authority.serving_authority(DATABASE, source).unwrap());
+        if authenticated {
+            database = database.with_authenticated_journal(journal.clone(), true);
+        }
         database.create().await.unwrap();
         assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
         use rtdb_tx::transact::{Cell, Op, Row, Transact};
@@ -486,11 +494,34 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires a disposable loopback S3 bucket with Object Lock and the AWS CLI"]
     async fn staged_backup_checks_exact_provider_holds_on_its_complete_object_closure() {
+        check_provider_holds(false).await;
+    }
+
+    #[test]
+    #[ignore = "requires a disposable loopback S3 service with Object Lock and the AWS CLI"]
+    fn published_provider_lineage_survives_source_and_temporary_custody_release() {
+        std::thread::Builder::new().stack_size(16 << 20).spawn(|| {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(4)
+                .thread_stack_size(16 << 20).enable_all().build().unwrap()
+                .block_on(provider_lineage_survives_source_and_release());
+        }).unwrap().join().unwrap();
+    }
+
+    async fn provider_lineage_survives_source_and_release() {
+        check_provider_holds(true).await;
+    }
+
+    async fn check_provider_holds(authenticated: bool) {
         let endpoint = std::env::var("RTDB_BACKUP_HOLD_TEST_ENDPOINT").unwrap();
         let url = url::Url::parse(&endpoint).unwrap();
         assert_eq!(url.host_str(), Some("127.0.0.1"));
-        let bucket = std::env::var("RTDB_BACKUP_HOLD_TEST_BUCKET").unwrap();
-        assert!(bucket.starts_with("rtdb-backup-hold-test-"));
+        let bucket = if authenticated {
+            format!("rtdb-backup-hold-test-l-{}", Uuid::new_v4().simple())
+        } else {
+            let bucket = std::env::var("RTDB_BACKUP_HOLD_TEST_BUCKET").unwrap();
+            assert!(bucket.starts_with("rtdb-backup-hold-test-"));
+            bucket
+        };
         let aws_call = |bucket: &str, operation: &str, fields: &[&str]| {
             std::process::Command::new("aws")
                 .args(["--no-cli-pager", "--endpoint-url", &endpoint, "--region", "us-east-1",
@@ -503,13 +534,17 @@ mod tests {
             if result.stdout.is_empty() { Value::Null } else { serde_json::from_slice(&result.stdout).unwrap() }
         };
         let aws = |operation: &str, fields: &[&str]| aws_bucket(&bucket, operation, fields);
+        if authenticated {
+            aws("create-bucket", &["--object-lock-enabled-for-bucket"]);
+        }
         let source_bucket = format!("{bucket}-source");
         aws_bucket(&source_bucket, "create-bucket", &["--object-lock-enabled-for-bucket"]);
 
         const PRINCIPAL: &str = "urn:logkeeper:client:backup-object-holds";
         const READER: &str = "urn:logkeeper:client:backup-destination-reader";
         const CUSTODIAN: &str = "urn:logkeeper:client:backup-checkpoint-custodian";
-        let mut keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+        let mut keepers = if authenticated { LocalCluster::start_authenticated(&[PRINCIPAL]).await }
+            else { LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await }.unwrap();
         let placement = keepers.journal_config(64 << 20, 4 << 20);
         let journal = Arc::new(keepers.journal(PRINCIPAL, &placement).unwrap());
         journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
@@ -529,7 +564,7 @@ mod tests {
         let authority = Uuid::new_v4();
         let archive_path = home.path().join("archive");
         let source_vault = home.path().join("source");
-        let mut source = rtdb_s3::S3Config::new(source_bucket);
+        let mut source = rtdb_s3::S3Config::new(&source_bucket);
         source.endpoint = Some(endpoint.clone());
         source.region = Some("us-east-1".into());
         let mut s3 = rtdb_s3::S3Config::new(&bucket);
@@ -545,7 +580,8 @@ mod tests {
         let cell = Uuid::new_v4();
         const AUTHORITY_PRINCIPAL: &str = "urn:logkeeper:client:backup-activation";
         const AUTHORITY_READER: &str = "urn:logkeeper:client:backup-activation-reader";
-        let mut authority_keepers = LocalCluster::start_independent_catalog(&[AUTHORITY_PRINCIPAL]).await.unwrap();
+        let mut authority_keepers = if authenticated { LocalCluster::start_authenticated(&[AUTHORITY_PRINCIPAL]).await }
+            else { LocalCluster::start_independent_catalog(&[AUTHORITY_PRINCIPAL]).await }.unwrap();
         let authority_placement = authority_keepers.journal_config(64 << 20, 4 << 20);
         let authority_journal = Arc::new(authority_keepers.journal(AUTHORITY_PRINCIPAL, &authority_placement).unwrap());
         authority_journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
@@ -557,9 +593,25 @@ mod tests {
         ).await.unwrap();
         let activation = ActivationAuthority::new(authority_journal.clone(), authority).unwrap();
         let source_id = Uuid::new_v4();
-        let predecessor = activation.bootstrap(DATABASE, source_id).await.unwrap();
-        let source = commissioned_source(home.path(), &authority_reader, source_id, &source, &source_vault).await;
+        let predecessor = if authenticated {
+            ActivationOptions::parse([
+                "bootstrap".into(), DATABASE.into(), "--incarnation".into(), source_id.to_string(),
+                "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
+                "--authority-tls-dir".into(), authority_tls.display().to_string(),
+            ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap();
+            authority_reader.binding(DATABASE).await.unwrap()
+        } else {
+            activation.bootstrap(DATABASE, source_id).await.unwrap()
+        };
+        let source = commissioned_source(home.path(), &authority_reader, source_id, &source, &source_vault, authenticated).await;
         source.export(&archive_path).await.unwrap();
+        let source_root = if authenticated {
+            let root = source.journal.catalog_history().await.unwrap().genesis.root();
+            assert_ne!(root, authority_journal.catalog_history().await.unwrap().genesis.root());
+            assert_ne!(root, journal.catalog_history().await.unwrap().genesis.root());
+            Some(root)
+        } else { None };
+        let source_end = source.head;
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         let signing_key = home.path().join("attestor.pkcs8");
         fs::write(&signing_key, pkcs8.as_ref()).unwrap();
@@ -636,8 +688,8 @@ mod tests {
             activation.begin_recovery(DATABASE, intent, Some(lossless_id)).await.unwrap()
         else { panic!("expected a pending recovery"); };
         recover("freeze-recovery", vec!["--operation-id".into(), operation_id.to_string()]).await.unwrap();
-        source.keepers.shutdown().await;
-        let archive = fs::read(&archive_path).unwrap();
+        source.shutdown().await;
+        let archive_digest: [u8; 32] = Sha256::digest(fs::read(&archive_path).unwrap()).into();
         let stream = StreamId(incarnation.as_u128());
         let activation_stream = activation.commissioning_stream_id(DATABASE).unwrap();
         let activation_head = authority_journal.head(activation_stream).await.unwrap();
@@ -715,7 +767,7 @@ mod tests {
         };
         let objects: Vec<_> = store.list(None).await.unwrap().into_iter()
             .filter(|entry| !entry.key.as_str().starts_with("recovery-custody/")).collect();
-        assert_eq!(objects.len(), 4);
+        assert_eq!(objects.len(), 4 + usize::from(authenticated));
         let token = &objects.iter().find(|entry| entry.key.as_str().starts_with("~rtdb-v1/")).unwrap().key;
         assert!(verify(None, &receipt_path).await.is_err());
         let hold = |version: &rtdb_types::PhysicalObjectVersion| {
@@ -745,7 +797,7 @@ mod tests {
         assert_eq!(result["object_holds_verified"], true);
         assert_eq!(result["key_hold"], receipt["key_hold"]);
         assert_eq!(result["incarnation"], incarnation.to_string());
-        assert_eq!(result["archive_sha256"], digest_hex(&Sha256::digest(&archive).into()));
+        assert_eq!(result["archive_sha256"], digest_hex(&archive_digest));
         assert_eq!(result["journal_head"], head.0);
         assert_eq!(result["held_versions"].as_array().unwrap().len(), 4);
         assert!(result["held_versions"].as_array().unwrap().contains(&json!(physical)));
@@ -952,10 +1004,11 @@ mod tests {
         let original_keys = FileKms::open(&vault, || SystemClock.now().0).unwrap();
         original_keys.require_recovery_key(plan.key_hold.unwrap()).await.unwrap();
         let abandoned_result = discover(abandoned, &vault).await.unwrap();
-        assert_eq!(abandoned_result["retired_versions"], plan.held_versions.len());
+        let retired_versions = plan.pinned_versions();
+        assert_eq!(abandoned_result["retired_versions"], retired_versions.len());
         assert_eq!(discover(abandoned, &vault).await.unwrap(), abandoned_result);
         assert_eq!(observe_hold(&unrelated)["LegalHold"]["Status"], "ON");
-        for version in &plan.held_versions {
+        for version in &retired_versions {
             let listed = aws("list-object-versions", &["--prefix", &version.key]);
             assert!(listed["Versions"].as_array().into_iter().flatten().all(|entry| entry["VersionId"] != version.version));
         }
@@ -973,7 +1026,10 @@ mod tests {
         assert!(custodian.retain(abandoned, retained).await.is_err());
         assert!(original_keys.require_recovery_key(plan.key_hold.unwrap()).await.is_err());
 
-        for journal_tls in [&reader_tls, &tls] {
+        // The broad custody fixture exercises interrupted staging; the
+        // authenticated fixture goes straight to its selected proof.
+        let interrupted_stages = [&reader_tls, &tls].into_iter().filter(|_| !authenticated);
+        for journal_tls in interrupted_stages {
             let operation = serving_intent.operation;
             let Status::Pending { candidate, .. } = activation.recovery_status(DATABASE, operation).await.unwrap()
             else { panic!("expected a staging intent"); };
@@ -1042,9 +1098,41 @@ mod tests {
         let serving_authority = authority_reader.serving_authority_for_cell(DATABASE, candidate, Some(cell)).unwrap();
         assert_eq!(serving_authority.acquire().await.unwrap_err().code, "rtdb/activation-fenced");
 
+        let held_inclusion = |root: rtdb_stream_journal::authenticated::CatalogRoot| MultiBackupOptions::parse([
+            "lineage-inclusion-held".into(), "--database".into(), DATABASE.into(),
+            "--authority-id".into(), authority.to_string(), "--authority-url".into(), authority_url.clone(),
+            "--authority-tls-dir".into(), authority_reader_tls.display().to_string(),
+            "--expected-incarnation".into(), predecessor.incarnation.to_string(),
+            "--expected-revision".into(), predecessor.revision.to_string(),
+            "--catalog-root".into(), digest_hex(&root.0), "--position".into(), source_end.0.to_string(),
+            "--bucket".into(), bucket.clone(), "--region".into(), "us-east-1".into(),
+            "--s3-endpoint".into(), endpoint.clone(),
+        ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full);
+        let expected_inclusion = if let Some(root) = source_root {
+            assert_eq!(held_inclusion(root).await.unwrap_err().code, "rtdb/held-lineage-proof-unavailable");
+            Some(MultiBackupOptions::parse([
+                "lineage-inclusion".into(), "--archive".into(), archive_path.display().to_string(),
+                "--catalog-root".into(), digest_hex(&root.0), "--position".into(), source_end.0.to_string(),
+            ].into_iter()).unwrap().run(rtdb_storage::AppleSync::Full).await.unwrap())
+        } else { None };
         let published = recover("publish-recovery", vec!["--operation-id".into(), operation.operation_id.to_string()]).await.unwrap();
         assert_eq!(published["binding"]["incarnation"], candidate.to_string());
         serving_authority.acquire().await.unwrap().check().unwrap();
+        if let Some((root, expected)) = source_root.zip(expected_inclusion.as_ref()) {
+            fs::remove_file(&archive_path).unwrap();
+            fs::remove_dir_all(&source_vault).unwrap();
+            let source_objects = aws_bucket(&source_bucket, "list-object-versions", &[]);
+            assert!(!source_objects["Versions"].as_array().unwrap().is_empty());
+            for kind in ["Versions", "DeleteMarkers"] {
+                for entry in source_objects[kind].as_array().into_iter().flatten() {
+                    aws_bucket(&source_bucket, "delete-object", &[
+                        "--key", entry["Key"].as_str().unwrap(), "--version-id", entry["VersionId"].as_str().unwrap(),
+                    ]);
+                }
+            }
+            aws_bucket(&source_bucket, "delete-bucket", &[]);
+            assert_eq!(&held_inclusion(root).await.unwrap(), expected);
+        }
         let serving_keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
         let mut serving = MultiDatabase::new(
             options(candidate), journal.clone(), store.clone(), serving_keys.clone(), Arc::new(|| SystemClock.now()),
@@ -1116,7 +1204,31 @@ mod tests {
         for version in serving_report.held_versions.iter().filter(|version| **version != previous_version) {
             assert_eq!(observe_hold(version)["LegalHold"]["Status"], "OFF");
         }
-        let archive_digest: [u8; 32] = Sha256::digest(&archive).into();
+        if let Some((root, expected)) = source_root.zip(expected_inclusion.as_ref()) {
+            let lineage = serving_report.lineage.as_ref().unwrap();
+            assert_eq!(observe_hold(&lineage.version)["LegalHold"]["Status"], "ON");
+            assert_eq!(&held_inclusion(root).await.unwrap(), expected);
+
+            let key = lineage.object.key(candidate, lineage.manifest).unwrap();
+            let mut altered = store.get_fresh(&key).await.unwrap().to_vec();
+            altered[0] ^= 1;
+            fs::write(&retry_bytes, altered).unwrap();
+            aws("put-object", &["--key", &lineage.version.key, "--body", retry_bytes.to_str().unwrap()]);
+            let altered_version = store.observe_head(&key).await.unwrap().version.unwrap();
+            assert_ne!(altered_version, lineage.version);
+            assert_eq!(&held_inclusion(root).await.unwrap(), expected);
+
+            let acquisition = ObjectKey::new(format!("recovery-custody/{authority}/{candidate}/acquisition")).unwrap();
+            let mut altered_plan: Value = serde_json::from_slice(&store.get_fresh(&acquisition).await.unwrap()).unwrap();
+            altered_plan["lineage"]["version"] = json!(&altered_version);
+            fs::write(&retry_bytes, serde_json::to_vec(&altered_plan).unwrap()).unwrap();
+            let plan_key = format!("multi/{acquisition}");
+            let forged = aws("put-object", &["--key", &plan_key, "--body", retry_bytes.to_str().unwrap()]);
+            assert_eq!(held_inclusion(root).await.unwrap_err().code, "rtdb/held-lineage-proof");
+            aws("delete-object", &["--key", &plan_key, "--version-id", forged["VersionId"].as_str().unwrap()]);
+            aws("delete-object", &["--key", &altered_version.key, "--version-id", &altered_version.version]);
+            assert_eq!(&held_inclusion(root).await.unwrap(), expected);
+        }
         assert_eq!(serving.installed_backup().await.unwrap().unwrap().manifest_sha256(), archive_digest);
         let replacement_head = journal.head(serving_stream).await.unwrap();
         assert!(replacement_head > installed_head);
