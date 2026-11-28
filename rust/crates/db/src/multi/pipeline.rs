@@ -13,7 +13,7 @@ use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, Decision, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
     TransactPipeline, TransactState, TransactionRecord, TxKey, ROW_CUSTODY, prepare_custody, workload,
 };
-use rtdb_index::branches::{BranchCut, store::KeyRange};
+use rtdb_index::branches::{BranchCut, store::{KeyRange, StoreWriterClaim}};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryReservation, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
 use tokio::{
     sync::{Mutex, OnceCell, mpsc, oneshot},
@@ -67,6 +67,7 @@ enum Command {
         since: Basis,
         keep_from: u64,
         reads: Vec<KeyRange>,
+        writer: Option<StoreWriterClaim>,
         request_memory: Arc<MemoryReservation>,
         reply: Reply<()>,
     },
@@ -142,9 +143,10 @@ impl WritePipeline {
 
     /// Keeps an admitted publication in the writer's queue after the caller drops its reply.
     pub async fn publish_store_purge_floor(
-        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, request_memory: Arc<MemoryReservation>,
+        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, writer: Option<StoreWriterClaim>,
+        request_memory: Arc<MemoryReservation>,
     ) -> Result<()> {
-        self.request(|reply| Command::PublishStorePurgeFloor { since, keep_from, reads, request_memory, reply }).await
+        self.request(|reply| Command::PublishStorePurgeFloor { since, keep_from, reads, writer, request_memory, reply }).await
     }
 
     pub async fn publish_ranked_catalog(
@@ -471,9 +473,9 @@ async fn run(
                 let result = Box::pin(async { database.lock().await.publish_ranked_catalog(build, inventory, files, &memory).await }).await;
                 let _ = reply.send(result);
             }
-            Command::PublishStorePurgeFloor { since, keep_from, reads, request_memory: _request_memory, reply } => {
+            Command::PublishStorePurgeFloor { since, keep_from, reads, writer, request_memory: _request_memory, reply } => {
                 let result = Box::pin(async {
-                    database.lock().await.publish_store_purge_floor(since, keep_from, &reads).await
+                    database.lock().await.publish_store_purge_floor(since, keep_from, &reads, writer).await
                 }).await;
                 let _ = reply.send(result);
             }

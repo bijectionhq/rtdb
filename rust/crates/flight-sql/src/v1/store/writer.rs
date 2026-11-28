@@ -1,5 +1,5 @@
 use prost::Message;
-use rtdb_index::branches::store::StoreWriterFence;
+use rtdb_index::branches::store::{StoreWriterClaim, StoreWriterFence};
 use rtdb_auth::PlacementFence;
 use rtdb_node::{DatabaseAccess, SessionIdentity};
 use rtdb_tx::transact::{Outcome, Transact};
@@ -18,6 +18,15 @@ pub(super) fn fence(epoch: u64, writer: Option<Vec<u8>>) -> Result<StoreWriterFe
     let writer = writer.map(|writer| writer.try_into()
         .map_err(|_| error::incorrect("A store writer identity has 16 bytes"))).transpose()?;
     Ok(StoreWriterFence { epoch, writer })
+}
+
+pub(super) fn ordered_claim(fence: StoreWriterFence, generation: u64, claim: &[u8]) -> Result<StoreWriterClaim, Status> {
+    let claim: [u8; 16] = claim.try_into()
+        .map_err(|_| error::incorrect("A store writer claim has 16 bytes"))?;
+    if generation == 0 || claim == [0; 16] || fence.writer.is_none_or(|writer| writer == [0; 16]) {
+        return Err(error::incorrect("A store writer claim requires its ordered generation and claim identity"));
+    }
+    Ok(StoreWriterClaim { fence, generation, claim })
 }
 
 impl Service {

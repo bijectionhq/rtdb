@@ -1,5 +1,5 @@
 use super::*;
-use rtdb_flight_sql::rtdb::store::v1::{KeyRange, PurgeFloorRequest};
+use rtdb_flight_sql::rtdb::store::v1::{KeyRange, PurgeFloorRequest, WriterFence};
 use rtdb_node::serving::NativeServingAuthority;
 use tonic::Code;
 
@@ -15,6 +15,7 @@ fn request(incarnation: [u8; 16]) -> Bytes {
     PurgeFloorRequest {
         incarnation: incarnation.to_vec(), since: Some(0), keep_from: Some(0),
         reads: vec![KeyRange { start: vec![1], end: None }],
+        writer_fence: Some(WriterFence { epoch: 1, writer: vec![2; 16], generation: 3, claim: vec![4; 16] }),
     }.encode_to_vec().into()
 }
 

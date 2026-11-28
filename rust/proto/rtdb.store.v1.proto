@@ -371,6 +371,8 @@ message PurgeFloorRequest {
   // Nonempty, in the planner's order, including retention and writer-fence guards.
   // A write after since intersecting any guard refuses publication.
   repeated KeyRange reads = 4;
+  // Required. The exact current placement assignment, ordered generation and claim identity.
+  WriterFence writer_fence = 5;
 }
 
 message PurgeFloorReply {

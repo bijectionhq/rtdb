@@ -1,5 +1,5 @@
 use rtdb_format::journal::Record;
-use rtdb_index::branches::store::KeyRange;
+use rtdb_index::branches::store::{KeyRange, StoreWriterClaim};
 use rtdb_store::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::Basis};
 
@@ -36,20 +36,26 @@ impl MultiDatabase {
 
     /// Advisory preflight at the settled Multi writer prefix. Durable
     /// publication must repeat admission under its fenced append authority.
-    pub async fn check_store_purge_floor(&mut self, since: Basis, keep_from: u64, reads: &[KeyRange]) -> Result<()> {
-        self.admit_store_purge_floor(since, keep_from, reads).await.map(|_| ())
+    pub async fn check_store_purge_floor(
+        &mut self, since: Basis, keep_from: u64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
+    ) -> Result<()> {
+        self.admit_store_purge_floor(since, keep_from, reads, writer).await.map(|_| ())
     }
 
     /// Orders the exclusive upper bound on versions eligible for reclamation.
     /// Recovery and reader obligations can still retain versions below it.
-    pub async fn publish_store_purge_floor(&mut self, since: Basis, keep_from: u64, reads: &[KeyRange]) -> Result<()> {
-        if let Some(lease) = self.admit_store_purge_floor(since, keep_from, reads).await? {
+    pub async fn publish_store_purge_floor(
+        &mut self, since: Basis, keep_from: u64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
+    ) -> Result<()> {
+        if let Some(lease) = self.admit_store_purge_floor(since, keep_from, reads, writer).await? {
             self.append_control(lease, Record::StorePurgeReclaim { since, keep_from }).await?;
         }
         Ok(())
     }
 
-    async fn admit_store_purge_floor(&mut self, since: Basis, keep_from: u64, reads: &[KeyRange]) -> Result<Option<Lease>> {
+    async fn admit_store_purge_floor(
+        &mut self, since: Basis, keep_from: u64, reads: &[KeyRange], writer: Option<StoreWriterClaim>,
+    ) -> Result<Option<Lease>> {
         self.stream.require_serving().await?;
         self.refresh().await?;
         let lease = self.settled_store_writer()?;
@@ -58,6 +64,7 @@ impl MultiDatabase {
         let journal_floor = state.floor;
 
         let index = state.transactions.index();
+        index.require_store_writer(writer.map(|claim| (since.incarnation(), claim.fence, claim.generation, claim.claim)))?;
         index.check_store_purge_guards(since, keep_from, reads)?;
         if keep_from <= state.store_purge_floor && keep_from <= index.store_history_floor() {
             self.require_authority(lease)?;

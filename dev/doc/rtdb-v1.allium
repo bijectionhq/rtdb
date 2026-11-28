@@ -245,7 +245,9 @@ surface StatelessDatabase {
     @guarantee StorePurgeFloor
         -- PurgeFloor requires a verified credential with unscoped database write access to the attached Multi incarnation.
         -- The request names one retained basis, a minimum retained version at or below that basis, and the original ordered list of half-open guards.
-        -- The local Multi writer checks the basis and every guard against its settled prefix, including when the durable floor already covers the request.
+        -- The request also names its current placement epoch, assignment, ordered writer generation and opaque claim identity.
+        -- The local Multi writer checks the exact claim, basis and every guard against its settled prefix, including when the durable floor already covers the request.
+        -- An authenticated handshake on a route that supports this check advertises x-rtdb-store-purge-writer: 1.
         -- An admitted publication retains its request reservation through the ordered decision even if the Flight call ends.
         -- A successful reply names the same incarnation and the requested minimum once the durable floor covers it.
         -- The writer reclaims superseded history within that floor under its retention and checkpoint rules.

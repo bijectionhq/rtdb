@@ -96,7 +96,7 @@ pub fn anomaly(native: Anomaly) -> Status {
 
 pub(super) fn purge_floor(native: Anomaly) -> Status {
     let stable = (native.code.starts_with("rtdb.store/purge-")
-        || matches!(native.code.as_str(), "rtdb.store/outside-grant" | "rtdb/no-writer"
+        || matches!(native.code.as_str(), "rtdb.store/outside-grant" | "rtdb.store/stale-writer" | "rtdb/no-writer"
             | "rtdb/basis-ahead" | "rtdb/unknown-basis" | "rtdb/foreign-basis"))
         .then(|| native.code.clone());
     let mut error = detail(native);

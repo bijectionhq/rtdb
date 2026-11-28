@@ -9,6 +9,13 @@ pub struct StoreWriterFence {
     pub writer: Option<[u8; 16]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreWriterClaim {
+    pub fence: StoreWriterFence,
+    pub generation: u64,
+    pub claim: [u8; 16],
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(in crate::branches) struct StoreWriterState {
     pub epoch: u64,

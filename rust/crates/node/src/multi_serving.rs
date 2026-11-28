@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, Role, ServingAuthority, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
-use rtdb_index::branches::store::{KeyRange, StorePage, StoreRead, sizes::StorageSizes};
+use rtdb_index::branches::store::{KeyRange, StorePage, StoreRead, StoreWriterClaim, sizes::StorageSizes};
 use rtdb_tx::transact::{
     CustodyGroupId, CustodyWriterFence, PHYSICAL_ERASURE, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand, workload,
 };
@@ -992,14 +992,14 @@ impl ServingDriver for MultiServing {
     }
 
     async fn publish_store_purge_floor(
-        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, memory: Arc<MemoryReservation>,
-        cancellation: &CancellationToken,
+        &self, since: Basis, keep_from: u64, reads: Vec<KeyRange>, writer: StoreWriterClaim,
+        memory: Arc<MemoryReservation>, cancellation: &CancellationToken,
     ) -> Result<()> {
         if self.classic_workload_fence.is_some() {
             return Err(workload::denied());
         }
         cancellation.run_until_cancelled(self.serve(
-            self.writes.publish_store_purge_floor(since, keep_from, reads, memory),
+            self.writes.publish_store_purge_floor(since, keep_from, reads, Some(writer), memory),
         )).await.ok_or_else(interrupted)?
     }
 
@@ -1474,8 +1474,8 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_local_multi_writer_publishes_a_guarded_store_floor() {
-        use rtdb_index::branches::store::Projection;
-        use rtdb_tx::transact::{StoreAppend, StoreWrite};
+        use rtdb_index::branches::store::{Projection, StoreWriterFence};
+        use rtdb_tx::transact::{Guard, StoreAppend, StoreWrite};
 
         let journal = MemoryJournal::default();
         let id = Uuid::from_u128(1);
@@ -1514,6 +1514,12 @@ mod tests {
         };
         let first = writer.transact(store_write(1, b"a", b"original"), &cancellation).await.unwrap().basis;
         let floor = writer.transact(store_write(2, b"a", b"replacement"), &cancellation).await.unwrap().basis;
+        let incarnation = floor.incarnation();
+        let fence = StoreWriterFence { epoch: 1, writer: Some([2; 16]) };
+        let first_attempt = [3; 16];
+        let first_claim = writer.transact(Transact::claim_store_writer(incarnation, fence, first_attempt), &cancellation)
+            .await.unwrap().basis;
+        let first_writer = StoreWriterClaim { fence, generation: first_claim.position(), claim: first_attempt };
         let guards = || vec![KeyRange { start: b"b".to_vec(), end: Some(b"c".to_vec()) }];
         let reserve = || memory.try_reserve(4096).unwrap();
         let read = || StoreRead {
@@ -1524,21 +1530,36 @@ mod tests {
         assert_eq!(original.entries[0].value.as_deref(), Some(b"original".as_slice()));
 
         assert!(!follower.supports_store_purge_floor().await);
-        let refusal = follower.publish_store_purge_floor(floor, floor.position(), guards(), reserve(), &cancellation)
+        let refusal = follower.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
             .await.unwrap_err();
         assert_eq!(refusal.code, "rtdb/no-writer");
         assert!(writer.supports_store_purge_floor().await);
-        for _ in 0..2 {
-            writer.publish_store_purge_floor(floor, floor.position(), guards(), reserve(), &cancellation).await.unwrap();
+        writer.publish_store_purge_floor(floor, floor.position(), guards(), first_writer, reserve(), &cancellation)
+            .await.unwrap();
+
+        let second_attempt = [4; 16];
+        let second_claim = writer.transact(Transact::claim_store_writer(incarnation, fence, second_attempt), &cancellation)
+            .await.unwrap().basis;
+        let current_writer = StoreWriterClaim { fence, generation: second_claim.position(), claim: second_attempt };
+        for stale in [first_writer, StoreWriterClaim { claim: first_attempt, ..current_writer }] {
+            let refusal = writer.publish_store_purge_floor(floor, floor.position(), guards(), stale, reserve(), &cancellation)
+                .await.unwrap_err();
+            assert_eq!(refusal.code, "rtdb.store/stale-writer");
         }
+        writer.publish_store_purge_floor(floor, floor.position(), guards(), current_writer, reserve(), &cancellation)
+            .await.unwrap();
 
         let expired = writer.read_store(read(), At::Exactly(first), Timestamp(100), &cancellation).await.unwrap_err();
         assert_eq!(expired.code, "rtdb/cursor-expired");
         let retained = writer.read_store(read(), At::Exactly(floor), Timestamp(100), &cancellation).await.unwrap();
         assert_eq!(retained.entries[0].value.as_deref(), Some(b"replacement".as_slice()));
 
-        writer.transact(store_write(3, b"b", b"new"), &cancellation).await.unwrap();
-        let refusal = writer.publish_store_purge_floor(floor, floor.position(), guards(), reserve(), &cancellation)
+        let mut write = store_write(3, b"b", b"new");
+        write.guards.push(Guard::StoreWriterGeneration {
+            incarnation, fence, generation: current_writer.generation, claim: current_writer.claim,
+        });
+        writer.transact(write, &cancellation).await.unwrap();
+        let refusal = writer.publish_store_purge_floor(floor, floor.position(), guards(), current_writer, reserve(), &cancellation)
             .await.unwrap_err();
         assert_eq!(refusal.code, "rtdb.store/purge-guard");
     }

@@ -17,7 +17,7 @@ use super::{BranchCut, BranchEvent, BranchView};
 
 pub mod sizes;
 mod writer;
-pub use writer::StoreWriterFence;
+pub use writer::{StoreWriterClaim, StoreWriterFence};
 pub(super) use writer::StoreWriterState;
 pub use store_derive;
 pub use store_filter::ValueFilter;

@@ -651,6 +651,7 @@ impl FlightService for Service {
             && call.session.caller.principal.label_scope().is_none()
             && call.session.caller.principal.workload_grant().is_none_or(|grant| grant.is_store_grant() || grant.is_placement_fence())
             && !call.session.fresh_replica && !self.follower_only();
+        let fenced_purge = retained_basis_append && self.supports_store_purge_floor(&call).await;
         #[cfg(feature = "multi")]
         let timed_append = call.session.timed_store_incarnation;
         let mut reply = result_stream(call, Vec::new())?;
@@ -667,6 +668,9 @@ impl FlightService for Service {
         }
         if fenced_append {
             reply.metadata_mut().insert(crate::v1::WRITER_FENCE_HEADER, tonic::metadata::MetadataValue::from_static("2"));
+        }
+        if fenced_purge {
+            reply.metadata_mut().insert(crate::v1::store::PURGE_WRITER_HEADER, tonic::metadata::MetadataValue::from_static("1"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());

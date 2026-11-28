@@ -1,5 +1,5 @@
 use prost::Message;
-use rtdb_flight_sql::rtdb::store::v1::{KeyRange, PurgeFloorReply, PurgeFloorRequest};
+use rtdb_flight_sql::rtdb::store::v1::{KeyRange, PurgeFloorReply, PurgeFloorRequest, WriterFence};
 
 #[test]
 fn purge_request_keeps_zero_versions_and_exact_guard_order_on_the_wire() {
@@ -12,12 +12,17 @@ fn purge_request_keeps_zero_versions_and_exact_guard_order_on_the_wire() {
             KeyRange { start: b"z".to_vec(), end: None },
             KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) },
         ],
+        writer_fence: Some(WriterFence { epoch: 1, writer: vec![2; 16], generation: 3, claim: vec![4; 16] }),
     };
     let mut wire = vec![0x0a, 16];
     wire.extend(incarnation);
     wire.extend([0x10, 0x00, 0x18, 0x00]);
     wire.extend([0x22, 3, 0x0a, 1, b'z']);
     wire.extend([0x22, 6, 0x0a, 1, b'a', 0x12, 1, b'b']);
+    wire.extend([0x2a, 40, 0x08, 1, 0x12, 16]);
+    wire.extend([2; 16]);
+    wire.extend([0x18, 3, 0x22, 16]);
+    wire.extend([4; 16]);
     assert_eq!(request.encode_to_vec(), wire);
     assert_eq!(PurgeFloorRequest::decode(wire.as_slice()).unwrap(), request);
 }

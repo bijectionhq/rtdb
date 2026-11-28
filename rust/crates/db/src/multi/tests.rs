@@ -361,24 +361,24 @@ async fn store_purge_preflight_checks_exact_absence_guards_after_checkpoint_trim
         KeyRange { start: b"h".to_vec(), end: Some(b"i".to_vec()) },
     ];
     writer.transact(&store_write(2, b"i", Some(b"outside"))).await.unwrap();
-    writer.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap();
+    writer.check_store_purge_floor(basis, basis.position(), &reads, None).await.unwrap();
     writer.transact(&store_write(3, b"held", Some(b"hold"))).await.unwrap();
     writer.transact(&store_write(4, b"held", None)).await.unwrap();
     writer.checkpoint(Vec::new()).await.unwrap();
 
-    let error = writer.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err();
+    let error = writer.check_store_purge_floor(basis, basis.position(), &reads, None).await.unwrap_err();
     assert_eq!(error.code, "rtdb.store/purge-guard");
     assert_eq!(error.context.get("read").and_then(|read| read.as_u64()), Some(1));
     let head = writer.stream.head().await.unwrap();
-    assert_eq!(writer.publish_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code,
+    assert_eq!(writer.publish_store_purge_floor(basis, basis.position(), &reads, None).await.unwrap_err().code,
         "rtdb.store/purge-guard");
     assert_eq!(writer.stream.head().await.unwrap(), head);
     let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
-    assert_eq!(follower.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code, "rtdb/no-writer");
+    assert_eq!(follower.check_store_purge_floor(basis, basis.position(), &reads, None).await.unwrap_err().code, "rtdb/no-writer");
     cluster.at(200);
-    assert_eq!(writer.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code, "rtdb/no-writer");
+    assert_eq!(writer.check_store_purge_floor(basis, basis.position(), &reads, None).await.unwrap_err().code, "rtdb/no-writer");
     assert!(matches!(follower.tick(&live(2)).await.unwrap(), Role::Writer(_)));
-    assert_eq!(follower.check_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code, "rtdb.store/purge-guard");
+    assert_eq!(follower.check_store_purge_floor(basis, basis.position(), &reads, None).await.unwrap_err().code, "rtdb.store/purge-guard");
 }
 
 #[tokio::test]
@@ -395,26 +395,26 @@ async fn store_purge_preflight_checks_committed_bases_and_preserves_native_reten
     let floor = current.position();
     let reads = [KeyRange { start: b"a".to_vec(), end: None }];
     let foreign = Basis::new([0; 16], floor);
-    assert_eq!(writer.check_store_purge_floor(foreign, floor, &reads).await.unwrap_err().code, "rtdb/foreign-basis");
-    assert_eq!(writer.check_store_purge_floor(current, floor + 1, &reads).await.unwrap_err().code, "rtdb.store/purge-floor-ahead");
+    assert_eq!(writer.check_store_purge_floor(foreign, floor, &reads, None).await.unwrap_err().code, "rtdb/foreign-basis");
+    assert_eq!(writer.check_store_purge_floor(current, floor + 1, &reads, None).await.unwrap_err().code, "rtdb.store/purge-floor-ahead");
     let empty = KeyRange { start: b"a".to_vec(), end: Some(b"a".to_vec()) };
-    assert_eq!(writer.check_store_purge_floor(current, floor, &[empty]).await.unwrap_err().code, "rtdb.store/empty-range");
+    assert_eq!(writer.check_store_purge_floor(current, floor, &[empty], None).await.unwrap_err().code, "rtdb.store/empty-range");
 
     let id = Uuid::from_u128(9);
     writer.pin_checkpoint_at(id, old, None).await.unwrap();
     let control = writer.state().coordinates.position(writer.state().head).unwrap();
     let control = Basis::new(current.incarnation(), control);
-    assert_eq!(writer.check_store_purge_floor(control, floor, &reads).await.unwrap_err().code, "rtdb/unknown-basis");
-    assert_eq!(writer.publish_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-pin");
+    assert_eq!(writer.check_store_purge_floor(control, floor, &reads, None).await.unwrap_err().code, "rtdb/unknown-basis");
+    assert_eq!(writer.publish_store_purge_floor(current, floor, &reads, None).await.unwrap_err().code, "rtdb.store/purge-pin");
     writer.release_pin(id).await.unwrap();
 
     writer.transact(&request(3, Op::Fork {
         child: "held".into(), from: (MAIN_BRANCH.into(), old), writable: false, expires_at: None,
     })).await.unwrap();
-    assert_eq!(writer.publish_store_purge_floor(current, floor, &reads).await.unwrap_err().code, "rtdb.store/purge-retention");
+    assert_eq!(writer.publish_store_purge_floor(current, floor, &reads, None).await.unwrap_err().code, "rtdb.store/purge-retention");
     let dropped = writer.transact(&request(4, Op::DropBranch { branch: "held".into() })).await.unwrap().basis;
     let head = writer.stream.head().await.unwrap();
-    writer.check_store_purge_floor(dropped, dropped.position(), &reads).await.unwrap();
+    writer.check_store_purge_floor(dropped, dropped.position(), &reads, None).await.unwrap();
     assert_eq!(writer.stream.head().await.unwrap(), head);
     assert_eq!(writer.fresh_index().await.unwrap().exact(old).unwrap().basis, old);
     let replay = writer.transact(&store_write(1, b"a", Some(b"old"))).await.unwrap();
@@ -431,13 +431,13 @@ async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
     writer.create().await.unwrap();
     writer.tick(&live(1)).await.unwrap();
     let first = writer.transact(&store_write(1, b"a", Some(b"first"))).await.unwrap().basis;
-    writer.publish_store_purge_floor(first, first.position(), &[]).await.unwrap();
+    writer.publish_store_purge_floor(first, first.position(), &[], None).await.unwrap();
     let capture = writer.capture_checkpoint(1).await.unwrap().unwrap();
     let prepared = writer.checkpoint_builder().build(capture).await.unwrap();
 
     let second = writer.transact(&store_write(2, b"a", Some(b"second"))).await.unwrap().basis;
     faults.inject(Fault::DropAppendReply);
-    assert_eq!(writer.publish_store_purge_floor(second, second.position(), &[]).await.unwrap_err().category,
+    assert_eq!(writer.publish_store_purge_floor(second, second.position(), &[], None).await.unwrap_err().category,
         AnomalyCategory::Interrupted);
     assert!(matches!(writer.tick(&live(1)).await.unwrap(), Role::Writer(_)));
     let publication = writer.state().head;
@@ -445,8 +445,8 @@ async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
     assert_eq!(first_record(&writer, publication).await, Record::StorePurgeReclaim {
         since: second, keep_from: second.position(),
     });
-    writer.publish_store_purge_floor(second, second.position(), &[]).await.unwrap();
-    writer.publish_store_purge_floor(second, first.position(), &[]).await.unwrap();
+    writer.publish_store_purge_floor(second, second.position(), &[], None).await.unwrap();
+    writer.publish_store_purge_floor(second, first.position(), &[], None).await.unwrap();
     assert_eq!(writer.stream.head().await.unwrap(), publication);
 
     writer.announce_checkpoint(prepared).await.unwrap().manifest().unwrap();
@@ -496,10 +496,10 @@ async fn permission_only_store_floor_can_be_reclaimed_by_an_authorized_retry() {
     let index = successor.fresh_index().await.unwrap();
     let view = index.view(MAIN_BRANCH, At::Exactly(old), Layer::Merged, Timestamp(200)).unwrap();
     assert_eq!(view.store_value(b"a").unwrap(), Some(b"old".as_slice()));
-    assert_eq!(successor.publish_store_purge_floor(current, current.position(), &[]).await.unwrap_err().code,
+    assert_eq!(successor.publish_store_purge_floor(current, current.position(), &[], None).await.unwrap_err().code,
         "rtdb.store/purge-pin");
     successor.release_pin(pin.id).await.unwrap();
-    successor.publish_store_purge_floor(current, current.position(), &[]).await.unwrap();
+    successor.publish_store_purge_floor(current, current.position(), &[], None).await.unwrap();
     assert_eq!(successor.fresh_index().await.unwrap().store_history_floor(), current.position());
 }
 
@@ -520,7 +520,7 @@ async fn store_purge_keeps_boundary_values_receipts_and_recovery_roots() {
     let boundary = writer.transact(&store_write(3, b"key", Some(b"replacement"))).await.unwrap().basis;
     let newest = writer.transact(&store_write(4, b"key", None)).await.unwrap().basis;
     let keys = KeyRange { start: b"key".to_vec(), end: Some(b"kez".to_vec()) };
-    writer.publish_store_purge_floor(newest, boundary.position(), std::slice::from_ref(&keys)).await.unwrap();
+    writer.publish_store_purge_floor(newest, boundary.position(), std::slice::from_ref(&keys), None).await.unwrap();
 
     let check = |index: &rtdb_index::branches::BranchIndex| {
         let id = EntityId::Binary(b"key".to_vec());
@@ -581,7 +581,7 @@ async fn store_purge_floor_append_is_fenced_after_admission() {
     let reads = [KeyRange { start: b"h".to_vec(), end: Some(b"i".to_vec()) }];
 
     gate.arm.store(true, Ordering::SeqCst);
-    let publish = writer.publish_store_purge_floor(basis, basis.position(), &reads);
+    let publish = writer.publish_store_purge_floor(basis, basis.position(), &reads, None);
     tokio::pin!(publish);
     tokio::select! {
         result = &mut publish => panic!("the floor returned before its append: {result:?}"),
@@ -593,7 +593,7 @@ async fn store_purge_floor_append_is_fenced_after_admission() {
     successor.transact(&store_write(2, b"held", Some(b"hold"))).await.unwrap();
     gate.release.notify_one();
     assert_eq!(publish.await.unwrap_err().code, "rtdb/writer-fenced");
-    assert_eq!(successor.publish_store_purge_floor(basis, basis.position(), &reads).await.unwrap_err().code,
+    assert_eq!(successor.publish_store_purge_floor(basis, basis.position(), &reads, None).await.unwrap_err().code,
         "rtdb.store/purge-guard");
     assert_eq!(successor.state().store_purge_floor, 0);
 }
@@ -616,7 +616,7 @@ async fn queued_store_purge_keeps_its_slot_when_the_caller_drops_the_reply() {
     let reads = vec![KeyRange { start: b"a".to_vec(), end: Some(b"b".to_vec()) }];
 
     gate.arm.store(true, Ordering::SeqCst);
-    let mut publish = Box::pin(writes.publish_store_purge_floor(basis, basis.position(), reads, reservation));
+    let mut publish = Box::pin(writes.publish_store_purge_floor(basis, basis.position(), reads, None, reservation));
     tokio::select! {
         result = &mut publish => panic!("the floor returned before its append: {result:?}"),
         reached = tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()) => reached.unwrap(),
@@ -643,13 +643,13 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
     let reader = [1; 32];
     let retain = StoreVersionHoldRequest::Retain { basis: old, expires_at: Timestamp(40) };
     let memory = rtdb_types::MemoryBudget::new(4096);
-    let purge = || writes.publish_store_purge_floor(current, current.position(), Vec::new(), memory.try_reserve(1024).unwrap());
+    let purge = || writes.publish_store_purge_floor(current, current.position(), Vec::new(), None, memory.try_reserve(1024).unwrap());
 
     let StoreVersionHoldReply::Held(first) = writes.store_version_hold(reader, retain).await.unwrap() else { panic!("expected a hold"); };
     assert_eq!(first.key.basis, old);
     assert_eq!(first.expires_at, Timestamp(40));
     assert_eq!(purge().await.unwrap_err().code, "rtdb.store/purge-retention");
-    writes.publish_store_purge_floor(current, old.position(), Vec::new(), memory.try_reserve(1024).unwrap()).await.unwrap();
+    writes.publish_store_purge_floor(current, old.position(), Vec::new(), None, memory.try_reserve(1024).unwrap()).await.unwrap();
 
     let wrong_version = StoreVersionHoldKey { basis: current, ..first.key };
     assert_eq!(writes.store_version_hold(reader, StoreVersionHoldRequest::Reopen(wrong_version)).await.unwrap_err().code,
@@ -697,7 +697,7 @@ async fn store_version_hold_cannot_reopen_on_a_replacement_writer() {
     successor.tick(&live(2)).await.unwrap();
     assert_eq!(writer.store_version_hold(reader, reopen).await.unwrap_err().code, "rtdb/no-writer");
     assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap_err().code, "rtdb.store/hold-unavailable");
-    successor.publish_store_purge_floor(current, current.position(), &[]).await.unwrap();
+    successor.publish_store_purge_floor(current, current.position(), &[], None).await.unwrap();
     assert_eq!(successor.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
 }
 

@@ -1,20 +1,22 @@
 use std::sync::Arc;
 
 use prost::Message;
-use rtdb_index::branches::store::KeyRange;
+use rtdb_index::branches::store::{KeyRange, StoreWriterClaim};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_types::{Anomaly, AnomalyCategory, rtdb_v1::Basis};
 use tonic::Status;
 
-use super::{Call, Service, error, incarnation, proto, ranges};
+use super::{Call, Service, error, incarnation, proto, ranges, writer};
 use crate::store_release::StoreRelease;
 
 pub(crate) const PURGE_FLOOR: &str = "rtdb.store.v1.PurgeFloor";
+pub(crate) const PURGE_WRITER_HEADER: &str = "x-rtdb-store-purge-writer";
 
 struct PurgePlan {
     since: Basis,
     keep_from: u64,
     reads: Vec<KeyRange>,
+    writer: StoreWriterClaim,
 }
 
 impl TryFrom<proto::PurgeFloorRequest> for PurgePlan {
@@ -32,7 +34,10 @@ impl TryFrom<proto::PurgeFloorRequest> for PurgePlan {
         if request.reads.is_empty() {
             return Err(error::incorrect("A purge floor names its writer and retention guards"));
         }
-        Ok(Self { since: Basis::new(incarnation, since), keep_from, reads: ranges(request.reads)? })
+        let binding = request.writer_fence.ok_or_else(|| error::incorrect("A purge floor requires its ordered writer claim"))?;
+        let fence = writer::fence(binding.epoch, Some(binding.writer))?;
+        let writer = writer::ordered_claim(fence, binding.generation, &binding.claim)?;
+        Ok(Self { since: Basis::new(incarnation, since), keep_from, reads: ranges(request.reads)?, writer })
     }
 }
 
@@ -78,12 +83,12 @@ impl Service {
             return Err(error::unsupported(PURGE_FLOOR));
         }
         require_purge_credential(call)?;
-        let PurgePlan { since, keep_from, reads } = request.try_into()?;
+        let PurgePlan { since, keep_from, reads, writer } = request.try_into()?;
         let (database, incarnation, _) = self.store_database(call, DatabaseAccess::Write, Some(&since.incarnation())).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported(PURGE_FLOOR))?;
         call.session.caller.principal.revalidate(self.0.node.now()).await.map_err(error::anomaly)?;
         self.check_purge_attachment(call, &database)?;
-        driver.publish_store_purge_floor(since, keep_from, reads, call.request_reservation(), &call.cancellation)
+        driver.publish_store_purge_floor(since, keep_from, reads, writer, call.request_reservation(), &call.cancellation)
             .await.map_err(error::purge_floor)?;
         self.check_purge_attachment(call, &database)?;
         Ok(proto::PurgeFloorReply { incarnation: incarnation.to_vec(), keep_from: Some(keep_from) }.encode_to_vec())
@@ -101,6 +106,7 @@ mod tests {
                 proto::KeyRange { start: vec![9], end: None },
                 proto::KeyRange { start: vec![1], end: Some(vec![2]) },
             ],
+            writer_fence: Some(proto::WriterFence { epoch: 4, writer: vec![2; 16], generation: 11, claim: vec![3; 16] }),
         }
     }
 
@@ -109,6 +115,10 @@ mod tests {
         let checked = PurgePlan::try_from(plan()).unwrap();
         assert_eq!(checked.since, Basis::new([9; 16], 0));
         assert_eq!(checked.keep_from, 0);
+        assert_eq!(checked.writer.fence.epoch, 4);
+        assert_eq!(checked.writer.fence.writer, Some([2; 16]));
+        assert_eq!(checked.writer.generation, 11);
+        assert_eq!(checked.writer.claim, [3; 16]);
         assert_eq!(checked.reads, [
             KeyRange { start: vec![9], end: None },
             KeyRange { start: vec![1], end: Some(vec![2]) },
@@ -124,6 +134,15 @@ mod tests {
             proto::PurgeFloorRequest { keep_from: None, ..plan() },
             proto::PurgeFloorRequest { keep_from: Some(1), ..plan() },
             proto::PurgeFloorRequest { reads: vec![], ..plan() },
+            proto::PurgeFloorRequest { writer_fence: None, ..plan() },
+            proto::PurgeFloorRequest {
+                writer_fence: Some(proto::WriterFence { generation: 0, ..plan().writer_fence.unwrap() }),
+                ..plan()
+            },
+            proto::PurgeFloorRequest {
+                writer_fence: Some(proto::WriterFence { claim: vec![1; 15], ..plan().writer_fence.unwrap() }),
+                ..plan()
+            },
             proto::PurgeFloorRequest {
                 reads: vec![proto::KeyRange { start: vec![1], end: Some(vec![1]) }],
                 ..plan()

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{
     Snapshot,
-    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{KeyRange, StorePage, StoreRead, sizes::StorageSizes}},
+    branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{KeyRange, StorePage, StoreRead, StoreWriterClaim, sizes::StorageSizes}},
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand, workload};
 #[cfg(feature = "multi")]
@@ -450,10 +450,10 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/hold-unsupported", "This route cannot order a Store Version hold"))
     }
 
-    /// Success confirms the durable floor in `since`'s incarnation after checking the exact retained basis and guards.
+    /// Success confirms the durable floor after checking the retained basis, guards and current writer claim.
     async fn publish_store_purge_floor(
-        &self, _since: Basis, _keep_from: u64, _reads: Vec<KeyRange>, _memory: Arc<MemoryReservation>,
-        _cancellation: &CancellationToken,
+        &self, _since: Basis, _keep_from: u64, _reads: Vec<KeyRange>, _writer: StoreWriterClaim,
+        _memory: Arc<MemoryReservation>, _cancellation: &CancellationToken,
     ) -> Result<()> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.store/purge-unsupported", "This route cannot order a store purge floor"))
     }
