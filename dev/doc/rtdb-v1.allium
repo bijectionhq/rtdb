@@ -259,6 +259,7 @@ surface StatelessDatabase {
         -- A Watch reply checks its original cursor even when the scan visited later effect pages.
         -- A live local writer retains a read turn through reply encoding. Its ordered purge refuses to pass any such turn's oldest basis.
         -- Release checks the original local read turn, writer epoch and key generation. A Rank reply refuses if its consulted pages span a writer change.
+        -- Flight checks the original delivery fence again on the response turn. The encoded body retains the writer's read turn through the transport handoff.
 
     @guarantee StoreVersionHold
         -- The hosted Multi writer orders exact physical Version admission and release alongside Store floor publication.

@@ -358,11 +358,19 @@ impl Service {
         let charge = call
             .reserve(result.len())
             .map_err(|status| call.error(error::map_status(status)))?;
+        let body = crate::wire::retain(result, charge);
+        #[cfg(feature = "multi")]
+        {
+            let mut call = call;
+            if let Some(guard) = call.take_store_reply()? {
+                return self.store_reply_stream(call, guard, body);
+            }
+            return result_stream(call, vec![Ok(flight::Result { body })]).map_err(error::map_status);
+        }
+        #[cfg(not(feature = "multi"))]
         result_stream(
             call,
-            vec![Ok(flight::Result {
-                body: crate::wire::retain(result, charge),
-            })],
+            vec![Ok(flight::Result { body })],
         )
         .map_err(error::map_status)
     }

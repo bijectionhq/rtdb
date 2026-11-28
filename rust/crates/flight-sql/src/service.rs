@@ -129,6 +129,8 @@ pub(crate) struct Call {
     _lease: Option<AcquiredSession>,
     _active_call: Option<Arc<dyn Send + Sync>>,
     _reservation: Arc<MemoryReservation>,
+    #[cfg(feature = "multi")]
+    store_reply: std::sync::Mutex<Option<crate::v1::store::StoreReplyGuard>>,
     egress: Option<Arc<crate::server::FlightEgress>>,
     routed_delivery: bool,
     pub(crate) classic_flight_excluded: bool,
@@ -145,6 +147,21 @@ impl Drop for Call {
     fn drop(&mut self) { self.cancellation.cancel(); self._lease.take(); }
 }
 impl Call {
+    #[cfg(feature = "multi")]
+    pub(crate) fn retain_store_reply(&self, guard: crate::v1::store::StoreReplyGuard) -> Result<(), Status> {
+        let mut slot = self.store_reply.lock().map_err(|_| Status::internal("Store reply ownership is unavailable"))?;
+        if slot.is_some() {
+            return Err(Status::internal("An action owns one Store reply"));
+        }
+        *slot = Some(guard);
+        Ok(())
+    }
+
+    #[cfg(feature = "multi")]
+    pub(crate) fn take_store_reply(&mut self) -> Result<Option<crate::v1::store::StoreReplyGuard>, Status> {
+        Ok(self.store_reply.get_mut().map_err(|_| Status::internal("Store reply ownership is unavailable"))?.take())
+    }
+
     pub(crate) fn require_imported_workload(&self, database: &rtdb_node::Database) -> Result<(), Status> {
         let Some(driver) = database.serving_driver() else { return Ok(()); };
         let Some(fence) = driver.classic_workload_fence() else { return Ok(()); };
@@ -544,6 +561,8 @@ impl Service {
             .and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
         let call = Call { service: self.clone(), kind, session, minted, database, cancellation: self.0.cancellation.child_token(),
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation,
+            #[cfg(feature = "multi")]
+            store_reply: std::sync::Mutex::new(None),
             egress: transport.map(|transport| transport.egress.clone()),
             routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward"),
             classic_flight_excluded, classic_retained: None };

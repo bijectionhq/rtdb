@@ -89,6 +89,26 @@ struct StoreBatch {
     hold: Option<rtdb_node::serving::StoreReadTurn>,
 }
 
+/// Retain the selected cut until the action response is handed to Flight.
+#[cfg(feature = "multi")]
+pub(crate) struct StoreReplyGuard {
+    pub(crate) database: std::sync::Arc<rtdb_node::Database>,
+    pub(crate) basis: Basis,
+    pub(crate) delivery: Option<rtdb_node::FollowerStoreDelivery>,
+    pub(crate) hold: Option<rtdb_node::serving::StoreReadTurn>,
+}
+
+#[cfg(feature = "multi")]
+struct RetainedStoreReply {
+    bytes: Bytes,
+    _guard: StoreReplyGuard,
+}
+
+#[cfg(feature = "multi")]
+impl AsRef<[u8]> for RetainedStoreReply {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
+}
+
 #[cfg(feature = "multi")]
 fn include_delivery(
     admitted: &mut Option<rtdb_node::FollowerStoreDelivery>,
@@ -314,14 +334,38 @@ impl Service {
 
     #[cfg(feature = "multi")]
     async fn check_follower_store_reply(
-        &self, delivery: Option<rtdb_node::FollowerStoreDelivery>,
+        &self, delivery: Option<&rtdb_node::FollowerStoreDelivery>,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<(), Status> {
         if let Some(delivery) = delivery {
             let follower = self.follower().ok_or_else(|| Status::unavailable("The assigned Store follower is unavailable"))?;
-            follower.reader.check_store_delivery(&delivery, cancellation).await.map_err(error::follower)?;
+            follower.reader.check_store_delivery(delivery, cancellation).await.map_err(error::follower)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "multi")]
+    pub(crate) async fn check_store_reply_guard(&self, call: &Call, guard: &StoreReplyGuard) -> Result<(), Status> {
+        let driver = guard.database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
+        self.check_follower_store_reply(guard.delivery.as_ref(), &call.cancellation).await?;
+        self.check_local_store_reply(driver, guard.basis, &call.cancellation, guard.hold.as_ref()).await?;
+        self.check_attachment(call, &guard.database)
+    }
+
+    #[cfg(feature = "multi")]
+    pub(super) fn store_reply_stream(
+        &self, call: Call, guard: StoreReplyGuard, bytes: Bytes,
+    ) -> Result<tonic::Response<crate::service::Output<arrow_flight::Result>>, Status> {
+        let headers = call.response(())?.metadata().clone();
+        let service = self.clone();
+        let stream: crate::service::Output<_> = Box::pin(async_stream::try_stream! {
+            service.check_store_reply_guard(&call, &guard).await.map_err(|status| call.error(status))?;
+            let body = Bytes::from_owner(RetainedStoreReply { bytes, _guard: guard });
+            yield arrow_flight::Result { body };
+        });
+        let mut response = tonic::Response::new(stream);
+        *response.metadata_mut() = headers;
+        Ok(response)
     }
 
     async fn check_local_store_reply(
@@ -370,8 +414,6 @@ impl Service {
         });
         let clock = self.0.node.now();
         let batch = self.read_store_batch(driver, &mut reads, at, incarnation, clock, &call.cancellation).await?;
-        #[cfg(feature = "multi")]
-        let hold = batch.hold;
         let pages = batch.pages.into_iter().map(|page| proto::RangePage {
             entries: page.entries.into_iter().map(|entry| proto::Entry {
                 key: entry.key, value: entry.value, written: entry.written.position(),
@@ -385,12 +427,16 @@ impl Service {
             clock_micros: Some(clock.0),
         }.encode_to_vec();
         #[cfg(feature = "multi")]
-        self.check_follower_store_reply(batch.delivery, &call.cancellation).await?;
+        {
+            let guard = StoreReplyGuard { database, basis: batch.basis, delivery: batch.delivery, hold: batch.hold };
+            self.check_store_reply_guard(call, &guard).await?;
+            call.retain_store_reply(guard)?;
+        }
+        #[cfg(not(feature = "multi"))]
         self.check_local_store_reply(
             driver, batch.basis, &call.cancellation,
-            #[cfg(feature = "multi")]
-            hold.as_ref(),
         ).await?;
+        #[cfg(not(feature = "multi"))]
         self.check_attachment(call, &database)?;
         Ok(reply)
     }
@@ -625,12 +671,16 @@ impl Service {
             through: after.position(),
         }.encode_to_vec();
         #[cfg(feature = "multi")]
-        self.check_follower_store_reply(delivery, &call.cancellation).await?;
+        {
+            let guard = StoreReplyGuard { database, basis: original, delivery, hold };
+            self.check_store_reply_guard(call, &guard).await?;
+            call.retain_store_reply(guard)?;
+        }
+        #[cfg(not(feature = "multi"))]
         self.check_local_store_reply(
             driver, original, &call.cancellation,
-            #[cfg(feature = "multi")]
-            hold.as_ref(),
         ).await?;
+        #[cfg(not(feature = "multi"))]
         self.check_attachment(call, &database)?;
         Ok(reply)
     }
@@ -665,16 +715,20 @@ impl Service {
         let reply = reply.encode().map_err(|failed| Status::internal(failed.to_string()))?;
         let reply = proto::RankReply { incarnation: incarnation.to_vec(), reply }.encode_to_vec();
         #[cfg(feature = "multi")]
-        self.check_follower_store_reply(
-            source.delivery.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))?, &call.cancellation,
-        ).await?;
+        let delivery = source.delivery.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
         #[cfg(feature = "multi")]
         let hold = source.hold.into_inner().map_err(|_| Status::internal("Rank retention state is unavailable"))?;
         if let Some(oldest) = source.oldest.into_inner().map_err(|_| Status::internal("Rank delivery state is unavailable"))? {
+            #[cfg(feature = "multi")]
+            {
+                let guard = StoreReplyGuard { database, basis: oldest, delivery, hold };
+                self.check_store_reply_guard(call, &guard).await?;
+                call.retain_store_reply(guard)?;
+                return Ok(reply);
+            }
+            #[cfg(not(feature = "multi"))]
             self.check_local_store_reply(
                 driver, oldest, &call.cancellation,
-                #[cfg(feature = "multi")]
-                hold.as_ref(),
             ).await?;
         }
         self.check_attachment(call, &database)?;
