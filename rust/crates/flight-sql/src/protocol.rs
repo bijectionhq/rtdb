@@ -22,7 +22,13 @@ pub(crate) struct OptionError { #[prost(int32, tag = "1")] pub value: i32 }
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct SetOptionsResult { #[prost(btree_map = "string, message", tag = "1")] pub errors: BTreeMap<String, OptionError> }
 #[derive(Clone, PartialEq, Message)]
-pub(crate) struct CloseResult { #[prost(int32, tag = "1")] pub status: i32 }
+pub(crate) struct CloseResult {
+    #[prost(int32, tag = "1")]
+    pub status: i32,
+    /// Store calls and Flight-owned reply buffers of this closed session.
+    #[prost(bool, tag = "2")]
+    pub store_reads_drained: bool,
+}
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct PreparedResult {
     #[prost(bytes = "bytes", tag = "1")] pub prepared_statement_handle: bytes::Bytes,

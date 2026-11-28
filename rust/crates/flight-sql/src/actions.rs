@@ -495,9 +495,9 @@ impl Service {
                 }
                 CLOSE_SESSION => {
                     protocol::Empty::decode(action.body.as_ref()).map_err(arrow)?;
-                    call.close_session();
+                    call.close_session().await;
                     if call.minted { return Err(Status::not_found("No session to close")); }
-                    let result = protocol::CloseResult { status: 1 };
+                    let result = protocol::CloseResult { status: 1, store_reads_drained: true };
                     let charge = call.reserve(wire::add(result.encoded_len(), 256)?)?;
                     Ok(vec![Ok(ActionResult { body: wire::retain(result.encode_to_vec(), charge) })])
                 }

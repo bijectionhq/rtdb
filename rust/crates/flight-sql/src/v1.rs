@@ -358,7 +358,7 @@ impl Service {
         let charge = call
             .reserve(result.len())
             .map_err(|status| call.error(error::map_status(status)))?;
-        let body = crate::wire::retain(result, charge);
+        let body = call.retain_store_read_body(crate::wire::retain(result, charge));
         #[cfg(feature = "multi")]
         {
             let mut call = call;

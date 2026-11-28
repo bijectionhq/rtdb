@@ -46,6 +46,23 @@ enum SessionState {
 }
 struct Placement { name: String, attachment: Weak<Database> }
 
+#[derive(Default)]
+struct StoreReadDrain {
+    active: std::sync::atomic::AtomicUsize,
+    finished: tokio::sync::Notify,
+}
+
+/// One admitted call, including all Flight-owned copies of its reply buffer.
+pub(crate) struct StoreReadLease(Arc<StoreReadDrain>);
+
+impl Drop for StoreReadLease {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.finished.notify_waiters();
+        }
+    }
+}
+
 pub(crate) struct Session {
     pub id: String,
     pub caller: Arc<Caller>,
@@ -54,6 +71,7 @@ pub(crate) struct Session {
     pub(crate) timed_store_incarnation: Option<[u8; 16]>,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
+    store_reads: Arc<StoreReadDrain>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Session {
@@ -63,6 +81,7 @@ impl Session {
         Self {
             id, caller, placement, fresh_replica, store_release, timed_store_incarnation,
             state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }),
+            store_reads: Arc::default(),
             _reservation: reservation,
         }
     }
@@ -73,6 +92,28 @@ impl Session {
             return Err(Status::not_found("session closed"));
         }
         register()
+    }
+
+    pub(crate) fn enter_store_read(&self) -> Result<Arc<StoreReadLease>, Status> {
+        let mut lease = None;
+        self.register_read(|| {
+            self.store_reads.active.fetch_add(1, Ordering::AcqRel);
+            lease = Some(Arc::new(StoreReadLease(self.store_reads.clone())));
+            Ok(())
+        })?;
+        Ok(lease.expect("Store reader registered under the session lock"))
+    }
+
+    pub(crate) async fn wait_store_reads(&self) {
+        loop {
+            let completion = self.store_reads.finished.notified();
+            tokio::pin!(completion);
+            completion.as_mut().enable();
+            if self.store_reads.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            completion.await;
+        }
     }
 
     pub fn memory(&self) -> &Arc<MemoryBudget> { self._reservation.budget() }

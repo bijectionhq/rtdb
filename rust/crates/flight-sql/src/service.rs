@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
-use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::{Binding, ServerStatus}, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::{Binding, ServerStatus}, state::{ConnectionResource, Prepared, PreparedScope, Session, StoreReadLease, Transaction}, wire};
 use crate::store_release::{self, StoreRelease};
 
 pub(crate) const CLOSE_SESSION: &str = "CloseSession";
@@ -48,7 +48,7 @@ pub(crate) struct Inner {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store, StoreRead, StoreWriter,
+enum CallKind { Ordinary, Handshake, Action, SessionClose, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store, StoreRead, StoreWriter,
     #[cfg(feature = "multi")]
     StoreTimedAppend,
 }
@@ -64,11 +64,11 @@ impl CallKind {
     }
 
     fn allows_label_scope(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::Store | Self::StoreRead | Self::V1Appointment | Self::TxStatus)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::SessionClose | Self::Store | Self::StoreRead | Self::V1Appointment | Self::TxStatus)
     }
 
     fn serves_assigned_follower(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities | Self::V1ExactRead)
+        matches!(self, Self::Handshake | Self::SessionClose | Self::V1Query | Self::V1Capabilities | Self::V1ExactRead)
     }
 
     fn allows_workload_root_read(self) -> bool {
@@ -94,7 +94,7 @@ impl CallKind {
     /// A store grant (a placement fence or a provisioning grant) reaches only
     /// the store contract, whose actions keep it inside its scope.
     fn allows_store_grant(self) -> bool {
-        matches!(self, Self::Handshake | Self::Store | Self::StoreRead)
+        matches!(self, Self::Handshake | Self::SessionClose | Self::Store | Self::StoreRead)
     }
 
     fn allows_funded_appointment(self) -> bool {
@@ -109,7 +109,9 @@ impl CallKind {
     }
 
     fn action(name: &str) -> Self {
-        if name == crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 {
+        if name == CLOSE_SESSION {
+            Self::SessionClose
+        } else if name == crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 {
             Self::OpenFresh
         } else if name.starts_with("rtdb.owned.") {
             Self::OwnedAction
@@ -128,6 +130,7 @@ pub(crate) struct Call {
     admission: Arc<Admission>,
     _lease: Option<AcquiredSession>,
     _active_call: Option<Arc<dyn Send + Sync>>,
+    store_read: Option<Arc<StoreReadLease>>,
     _reservation: Arc<MemoryReservation>,
     #[cfg(feature = "multi")]
     store_reply: std::sync::Mutex<Option<crate::v1::store::StoreReplyGuard>>,
@@ -136,6 +139,15 @@ pub(crate) struct Call {
     pub(crate) classic_flight_excluded: bool,
     pub(crate) classic_retained: Option<crate::ClassicRetainedAdmission>,
 }
+struct StoreReadBuffer {
+    bytes: Bytes,
+    _reader: Arc<StoreReadLease>,
+}
+
+impl AsRef<[u8]> for StoreReadBuffer {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
+}
+
 struct Admission { service: Service, permit: Option<OwnedSemaphorePermit> }
 impl Admission {
     fn new(service: Service, permit: OwnedSemaphorePermit) -> Self { service.0.status.send_modify(|status| status.active_calls += 1); Self { service, permit: Some(permit) } }
@@ -253,8 +265,16 @@ impl Call {
     pub(crate) fn retain_request_bytes(&self, bytes: impl Into<Bytes>) -> Bytes {
         wire::retain(bytes, self.request_reservation())
     }
-    pub fn close_session(&self) {
+    pub(crate) fn retain_store_read_body(&self, bytes: Bytes) -> Bytes {
+        match &self.store_read {
+            Some(reader) => Bytes::from_owner(StoreReadBuffer { bytes, _reader: reader.clone() }),
+            None => bytes,
+        }
+    }
+
+    pub async fn close_session(&self) {
         self.service.retire_session(&self.session);
+        self.session.wait_store_reads().await;
     }
     pub fn error(&self, mut error: Status) -> Status {
         if let Ok(response) = self.response(()) { for key in ["set-cookie", "authorization"] { if let Some(value) = response.metadata().get(key) { error.metadata_mut().insert(key, value.clone()); } } }
@@ -290,9 +310,8 @@ impl Service {
         crate::ticket::Binding { mac: self.0.auth.ticket_mac(), session: &call.session.id, owner: call.session.caller.owner }
     }
     fn retire_session(&self, session: &Session) {
-        if let Lookup::Found(registered) = self.0.sessions.take(&session.id) {
-            registered.close();
-        }
+        session.close();
+        let _ = self.0.sessions.take(&session.id);
         self.0.owned_reads.close_where(|read| read.session == session.id);
         self.0.owned_world_reads.close_where(|read| read.session == session.id);
         self.0.exact_reads.close_where(|read| read.session == session.id);
@@ -442,7 +461,7 @@ impl Service {
             if timed_store.is_some() {
                 return Err(Status::failed_precondition("A timed Store handshake opens a new Flight session"));
             }
-            if session.fresh_replica && !store_read && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
+            if session.fresh_replica && !store_read && !matches!(kind, CallKind::Action | CallKind::SessionClose | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if let Some(raw) = credentials.raw() {
@@ -558,8 +577,9 @@ impl Service {
         if classic_flight_excluded && matches!(kind, CallKind::OpenFresh) && !retained_proof { return Err(classic_flight_refusal()); }
         let active_call = attachment.as_deref().filter(|_| !retained_proof)
             .and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
+        let store_read = store_read.then(|| session.enter_store_read()).transpose()?;
         let call = Call { service: self.clone(), kind, session, minted, database, cancellation: self.0.cancellation.child_token(),
-            admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation,
+            admission, _lease: Some(lease), _active_call: active_call, store_read, _reservation: reservation,
             #[cfg(feature = "multi")]
             store_reply: std::sync::Mutex::new(None),
             egress: transport.map(|transport| transport.egress.clone()),
