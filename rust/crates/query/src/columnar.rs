@@ -5437,7 +5437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_and_empty_delimiters_write_split_lists_with_the_checked_layouts() {
+    async fn string_to_array_preserves_ascii_null_delimiter_tokens_and_observed_layouts() {
         let memory = MemoryBudget::new(1 << 22);
         let input = field(0, ScalarType::Utf8);
         let delimiter = field(1, ScalarType::Utf8);
@@ -5456,19 +5456,30 @@ mod tests {
             let name = "string_to_array";
             Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args }
         };
-        let texts = [Some("é🪢é\0🪢"), Some("😀\0"), None, Some(""), Some("🪢")];
+        let texts = [Some("é🪢é\0🪢"), Some("A\0\n\u{7f}"), Some("😀\0"), None, Some(""), Some("🪢")];
         let mut cursor = record_projection_cursor(
-            batch(&texts, &[Some("🪢"), Some(""), None, None, Some("🪢")]),
+            batch(&texts, &[Some("🪢"), None, Some(""), None, None, Some("🪢")]),
             schema.clone(), vec![expr(delimiter.expression()), expr(Expr::Literal(Value::Utf8(String::new())))], &memory,
         );
         cursor.scalar_fallbacks = Some(0);
         let page = cursor.next_batch().await.unwrap().unwrap();
         assert_eq!(cursor.scalar_fallbacks, Some(0));
         assert_observed_list_result(&page.columns[0], &[
-            list(&["é", "é\0", ""]), list(&["😀\0"]), Value::Null, list(&[]), list(&["", ""]),
+            list(&["é", "é\0", ""]), list(&["A", "\0", "\n", "\u{7f}"]), list(&["😀\0"]),
+            Value::Null, list(&[]), list(&["", ""]),
         ], &memory);
         assert_observed_list_result(&page.columns[1], &[
-            list(&["é🪢é\0🪢"]), list(&["😀\0"]), Value::Null, list(&[]), list(&["🪢"]),
+            list(&["é🪢é\0🪢"]), list(&["A\0\n\u{7f}"]), list(&["😀\0"]), Value::Null, list(&[]), list(&["🪢"]),
+        ], &memory);
+
+        let mut cursor = record_projection_cursor(
+            batch(&[Some("a b"), None, Some("")], &[None; 3]), schema.clone(), vec![expr(Expr::Literal(Value::Null))], &memory,
+        );
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        assert_observed_list_result(&page.columns[0], &[
+            list(&["a", " ", "b"]), Value::Null, list(&[]),
         ], &memory);
 
         let expression = expr(Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) });
@@ -5479,11 +5490,13 @@ mod tests {
         assert_eq!(cursor.scalar_fallbacks, Some(0));
         assert_observed_list_result(&page.columns[0], &[list(&["a", "b", ""])], &memory);
 
-        let mut cursor = record_projection_cursor(batch(&[Some("😀a")], &[None]), schema, vec![expr(delimiter.expression())], &memory);
+        let mut cursor = record_projection_cursor(
+            batch(&[Some("a b"), Some("😀a"), Some("é")], &[None; 3]), schema, vec![expr(delimiter.expression())], &memory,
+        );
         cursor.scalar_fallbacks = Some(0);
         let page = cursor.next_batch().await.unwrap().unwrap();
         assert_eq!(cursor.scalar_fallbacks, Some(1));
-        assert_observed_list_result(&page.columns[0], &[list(&["?", "?", "a"])], &memory);
+        assert_observed_list_result(&page.columns[0], &[list(&["a", " ", "b"]), list(&["?", "?", "a"]), list(&["é"])], &memory);
     }
 
     #[tokio::test]

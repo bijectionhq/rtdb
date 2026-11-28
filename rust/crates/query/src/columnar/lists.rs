@@ -82,6 +82,7 @@ enum ListRow<'a> {
     Null,
     Empty,
     Split(&'a str, &'a str),
+    AsciiUnits(&'a str),
     Text(&'a StringArray, Range<usize>),
     Binary(&'a BinaryArray, Range<usize>),
 }
@@ -103,10 +104,12 @@ pub(super) fn list_call(
             let row = |row| {
                 let text = source.read(row, text_cell)?;
                 let delimiter = delimiter.read(row, text_cell)?;
-                match text {
-                    None => Some(ListRow::Null),
-                    Some("") => Some(ListRow::Empty),
-                    Some(text) => Some(ListRow::Split(text, delimiter?)),
+                match (text, delimiter) {
+                    (None, _) => Some(ListRow::Null),
+                    (Some(""), _) => Some(ListRow::Empty),
+                    (Some(text), Some(delimiter)) => Some(ListRow::Split(text, delimiter)),
+                    (Some(text), None) if text.is_ascii() => Some(ListRow::AsciiUnits(text)),
+                    _ => None,
                 }
             };
             project_runs(row, batch.len, execution)
@@ -163,6 +166,7 @@ fn project_runs<'a>(
                 let separators = text.matches(delimiter).count();
                 (ListShape::Text(false), separators + 1, text.len() - separators * delimiter.len())
             }
+            ListRow::AsciiUnits(text) => (ListShape::Text(false), text.len(), text.len()),
             ListRow::Text(array, rows) => measure_prefix(array, rows, |row| array.value(row).len(), ListShape::Text, execution)?,
             ListRow::Binary(array, rows) => measure_prefix(array, rows, |row| array.value(row).len(), ListShape::Binary, execution)?,
         };
@@ -275,6 +279,12 @@ fn write_run<'a>(
                             Some(ListRow::Split(text, "")) => builder.append_value(text),
                             Some(ListRow::Split(text, delimiter)) => {
                                 for part in text.split(delimiter) { builder.append_value(part); }
+                            }
+                            Some(ListRow::AsciiUnits(text)) => {
+                                for start in 0..text.len() {
+                                    execution.context.check_cancelled_at(start + 1)?;
+                                    builder.append_value(&text[start..start + 1]);
+                                }
                             }
                             Some(ListRow::Text(array, rows)) => {
                                 for row in rows {

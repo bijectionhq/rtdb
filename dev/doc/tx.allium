@@ -230,6 +230,7 @@
 -- A null list parent short-circuits the trim count, and a reached null count yields null.
 -- The trimmed output preserves null parents, bottom-typed empty lists, and the type and nullability observed in each retained prefix.
 -- Native STRING_TO_ARRAY with an exact text delimiter can write tokens from plain text into funded Arrow lists.
+-- With a null delimiter, native STRING_TO_ARRAY can write one token per ASCII byte into a funded Arrow list.
 -- The result preserves null inputs, empty lists, and empty tokens within nonempty inputs in their observed layouts.
 -- An empty delimiter keeps nonempty text as one token, and a null delimiter splits it into UTF-16 units.
 -- JVM STRING_TO_ARRAY with well-formed UTF-8 operands can write token spans into a plain Arrow UTF-8 list using its projection allocator.
