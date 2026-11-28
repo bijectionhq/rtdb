@@ -74,6 +74,12 @@ The authenticated writer handshake advertises `x-rtdb-store-writer-fence: 1`.
 A checkpoint preserves the fence at its selected cut, and a restored incarnation starts with that epoch closed for a new claim.
 Fence changes produce no byte-key writes or range-watch matches.
 
+An authenticated access probe supports checking isolation at an exact placed Store endpoint.
+The caller sends the 16 incarnation bytes in the binary `x-rtdb-store-access-probe-bin` metadata of a new Flight handshake.
+A verified principal denied database read access receives `PERMISSION_DENIED` with `StoreAccessDenial` in `x-rtdb-store-access-denial-bin`.
+The denial binds the selected database, current incarnation and authenticated principal.
+Probes issue no session.
+
 *Derived writes.* A write may be a _derive_ (`AppendRequest.derives`, encoded by Bijection's `store_read::derive` and vendored verbatim as `rust/vendor/bijection-store-derive`), also called retire-on-write.
 It names a row's derived-line manifest prefix, the lookup levels in which its previous line is found (the target world's own, then each ancestor bounded by its fork stamp), an interval `[from, to)` of the `i64` valid axis (each bound a fixed instant or the stamp's micros plus an offset, so a period bound placed as `now + d`, start or end, takes the stamp), and the row's new derived entries over that interval, or `Close` on a unit's closure, or `Purge` on erasure or expiry, or `Backfill`: a path backfill's entries for the row's history, written as given and added to the line's inventory so a purge deletes them. A `Close` and a `Purge` also name the compaction bases of the row's counted paths (`CountedBase`: the path's record identity, its value lanes, and where its bases lie), read from Bijection's catalog without reading the store.
 Each entry is one of five kinds, each with one exact law:

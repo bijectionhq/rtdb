@@ -231,6 +231,61 @@ async fn a_forwarded_reader_checks_the_release_before_issuing_a_session() {
 }
 
 #[tokio::test]
+async fn a_store_access_probe_binds_a_verified_denial_to_the_placed_store() {
+    use rtdb_auth::{GrantedAccess, Method, MethodRule, PasswordHash};
+    use rtdb_flight_sql::rtdb::store::v1::StoreAccessDenial;
+    use rtdb_node::serving::NativeServingAuthority;
+
+    const PROBE: &str = "x-rtdb-store-access-probe-bin";
+    const DENIAL: &str = "x-rtdb-store-access-denial-bin";
+    let incarnation = [54; 16];
+    let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
+        .with_native_serving_authority("catalog", NativeServingAuthority { incarnation, checkpoints: None })));
+    let running = Running::start_with_clocked_resources(
+        None, FlightConfig::default(), &["catalog"], None, Default::default(), None, Some(resources),
+    ).await;
+    let password = PasswordHash::bcrypt("secret").unwrap();
+    let auth_config = AuthConfig::UserList {
+        users: [("tenant".into(), password.clone()), ("owner".into(), password)].into(),
+        rules: vec![MethodRule::any(Method::Password)],
+        grants: [
+            ("tenant".into(), [("catalog".into(), GrantedAccess::Deny)].into()),
+            ("owner".into(), [("catalog".into(), GrantedAccess::Read)].into()),
+        ].into(),
+    };
+    let auth = Authenticator::open(auth_config, MemoryBudget::new(64 << 20), running.clock.clone(), Arc::new(NoHttp)).await.unwrap();
+    let config = FlightConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    let (server, driver) = ServerDriver::bind_with_clock(config, running.node.clone(), auth, running.clock.clone()).await.unwrap();
+    let task = tokio::spawn(driver.run());
+    let channel = Channel::from_shared(format!("http://{}", server.address())).unwrap().connect().await.unwrap();
+    let mut client = FlightServiceClient::new(channel);
+    let probe = |credentials, expected: [u8; 16]| {
+        use base64::Engine;
+        let mut request = Request::new(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
+        let headers = request.metadata_mut();
+        headers.insert("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(credentials)).parse().unwrap());
+        headers.insert("x-xtdb-database", "catalog".parse().unwrap());
+        headers.insert_bin(PROBE, tonic::metadata::MetadataValue::from_bytes(&expected));
+        request
+    };
+    let refusal = client.handshake(probe("tenant:secret", incarnation)).await.err().unwrap();
+    assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    let details = refusal.metadata().get_bin(DENIAL).unwrap().to_bytes().unwrap();
+    assert_eq!(StoreAccessDenial::decode(details).unwrap(), StoreAccessDenial {
+        database: "catalog".into(), incarnation: incarnation.to_vec(), principal: "tenant".into(),
+    });
+    assert!(!refusal.metadata().contains_key("authorization"));
+    for (credential, expected) in [("tenant:wrong", incarnation), ("tenant:secret", [1; 16]), ("owner:secret", incarnation)] {
+        let refusal = client.handshake(probe(credential, expected)).await.err().unwrap();
+        assert!(refusal.metadata().get_bin(DENIAL).is_none());
+    }
+    assert_eq!(server.status().sessions, 0);
+    server.shutdown();
+    task.await.unwrap().unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn store_fence_closes_the_previous_assignment() {
     use rtdb_flight_sql::rtdb::store::v1 as store;
     use rtdb_node::serving::NativeServingAuthority;

@@ -41,6 +41,7 @@ use tonic::Status;
 use super::{MAX_CHANGE_GROUPS, MAX_WAIT, check_key, error};
 use crate::{rtdb::store::v1 as proto, service::{Call, Service}};
 
+pub(crate) mod access;
 #[cfg(feature = "multi")]
 mod hold_version;
 mod purge;

@@ -231,6 +231,11 @@ surface StatelessDatabase {
         -- Replay and checkpoints preserve the fence at their selected position.
         -- A restore to a new incarnation carries the fence epoch in the closed state.
 
+    @guarantee PlacedStoreIsolationProbe
+        -- A new handshake can probe a verified principal's read admission at the named placed store incarnation.
+        -- An authorization denial binds the selected database, current incarnation and authenticated principal.
+        -- A probe issues no session.
+
     @guarantee StorePurgeFloor
         -- PurgeFloor requires a verified credential with unscoped database write access to the attached Multi incarnation.
         -- The request names one retained basis, a minimum retained version at or below that basis, and the original ordered list of half-open guards.

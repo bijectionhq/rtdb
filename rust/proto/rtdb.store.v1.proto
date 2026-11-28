@@ -197,6 +197,13 @@ message FenceWriterReply {
   optional bytes writer = 3;
 }
 
+// Returned in x-rtdb-store-access-denial-bin on a denied access probe.
+message StoreAccessDenial {
+  string database = 1;
+  bytes incarnation = 2;
+  string principal = 3;
+}
+
 message AppendReply {
   bytes incarnation = 1;
   oneof outcome {

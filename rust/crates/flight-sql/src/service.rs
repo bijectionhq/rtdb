@@ -311,6 +311,7 @@ impl Service {
         }
         let transport = request.extensions().get::<crate::server::FlightConnectInfo>();
         let is_handshake = matches!(kind, CallKind::Handshake);
+        let store_access_probe = crate::v1::store_access::probe(request.metadata(), is_handshake)?;
         let store_action = matches!(kind, CallKind::Store | CallKind::StoreRead);
         let offers_store_release = request.metadata().contains_key(store_release::HEADER);
         let store_handshake = is_handshake && offers_store_release;
@@ -370,6 +371,9 @@ impl Service {
         };
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
+        if store_access_probe.is_some() && (bearer.or(cookie).is_some() || self.follower_only() || store_handshake) {
+            return Err(Status::invalid_argument("A Store access probe requires new credentials on a placed writer route"));
+        }
         if retained_proof && bearer.or(cookie).is_none() { return Err(classic_retained_refusal()); }
         if let (Some(cookie), Some(bearer)) = (cookie, bearer) { if !auth::equal(cookie.as_bytes(), bearer.as_bytes()) { return Err(auth::unauthenticated("the session cookie and bearer token name different sessions")); } }
         let (session, minted, lease, mint_exclusion) = if let Some(id) = bearer.or(cookie) {
@@ -420,6 +424,16 @@ impl Service {
                 (transport.and_then(|transport| transport.peer.remote_addr()).or_else(|| request.remote_addr()).map(|address| address.ip().to_string()), None, false)
             };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
+            if let Some(expected) = store_access_probe {
+                if !catalog.is_placed() || fresh_replica {
+                    return Err(crate::v1::error::unsupported("store.access-probe"));
+                }
+                let attachment = match verified_attachment {
+                    Some(attachment) => attachment,
+                    None => catalog.database(placed_name()?).map_err(status)?,
+                };
+                return Err(crate::v1::store_access::store_denial(&caller, &attachment, expected));
+            }
             if store_action { StoreRelease::require(None)?; }
             if self.follower_only() && (!caller.verified_credential || caller.principal.label_scope().is_some()) {
                 return Err(auth::unauthenticated("The assigned follower requires verified unscoped credentials"));

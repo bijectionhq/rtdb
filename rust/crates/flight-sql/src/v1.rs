@@ -53,6 +53,7 @@ pub(crate) const TX_STATUS: &str = "rtdb.v1.TxStatus";
 pub(crate) const OFFER_DECISION_CLOCK: &str = "rtdb.v1.OfferDecisionClock";
 pub(crate) use store::ACTIONS as STORE_ACTIONS;
 pub(crate) use store::WRITER_FENCE_HEADER;
+pub(crate) use store::access as store_access;
 pub(crate) const ACTIONS: [&str; 6] = [
     CAPABILITIES,
     exact_read::OPEN,
