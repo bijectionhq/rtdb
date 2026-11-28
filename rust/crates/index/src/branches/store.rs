@@ -377,9 +377,8 @@ pub fn resolve_derives(
                     out.extend(emitted.into_iter().map(|write| (write.key, write.value)));
                     continue;
                 }
-                // A close keeps the line's versions, with a closed one on
-                // top; where the row never sat, or its line is closed
-                // already, it changes nothing.
+                // A successful close replaces the old manifests with
+                // one closed version at this append's position.
                 let Some((emitted, closed)) = store_derive::close::<Removal>(&derive.manifest_prefix, &stored, bases, &mut lookup).map_err(Removal::anomaly)? else {
                     if !stored.is_empty() {
                         pending_manifests.insert(derive.manifest_prefix.clone(), stored);
@@ -390,8 +389,7 @@ pub fn resolve_derives(
                 let manifest_key = store_derive::stamped_key(&derive.manifest_prefix, &stamp_bytes, ordinal);
                 ordinal = ordinal.wrapping_add(1);
                 out.push((manifest_key.clone(), Some(closed.encode())));
-                stored.push((manifest_key, closed));
-                pending_manifests.insert(derive.manifest_prefix.clone(), stored);
+                pending_manifests.insert(derive.manifest_prefix.clone(), vec![(manifest_key, closed)]);
             },
         }
     }

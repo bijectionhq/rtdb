@@ -1443,26 +1443,25 @@ pub fn purge<E: From<DeriveError>>(
 /// newest last), reading the store through `lookup`. The closing commit read
 /// nothing; this runs at the ordering point.
 ///
-/// It removes the row's whole derived history at every cut, whatever
+/// It removes the fact's whole derived history at every cut, whatever
 /// compaction folded:
-/// - each base of `bases` that folded some of the row's records is
+/// - each base of `bases` that folded some of the fact's records is
 ///   re-derived without them: the line as of the base's cut
 ///   ([`line_through`]) held, per edge of an aggregate group, the sum of the
-///   row's records stamped at or below it (P9), and for a statistics or
-///   presence path its live deltas ([`live_counts`]); less the row's records
+///   fact's records stamped at or below it (P9), and for a statistics or
+///   presence path its live deltas ([`live_counts`]); less the fact's records
 ///   compaction left stored beside the base (deleted below), that is what
-///   the base holds of the row, and the store subtracts it lane by lane;
+///   the base holds of the fact, and the store subtracts it lane by lane;
 /// - every key the line's versions list is deleted, at every stamp:
 ///   markers, singles, statistics and presence deltas, claims and
 ///   unretained edged records.
 ///
-/// A read at every cut, before the closure or after it, then sums exactly
-/// the other rows (Lean `close_counts_zero`), and no derived key carries
-/// the row. Returns those writes and the closed version to store on top of
-/// the line's others: its retained edged segments only, no key listed
-/// ([`Manifest::closed`]). The line's versions stay with the row's events
-/// until destruction purges both. `None` where the row never sat (no
-/// version) or its line is closed already: nothing changes there.
+/// A read at every cut sums exactly the other facts (Lean
+/// `close_counts_zero`). The append deletes superseded manifests and removes
+/// derived path and group key bytes from each retained event. It keeps the
+/// event's precedence, validity, and remaining fields for retained content.
+/// The new manifest contains only retained aggregate segments.
+/// An absent or already closed line changes nothing.
 #[cfg_attr(verus_keep_ghost, verifier::external)]
 pub fn close<E: From<DeriveError>>(
     manifest_prefix: &[u8],
@@ -1474,14 +1473,89 @@ pub fn close<E: From<DeriveError>>(
     if place_bounds(manifest_prefix).is_none() || newest.closed {
         return Ok(None);
     }
-    let writes = removal(manifest_prefix, stored_manifests, bases, lookup)?;
+    let mut writes = removal(manifest_prefix, stored_manifests, bases, lookup)?;
+    writes.extend(stored_manifests.iter()
+        .filter(|(key, _)| same_place(key, manifest_prefix))
+        .map(|(key, _)| EmittedWrite { key: key.clone(), value: None }));
+    if let Some(fact) = manifest_prefix.strip_suffix(&[0x04]) {
+        // Store keys: fact + EVENTS (0x02), ending before FLOOR (0x03).
+        let events = [fact, &[0x02]].concat();
+        let until = [fact, &[0x03]].concat();
+        for (key, event) in lookup(&events, &until)? {
+            if let Some(value) = scrub_path_columns(&event)? {
+                writes.push(put(key, value));
+            }
+        }
+    }
     let segments = newest
         .segments
         .iter()
-        .filter(|segment| segment.kind == (EntryKind::Edged { retain: true }) && same_place(&segment.identity, manifest_prefix))
+        .filter(|segment| segment.kind == (EntryKind::Edged { counts_erased: true }) && same_place(&segment.identity, manifest_prefix))
         .map(|segment| Segment { live_key: Vec::new(), ..segment.clone() })
         .collect();
     Ok(Some((writes, Manifest { segments, horizon: newest.horizon, written_keys: Vec::new(), closed: true })))
+}
+
+/// Rewrite an owned put image without its physical path and aggregate
+/// group columns. Preserve the event prefix and the exact bytes of every
+/// other column and relative instant slot. This runs inside the store's
+/// ordered derive, so no event or token crosses the writer's clearance.
+#[cfg_attr(verus_keep_ghost, verifier::external)]
+fn scrub_path_columns(event: &[u8]) -> Result<Option<Vec<u8>>, DeriveError> {
+    const PUT: u8 = 1;
+    const EVENT_HEADER: usize = 1 + (1 + 8) * 2 + 8 + 4;
+    const INSTANT_SLOT: usize = 4 + 1 + 8;
+
+    if event.first() != Some(&PUT) {
+        return Ok(None);
+    }
+    let mut rest = event;
+    let header = take(&mut rest, EVENT_HEADER)?;
+    let path = |name: &[u8]| name.starts_with(b"p_") || name.starts_with(b"a_");
+    let image_count = take_u32(&mut rest)?;
+    let mut image = Vec::new();
+    let mut kept = 0u32;
+    for _ in 0..image_count {
+        let field = rest;
+        let len = take(&mut rest, 2)?;
+        let name = take(&mut rest, usize::from(u16::from_be_bytes([len[0], len[1]])))?;
+        let len = take_u32(&mut rest)? as usize;
+        take(&mut rest, len)?;
+        if !path(name) {
+            image.extend_from_slice(&field[..field.len() - rest.len()]);
+            kept += 1;
+        }
+    }
+    if kept == image_count {
+        return Ok(None);
+    }
+
+    let mut out = header.to_vec();
+    out.extend_from_slice(&kept.to_be_bytes());
+    out.extend(image);
+    if !rest.is_empty() {
+        let instant_count = take_u32(&mut rest)?;
+        let mut instants = Vec::new();
+        let mut kept_instants = 0u32;
+        for _ in 0..instant_count {
+            let slot = rest;
+            let len = take(&mut rest, 2)?;
+            let field = take(&mut rest, usize::from(u16::from_be_bytes([len[0], len[1]])))?;
+            take(&mut rest, INSTANT_SLOT)?;
+            if !path(field) {
+                instants.extend_from_slice(&slot[..slot.len() - rest.len()]);
+                kept_instants += 1;
+            }
+        }
+        if !rest.is_empty() {
+            return Err(DeriveError::new("Trailing owned event bytes"));
+        }
+        if kept_instants > 0 {
+            out.extend_from_slice(&kept_instants.to_be_bytes());
+            out.extend(instants);
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Whether the newest stored version of a line is closed.
@@ -2350,7 +2424,7 @@ mod tests {
         for key in &emitted {
             assert_eq!(writes.iter().any(|write| write.key == *key), !retained(key), "every unretained key at every stamp");
         }
-        assert!(writes.iter().all(|write| !stored.iter().any(|(manifest, _)| *manifest == write.key)), "the line's versions stay with the row's events");
+        assert!(stored.iter().all(|(manifest, _)| writes.iter().any(|write| &write.key == manifest)), "older token-bearing manifests are removed");
         assert!(closed.closed && closed.written_keys.is_empty());
         assert!(
             !closed.segments.is_empty() && closed.segments.iter().all(|segment| segment.kind == (EntryKind::Edged { retain: true })),
@@ -2374,6 +2448,32 @@ mod tests {
         let derive = Derive { manifest_prefix: prefix(), levels: Vec::new(), mode: DeriveMode::Close { bases: Vec::new() } };
         check(&derive).unwrap();
         assert_eq!(Derive::decode(&derive.encode()).unwrap(), derive);
+    }
+
+    #[test]
+    fn close_scrubs_path_columns_at_the_original_event_key() {
+        let manifest_prefix = prefix();
+        let row = manifest_prefix.strip_suffix(&[0x04]).unwrap();
+        let event_key = [row, &[0x02], &[0; PRECEDENCE_BYTES]].concat();
+        let mut header = vec![0; 31];
+        header[0] = 1;
+        let encode = |fields: &[(&[u8], &[u8])]| {
+            let mut event = header.clone();
+            event.extend_from_slice(&(fields.len() as u32).to_be_bytes());
+            for (name, bytes) in fields {
+                event.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                event.extend_from_slice(name);
+                put_bytes(&mut event, bytes);
+            }
+            event
+        };
+        let event = encode(&[(b"fact_body", b"sealed"), (b"p_search", b"token"), (b"a_total", b"group")]);
+        let stored = [(stamped_key(&manifest_prefix, &stamp(1, 1), DERIVE_ORDINAL_BASE), Manifest::empty())];
+        let (writes, _) = close::<DeriveError>(
+            &manifest_prefix, &stored, &[], &mut Fake(std::collections::BTreeMap::from([(event_key.clone(), event)])).lookup(),
+        ).unwrap().unwrap();
+        let scrubbed = writes.iter().find(|write| write.key == event_key).and_then(|write| write.value.as_ref()).unwrap();
+        assert_eq!(*scrubbed, encode(&[(b"fact_body", b"sealed")]));
     }
 
     /// The store rebases what compaction folded of a closed row: an
