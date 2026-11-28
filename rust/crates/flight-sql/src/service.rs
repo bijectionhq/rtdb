@@ -720,6 +720,8 @@ impl FlightService for Service {
         let fenced_purge = retained_basis_append && self.supports_store_purge_floor(&call).await;
         #[cfg(feature = "multi")]
         let timed_append = call.session.timed_store_incarnation;
+        #[cfg(feature = "multi")]
+        let version_hold = call.minted && self.supports_store_version_holds(&call).await;
         let mut reply = result_stream(call, Vec::new())?;
         #[cfg(feature = "multi")]
         if let Some(incarnation) = timed_append {
@@ -738,6 +740,10 @@ impl FlightService for Service {
         }
         if fenced_purge {
             reply.metadata_mut().insert(crate::v1::store::PURGE_WRITER_HEADER, tonic::metadata::MetadataValue::from_static("2"));
+        }
+        #[cfg(feature = "multi")]
+        if version_hold {
+            reply.metadata_mut().insert(crate::v1::store::HOLD_VERSION_HEADER, tonic::metadata::MetadataValue::from_static("1"));
         }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());
@@ -808,10 +814,15 @@ impl FlightService for Service {
         let store_enabled = !call.session.fresh_replica
             && call.session.caller.principal.label_scope().is_none();
         let purge_enabled = store_enabled && self.supports_store_purge_floor(&call).await;
+        #[cfg(feature = "multi")]
+        let hold_enabled = store_enabled && self.supports_store_version_holds(&call).await;
+        #[cfg(not(feature = "multi"))]
+        let hold_enabled = false;
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS.into_iter()
             .filter(|name| !matches!(*name, crate::v1::MANAGED_WORKLOAD | crate::v1::exact_read::OPEN | crate::v1::exact_read::CLOSE)))
-            .chain(crate::v1::STORE_ACTIONS.into_iter().filter(|name| store_enabled
-                && (*name != crate::v1::store::PURGE_FLOOR || purge_enabled)))
+            .chain(crate::v1::STORE_ACTIONS.iter().copied().filter(|name| store_enabled
+                && (*name != crate::v1::store::PURGE_FLOOR || purge_enabled)
+                && (*name != crate::v1::store::HOLD_VERSION || hold_enabled)))
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
             .chain(hosted_carrier_actions.into_iter().filter(|_| hosted_upload.is_some()))
             .chain(crate::owned_actions::ROOT_RANK_ACTIONS.into_iter().filter(|_| root_rank))

@@ -458,6 +458,9 @@ pub trait ServingDriver: Send + Sync {
     async fn supports_store_purge_floor(&self) -> bool { false }
 
     #[cfg(feature = "multi")]
+    async fn supports_store_version_holds(&self) -> bool { false }
+
+    #[cfg(feature = "multi")]
     async fn store_version_hold(
         &self, _reader: [u8; 32], _request: StoreVersionHoldRequest, _cancellation: &CancellationToken,
     ) -> Result<StoreVersionHoldReply> {

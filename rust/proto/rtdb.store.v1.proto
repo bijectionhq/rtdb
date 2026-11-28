@@ -391,7 +391,10 @@ message PurgeFloorReply {
   optional uint64 keep_from = 2;
 }
 
-// Authored contract for rtdb.store.v1.HoldVersion on the current Multi writer.
+// rtdb.store.v1.HoldVersion orders exact byte retention on the current Multi writer.
+// A fresh Store handshake advertises x-rtdb-store-hold-version: 1 when available.
+// Reopen and release require database read access for the same authenticated account
+// and issuer in this incarnation. The receipt carries no data authority.
 message HoldVersionRequest {
   // Exact 16-byte physical incarnation previously observed by the reader.
   bytes incarnation = 1;

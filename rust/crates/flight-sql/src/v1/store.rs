@@ -58,7 +58,14 @@ pub(crate) const RANK: &str = "rtdb.store.v1.Rank";
 pub(crate) use purge::{PURGE_FLOOR, PURGE_WRITER_HEADER};
 pub(crate) use writer::{CLAIM_WRITER, FENCE_WRITER, WRITER_FENCE_HEADER};
 pub(super) use sizes::STORAGE_SIZES;
-pub(crate) const ACTIONS: [&str; 8] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR, FENCE_WRITER, CLAIM_WRITER];
+pub(crate) const HOLD_VERSION: &str = "rtdb.store.v1.HoldVersion";
+#[cfg(feature = "multi")]
+pub(crate) const HOLD_VERSION_HEADER: &str = "x-rtdb-store-hold-version";
+pub(crate) const ACTIONS: &[&str] = &[
+    READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR, FENCE_WRITER, CLAIM_WRITER,
+    #[cfg(feature = "multi")]
+    HOLD_VERSION,
+];
 
 struct StoreBatch {
     basis: Basis,
@@ -232,7 +239,7 @@ impl Service {
             FENCE_WRITER => self.store_fence_writer(call, decode(body)?).await,
             CLAIM_WRITER => self.store_claim_writer(call, decode(body)?).await,
             #[cfg(feature = "multi")]
-            hold_version::ACTION if hold_version::AVAILABLE => self.store_hold_version(call, decode(body)?).await,
+            HOLD_VERSION => self.store_hold_version(call, decode(body)?).await,
             _ => Err(error::unsupported("rtdb.store.v1")),
         }
     }

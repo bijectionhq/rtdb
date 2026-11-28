@@ -1040,6 +1040,10 @@ impl ServingDriver for MultiServing {
             && self.serve(async { Ok(self.is_writer().await) }).await.unwrap_or(false)
     }
 
+    async fn supports_store_version_holds(&self) -> bool {
+        self.supports_store_purge_floor().await
+    }
+
     async fn store_version_hold(
         &self, reader: [u8; 32], request: StoreVersionHoldRequest, cancellation: &CancellationToken,
     ) -> Result<StoreVersionHoldReply> {

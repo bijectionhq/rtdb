@@ -66,6 +66,8 @@ pub(crate) struct Credentials {
     token: Mutex<Token>,
 }
 impl Credentials {
+    pub(crate) fn issuer(&self) -> &str { self.provider.issuer.as_str() }
+
     pub async fn revalidate(&self, now: Timestamp, subject: &str) -> Result<()> {
         let mut token = self.token.lock().await;
         if !token.expired(now) { return Ok(()); }

@@ -630,7 +630,7 @@ mod store_only_tests {
 
     #[test]
     fn release_checked_readers_admit_only_read_watch_and_rank() {
-        let actions = store::ACTIONS.into_iter()
+        let actions = store::ACTIONS.iter().copied()
             .filter(|name| is_store_reader_action(name))
             .collect::<Vec<_>>();
         assert_eq!(actions, [store::READ, store::WATCH, store::RANK]);

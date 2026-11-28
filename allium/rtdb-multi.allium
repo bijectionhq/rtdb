@@ -4395,6 +4395,8 @@ actor Gateway {
     -- A replacement Store claim fences the previous turn's delivery even if the journal writer stays in place. Its original in-flight buffers retain their byte protection until released.
     -- An ordered Store purge records its census time and the writer lower-clock bound used for expiry. Replay checks those coordinates against the writer lease.
     -- Store Version hold acquisition and release order with purge under the same writer. Checkpoints carry the settled hold inventory for that incarnation. A fresh restore does not inherit source receipt ownership.
+    -- A Store release handshake advertises Version hold support to a verified unscoped account with database read access when the ordinary Multi writer is serving.
+    -- Reconnecting can reopen or release an exact receipt under the same authenticated issuer, account and physical incarnation. Receipt ownership does not authorize a read.
     identified_by: MemberRecord where role = gateway
 }
 

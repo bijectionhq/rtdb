@@ -312,6 +312,17 @@ impl Principal {
         Ok(Arc::new(Self { user: user.map(str::to_owned), credentials: Credentials::Static, static_grants: grants, _reservation: reservation }))
     }
     pub fn user_id(&self) -> Option<&str> { self.user.as_deref() }
+    /// The configured authentication namespace and subject of an unscoped account.
+    /// The caller must separately establish that the account was authenticated.
+    pub fn unscoped_account(&self) -> Option<(Option<&str>, &str)> {
+        let subject = self.user_id().filter(|subject| !subject.is_empty())?;
+        match &self.credentials {
+            Credentials::Static => Some((None, subject)),
+            Credentials::Oidc(credentials) => Some((Some(credentials.issuer()), subject)),
+            Credentials::ScopedOidc(_) => None,
+        }
+    }
+
     pub fn label_scope(&self) -> Option<&VerifiedLabelScope> {
         match &self.credentials { Credentials::ScopedOidc(Scope::Labels(scope)) => Some(scope), _ => None }
     }
