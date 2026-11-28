@@ -519,6 +519,8 @@ The same decision orders the segment and the successor binding in the independen
 A writer takeover can fence an earlier epoch within the application stream while that incarnation's lineage publication is still pending.
 
 RTDB pins each catalog's root in its journal configuration's `catalog_root`, and refuses authenticated history without one.
+A database whose control catalog is authenticated settles against its lineage, so its application catalog must support authenticated streams.
+Finalize level 14 on application catalogs before the control catalog; creation otherwise fails with `rtdb/lineage-application-catalog`.
 
 For a lossless recovery, select the segment end returned by the source quorum seal.
 For `accept-unknown-tail`, use the verified cut installed from the selected archive.

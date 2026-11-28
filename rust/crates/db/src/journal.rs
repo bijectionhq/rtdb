@@ -227,7 +227,13 @@ impl Stream {
             if let Some(authenticated) = self.authenticated_journal.as_ref().filter(|_| self.create_authenticated) {
                 match authenticated.require_authenticated(self.id()).await {
                     Ok(()) => (),
-                    Err(JournalError::NotFound) => authenticated.create_authenticated(self.id()).await.map_err(journal_error)?,
+                    Err(JournalError::NotFound) => authenticated.create_authenticated(self.id()).await.map_err(|error| match error {
+                        JournalError::Unsupported => Anomaly::unsupported(
+                            "rtdb/lineage-application-catalog",
+                            "This database settles against its lineage, so its application catalog must support authenticated streams. Finalize level 14 on application catalogs before the control catalog.",
+                        ),
+                        error => journal_error(error),
+                    })?,
                     Err(error) => return Err(journal_error(error)),
                 }
             } else {

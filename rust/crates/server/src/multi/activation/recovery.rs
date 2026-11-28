@@ -824,6 +824,28 @@ mod tests {
     use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lineage_database_names_an_unauthenticated_application_catalog() {
+        use rtdb_crypt::FileKms;
+        use rtdb_db::{MultiDatabase, MultiOptions};
+        use rtdb_node::{Clock, SystemClock};
+        use rtdb_storage::MemoryStore;
+
+        const PRINCIPAL: &str = "urn:logkeeper:client:lineage-legacy-application";
+        let keepers = LocalCluster::start_replicated_catalog(&[PRINCIPAL]).await.unwrap();
+        let journal = Arc::new(keepers.journal(PRINCIPAL, &keepers.journal_config(64 << 20, 4 << 20)).unwrap());
+        journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let vault = directory.path().join("keys");
+        FileKms::create_directory(&vault).unwrap();
+        let keys = Arc::new(FileKms::open(&vault, || SystemClock.now().0).unwrap());
+        let database = MultiDatabase::new(
+            MultiOptions { database: Uuid::new_v4(), node: std::net::Ipv4Addr::LOCALHOST.into(), lease_micros: 60_000_000, drift_micros: 0 },
+            journal.clone(), Arc::new(MemoryStore::default()), keys, Arc::new(|| SystemClock.now()),
+        ).unwrap().with_immutable_journal().with_authenticated_journal(journal, true);
+        assert_eq!(database.create().await.unwrap_err().code, "rtdb/lineage-application-catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lineage_recovery_publishes_a_cut_after_source_loss_and_proves_it_after_trim() {
         use std::{collections::BTreeSet, net::Ipv4Addr};
         use rtdb_crypt::FileKms;
