@@ -3,7 +3,8 @@
 //! (Flight + SQL) fencing.
 use std::{collections::BTreeSet, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, cast::AsArray};
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, builder::StringBuilder, cast::AsArray};
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_types::{
@@ -15,7 +16,7 @@ use super::footprint_grant::{
     self, GrantHolder, GrantProposalVerdict, TransferVerdict,
     WaiterEntry, WriterKind,
 };
-use super::{OpenTransaction, interval, positioned_control::{ControlCell, control_record}};
+use super::{OpenTransaction, interval, overflow, positioned_control::{ControlCell, control_record}};
 use crate::OwnedFootprintGrantOp;
 
 /// The resolver's durable footprint grant settings, configured from the node configuration.
@@ -125,16 +126,16 @@ impl DurableGrantRow {
 
     fn positioned_document(&self, memory: &Arc<MemoryBudget>) -> Result<Option<ArrayRef>> {
         let Some(footprint) = self.positioned_footprint.as_ref() else { return Ok(None); };
-        if !matches_footprint(footprint, &self.footprint) {
+        let Some(footprint) = footprint_with_additions(footprint, &self.footprint, memory)? else {
             return Ok(None);
-        }
+        };
         control_record(memory, &[
             ("_id", ControlCell::Value(Value::Utf8(self.work_key.clone()))),
             ("work_age", ControlCell::Value(Value::I64(self.work_age as i64))),
             ("holder_attempt", ControlCell::Value(Value::I64(self.holder_attempt as i64))),
             ("reopened_cut", ControlCell::Value(Value::I64(self.reopened_cut))),
             ("progress_step", ControlCell::Value(Value::I64(self.progress_step as i64))),
-            ("footprint", ControlCell::Funded(footprint)),
+            ("footprint", ControlCell::Funded(&footprint)),
             ("status", ControlCell::Value(Value::Utf8(self.status().into()))),
         ]).map(Some)
     }
@@ -219,11 +220,54 @@ fn copy_footprint(batch: &RecordBatch, row: usize, memory: &Arc<MemoryBudget>) -
     rtdb_columnar::retain_array(copied, &charge).ok()
 }
 
-fn matches_footprint(array: &ArrayRef, footprint: &BTreeSet<String>) -> bool {
-    let items = array.as_list::<i32>().value(0);
-    let strings = items.as_string::<i32>();
-    !strings.is_empty() && strings.len() == footprint.len()
-        && strings.iter().zip(footprint).all(|(name, expected)| name == Some(expected.as_str()))
+fn footprint_with_additions(
+    source: &ArrayRef, footprint: &BTreeSet<String>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<ArrayRef>> {
+    let DataType::List(item) = source.data_type() else { return Ok(None); };
+    let children = source.as_list::<i32>().value(0);
+    let prior = children.as_string::<i32>();
+    if prior.is_empty() || prior.null_count() != 0 || prior.len() > footprint.len()
+        || !prior.iter().flatten().all(|table| footprint.contains(table))
+    {
+        return Ok(None);
+    }
+    if prior.len() == footprint.len() {
+        return Ok(Some(Arc::clone(source)));
+    }
+
+    let bytes = footprint.iter().try_fold(0usize, |bytes, name| {
+        bytes.checked_add(name.len()).ok_or_else(overflow)
+    })?;
+    if i32::try_from(bytes).is_err() || i32::try_from(footprint.len()).is_err() {
+        return Ok(None);
+    }
+    let bound = footprint.len().checked_mul(64)
+        .and_then(|rows| bytes.checked_mul(4)?.checked_add(rows))
+        .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?;
+    let mut charge = memory.reserve(bound)?;
+    let mut additions = StringBuilder::with_capacity(footprint.len() - prior.len(), 0);
+    let mut previous = prior.iter().flatten().enumerate().peekable();
+    let mut new_rows = 0usize;
+    let mut positions = Vec::with_capacity(footprint.len());
+    for name in footprint {
+        if previous.peek().is_some_and(|&(_, table)| table == name.as_str()) {
+            let (index, _) = previous.next().expect("present footprint member");
+            positions.push(Some((0, index)));
+        } else {
+            additions.append_value(name);
+            positions.push(Some((1, new_rows)));
+            new_rows += 1;
+        }
+    }
+    let additions = additions.finish();
+    let entries = rtdb_columnar::copy_event_cells(&[prior, &additions], &positions)?;
+    drop(positions);
+    drop(additions);
+    let list = ListArray::try_new(Arc::clone(item), OffsetBuffer::from_lengths([footprint.len()]), entries, None)
+        .map_err(rtdb_columnar::arrow_error)?;
+    Arc::get_mut(&mut charge).expect("Footprint construction owns its reservation")
+        .shrink_to(list.get_array_memory_size())?;
+    rtdb_columnar::retain_array(Arc::new(list), &charge).map(Some)
 }
 
 impl OpenTransaction<'_> {
@@ -629,7 +673,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_grant_reuses_only_the_same_normalized_footprint() -> Result<()> {
+    fn a_grant_reuses_prior_members_of_a_normalized_footprint() -> Result<()> {
         let memory = MemoryBudget::new(1 << 20);
         let mut grant = DurableGrantRow {
             work_key: "work".into(), work_age: 1, holder_attempt: 2, reopened_cut: 3, progress_step: 0,
@@ -650,7 +694,18 @@ mod tests {
             &memory, &ss8_footprint_grants_table(), grant.to_document(), positioned, None,
         )?;
 
-        grant.footprint.insert("public.c".into());
+        grant.footprint.extend(["public.aa".into(), "public.b".into(), "public.z".into()]);
+        let source = grant.positioned_footprint.as_ref().unwrap();
+        assert_eq!(
+            footprint_with_additions(source, &grant.footprint, &MemoryBudget::new(1)).unwrap_err().code,
+            "rtdb/memory-budget-exceeded",
+        );
+        let positioned = grant.positioned_document(&memory)?.expect("canonical footprint with additions");
+        super::super::positioned_control::assert_control_bytes(
+            &memory, &ss8_footprint_grants_table(), grant.to_document(), positioned, None,
+        )?;
+
+        grant.footprint.remove("public.a");
         assert!(grant.positioned_document(&memory)?.is_none());
         for names in [["public.b", "public.a"], ["public.a", "public.a"]] {
             let list = Value::list(names.map(|name| Value::Utf8(name.into())).into());
