@@ -426,6 +426,11 @@
   #{ArrowTypes/I8_TYPE ArrowTypes/I16_TYPE ArrowTypes/I32_TYPE ArrowTypes/I64_TYPE
     ArrowTypes/F32_TYPE ArrowTypes/F64_TYPE})
 
+(def ^:private percentile-interval-types
+  #{(.getArrowType VectorType/INTERVAL_YEAR)
+    (.getArrowType VectorType/INTERVAL_MDN)
+    (.getArrowType VectorType/INTERVAL_MDM)})
+
 (defn- percentile-double ^double [^VectorReader values, ^long idx]
   (if (percentile-primitive-numeric-types (.getArrowType values))
     (.getAsDouble values (int idx))
@@ -443,7 +448,9 @@
   (let [arrow-type (.getArrowType values)
         same-type? (= (.getArrowType out-vec) arrow-type)]
     (cond
-      (and same-type? (instance? ArrowType$Decimal arrow-type))
+      (and same-type?
+           (or (instance? ArrowType$Decimal arrow-type)
+               (percentile-interval-types arrow-type)))
       (let [^RowValueReader value (.valueReader values)]
         (.setPos value (int idx))
         (.writeValue out-vec value))

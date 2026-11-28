@@ -12,8 +12,9 @@
            (java.nio.file.attribute FileAttribute)
            (java.time DateTimeException LocalDate LocalDateTime ZoneOffset)
            (java.util Random)
-           (xtdb.arrow DateMilliVector DecimalVector RelationReader RowMask Vector)
-           (xtdb.arrow.agg AggregateSpec)))
+           (xtdb.arrow DateMilliVector DecimalVector RelationReader RowMask Vector VectorType)
+           (xtdb.arrow.agg AggregateSpec)
+           (xtdb.time Interval)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
 
@@ -186,6 +187,32 @@
       (t/is (thrown-with-msg? Exception #"invalid writeObject"
                               (#'group-by/copy-percentile-value! out src 2)))
       (t/is (= 2 (.getValueCount out))))))
+
+(t/deftest test-discrete-percentile-interval-winners-keep-components-and-layout
+  (doseq [[interval-type lo middle hi]
+          [[#xt/type [:interval :year-month] (Interval. -4 0 0) (Interval. 6 0 0) (Interval. 12 0 0)]
+           [#xt/type [:interval :month-day-nano]
+            (Interval. 0 1 -86400000001234) (Interval. 0 0 1000) (Interval. 0 -1 86400000005678)]
+           [#xt/type [:interval :month-day-micro]
+            (Interval. 0 1 -86400000002000) (Interval. 0 0 1000) (Interval. 0 -1 86400000004000)]]
+          block-size [1024 2]]
+    (let [nullable-type (VectorType/maybe interval-type)]
+      (binding [order-by/*block-size* (int block-size)]
+        (let [{:keys [res types]}
+              (tu/query-ra [:group-by '{:columns [g {lo (percentile_disc 0.25 [v {:direction :asc}])}
+                                                      {hi (percentile_disc 0.25 [v {:direction :desc}])}]}
+                            [::tu/pages {'g #xt/type :i64, 'v nullable-type}
+                             [[{:g 1, :v middle} {:g 2, :v nil}]
+                              [{:g 1, :v hi} {:g 1, :v lo}]]]]
+                           {:with-types? true})]
+          (t/is (= #{{:g 1, :lo lo, :hi hi} {:g 2}} (set res)))
+          (t/is (= {'lo nullable-type, 'hi nullable-type} (select-keys types '[lo hi]))))))))
+
+(t/deftest test-discrete-percentile-preserves-interval-comparison-error
+  (t/is (thrown-with-msg? Exception #"Cannot compare month-day-micro/nano intervals when month component is non-zero"
+                          (tu/query-ra [:group-by '{:columns [{p (percentile_disc 0.0 [v {:direction :asc}])}]}
+                                        [::tu/pages '{v #xt/type [:interval :month-day-nano]}
+                                         [[{:v (Interval. 0 0 1)} {:v (Interval. 1 0 0)}]]]]))))
 
 (t/deftest test-discrete-percentile-second-timestamp-winner-validation
   (doseq [[src-type dst-type] [[#xt/type [:timestamp-local :second] #xt/type [:? [:timestamp-local :second]]]
