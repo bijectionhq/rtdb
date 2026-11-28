@@ -4386,6 +4386,7 @@ actor Gateway {
     -- The gateway accepts that ticket only for a single uncompressed CloseSession action and routes it to the ticket's original placement.
     -- A drain ticket carries no data request authority.
     -- Completion requires the original receiver's explicit Store read drain acknowledgement.
+    -- An original receiver with a registered closed session can retry the close acknowledgement at the same placement.
     identified_by: MemberRecord where role = gateway
 }
 

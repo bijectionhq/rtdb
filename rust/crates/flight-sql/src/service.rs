@@ -575,7 +575,11 @@ impl Service {
         }
         let requested_database = requested_database
             .or_else(|| session.caller.principal.workload_grant().map(|grant| grant.database()));
-        let (database, attachment) = session.resolve_database(requested_database, &self.0.node)?;
+        let (database, attachment) = if matches!(kind, CallKind::SessionClose) {
+            session.resolve_close_route(requested_database, &self.0.node)?
+        } else {
+            session.resolve_database(requested_database, &self.0.node)?
+        };
         if let Some(scope) = session.caller.principal.label_scope() {
             scope.admit_database_name(&database).map_err(status)?;
         }

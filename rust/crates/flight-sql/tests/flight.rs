@@ -807,6 +807,20 @@ async fn authenticated_handles_require_the_original_session_but_query_tickets_do
 }
 
 #[tokio::test]
+async fn retrying_close_confirms_the_original_drain_without_reopening_the_session() {
+    let running = Running::start(Some("correct"), FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:correct")).await;
+    for _ in 0..2 {
+        let reply = client.action("CloseSession", Bytes::new()).await.unwrap();
+        let [result] = reply.as_slice() else { panic!("one confirmation per close") };
+        assert_eq!(result.body.as_ref(), &[8, 1, 16, 1]);
+    }
+    let error = client.action("GetSessionOptions", Bytes::new()).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn anonymous_transaction_survives_issuer_session_close_and_can_be_claimed_once() {
     let running = Running::start(None, FlightConfig::default()).await; let mut first = Client::connect(&running.server, None).await; let mut second = Client::connect(&running.server, None).await;
     let handle = first.begin().await; first.update("INSERT INTO docs (_id) VALUES (1)", Some(handle.clone())).await;

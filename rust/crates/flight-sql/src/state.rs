@@ -140,9 +140,21 @@ impl Session {
         Ok(None)
     }
     pub fn resolve_database(&self, header: Option<&str>, node: &Node) -> Result<(String, Option<Arc<Database>>), Status> {
+        self.resolve_route(header, node, false)
+    }
+
+    pub fn resolve_close_route(&self, header: Option<&str>, node: &Node) -> Result<(String, Option<Arc<Database>>), Status> {
+        self.resolve_route(header, node, true)
+    }
+
+    fn resolve_route(&self, header: Option<&str>, node: &Node, close: bool) -> Result<(String, Option<Arc<Database>>), Status> {
         let state = self.state.lock().expect("session lock");
-        let SessionState::Open { catalog, .. } = &*state else { return Err(Status::not_found("session closed")); };
-        let database = header.or_else(|| self.placed_database()).or_else(|| catalog.as_ref().map(|selection| selection.name.as_str())).unwrap_or("xtdb");
+        let catalog = match &*state {
+            SessionState::Open { catalog, .. } => catalog.as_ref().map(|selection| selection.name.as_str()),
+            SessionState::Closed if close => None,
+            SessionState::Closed => return Err(Status::not_found("session closed")),
+        };
+        let database = header.or_else(|| self.placed_database()).or(catalog).unwrap_or("xtdb");
         let attachment = self.require_database(database, node)?;
         Ok((database.into(), attachment))
     }
