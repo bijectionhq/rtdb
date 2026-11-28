@@ -64,6 +64,13 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
                 return Ok((Arc::clone(array), None));
             }
             if *source_layout == SourceArgumentLayout::Canonical
+                && matches!(field.data_type(), DataType::Utf8 | DataType::Binary)
+                && field.data_type() == target.data_type() && source == ty
+                && !field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)
+                && target.metadata().is_empty() {
+                return Ok((Arc::clone(array), None));
+            }
+            if *source_layout == SourceArgumentLayout::Canonical
                 && (matches!(field.data_type(), DataType::List(_) | DataType::FixedSizeList(..) | DataType::Map(..) | DataType::Struct(_))
                     || matches!(field.data_type(), DataType::RunEndEncoded(_, child)
                         if child.data_type() == target.data_type() && canonical_argument_field(child)
@@ -354,6 +361,35 @@ fn canonical_temporal_arguments_keep_storage_and_clear_masked_payloads_in_source
     }
     assert_eq!(crate::source::encode_arguments(&arrow, &memory).unwrap().as_slice(),
         crate::source::encode_arguments(&row, &memory).unwrap().as_slice());
+}
+
+#[test]
+fn canonical_annotated_byte_arguments_gather_visible_cells_in_row_layout() {
+    use arrow_array::{BinaryArray, StringArray};
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+    use rtdb_types::Value;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let offsets = OffsetBuffer::new(vec![0_i32, 4, 7].into());
+    let nulls = Some(NullBuffer::from(vec![false, true]));
+    let text = StringArray::new(offsets.clone(), Buffer::from(b"hideabc".to_vec()), nulls.clone());
+    let binary = BinaryArray::new(offsets, Buffer::from(b"hide\0\xfe\xff".to_vec()), nulls);
+    let schema = Arc::new(Schema::new([("text", DataType::Utf8), ("bytes", DataType::Binary)].map(|(name, ty)| {
+        Field::new(name, ty, true).with_metadata([("client".into(), "annotation".into())].into())
+    }).to_vec()));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(text), Arc::new(binary)]).unwrap();
+    let arrow = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let rows = SqlArguments::from_rows(vec![vec![Value::Null, Value::Null],
+        vec![Value::Utf8("abc".into()), Value::Binary(vec![0, 0xfe, 0xff])]], &memory).unwrap();
+    let ArgumentChunk::Arrow { batch, .. } = arrow.chunks[0].1.as_ref() else { panic!("Expected Arrow arguments"); };
+    for (position, ty) in arrow.types().iter().enumerate() {
+        let target = to_field(&format!("?_{position}"), ty).unwrap();
+        let (kept, scratch) = argument_vector(&arrow.chunks[0].1, position, &target, ty, &memory).unwrap();
+        assert!(scratch.is_none());
+        assert!(Arc::ptr_eq(&kept, batch.batch().column(position)));
+    }
+    assert_eq!(crate::source::encode_arguments(&arrow, &memory).unwrap().as_slice(),
+        crate::source::encode_arguments(&rows, &memory).unwrap().as_slice());
 }
 
 #[test]
