@@ -5703,6 +5703,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_trim_reads_signed_octets_and_checks_only_present_operands() {
+        use arrow_array::{BinaryArray, Int16Array};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let schema =
+            Schema::new(vec![field(0, ScalarType::Binary), field(1, ScalarType::I16)]).unwrap();
+        let batch = |offset, len| {
+            let bytes = [
+                Some(&[0x80, 1, 0x80][..]),
+                None,
+                Some(&[0xff][..]),
+                Some(&[0x7f][..]),
+                Some(&[][..]),
+                Some(&[0][..]),
+            ];
+            let tokens = [Some(-128), Some(-129), None, Some(127), Some(128), Some(-129)];
+            let arrays: [ArrayRef; 2] = [
+                Arc::new(BinaryArray::from_iter(bytes.into_iter().skip(offset).take(len))),
+                Arc::new(Int16Array::from_iter(tokens.into_iter().skip(offset).take(len))),
+            ];
+            let columns = arrays
+                .into_iter()
+                .zip(schema.fields())
+                .map(|(array, field)| Column::Arrow {
+                    array,
+                    field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                    logical: Some(field.data_type.clone()),
+                })
+                .collect();
+            ColumnBatch::settled(columns, len, memory.reserve(4096).unwrap()).unwrap()
+        };
+        let args = schema.fields().iter().map(rtdb_plan::Field::expression).collect::<Vec<_>>();
+        let call = |name: &str| Expr::Call {
+            name: name.into(),
+            return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(),
+            args: args.clone(),
+        };
+        let expressions = vec![call("trim"), call("trim_leading"), call("trim_trailing")];
+        let mut cursor = record_projection_cursor(batch(0, 4), schema.clone(), expressions, &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        for (column, retained) in page.columns.iter().zip([&[1][..], &[1, 0x80], &[0x80, 1]]) {
+            let Column::Arrow { array, .. } = column else { panic!("Expected packed bytes"); };
+            let values = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(values.iter().collect::<Vec<_>>(), [Some(retained), None, None, Some(&[])]);
+        }
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+
+        let mut cursor =
+            record_projection_cursor(batch(1, 2), schema.clone(), vec![call("trim")], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(&page.columns[0], Column::Arrow { array, .. } if array.data_type() == &DataType::Null));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+
+        for (offset, message) in [(0, "Value out of range for byte: 128"), (5, "Value out of range for byte: -129")] {
+            let mut cursor = record_projection_cursor(batch(offset, 6 - offset), schema.clone(), vec![call("trim")], &memory);
+            let error = cursor.next_batch().await.err().unwrap();
+            assert_eq!(error.code, "xtdb.expression/illegal-argument-exception");
+            assert_eq!(error.message.as_deref(), Some(message));
+        }
+    }
+
+    #[tokio::test]
     async fn binary_substring_with_a_bound_signed_length_copies_only_the_reached_slice() {
         use arrow_array::{BinaryArray, Int16Array, RecordBatch};
 

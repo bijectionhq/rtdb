@@ -212,6 +212,11 @@ pub fn binary_trim<'a>(source: &'a [u8], token: &[u8], leading: bool, trailing: 
     crate::string::binary_trim(source, token, leading, trailing)
 }
 
+/// Borrows the retained Binary span after checking the token against the signed octet range.
+pub fn binary_trim_signed(source: &[u8], token: i64, leading: bool, trailing: bool) -> Result<&[u8]> {
+    crate::string::binary_trim_signed(source, token, leading, trailing)
+}
+
 /// Counts the octets of a borrowed Binary cell with the scalar result width.
 pub fn binary_octet_length(source: &[u8]) -> Result<i32> {
     crate::string::octet_length(source)

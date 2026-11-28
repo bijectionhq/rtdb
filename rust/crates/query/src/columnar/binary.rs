@@ -465,6 +465,11 @@ fn overlay(
     })
 }
 
+enum TrimToken<'a> {
+    Binary(BinaryInput<'a>),
+    Signed(SignedInput<'a>),
+}
+
 fn trim(
     name: &str,
     args: &[Expr],
@@ -486,8 +491,16 @@ fn trim(
     };
     let bind = |expr| BinaryInput::bind_binary(expr, schema, batch, execution);
     let (source, token) = match args {
-        [source] => (source, Some(BinaryInput::Literal(Some(&b" "[..])))),
-        [source, token] => (source, bind(token)),
+        [source] => (
+            source,
+            Some(TrimToken::Binary(BinaryInput::Literal(Some(b" ")))),
+        ),
+        [source, token] => (
+            source,
+            bind(token).map(TrimToken::Binary).or_else(|| {
+                SignedInput::bind_signed(token, schema, batch, execution).map(TrimToken::Signed)
+            }),
+        ),
         _ => return Ok(None),
     };
     let (Some(source), Some(token)) = (bind(source), token) else {
@@ -497,13 +510,15 @@ fn trim(
         let Some(source) = source.binary(row)? else {
             return Some(Ok(None));
         };
-        let Some(token) = token.binary(row)? else {
-            return Some(Ok(None));
+        let retained = match &token {
+            TrimToken::Binary(token) => token
+                .binary(row)?
+                .map(|token| rtdb_expr::kernels::binary_trim(source, token, leading, trailing)),
+            TrimToken::Signed(token) => token.signed(row)?.map(|token| {
+                rtdb_expr::kernels::binary_trim_signed(source, token, leading, trailing)
+            }),
         };
-        Some(
-            rtdb_expr::kernels::binary_trim(source, token, leading, trailing)
-                .map(|slice| Some([slice])),
-        )
+        Some(retained.transpose().map(|span| span.map(|span| [span])))
     })
 }
 

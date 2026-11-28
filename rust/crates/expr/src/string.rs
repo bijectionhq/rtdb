@@ -248,6 +248,10 @@ pub(crate) fn binary_trim<'a>(source: &'a [u8], token: &[u8], leading: bool, tra
     Ok(trim_octet(source, octet, leading, trailing))
 }
 
+pub(crate) fn binary_trim_signed(source: &[u8], token: i64, leading: bool, trailing: bool) -> Result<&[u8]> {
+    Ok(trim_octet(source, signed_octet(i128::from(token))?, leading, trailing))
+}
+
 fn trim_octet(source: &[u8], octet: u8, leading: bool, trailing: bool) -> &[u8] {
     let start = if leading { source.iter().position(|byte| *byte != octet).unwrap_or(source.len()) } else { 0 };
     let end = if trailing { source.iter().rposition(|byte| *byte != octet).map_or(0, |index| index + 1) } else { source.len() };
@@ -323,10 +327,13 @@ fn text(value: &Value) -> Result<&str> { if let Value::Utf8(text) = value { Ok(t
 fn bytes(value: &Value) -> Result<&[u8]> { match value { Value::Utf8(text) => Ok(text.as_bytes()), Value::Binary(bytes) => Ok(bytes), _ => Err(inapplicable("string", &[value])) } }
 fn int(value: &Value) -> Result<i32> { integer(value).map(|value| value as i32).ok_or_else(|| inapplicable("string index", &[value])) }
 fn numeric_octet(value: &Value) -> Result<u8> {
-    if let Some(integer) = integer(value) { return i8::try_from(integer).map(|value| value as u8).map_err(|_| illegal(&format!("Value out of range for byte: {integer}"))); }
+    if let Some(integer) = integer(value) { return signed_octet(integer); }
     let value = number(value).ok_or_else(|| inapplicable("binary trim octet", &[value]))?;
     if value < -128.0 || value > 127.0 { return Err(illegal(&format!("Value out of range for byte: {value}"))); }
     Ok(value as i8 as u8)
+}
+fn signed_octet(integer: i128) -> Result<u8> {
+    i8::try_from(integer).map(|value| value as u8).map_err(|_| illegal(&format!("Value out of range for byte: {integer}")))
 }
 fn count_i32(value: usize) -> Result<i32> { i32::try_from(value).map_err(|_| overflow()) }
 fn count(value: usize) -> Result<Value> { count_i32(value).map(Value::I32) }
