@@ -2,7 +2,7 @@ use std::{fmt::Write, mem::size_of, sync::Arc};
 
 use arrow_array::{
     Array, NullArray, StringArray,
-    builder::{ListBuilder, StringBuilder},
+    builder::{ArrayBuilder, ListBuilder, StringBuilder},
 };
 use arrow_schema::DataType;
 use rtdb_columnar::MemoryReservation;
@@ -218,8 +218,8 @@ fn parse_ident(
         if !cell.is_ascii() {
             return Ok(None);
         }
-        for (index, part) in cell.split('.').enumerate() {
-            context.check_cancelled_at(index)?;
+        for part in cell.split('.') {
+            context.check_cancelled_at(items)?;
             if part.is_empty() || part.starts_with('"') {
                 return Ok(None);
             }
@@ -260,8 +260,8 @@ fn parse_ident(
         context.check_cancelled_at(row)?;
         match source.text(row) {
             Some(Some(cell)) => {
-                for (index, part) in cell.split('.').enumerate() {
-                    context.check_cancelled_at(index)?;
+                for part in cell.split('.') {
+                    context.check_cancelled_at(builder.values_ref().len())?;
                     append_ascii_lowercase(builder.values(), part);
                 }
                 builder.append(true);
