@@ -55,6 +55,10 @@ impl Target {
             headers.insert(FRESH_HEADER, HeaderValue::from_static("1"));
         }
     }
+
+    fn confirm_drain_endpoint(&self, reported: &str) -> std::result::Result<(), Status> {
+        if self.address == reported { Ok(()) } else { Err(moved()) }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -375,6 +379,25 @@ impl Router {
         Ok(rtdb_directory::classic_flight::excludes_unclassified(&record).then_some(record))
     }
 
+    /// Resolve the ticket's original live worker, without selecting or
+    /// activating the deployment's current holder.
+    async fn validate_drain_target(&self, target: &Target) -> std::result::Result<(), Status> {
+        let control = if let Some(installed) = self.options.ordered_placement(&target.name).await.map_err(directory_error)? {
+            let enrollment = target.enrollment.filter(|enrollment| enrollment.worker.to_string() == target.holder.0)
+                .ok_or_else(moved)?;
+            if target.deployment != installed.deployment.to_string() { return Err(moved()); }
+            installed.endpoints.get(&enrollment).ok_or_else(moved)?.control.clone()
+        } else {
+            if self.options.installed_cell.is_some() || target.enrollment.is_some() || target.ordered_reader.is_some() {
+                return Err(moved());
+            }
+            self.directory.member(&target.holder).await.map_err(directory_error)?
+                .filter(|member| member.id == target.holder && member.may_hold(now_ms()))
+                .and_then(|member| member.control_address).ok_or_else(moved)?
+        };
+        target.confirm_drain_endpoint(&self.reported_flight_endpoint(&control).await?)
+    }
+
     async fn proxy(&self, mut request: Request<Incoming>, remote: IpAddr, egress: &FlightEgress) -> std::result::Result<Response<ProxyBody>, Status> {
         if request.method() != http::Method::POST || !request.uri().path().starts_with("/arrow.flight.protocol.FlightService/") {
             return Err(Status::unimplemented("This listener serves Arrow Flight SQL"));
@@ -387,6 +410,7 @@ impl Router {
             && cookie != bearer { return Err(Status::unauthenticated("Flight SQL cookie and bearer route disagree")); }
         let selector = single_header(request.headers(), DATABASE_HEADER)?;
         let drain = single_header(request.headers(), DRAIN_HEADER)?;
+        let draining = drain.is_some();
         let route = match drain {
             Some(token) if authorization.is_none() && cookie.is_none() && request.uri().path() == DO_ACTION => {
                 Some(self.decode(DRAIN_CONTEXT, token)?)
@@ -424,7 +448,12 @@ impl Router {
                             return Err(Status::permission_denied("This Flight SQL session belongs to another deployment"));
                         }
                     }
-                    let classic = self.validate(&route.target).await?;
+                    let classic = if draining {
+                        self.validate_drain_target(&route.target).await?;
+                        None
+                    } else {
+                        self.validate(&route.target).await?
+                    };
                     Ok((route.target, Some(route.session), classic))
                 }
                 None => self.first_target(selector.expect("a new session has a selector"), fresh).await
@@ -434,7 +463,6 @@ impl Router {
         let (target, session, classic) = tokio::time::timeout(self.timeout, routing).await
             .map_err(|_| Status::deadline_exceeded("Timed out resolving the Flight SQL route"))??;
 
-        let draining = drain.is_some();
         let has_bearer = bearer.is_some() || draining;
         let headers = request.headers_mut();
         headers.remove(header::HOST);
@@ -665,6 +693,18 @@ async fn drain_tickets_admit_only_one_canonical_close_action() {
     let mut read = close.to_vec();
     read[7] = b'X';
     assert!(inspect_drain_action(Full::new(Bytes::from(read))).await.is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn a_close_only_route_keeps_its_original_endpoint() {
+    let ticket = Target {
+        name: "db".into(), deployment: "deployment".into(), holder: MemberId("original".into()),
+        epoch: 3, address: "127.0.0.1:3000".into(), enrollment: None, replica: None,
+        ordered_reader: None, fresh: false,
+    };
+    assert!(ticket.confirm_drain_endpoint("127.0.0.1:3000").is_ok());
+    assert!(ticket.confirm_drain_endpoint("127.0.0.1:3001").is_err());
 }
 
 #[cfg(test)]

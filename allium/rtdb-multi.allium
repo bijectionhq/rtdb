@@ -4390,6 +4390,7 @@ actor Gateway {
     -- An expired Store session keeps its close identity while its reads or reply buffers are pending. Only CloseSession can resolve it.
     -- An enrolled Store bearer retains the close operation at its exact original attachment after its startup credential loses access.
     -- The original Store receiver can acknowledge close after local detachment. A same-named replacement cannot acknowledge the old session.
+    -- The gateway resolves close-only tickets against the original worker's enrollment and Flight endpoint. Placement replacement does not route a close to the new worker.
     identified_by: MemberRecord where role = gateway
 }
 
