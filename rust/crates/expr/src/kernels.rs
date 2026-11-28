@@ -181,6 +181,11 @@ pub fn text_substrings(values: &StringArray, positions: &Int64Array, lengths: Op
     Ok(Some(texts.finish()))
 }
 
+/// Borrows the scalar UTF-8 SUBSTRING result using the same signed index narrowing and character positions.
+pub fn text_substring(source: &str, position: i64, length: Option<i64>) -> Result<&str> {
+    crate::string::text_substring(source, position, length)
+}
+
 /// Borrows the scalar Binary SUBSTRING result using the same signed index narrowing and byte limits.
 pub fn binary_substring(source: &[u8], position: i64, length: Option<i64>) -> Result<&[u8]> {
     crate::string::binary_substring(source, position, length)

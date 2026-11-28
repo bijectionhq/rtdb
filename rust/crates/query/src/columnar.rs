@@ -5976,6 +5976,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_substring_reads_small_signed_controls_and_preserves_character_bounds() {
+        use arrow_array::{Int8Array, Int16Array};
+
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![
+            field(0, ScalarType::Utf8), field(1, ScalarType::I8), field(2, ScalarType::I16),
+        ]).unwrap();
+        let batch = |offset, len| {
+            let text = [Some("a🦀é"), Some("🦀éz"), None, Some("a🦀é"), Some("a🦀é"), Some("")];
+            let positions = [Some(2), Some(-1), Some(1), None, Some(2), Some(1)];
+            let lengths = [Some(2), Some(3), Some(-1), Some(-1), None, Some(-1)];
+            let arrays: [ArrayRef; 3] = [
+                Arc::new(StringArray::from_iter(text.into_iter().skip(offset).take(len))),
+                Arc::new(Int8Array::from_iter(positions.into_iter().skip(offset).take(len))),
+                Arc::new(Int16Array::from_iter(lengths.into_iter().skip(offset).take(len))),
+            ];
+            let columns = arrays.into_iter().zip(schema.fields()).map(|(array, field)| Column::Arrow {
+                array,
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                logical: Some(field.data_type.clone()),
+            }).collect();
+            ColumnBatch::settled(columns, len, memory.reserve(4096).unwrap()).unwrap()
+        };
+        let source = schema.fields()[0].expression();
+        let position = schema.fields()[1].expression();
+        let length = schema.fields()[2].expression();
+        let substring = |args: Vec<Expr>| Expr::Call {
+            name: "substring".into(),
+            return_type: rtdb_plan::function_type_with_args("substring", &args).unwrap(),
+            args,
+        };
+        let to_end = substring(vec![source.clone(), position.clone()]);
+        let limited = substring(vec![source.clone(), position, length.clone()]);
+        let wrapped = substring(vec![source, Expr::Literal(Value::I64((1 << 32) + 2)), length]);
+        let mut cursor = record_projection_cursor(
+            batch(0, 5), schema.clone(), vec![to_end, limited.clone()], &memory,
+        );
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let expected = [
+            [Some("🦀é"), Some("🦀éz"), None, None, Some("🦀é")],
+            [Some("🦀é"), Some("🦀"), None, None, None],
+        ];
+        for (column, expected) in page.columns.iter().zip(expected) {
+            let Column::Arrow { array, field, .. } = column else { panic!("Expected packed text"); };
+            assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().iter().collect::<Vec<_>>(), expected);
+            assert!(field.is_nullable());
+        }
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+
+        let mut cursor = record_projection_cursor(batch(0, 1), schema.clone(), vec![wrapped], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(), Value::Utf8("🦀é".into()));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+
+        let mut cursor = record_projection_cursor(batch(2, 3), schema.clone(), vec![limited.clone()], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(matches!(&page.columns[0], Column::Arrow { array, .. } if array.data_type() == &DataType::Null));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+
+        let mut cursor = record_projection_cursor(batch(0, 6), schema, vec![limited], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().message.as_deref(), Some("Negative substring length"));
+    }
+
+    #[tokio::test]
     async fn native_text_projection_preserves_reached_errors_and_empty_replace() {
         let memory = MemoryBudget::new(1 << 22);
         let input = field(0, ScalarType::Utf8);

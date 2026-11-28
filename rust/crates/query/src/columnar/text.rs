@@ -2,7 +2,7 @@ use std::{fmt::Write, mem::size_of, sync::Arc};
 
 use arrow_array::{Array, StringArray, builder::StringBuilder};
 use rtdb_columnar::MemoryReservation;
-use rtdb_expr::kernels::{literal_replace_length, text_overlay_edges, text_trim};
+use rtdb_expr::kernels::{literal_replace_length, text_overlay_edges, text_substring, text_trim};
 use rtdb_plan::{Expr, Schema};
 use rtdb_types::{AnomalyKind, LogicalType, Result, ScalarType, Value};
 
@@ -212,6 +212,35 @@ fn transform(
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let bind = |expr| TextInput::bind_text(expr, schema, batch, execution);
     match args {
+        [source, position] | [source, position, _] if name.eq_ignore_ascii_case("substring") => {
+            let signed = |expr| SignedInput::bind_signed(expr, schema, batch, execution);
+            let (Some(source), Some(position)) = (bind(source), signed(position)) else {
+                return Ok(None);
+            };
+            let length = if let Some(length) = args.get(2) {
+                let Some(length) = signed(length) else {
+                    return Ok(None);
+                };
+                Some(length)
+            } else {
+                None
+            };
+            project(batch.len, execution, |row| {
+                let source = source.text(row)?;
+                let position = position.signed(row)?;
+                let length = match &length {
+                    Some(length) => length.signed(row)?.map(Some),
+                    None => Some(None),
+                };
+                let (Some(source), Some(position), Some(length)) = (source, position, length)
+                else {
+                    return Some(None);
+                };
+                Some(Some(Spans::Slice(
+                    text_substring(source, position, length).ok()?,
+                )))
+            })
+        }
         [source, replacement, start, length] if name.eq_ignore_ascii_case("overlay") => {
             let (Some(source), Some(placing), Some(start)) = (
                 bind(source),

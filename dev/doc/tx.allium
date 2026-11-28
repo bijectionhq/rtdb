@@ -145,6 +145,7 @@
 -- Its byte slicing retains the scalar index narrowing, null behavior, and errors.
 -- Native Binary OCTET_LENGTH and OCTET_POSITION can read reached bytes from plain Arrow cells and write the scalar counts into a funded integer result.
 -- A bounded native UTF-8 NULLIF, LEAST, or GREATEST result can write reached text directly from its Arrow input while preserving operand demand and byte ordering.
+-- Native UTF-8 SUBSTRING can write the selected characters from plain Arrow text with exact signed controls, preserving scalar index narrowing, nulls and errors.
 -- A native UTF-8 OVERLAY over plain inputs can write reached spans to funded Arrow text using the scalar character bounds and signed controls.
 -- Native TRIM over plain text can write the retained span directly, including the scalar rule that a supplementary trim character is kept at the trailing edge.
 -- Native REPLACE with nonempty search text can write nonoverlapping matches into funded Arrow text, and native REVERSE can write the source's code points in reverse order.
