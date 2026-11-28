@@ -214,6 +214,12 @@ surface StatelessDatabase {
         -- Each included key contributes its visible encoded size at that version, including after replacement, deletion, or restore.
         -- Reconciliation replaces the rollup with a census of one retained version before publishing the result.
 
+    @guarantee StoreAppendRetainedBasis
+        -- A verified writer can require one exact retained Basis in a Store append.
+        -- The resolver checks the Basis in the same order as the append and the physical floor.
+        -- A removed or unknown Basis refuses the append before it publishes any effects.
+        -- The Basis is part of the request's idempotency identity.
+
     @guarantee StorePurgeFloor
         -- PurgeFloor requires a verified credential with unscoped database write access to the attached Multi incarnation.
         -- The request names one retained basis, a minimum retained version at or below that basis, and the original ordered list of half-open guards.

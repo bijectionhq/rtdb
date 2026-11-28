@@ -170,6 +170,9 @@ message AppendRequest {
   // present it must match RTDB's vendored DERIVE_DIGEST or the append fails
   // with rtdb.store/derive-version.
   optional string derive_digest = 9;
+  // Inclusive oldest committed basis the ordered append requires to remain
+  // available. It uses this request's incarnation and must be at or below since.
+  optional uint64 required_basis = 11;
 }
 
 message AppendReply {

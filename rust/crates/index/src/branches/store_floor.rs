@@ -20,6 +20,12 @@ impl BranchIndex {
         Ok(())
     }
 
+    /// Check an exact dependency at the same index that orders byte-store writes.
+    pub fn check_retained_store_basis(&self, basis: Basis) -> Result<()> {
+        self.require_store_history(basis)?;
+        self.exact(basis).map(|_| ())
+    }
+
     pub fn reclaim_store_history(&mut self, keep_from: u64) {
         if keep_from <= self.store_history_floor() {
             return;

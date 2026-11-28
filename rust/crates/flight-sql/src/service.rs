@@ -589,7 +589,14 @@ impl FlightService for Service {
             self.check_family_readback_handshake(&call).await.map_err(|status| call.error(status))?;
         }
         let release = if call.minted { call.session.store_release } else { None };
+        let retained_basis_append = call.minted && call.session.caller.verified_credential
+            && call.session.caller.principal.label_scope().is_none()
+            && call.session.caller.principal.workload_grant().is_none()
+            && !call.session.fresh_replica && !self.follower_only();
         let mut reply = result_stream(call, Vec::new())?;
+        if retained_basis_append {
+            reply.metadata_mut().insert("x-rtdb-store-retained-basis", tonic::metadata::MetadataValue::from_static("1"));
+        }
         if let Some(release) = release {
             reply.metadata_mut().insert(store_release::HEADER, release.metadata());
         }

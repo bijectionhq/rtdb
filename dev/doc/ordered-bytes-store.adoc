@@ -59,6 +59,10 @@ A placeholder out of bounds, over non-zero bytes or inside the prefix, a value p
 An append with no writes, bounds or derived writes only validates: it is recorded at a new version with no effects, the version it answers it validated through.
 Every outcome but `outside` is a receipt under the append's idempotency key, so a retry returns the first outcome: a commit with its first stamp, a conflict, a bound refusal, a claim refusal, or a validation with its version, even after a later write that a fresh judgement would conflict with.
 The key belongs to its first request; another request under it is refused.
+A verified unscoped writer may set `required_basis` to the earliest exact version the new effects depend on.
+The resolver checks the inclusive physical floor and the existence of that version before admitting the append.
+A writer detects this capability through `x-rtdb-store-retained-basis: 1` on the authenticated Flight handshake.
+A committed retry answers its original outcome. Reopening a retained basis requires current admission.
 
 *Derived writes.* A write may be a _derive_ (`AppendRequest.derives`, encoded by Bijection's `store_read::derive` and vendored verbatim as `rust/vendor/bijection-store-derive`), also called retire-on-write.
 It names a row's derived-line manifest prefix, the lookup levels in which its previous line is found (the target world's own, then each ancestor bounded by its fork stamp), an interval `[from, to)` of the `i64` valid axis (each bound a fixed instant or the stamp's micros plus an offset, so a period bound placed as `now + d`, start or end, takes the stamp), and the row's new derived entries over that interval, or `Close` on a unit's closure, or `Purge` on erasure or expiry, or `Backfill`: a path backfill's entries for the row's history, written as given and added to the line's inventory so a purge deletes them. A `Close` and a `Purge` also name the compaction bases of the row's counted paths (`CountedBase`: the path's record identity, its value lanes, and where its bases lie), read from Bijection's catalog without reading the store.

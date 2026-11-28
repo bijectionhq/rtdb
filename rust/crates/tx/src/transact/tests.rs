@@ -119,6 +119,24 @@ fn a_store_append_is_judged_and_stamped_at_its_clock_sample() {
     assert_eq!((receipt.basis, receipt.outcome), (basis(4), Outcome::Then));
 }
 
+#[test]
+fn store_append_requires_an_exact_basis_at_the_inclusive_floor() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &store_append(1, 0, Vec::new(), Vec::new(), Window::default()));
+    commit(&mut state, 2, &store_append(2, 1, Vec::new(), Vec::new(), Window::default()));
+    let mut index = state.index().clone();
+    index.reclaim_store_history(2);
+    state.replace_applied_index(index).unwrap();
+
+    let mut request = store_append(3, 2, Vec::new(), vec![StoreWrite {
+        key: b"lease".to_vec(), value: Some(vec![1]), key_stamp: None, value_stamp: None,
+    }], Window::default());
+    request.guards = vec![Guard::RetainedStoreBasis { basis: basis(1) }];
+    assert_eq!(refused(&state, &request, 3, 30), "rtdb/cursor-expired");
+    request.guards = vec![Guard::RetainedStoreBasis { basis: basis(2) }];
+    assert_eq!(commit(&mut state, 3, &request).outcome, Outcome::Then);
+}
+
 /// In shared main a classic transaction becomes the branch index head, stamped by XTDB's rule: one tick
 /// past a stalled predecessor, or at a supplied time ahead of the writer's clock. The next store append
 /// follows it one tick later instead of faulting as a clock regression.

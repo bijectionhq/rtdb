@@ -319,9 +319,18 @@ impl Service {
         })?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let since = Basis::new(incarnation, request.since);
-        let guards = read_guards.into_iter()
+        let mut guards = read_guards.into_iter()
             .map(|range| Guard::Unwritten { range, since })
             .collect::<Vec<_>>();
+        if let Some(required) = request.required_basis {
+            if !call.session.caller.verified_credential || scope.is_some() || call.session.fresh_replica || self.follower_only() {
+                return Err(Status::permission_denied("An ordered retained basis requires an unscoped writer"));
+            }
+            if required > request.since {
+                return Err(error::incorrect("The required basis cannot exceed the append predecessor"));
+            }
+            guards.push(Guard::RetainedStoreBasis { basis: Basis::new(incarnation, required) });
+        }
         let transaction = Transact {
             key: request.key,
             require: Vec::new(),

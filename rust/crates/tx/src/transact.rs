@@ -262,6 +262,8 @@ pub enum Guard {
     /// The store contract's read validation: nothing in `range` of the main
     /// branch's store relation was written or erased after `since`.
     Unwritten { range: KeyRange, since: Basis },
+    /// The store's final private guard names an exact retained dependency.
+    RetainedStoreBasis { basis: Basis },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1474,9 +1476,13 @@ impl TransactState {
         view: View<'_>, request: &Transact, append: &StoreAppend, position: u64, now: Timestamp,
         claims: &dyn ClaimVerifier, fingerprint: [u8; 32], canonical_request: CanonicalRequest,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
+        let (read_guards, retained_basis) = match request.guards.split_last() {
+            Some((Guard::RetainedStoreBasis { basis }, reads)) => (reads, Some(*basis)),
+            _ => (request.guards.as_slice(), None),
+        };
         if !request.otherwise.is_empty() || !request.requires.is_empty() || !request.require.is_empty()
             || request.window != Window::default() || request.custody_request_digest.is_some()
-            || !request.guards.iter().all(|guard| matches!(guard, Guard::Unwritten { .. }))
+            || !read_guards.iter().all(|guard| matches!(guard, Guard::Unwritten { .. }))
         {
             return Err(store_append_shape());
         }
@@ -1498,8 +1504,11 @@ impl TransactState {
         let now = crate::system_time::automatic_time(last, sample.0).map(Timestamp)
             .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))?;
         let guard_time = now;
+        if let Some(basis) = retained_basis {
+            view.index.check_retained_store_basis(basis)?;
+        }
         let mut failed = Vec::new();
-        for (i, guard) in request.guards.iter().enumerate() {
+        for (i, guard) in read_guards.iter().enumerate() {
             if !guard.evaluate(view.index, guard_time, claims, None)? { failed.push(i); }
         }
 
@@ -1959,7 +1968,7 @@ impl Guard {
             }
             Self::Version { branch, .. } | Self::CountAtMost { branch, .. } if branch != MAIN_BRANCH =>
                 Err(funding_invalid()),
-            Self::Unwritten { .. } => Err(funding_invalid()),
+            Self::Unwritten { .. } | Self::RetainedStoreBasis { .. } => Err(funding_invalid()),
             _ => self.evaluate(history.index(), reading, claims, None),
         }
     }
@@ -2001,6 +2010,7 @@ impl Guard {
             Self::CountAtMost { branch, range, .. } => view(branch)?.count_at_most(range, time),
             Self::Unwritten { range, since } => Ok(index.view(MAIN_BRANCH, At::Latest, Layer::Merged, time)?
                 .store_written_since(range, *since)?.is_none()),
+            Self::RetainedStoreBasis { .. } => Err(store_append_shape()),
         }
     }
 }
