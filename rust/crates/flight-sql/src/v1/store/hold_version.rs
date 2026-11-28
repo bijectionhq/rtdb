@@ -44,7 +44,7 @@ pub(super) fn hold_key(incarnation: [u8; 16], key: proto::HeldVersionKey) -> Res
     Ok(StoreVersionHoldKey { basis: exact(incarnation, key.at)?, id })
 }
 
-fn encode_key(key: StoreVersionHoldKey) -> proto::HeldVersionKey {
+pub(super) fn encode_key(key: StoreVersionHoldKey) -> proto::HeldVersionKey {
     proto::HeldVersionKey { hold_id: key.id.to_vec(), at: Some(key.basis.position()) }
 }
 
