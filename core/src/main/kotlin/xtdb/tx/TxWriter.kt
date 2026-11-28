@@ -5,6 +5,7 @@ package xtdb.tx
 import com.google.protobuf.ByteString
 import com.google.protobuf.UnsafeByteOperations
 import org.apache.arrow.memory.BufferAllocator
+import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
 import xtdb.arrow.*
 import xtdb.arrow.IID_TYPE
 import xtdb.arrow.INSTANT_TYPE
@@ -14,6 +15,7 @@ import xtdb.arrow.UTF8_TYPE
 import xtdb.arrow.VAR_BINARY_TYPE
 import xtdb.arrow.VectorType.*
 import xtdb.arrow.VectorType.Companion.INSTANT
+import xtdb.arrow.VectorType.Companion.TIME_NANO
 import xtdb.arrow.VectorType.Companion.UTF8
 import xtdb.arrow.VectorType.Companion.listTypeOf
 import xtdb.arrow.VectorType.Companion.maybe
@@ -27,6 +29,7 @@ import xtdb.util.asIid
 import xtdb.util.writeIid
 import java.nio.channels.Channels
 import java.time.Instant
+import java.time.LocalTime
 import java.time.ZoneId
 
 private val legacyTxSchema = schema(
@@ -319,6 +322,12 @@ fun deserializeUserMetadata(al: BufferAllocator, bytes: ByteString): Any? =
 
 private fun VectorReader.isDirectMetadataScalar(): Boolean = when (this) {
     is Utf8Vector, is KeywordVector -> (0 until valueCount).all { UnsafeByteOperations.unsafeWrap(getBytes(it)).isValidUtf8 }
+    is Time64Vector -> arrowType == TIME_NANO.arrowType && (0 until valueCount).all {
+        getLong(it) in 0L..LocalTime.MAX.toNanoOfDay()
+    }
+    is TimestampLocalVector -> unit == MICROSECOND
+    is TimestampTzVector -> unit == MICROSECOND
+    is DurationVector -> unit == MICROSECOND
     is BitVector, is ByteVector, is ShortVector, is IntVector, is LongVector,
     is FloatVector, is DoubleVector, is VarBinaryVector, is UuidVector, is DateDayVector -> true
     else -> false

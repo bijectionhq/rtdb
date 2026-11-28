@@ -4,6 +4,8 @@ import clojure.lang.Keyword
 import com.google.protobuf.ByteString
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.types.DateUnit
+import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
+import org.apache.arrow.vector.types.TimeUnit.NANOSECOND
 import org.apache.arrow.vector.types.pojo.ArrowType
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -32,12 +34,19 @@ import xtdb.arrow.VectorType.Companion.ofType
 import xtdb.arrow.extensions.UuidType
 import xtdb.arrow.schema
 import xtdb.time.InstantUtil.asMicros
+import xtdb.time.InstantUtil.fromMicros
 import xtdb.util.asIid
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
+import java.time.DateTimeException
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
 import java.time.ZoneOffset
+import java.time.temporal.ChronoUnit.MICROS
 import java.util.UUID
 
 class TxWriterTest {
@@ -253,6 +262,82 @@ class TxWriterTest {
                     assertSame(dates, dest.vectorFor("date"))
                     assertEquals(-86_400_000L, dates.getLong(1))
                     assertEquals(listOf(1L, 2L), dest.vectorFor("n").asList)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `source receipt preserves canonical temporal metadata ticks and bytes`() {
+        RootAllocator().use { allocator ->
+            val zone = ZoneId.of("America/New_York")
+            val metadata = linkedMapOf(
+                "absent" to null,
+                "time" to LocalTime.MAX,
+                "local" to LocalDateTime.ofInstant(fromMicros(Long.MIN_VALUE), ZoneOffset.UTC),
+                "zoned" to fromMicros(Long.MAX_VALUE).atZone(zone),
+                "duration" to Duration.of(Long.MIN_VALUE, MICROS),
+            )
+            val bytes = serializeUserMetadata(allocator, metadata)
+            withUserMetadata(allocator, bytes) { source ->
+                val write = sourceUserMetadataWriter(source)
+                val schema = schema("user_metadata" ofType VectorType.maybe(VectorType.structOf()))
+                Relation(allocator, schema).use { actual ->
+                    write(actual["user_metadata"])
+                    actual.endRow()
+                    val dest = actual["user_metadata"]
+                    assertNull(dest.vectorForOrNull("absent"))
+                    assertEquals(LocalTime.MAX.toNanoOfDay(), dest.vectorFor("time").getLong(0))
+                    assertEquals(Long.MIN_VALUE, dest.vectorFor("local").getLong(0))
+                    assertEquals(Long.MAX_VALUE, dest.vectorFor("zoned").getLong(0))
+                    assertEquals(Long.MIN_VALUE, dest.vectorFor("duration").getLong(0))
+                    assertEquals(ArrowType.Timestamp(MICROSECOND, zone.id), dest.vectorFor("zoned").arrowType)
+
+                    Relation(allocator, schema).use { expected ->
+                        expected["user_metadata"].writeObject(source!!.getObject(0))
+                        expected.endRow()
+                        assertEquals(expected.toArrowStream(), actual.toArrowStream())
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `source receipt keeps time validation and canonicalizes non-nanosecond times`() {
+        RootAllocator().use { allocator ->
+            for (tick in listOf(-1L, LocalTime.MAX.toNanoOfDay() + 1)) {
+                StructVector(allocator, "user_metadata", true).use { source ->
+                    source.vectorFor("time", ArrowType.Time(NANOSECOND, 64), false).writeLong(tick)
+                    source.endStruct()
+                    assertThrows<DateTimeException> { sourceUserMetadataWriter(source) }
+                }
+            }
+
+            StructVector(allocator, "user_metadata", true).use { source ->
+                source.vectorFor("time", ArrowType.Time(MICROSECOND, 64), false).writeLong(1)
+                source.endStruct()
+                StructVector(allocator, "user_metadata", true).use { dest ->
+                    sourceUserMetadataWriter(source)(dest)
+                    assertEquals(ArrowType.Time(NANOSECOND, 64), dest.vectorFor("time").arrowType)
+                    assertEquals(1000L, dest.vectorFor("time").getLong(0))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `source receipt promotes timestamps with different zones at the same tick`() {
+        RootAllocator().use { allocator ->
+            val before = Instant.EPOCH.atZone(ZoneOffset.UTC)
+            val after = Instant.EPOCH.atZone(ZoneId.of("America/New_York"))
+            val bytes = serializeUserMetadata(allocator, mapOf("zoned" to after))
+            withUserMetadata(allocator, bytes) { source ->
+                StructVector(allocator, "user_metadata", true).use { dest ->
+                    dest.writeObject(mapOf("zoned" to before))
+                    sourceUserMetadataWriter(source)(dest)
+                    assertEquals(mapOf("zoned" to before), dest.getObject(0))
+                    assertEquals(mapOf("zoned" to after), dest.getObject(1))
                 }
             }
         }

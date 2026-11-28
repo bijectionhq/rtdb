@@ -19,7 +19,7 @@
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
   (:import [java.nio.file Path]
-           [java.time Duration ZoneId ZonedDateTime]
+           [java.time Duration LocalDateTime LocalTime ZoneId ZonedDateTime]
            [xtdb.api ServerConfig Xtdb$Config Xtdb$Connection]
            xtdb.api.log.SourceMessage$LegacyTx
            xtdb.api.query.QueryOpts
@@ -1375,8 +1375,14 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
              (xt/q conn ["SELECT * FROM xt.txs ORDER BY _id"])))))
 
 (t/deftest legacy-and-aborted-source-transactions-keep-user-metadata
-  (let [legacy (array-map :tags ["first" "second"] :details (array-map :name "legacy" :attempt 1))
-        aborted (array-map :details (array-map :name "aborted" :attempt 2) :tags ["third"])
+  (let [legacy (array-map :tags ["first" "second"]
+                          :details (array-map :name "legacy" :attempt 1
+                                              :time (LocalTime/parse "23:59:59.999999999")
+                                              :local (LocalDateTime/parse "1969-12-31T23:59:59.999999")))
+        aborted (array-map :details (array-map :name "aborted" :attempt 2
+                                               :zoned #xt/zoned-date-time "2026-01-05T12:00-05:00[America/New_York]"
+                                               :elapsed (Duration/ofNanos -1000))
+                           :tags ["third"])
         fallback (array-map :details {:name nil, :attempt 3} :tags [nil "fourth"])
         changed-type (array-map :details {:name "changed", :attempt 4} :tags [42 43])
         payload (tu/serialize-tx-ops tu/*allocator* [{:op :put-docs, :table-name :docs, :docs [{:xt/id 1}]}]
