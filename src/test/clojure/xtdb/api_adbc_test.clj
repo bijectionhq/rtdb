@@ -15,7 +15,7 @@
            (java.time ZoneId)
            (org.antlr.v4.runtime ParserRuleContext)
            (xtdb.api.error Incorrect)
-           (xtdb.arrow Relation)
+           (xtdb.arrow Relation RelationReader VectorReader)
            (xtdb.query PlanCacheKey)
            (xtdb.tx TxOp$PatchDocs TxOp$PutDocs TxWriter)))
 
@@ -69,20 +69,21 @@
              (set (xt/q conn "SELECT _id, n FROM docs")))
           "delete-docs with several ids removes them all")))
 
+(defn- execute-prepared! [conn sql rows]
+  (with-open [stmt (.createStatement conn sql)]
+    (.prepare stmt)
+    (with-open [args (apply vw/open-args (.getAllocator conn) rows)]
+      (.bind stmt args))
+    (.executeUpdate stmt)))
+
 (deftest prepared-static-insert-and-patch
   (with-open [conn (xt/open-adbc-conn *node*)]
-    (let [al (.getAllocator conn)]
-      (doseq [[sql rows] [["INSERT INTO docs (_id, title, tally, _valid_from, _valid_to)
-                           VALUES (?, ?, ?, DATE '2019-01-01', DATE '2021-01-01')"
-                          [[1 "one" (int 10)] [2 "two" (int 20)]]]
-                         ["PATCH INTO docs FOR PORTION OF VALID_TIME FROM DATE '2019-06-01' TO DATE '2020-06-01'
-                           RECORDS {_id: ?, title: ?}"
-                          [[2 "patched"]]]]]
-        (with-open [stmt (.createStatement conn sql)]
-          (.prepare stmt)
-          (with-open [args (apply vw/open-args al rows)]
-            (.bind stmt args))
-          (.executeUpdate stmt))))
+    (execute-prepared! conn "INSERT INTO docs (_id, title, tally, _valid_from, _valid_to)
+                             VALUES (?, ?, ?, DATE '2019-01-01', DATE '2021-01-01')"
+                       [[1 "one" (int 10)] [2 "two" (int 20)]])
+    (execute-prepared! conn "PATCH INTO docs FOR PORTION OF VALID_TIME FROM DATE '2019-06-01' TO DATE '2020-06-01'
+                             RECORDS {_id: ?, title: ?}"
+                      [[2 "patched"]])
 
     (t/is (= [{:xt/id 1, :title "one", :tally 10}
               {:xt/id 2, :title "patched", :tally 20}]
@@ -90,6 +91,41 @@
                          FOR VALID_TIME AS OF DATE '2020-01-01' ORDER BY _id")))
     (t/is (= [{:title "two"}]
              (xt/q conn "SELECT title FROM docs FOR VALID_TIME AS OF DATE '2019-01-01' WHERE _id = 2")))))
+
+(deftest prepared-dml-without-a-static-source-uses-sql-resolution
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (execute-prepared! conn "INSERT INTO docs (_id, title) VALUES (?, UPPER(?))" [[1 "starting"]])
+    (execute-prepared! conn "UPDATE docs SET title = ? WHERE _id = ?" [["updated" 1]])
+    (execute-prepared! conn "INSERT INTO docs (_id, title) SELECT _id + 10, title FROM docs WHERE _id = ?" [[1]])
+    (t/is (= [{:xt/id 1, :title "updated"}
+              {:xt/id 11, :title "updated"}]
+             (xt/q conn "SELECT _id, title FROM docs ORDER BY _id")))))
+
+(deftest declined-static-dml-reaches-arguments-in-tuple-order
+  (with-open [conn (xt/open-adbc-conn *node*)]
+    (let [reads (atom [])
+          failure (AssertionError. "argument read")
+          cols (mapv (fn [column]
+                       (reify VectorReader
+                         (getName [_] column)
+                         (getObject [_ idx _key-fn]
+                           (let [position [idx column]]
+                             (swap! reads conj position)
+                             (when (= [1 "?_1"] position)
+                               (throw failure))))))
+                     ["?_0" "?_1" "?_2"])
+          args (RelationReader/from cols 2)
+          al (.getAllocator conn)]
+      (t/is (nil? (sql/sql->tx-ops "SELECT ?" args al time/utc {})))
+      (t/is (empty? @reads))
+      (doseq [sql ["UPDATE docs SET title = ?"
+                   "INSERT INTO docs (_id) SELECT ?"]]
+        (reset! reads [])
+        (t/is (identical? failure
+                          (try (sql/sql->tx-ops sql args al time/utc {})
+                               (catch AssertionError e e))))
+        (t/is (= [[0 "?_0"] [0 "?_1"] [0 "?_2"] [1 "?_0"] [1 "?_1"]]
+                 @reads))))))
 
 (defn- open-row-static-ops [al sql args tz]
   (util/safe-mapv

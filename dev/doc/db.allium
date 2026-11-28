@@ -1283,6 +1283,7 @@ rule ClientSubmitsTransaction {
     -- Each reuse evaluates the submitted argument rows and temporal bounds, and preserves the source encoding and retry digest of ordinary expansion.
     -- JVM static INSERT and PATCH copy compatible direct scalar parameters by Arrow position into source documents.
     -- Their source encoding follows inferred field types, field presence and the row order within each valid-time group.
+    -- JVM static expansion reaches bound arguments in row and parameter order before a statement falls through to SQL resolution.
     -- Volatile expressions and expressions requiring transaction time or a live catalog proceed to transaction resolution as SQL.
     -- A VALUES insert whose source width cannot match its declared projection proceeds to transaction resolution as SQL.
     -- A static SQL mutation with an invalid temporal literal proceeds to transaction resolution as SQL.

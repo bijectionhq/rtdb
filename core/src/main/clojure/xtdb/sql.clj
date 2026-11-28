@@ -28,6 +28,9 @@
            (org.apache.commons.codec.binary Hex)
            (xtdb.tx TxOp$PatchDocs TxOp$PutDocs)
            (xtdb.antlr Sql$DirectlyExecutableStatementContext Sql$DynamicParameterContext Sql$XtqlQueryContext Sql$GroupByClauseContext Sql$HavingClauseContext Sql$JoinSpecificationContext Sql$JoinTypeContext Sql$ObjectNameAndValueContext Sql$OrderByClauseContext Sql$QualifiedRenameColumnContext Sql$QuerySpecificationContext Sql$QueryTailContext Sql$RenameColumnContext Sql$RowValueListContext Sql$SearchedWhenClauseContext Sql$SelectClauseContext Sql$SetClauseContext Sql$SimpleWhenClauseContext Sql$SortSpecificationContext Sql$SortSpecificationListContext Sql$WhenOperandContext Sql$WhereClauseContext Sql$WithTimeZoneContext SqlLexer SqlVisitor)
+           (xtdb.antlr Sql$AssertStatementContext Sql$CreateTableStatementContext Sql$DeleteStatementContext
+                       Sql$EraseStatementContext Sql$GrantRoleStatementContext Sql$InsertFromSubqueryContext
+                       Sql$InsertStatementContext Sql$RevokeRoleStatementContext Sql$UpdateStatementContext)
            (xtdb.arrow PositionedScalar RelationReader VectorReader)
            (xtdb.query DmlCacheKey ParsedStatement$Dml SqlParser SqlPlanner)
            (xtdb.xtql QueryWithParams)
@@ -3533,11 +3536,7 @@
     expr))
 
 (declare ^:private sql->static-ops*)
-
-(defn- ->static-arg-rows [^RelationReader args]
-  (let [cols (vec (.getVectors args))]
-    (mapv (fn [idx] (mapv #(PositionedScalar/read % idx) cols))
-          (range (.getRowCount args)))))
+(declare ^:private ->static-arg-rows)
 
 (defn sql->tx-ops [sql args ^BufferAllocator al default-tz opts]
   (when-let [static-ops (seq (sql->static-ops* sql args opts ->static-arg-rows))]
@@ -3711,6 +3710,21 @@
   (visitRevokeRoleStatement [_ _])
   (visitCreateTableStatement [_ _]))
 
+(defn- discards-static-arg-rows? [ast]
+  (or (contains? #{Sql$UpdateStatementContext Sql$DeleteStatementContext Sql$EraseStatementContext
+                   Sql$AssertStatementContext Sql$GrantRoleStatementContext Sql$RevokeRoleStatementContext
+                   Sql$CreateTableStatementContext}
+                 (class ast))
+      (and (instance? Sql$InsertStatementContext ast)
+           (instance? Sql$InsertFromSubqueryContext (.insertColumnsAndSource ^Sql$InsertStatementContext ast)))))
+
+(defn- ->static-arg-rows [ast ^RelationReader args]
+  (let [row-idxs (range (.getRowCount args))]
+    (if (discards-static-arg-rows? ast)
+      (doseq [idx row-idxs, col (.getVectors args)]
+        (PositionedScalar/checkRead col idx))
+      (mapv (fn [idx] (mapv #(PositionedScalar/read % idx) (.getVectors args))) row-idxs))))
+
 (defn- sql->static-ops*
   [sql ^RelationReader args-rel {:keys [scope ^LoadingCache dml-cache default-db db-names tx-scoped? table-info] :as opts}
    read-args]
@@ -3726,7 +3740,7 @@
     (when (instance? ParsedStatement$Dml parsed)
       (try
         (let [ast (.getAst parsed)
-              arg-rows (some-> args-rel read-args)
+              arg-rows (when args-rel (read-args ast args-rel))
               arg-fields (mapv VectorReader/.getField (or args-rel []))
 
               skeleton (if dml-cache
@@ -3746,4 +3760,4 @@
   ([sql args-rel] (sql->static-ops sql args-rel {}))
 
   ([sql args-rel opts]
-   (sql->static-ops* sql args-rel opts #(.toTuples ^RelationReader % #xt/key-fn :snake-case-string))))
+   (sql->static-ops* sql args-rel opts (fn [_ ^RelationReader args] (.toTuples args #xt/key-fn :snake-case-string)))))

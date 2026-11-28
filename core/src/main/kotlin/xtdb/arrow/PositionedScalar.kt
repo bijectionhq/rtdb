@@ -21,7 +21,14 @@ class PositionedScalar private constructor(private val reader: Vector, private v
 
     companion object {
         @JvmStatic
-        fun read(reader: VectorReader, index: Int): Any? {
+        fun read(reader: VectorReader, index: Int): Any? = read(reader, index, keepPosition = true)
+
+        @JvmStatic
+        fun checkRead(reader: VectorReader, index: Int) {
+            read(reader, index, keepPosition = false)
+        }
+
+        private fun read(reader: VectorReader, index: Int, keepPosition: Boolean): Any? {
             val source = VectorReader.unwrapRenamed(reader)
             if (source !is MonoVector) return reader.getObject(index, SNAKE_CASE_STRING)
 
@@ -47,7 +54,7 @@ class PositionedScalar private constructor(private val reader: Vector, private v
                 }
                 else -> return reader.getObject(index, SNAKE_CASE_STRING)
             }
-            return PositionedScalar(source, index)
+            return if (keepPosition) PositionedScalar(source, index) else null
         }
     }
 }
