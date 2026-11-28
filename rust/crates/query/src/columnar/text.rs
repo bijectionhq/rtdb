@@ -11,7 +11,7 @@ use super::{
     binary::{Input, SignedInput},
     observed_scalar_column, owned_projection_bytes, plain_scalar, size_error,
 };
-use crate::context::Execution;
+use crate::{QueryContext, context::Execution};
 
 type TextInput<'a> = Input<'a, &'a str>;
 
@@ -304,9 +304,7 @@ fn transform(
             let Some(source) = bind(source) else {
                 return Ok(None);
             };
-            project(batch.len, execution, |row| {
-                Some(source.text(row)?.map(Spans::Reverse))
-            })
+            reverse(source, batch.len, &execution.context)
         }
         [source] | [source, _] => {
             let (leading, trailing) = if name.eq_ignore_ascii_case("trim") {
@@ -342,12 +340,62 @@ fn transform(
     }
 }
 
+pub(super) fn record_reverse(
+    source: &Expr,
+    schema: &Schema,
+    batch: &ColumnBatch,
+    parameters: rtdb_expr::Parameters<'_>,
+    context: &QueryContext,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let accepts = |logical: &LogicalType| {
+        *logical == LogicalType::Null || plain_scalar(logical) == Some(&ScalarType::Utf8)
+    };
+    let source = match source {
+        Expr::Column { id, .. } => {
+            let Some(position) = schema.position(*id) else {
+                return Ok(None);
+            };
+            if !accepts(&schema.fields()[position].data_type) {
+                return Ok(None);
+            }
+            TextInput::Column(&batch.columns[position])
+        }
+        Expr::Parameter { index, data_type } if accepts(data_type) => {
+            let Some(cell) = parameters.arrow_cell(*index) else {
+                return Ok(None);
+            };
+            TextInput::Parameter(cell)
+        }
+        Expr::Literal(Value::Utf8(text)) => TextInput::Literal(Some(text.as_str())),
+        Expr::Literal(Value::Null) => TextInput::Literal(None),
+        _ => return Ok(None),
+    };
+    reverse(source, batch.len, context)
+}
+
+fn reverse(
+    source: TextInput<'_>,
+    rows: usize,
+    context: &QueryContext,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    project_with_context(rows, context, |row| {
+        Some(source.text(row)?.map(Spans::Reverse))
+    })
+}
+
 fn project<'a>(
     rows: usize,
     execution: &Execution,
     read: impl Fn(usize) -> Option<Option<Spans<'a>>>,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    let context = &execution.context;
+    project_with_context(rows, &execution.context, read)
+}
+
+fn project_with_context<'a>(
+    rows: usize,
+    context: &QueryContext,
+    read: impl Fn(usize) -> Option<Option<Spans<'a>>>,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let mut payload = 0usize;
     for row in 0..rows {
         context.check_cancelled_at(row)?;

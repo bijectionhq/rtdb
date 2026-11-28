@@ -6410,6 +6410,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_field_record_keeps_funded_reverse_results_and_observed_nulls() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let args = vec![input.expression()];
+        let return_type = rtdb_plan::function_type_with_args("reverse", &args).unwrap();
+        let expression = Expr::Struct(vec![("label".into(), Expr::Call { name: "reverse".into(), args, return_type })]);
+        for (cells, expected) in [
+            ([Some("a🦀e\u{301}"), None, Some("")], [Some("\u{301}e🦀a"), None, Some("")]),
+            ([None; 3], [None; 3]),
+        ] {
+            let array = Arc::new(StringArray::from_iter(cells));
+            let field = Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap());
+            let column = Column::Arrow { array, field, logical: Some(input.data_type.clone()) };
+            let batch = ColumnBatch::settled(vec![column], 3, memory.reserve(4096).unwrap()).unwrap();
+            let mut cursor = record_projection_cursor(batch, schema.clone(), vec![expression.clone()], &memory);
+            cursor.scalar_fallbacks = Some(0);
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            drop(cursor);
+
+            let Column::Arrow { array, .. } = &page.columns[0] else { panic!("Expected an Arrow record"); };
+            let record = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let child = record.column(0);
+            assert_eq!(record.null_count(), 0);
+            assert!(record.fields()[0].is_nullable());
+            assert_eq!(child.data_type(), if expected[0].is_some() { &DataType::Utf8 } else { &DataType::Null });
+            assert!(page.column_reservation(0).backing()[0].bytes() >= child.get_array_memory_size());
+            for (row, label) in expected.into_iter().enumerate() {
+                let label = label.map_or(Value::Null, |text| Value::Utf8(text.into()));
+                assert_eq!(page.columns[0].value(row).unwrap(), Value::Struct(rtdb_types::StructFields::from([("label".into(), label)])));
+            }
+            drop(page);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_with_reverse_and_multiple_fields_reports_the_first_reached_row_error() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::I64);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let int = |value| Expr::Literal(Value::I64(value));
+        let args = vec![Expr::Cast {
+            expr: Box::new(Expr::binary(BinaryOp::Divide, int(1), input.expression())),
+            target: CastTarget::fixed(LogicalType::Scalar(ScalarType::Utf8)),
+        }];
+        let return_type = rtdb_plan::function_type_with_args("reverse", &args).unwrap();
+        let first = Expr::Call { name: "reverse".into(), args, return_type };
+        let second = Expr::Cast {
+            expr: Box::new(Expr::Literal(Value::Utf8("first row fails here".into()))),
+            target: CastTarget::fixed(LogicalType::Scalar(ScalarType::I64)),
+        };
+        let expression = Expr::Struct(vec![("label".into(), first), ("number".into(), second)]);
+        let column = arrow(Arc::new(Int64Array::from(vec![1, 0])), ScalarType::I64);
+        let batch = ColumnBatch::settled(vec![column], 2, memory.reserve(4096).unwrap()).unwrap();
+        let mut cursor = record_projection_cursor(batch, schema, vec![expression], &memory);
+        let error = cursor.next_batch().await.err().unwrap();
+        assert!(error.message.unwrap().contains("first row fails here"));
+    }
+
+    #[tokio::test]
     async fn case_record_with_mixed_child_types_keeps_the_checked_run_layouts() {
         let memory = MemoryBudget::new(1 << 20);
         let input = field(0, ScalarType::Utf8);
@@ -8354,6 +8416,10 @@ pub(crate) mod projection {
                     let input = super::functions::funded_record_case(expr, schema, batch, parameters, memory);
                     context.check_cancelled()?;
                     input.ok().flatten()
+                } else if fields.len() == 1 && let Expr::Call { name, args, .. } = expr
+                    && name.eq_ignore_ascii_case("reverse") && let [source] = args.as_slice()
+                {
+                    super::text::record_reverse(source, schema, batch, parameters, context)?
                 } else {
                     record_input(expr, schema, batch, parameters, context)?
                 };
