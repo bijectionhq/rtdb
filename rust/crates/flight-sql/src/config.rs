@@ -54,6 +54,9 @@ pub struct FlightConfig {
     /// standalone installation's one contract with Bijection.
     pub store_only: bool,
     pub hosted_controls: Option<HostedControlConfig>,
+    /// Installed clock for Kernel-authorized timed byte-store appends.
+    #[cfg(feature = "multi")]
+    pub timed_store_clock: Option<Arc<rtdb_node::CertifiedDecisionClock>>,
     pub custody_providers: std::collections::BTreeMap<String, Arc<crate::CustodyProviderRoute>>,
     pub maximum_concurrent_calls: usize,
     pub playground: bool,
@@ -70,6 +73,8 @@ pub struct FlightConfig {
 impl Default for FlightConfig {
     fn default() -> Self {
         Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, store_only: false, hosted_controls: None, custody_providers: Default::default(), maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, classic_flight_exclusion: None, owned_world_host: None,
+            #[cfg(feature = "multi")]
+            timed_store_clock: None,
             #[cfg(feature = "multi")]
             deployment_admin: None,
             #[cfg(feature = "multi")]
@@ -93,6 +98,10 @@ impl FlightConfig {
                     || rtdb_types::OwnedRelation::new(name.as_str()).is_err()))
         {
             return Err(Anomaly::incorrect("rtdb.flight-sql/configuration", "Invalid hosted control principal or relation allowlist"));
+        }
+        #[cfg(feature = "multi")]
+        if self.timed_store_clock.is_some() && self.hosted_controls.is_none() {
+            return Err(Anomaly::incorrect("rtdb.flight-sql/configuration", "Timed Store requires the installed Kernel principal"));
         }
         Ok(())
     }

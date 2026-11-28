@@ -7,6 +7,8 @@ use rtdb_index::{
     branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage, store::{KeyRange, StorePage, StoreRead, sizes::StorageSizes}},
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand, workload};
+#[cfg(feature = "multi")]
+pub use rtdb_db::{CatalogRoot, TimedStoreAppend, TimedStoreAuthorizer, TimedStoreCommitment, TimedStoreReceipt};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
 use rtdb_types::{
     EntityId, Interval, MemoryReservation, Result, TableRef, Timestamp,
@@ -221,6 +223,16 @@ pub trait ServingDriver: Send + Sync {
     fn classic_workload_fence(&self) -> Option<&rtdb_tx::transact::workload::Fence> { None }
     fn token_authority(&self) -> Option<TokenAuthority> { None }
     fn uses_database_tokens(&self) -> bool { false }
+
+    #[cfg(feature = "multi")]
+    async fn supports_timed_store_append(&self) -> bool { false }
+
+    #[cfg(feature = "multi")]
+    async fn append_timed_store(
+        &self, _request: TimedStoreAppend, _cancellation: &CancellationToken,
+    ) -> Result<TimedStoreReceipt> {
+        Err(rtdb_tx::transact::funding_kernel_unavailable())
+    }
 
     async fn supports_funded_transact(&self) -> bool { false }
 

@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeOrder, ChangePage, Changes, FamilyReviewSelection, QuerySource, QueryView, ROW_VISIBILITY,
-    ServingDriver, ServingScope, StoreVersionHoldReply, StoreVersionHoldRequest, WorkloadReadCut, append_change_rows,
+    ServingDriver, ServingScope, StoreVersionHoldReply, StoreVersionHoldRequest, TimedStoreAppend, TimedStoreReceipt,
+    WorkloadReadCut, append_change_rows,
 };
 use crate::{Database, DatabaseCatalog};
 
@@ -1086,6 +1087,24 @@ impl ServingDriver for MultiServing {
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
         self.transact_routed(request, None, cancellation).await
+    }
+
+    async fn supports_timed_store_append(&self) -> bool {
+        matches!(self.access, ServingAccess::Activated(_))
+            && self.classic_workload_fence.is_none()
+            && self.database.lock().await.supports_timed_store_append()
+    }
+
+    async fn append_timed_store(
+        &self, request: TimedStoreAppend, cancellation: &CancellationToken,
+    ) -> Result<TimedStoreReceipt> {
+        if !matches!(self.access, ServingAccess::Activated(_)) || self.classic_workload_fence.is_some() {
+            return Err(rtdb_tx::transact::funding_kernel_unavailable());
+        }
+        self.serve(async {
+            cancellation.run_until_cancelled(self.writes.append_timed_store(request))
+                .await.ok_or_else(interrupted)?
+        }).await
     }
 
     async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {

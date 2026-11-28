@@ -6,8 +6,8 @@ syntax = "proto3";
 // versions and stamps commits, checks range intersection and judges an
 // append's clock window.
 //
-// Every request is a Flight DoAction on an unscoped database route; each reply
-// is one Flight result holding the encoded reply message.
+// Ordinary requests use Flight DoAction on an unscoped database route. Each
+// reply is one Flight result holding the encoded reply message.
 //   rtdb.store.v1.Read   ReadRequest   -> ReadReply
 //   rtdb.store.v1.Append AppendRequest -> AppendReply
 //   rtdb.store.v1.Watch  WatchRequest  -> WatchReply
@@ -181,6 +181,55 @@ message AppendRequest {
 message WriterFence {
   uint64 epoch = 1;
   bytes writer = 2;
+}
+
+// The timed writer handshake offers and echoes x-rtdb-store-timed-append: 1
+// and x-rtdb-store-timed-incarnation-bin with the exact 16-byte incarnation.
+// Select the database by its bare name on that bearer.
+// Use Flight DoExchange with x-rtdb-store-exchange: timed-append-v1.
+// Each envelope is a single FlightData body without Arrow metadata.
+// Send Begin, wait for Prepared, send Confirm and half-close, then read
+// Committed. Closing before Confirm prevents dispatch.
+// All three appends carry the same Store writer fence when one is installed.
+message TimedAppendInput {
+  oneof message {
+    TimedAppendBegin begin = 1;
+    AppendRequest confirm = 2;
+  }
+}
+
+message TimedAppendBegin {
+  AppendRequest preview = 1;
+  AppendRequest effect = 2;
+  bytes application_root = 3;
+  int64 decision_before_micros = 4;
+  int64 journal_before_micros = 5;
+  bytes receiver_certificate_sha256 = 6;
+}
+
+message TimedAppendOutput {
+  oneof message {
+    TimedAppendCommitment prepared = 1;
+    TimedAppendReceipt committed = 2;
+  }
+}
+
+message TimedAppendCommitment {
+  bytes catalog = 1;
+  // Exact 16-byte, big-endian journal stream ID.
+  bytes stream = 2;
+  uint64 writer_epoch = 3;
+  uint64 lsn = 4;
+  bytes payload_sha256 = 5;
+  int64 journal_before_micros = 6;
+  bytes receiver_certificate_sha256 = 7;
+}
+
+message TimedAppendReceipt {
+  AppendReply reply = 1;
+  TimedAppendCommitment original = 2;
+  int64 quorum_sync_at_micros = 3;
+  bytes evidence_sha256 = 4;
 }
 
 message FenceWriterRequest {

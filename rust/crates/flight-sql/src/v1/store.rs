@@ -46,10 +46,16 @@ pub(crate) mod access;
 mod hold_version;
 mod purge;
 mod sizes;
+#[cfg(feature = "multi")]
+pub(crate) mod timed_append;
 mod writer;
 
 pub(crate) const READ: &str = "rtdb.store.v1.Read";
 pub(crate) const APPEND: &str = "rtdb.store.v1.Append";
+#[cfg(feature = "multi")]
+pub(crate) const TIMED_APPEND_CAPABILITY: &str = "x-rtdb-store-timed-append";
+pub(crate) const STORE_EXCHANGE_HEADER: &str = "x-rtdb-store-exchange";
+pub(crate) const TIMED_APPEND_VERSION: &str = "timed-append-v1";
 pub(crate) const WATCH: &str = "rtdb.store.v1.Watch";
 pub(crate) const RANK: &str = "rtdb.store.v1.Rank";
 pub(crate) use purge::PURGE_FLOOR;
@@ -200,6 +206,11 @@ impl Service {
         };
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let current = driver.incarnation();
+        if let Some(expected) = call.session.timed_store_incarnation
+            && (expected != current || !call.session.holds_attachment(&database))
+        {
+            return Err(Status::failed_precondition("The timed Store session's writer attachment changed"));
+        }
         let scope = match call.session.caller.principal.workload_grant().filter(|grant| grant.is_store_grant()) {
             Some(grant) => Some(grant.admit_store(&call.database, current, self.0.node.now()).map_err(error::anomaly)?),
             None => None,
@@ -282,14 +293,37 @@ impl Service {
     }
 
     async fn store_append(&self, call: &Call, request: proto::AppendRequest) -> Result<Vec<u8>, Status> {
+        let input = StoreAppendInput::parse(request)?;
+        let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Write, Some(&input.request.incarnation)).await?;
+        let admits_retained_basis = call.session.caller.verified_credential
+            && scope.is_none() && !call.session.fresh_replica && !self.follower_only();
+        let (transaction, validation) = input.transaction(incarnation, scope, admits_retained_basis, call.request_reservation())?;
+        let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
+        let decided = driver.transact(transaction, &call.cancellation).await;
+        if decided.is_ok() {
+            self.check_attachment(call, &database)?;
+        }
+        Ok(append_reply(incarnation, decided, validation)?.encode_to_vec())
+    }
+}
+
+struct StoreAppendInput {
+    request: proto::AppendRequest,
+    writes: Vec<StoreWrite>,
+    bounds: Vec<StoreBound>,
+    window: Window,
+}
+
+impl StoreAppendInput {
+    fn parse(mut request: proto::AppendRequest) -> Result<Self, Status> {
         check_key(&request.key)?;
         if request.incarnation.is_empty() {
             return Err(error::incorrect("An append states its incarnation"));
         }
-        let writes = request.writes.into_iter()
+        let writes = std::mem::take(&mut request.writes).into_iter()
             .map(|write| StoreWrite { key: write.key, value: write.value, key_stamp: write.key_stamp, value_stamp: write.value_stamp })
             .collect::<Vec<_>>();
-        let bounds = request.bounds.into_iter()
+        let bounds = std::mem::take(&mut request.bounds).into_iter()
             .map(|bound| StoreBound { key: bound.key, delta: bound.delta, min: bound.min, max: bound.max })
             .collect::<Vec<_>>();
         if let Some(digest) = request.derive_digest.as_deref()
@@ -304,16 +338,25 @@ impl Service {
         check_placeholders(&writes).map_err(error::anomaly)?;
         check_bounds(&bounds).map_err(error::anomaly)?;
         check_derives(&request.derives, &writes).map_err(error::anomaly)?;
-        let window = request.window.map_or(Window::default(), |window| Window {
+        let window = request.window.take().map_or(Window::default(), |window| Window {
             not_before: window.not_before.map(Timestamp),
             before: window.before.map(Timestamp),
         });
         if window.not_before.zip(window.before).is_some_and(|(start, end)| start >= end) {
             return Err(error::incorrect("The append's window is empty"));
         }
-        // Every append records its outcome under its key, a write-free one included.
+        Ok(Self { request, writes, bounds, window })
+    }
+
+    fn transaction(
+        self,
+        incarnation: [u8; 16],
+        scope: Option<&StoreScope>,
+        admits_retained_basis: bool,
+        request_memory: std::sync::Arc<rtdb_columnar::MemoryReservation>,
+    ) -> Result<(Transact, bool), Status> {
+        let Self { request, writes, bounds, window } = self;
         let validation = writes.is_empty() && bounds.is_empty() && request.derives.is_empty();
-        let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Write, Some(&request.incarnation)).await?;
         let read_guards = ranges(request.reads)?;
         reads_within(scope, &read_guards)?;
         within(scope, |scope| {
@@ -321,13 +364,12 @@ impl Service {
                 && writes.iter().all(|write| scope.admits_write(&write.key, write.key_stamp))
                 && bounds.iter().all(|bound| scope.admits_write(&bound.key, None))
         })?;
-        let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let since = Basis::new(incarnation, request.since);
         let mut guards = read_guards.into_iter()
             .map(|range| Guard::Unwritten { range, since })
             .collect::<Vec<_>>();
         if let Some(required) = request.required_basis {
-            if !call.session.caller.verified_credential || scope.is_some() || call.session.fresh_replica || self.follower_only() {
+            if !admits_retained_basis {
                 return Err(Status::permission_denied("An ordered retained basis requires an unscoped writer"));
             }
             if required > request.since {
@@ -350,13 +392,19 @@ impl Service {
             otherwise: Vec::new(),
             requires: Vec::new(),
             custody_request_digest: None,
-            request_memory: Some(call.request_reservation()),
+            request_memory: Some(request_memory),
         };
-        let decided = driver.transact(transaction, &call.cancellation).await;
-        let outcome = match decided {
-            Ok(receipt) => {
-                self.check_attachment(call, &database)?;
-                match receipt.outcome {
+        Ok((transaction, validation))
+    }
+}
+
+fn append_reply(
+    incarnation: [u8; 16],
+    decided: rtdb_types::Result<rtdb_tx::transact::Receipt>,
+    validation: bool,
+) -> Result<proto::AppendReply, Status> {
+    let outcome = match decided {
+            Ok(receipt) => match receipt.outcome {
                     Outcome::Then if validation => proto::append_reply::Outcome::Validated(receipt.basis.position()),
                     Outcome::Then => proto::append_reply::Outcome::Committed(proto::Stamp {
                         micros: receipt.system_time.0, version: receipt.basis.position(),
@@ -376,15 +424,15 @@ impl Service {
                         proto::append_reply::Outcome::Claimed(u32::try_from(derive).map_err(|_| Status::internal("Derive index overflow"))?)
                     }
                     Outcome::Refused { error } => return Err(error::anomaly(error)),
-                }
-            }
+            },
             Err(outside) if outside.code == STORE_OUTSIDE_EARLY => proto::append_reply::Outcome::Outside(proto::Side::Early as i32),
             Err(outside) if outside.code == STORE_OUTSIDE_LATE => proto::append_reply::Outcome::Outside(proto::Side::Late as i32),
             Err(error) => return Err(error::anomaly(error)),
-        };
-        Ok(proto::AppendReply { incarnation: incarnation.to_vec(), outcome: Some(outcome) }.encode_to_vec())
-    }
+    };
+    Ok(proto::AppendReply { incarnation: incarnation.to_vec(), outcome: Some(outcome) })
+}
 
+impl Service {
     async fn store_watch(&self, call: &Call, request: proto::WatchRequest) -> Result<Vec<u8>, Status> {
         if request.ranges.is_empty() {
             return Err(error::incorrect("A watch names at least one range"));

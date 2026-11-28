@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_crypt::receiver_clock::VerifiedReceiverCertificate;
 use rtdb_tx::{DecisionClock, DecisionObservation, FundedCutoff, transact::funding_unsupported};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, TimedJournalCutoff, Timestamp, rtdb_v1::Basis};
 
 pub struct CertifiedDecisionClock {
     receiver: Arc<dyn DecisionClock>,
@@ -11,7 +11,25 @@ pub struct CertifiedDecisionClock {
     domain: [u8; 16],
 }
 
+impl std::fmt::Debug for CertifiedDecisionClock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CertifiedDecisionClock").finish_non_exhaustive()
+    }
+}
+
 impl CertifiedDecisionClock {
+    pub fn supports_timed_store(&self, incarnation: [u8; 16]) -> bool {
+        incarnation == self.certificate.source()
+    }
+
+    pub async fn admit_timed_store(
+        &self, incarnation: [u8; 16], decision_before: Timestamp, journal_cutoff: TimedJournalCutoff,
+    ) -> Result<()> {
+        if !self.supports_timed_store(incarnation) { return Err(funding_unsupported()); }
+        let sample = self.observe().await?;
+        self.certificate.admit_timed_store(sample.instant, decision_before, journal_cutoff)
+    }
+
     pub fn new(
         receiver: Arc<dyn DecisionClock>, certificate: VerifiedReceiverCertificate, domain: [u8; 16],
     ) -> Result<Self> {

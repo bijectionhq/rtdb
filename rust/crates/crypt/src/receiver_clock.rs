@@ -90,6 +90,26 @@ impl VerifiedReceiverCertificate {
         micros_to_nanos(now).is_some_and(|now| now < self.expires_ns)
     }
 
+    pub fn admit_timed_store(
+        &self, observed: Timestamp, decision_before: Timestamp, journal_cutoff: TimedJournalCutoff,
+    ) -> Result<()> {
+        let latest_decision = ((self.expires_ns - self.lag_ns) / 1000) as i64;
+        let latest_journal = ((self.expires_ns - self.journal_error_ns) / 1000) as i64;
+        let minimum_separation = ((self.lag_ns - self.journal_error_ns) / 1000) as i64;
+        let journal_before = journal_cutoff.before().0;
+        if journal_cutoff.certificate_sha256() != self.digest
+            || !self.live_at(observed)
+            || observed.0 <= 0
+            || observed >= decision_before
+            || decision_before.0 > latest_decision
+            || journal_before > latest_journal
+            || decision_before.0 > journal_before - minimum_separation
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     pub fn cutoffs(&self, observed: Timestamp, before: Timestamp) -> Result<(Timestamp, TimedJournalCutoff)> {
         let limit = micros_to_nanos(before).ok_or_else(invalid)?.min(self.expires_ns);
         let decision = limit.checked_sub(self.lag_ns).ok_or_else(invalid)?;
@@ -154,6 +174,17 @@ mod tests {
         assert_eq!(decision, Timestamp(1_999_998));
         assert_eq!(journal.before(), Timestamp(1_999_999));
         assert_eq!(journal.certificate_sha256(), digest);
+        let observed = Timestamp(1_000_000);
+        verified.admit_timed_store(observed, decision, journal).unwrap();
+        assert!(verified.admit_timed_store(decision, decision, journal).is_err());
+        assert!(verified.admit_timed_store(observed, Timestamp(decision.0 + 1), journal).is_err());
+        for invalid_cutoff in [
+            TimedJournalCutoff::new(Timestamp(journal.before().0 + 1), digest).unwrap(),
+            TimedJournalCutoff::new(Timestamp(decision.0 - 1), digest).unwrap(),
+            TimedJournalCutoff::new(journal.before(), [9; 32]).unwrap(),
+        ] {
+            assert!(verified.admit_timed_store(observed, decision, invalid_cutoff).is_err());
+        }
         assert!(verified.cutoffs(decision, Timestamp(2_500_000)).is_err());
         assert!(!verified.live_at(Timestamp(2_000_001)));
     }

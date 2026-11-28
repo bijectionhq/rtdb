@@ -577,9 +577,7 @@ fn load_multi_dev_authn(path: &Path, memory: &std::sync::Arc<MemoryBudget>) -> R
 
 impl MultiDevTls {
     pub fn server_tls(&self) -> Result<tokio_rustls::rustls::ServerConfig> {
-        let certificate = self.read("certificate.pem", 64 * 1024)?;
-        let key = Zeroizing::new(self.read("key.pem", 64 * 1024)?);
-        crate::tls::from_pem_identity(&certificate, &key)
+        private_flight_tls(&self.directory)
     }
 
     #[cfg(feature = "multi")]
@@ -658,6 +656,12 @@ fn open_private_multi_input(path: &Path) -> Result<File> {
         }
     }
     File::open(path).map_err(io_error)
+}
+
+pub(crate) fn private_flight_tls(directory: &Path) -> Result<tokio_rustls::rustls::ServerConfig> {
+    let certificate = read_private_multi_input(&directory.join("certificate.pem"), 64 * 1024)?;
+    let key = Zeroizing::new(read_private_multi_input(&directory.join("key.pem"), 64 * 1024)?);
+    crate::tls::from_pem_identity(&certificate, &key)
 }
 
 fn read_private_multi_input(path: &Path, limit: usize) -> Result<Vec<u8>> {

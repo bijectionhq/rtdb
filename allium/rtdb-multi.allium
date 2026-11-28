@@ -489,6 +489,12 @@ contract KernelFundedAdmission {
         -- The authorization identifies the application catalog, stream, writer epoch, position, sealed payload digest, receiver certificate digest and exclusive journal cutoff.
         -- Exact retries reuse the original booking and authorization, and a changed request for the same stage conflicts.
 
+    @invariant TimedStoreEnrollment
+        -- The operator enables the exchange on a private TLS Multi writer and installs the hosted control owner and source-bound receiver certificate.
+        -- Timed Store negotiation requires a non-fresh authenticated writer session for an activated commissioned database.
+        -- The exchange checks a fresh receiver sample and the submitted cutoffs against the installed certificate before entering the writer turn.
+        -- The Kernel verifies the offered commitment against its installed application catalog before returning the exact authorization.
+
     @invariant StandaloneAdmission
         -- Ordinary reads, writes, recovery and ordered clock slots remain available independently of the Kernel.
         -- A live funded call without a reachable Kernel fails at admission with Unavailable and rtdb/funding-kernel-unavailable.

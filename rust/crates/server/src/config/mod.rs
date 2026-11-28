@@ -36,11 +36,13 @@ pub struct FlightSettings {
     pub session_idle_timeout: Duration, pub session_unclaimed_timeout: Duration,
     pub owned_native_actions: bool,
     pub store_only: bool,
+    pub kernel_timed_store: bool,
+    pub kernel_timed_store_tls_directory: Option<PathBuf>,
     pub hosted_controls: Option<rtdb_flight_sql::HostedControlConfig>,
     pub custody_providers: Vec<CustodyProviderSettings>,
 }
 impl Default for FlightSettings {
-    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, store_only: false, hosted_controls: None, custody_providers: Vec::new() } }
+    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, store_only: false, kernel_timed_store: false, kernel_timed_store_tls_directory: None, hosted_controls: None, custody_providers: Vec::new() } }
 }
 #[derive(Clone, Debug)]
 pub struct HealthSettings { pub host: String, pub port: i32 }
@@ -341,9 +343,15 @@ fn flight(value: Yaml) -> Result<FlightSettings> {
     if hosted_controls.is_none() && custody_providers.iter().any(|route| route.owner.is_none()) {
         return Err(Anomaly::incorrect("rtdb/custody-provider-configuration", "Each custody provider route requires a configured owner"));
     }
+    let kernel_timed_store = fields.boolean("kernelTimedStore")?.unwrap_or(false);
+    let kernel_timed_store_tls_directory = fields.string("kernelTimedStoreTlsDirectory")?.map(PathBuf::from);
+    if kernel_timed_store_tls_directory.as_ref().is_some_and(|path| !kernel_timed_store || !path.is_absolute()) {
+        return Err(invalid("flightSql.kernelTimedStoreTlsDirectory requires an absolute path and an enabled kernelTimedStore"));
+    }
     let config = FlightSettings { host: fields.string("host")?.map(normalize_bind_host).unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
         transaction_idle_timeout: duration(&mut fields, "transactionIdleTimeout", 1800)?, prepared_statement_idle_timeout: duration(&mut fields, "preparedStatementIdleTimeout", 1800)?,
-        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), store_only: false, hosted_controls, custody_providers };
+        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), store_only: false,
+        kernel_timed_store, kernel_timed_store_tls_directory, hosted_controls, custody_providers };
     fields.finish()?;
     Ok(config)
 }

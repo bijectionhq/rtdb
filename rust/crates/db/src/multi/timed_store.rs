@@ -42,6 +42,19 @@ pub struct TimedStoreReceipt {
 }
 
 impl MultiDatabase {
+    pub fn supports_timed_store_append(&self) -> bool {
+        self.authenticated_store_history()
+            && self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes()).is_some()
+            && matches!(self.role(), super::Role::Writer(_))
+    }
+
+    fn authenticated_store_history(&self) -> bool {
+        self.stream.authenticated_journal.is_some()
+            && self.stream.immutable_history()
+            && self.stream.activation_scope.is_some()
+            && self.stream.serving_authority.is_some()
+    }
+
     pub(super) async fn append_timed_store_serial(&mut self, request: TimedStoreAppend) -> Result<TimedStoreReceipt> {
         let result = self.order_timed_store(request).await;
         if result.is_err() && self.writer.as_ref().is_some_and(|writer| writer.recovering) {
@@ -55,9 +68,8 @@ impl MultiDatabase {
         if decision_before.0 <= 0 || decision_before > journal_cutoff.before() {
             return Err(invalid("The dispatch deadline must be within the certified journal cutoff"));
         }
-        let journal = self.stream.authenticated_journal.as_ref().filter(|_| {
-            self.stream.immutable_history() && self.stream.activation_scope.is_some() && self.stream.serving_authority.is_some()
-        }).cloned().ok_or_else(funding_unavailable)?;
+        let journal = self.stream.authenticated_journal.as_ref()
+            .filter(|_| self.authenticated_store_history()).cloned().ok_or_else(funding_unavailable)?;
         let limit = self.stream.batch.as_ref().and_then(|batch| batch.maximum_timed_original_bytes())
             .ok_or_else(funding_unavailable)?;
         self.refresh().await?;

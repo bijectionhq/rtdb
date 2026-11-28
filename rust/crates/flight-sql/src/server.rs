@@ -86,6 +86,10 @@ impl ServerDriver {
         Self::bind_listener(config, node, authenticator, Arc::new(SystemClock), Some(TlsAcceptor::from(Arc::new(tls))), listener, Binding::Follower(route))
     }
     fn bind_listener(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, clock: Arc<dyn Clock>, tls: Option<TlsAcceptor>, listener: TcpListener, binding: Binding) -> Result<(ServerHandle, Self)> {
+        #[cfg(feature = "multi")]
+        if config.timed_store_clock.is_some() && (tls.is_none() || !matches!(&binding, Binding::Ordinary)) {
+            return Err(Anomaly::incorrect("rtdb.flight-sql/timed-store-listener", "Timed Store requires an ordinary TLS writer listener"));
+        }
         let address = listener.local_addr().map_err(network)?;
         let cancellation = node.cancellation().child_token();
         let (sender, receiver) = watch::channel(ServerStatus::default());

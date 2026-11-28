@@ -84,6 +84,23 @@ enum Backend {
     Installed { resources: Box<NativeResources>, tls: Option<Tls> },
 }
 
+fn kernel_timed_store_clock(
+    config: &NodeConfiguration, backend: &Backend, clock: Option<&Arc<rtdb_node::CertifiedDecisionClock>>,
+) -> Result<Option<Arc<rtdb_node::CertifiedDecisionClock>>> {
+    let Some(flight) = config.flight_sql.as_ref().filter(|flight| flight.kernel_timed_store) else {
+        return Ok(None);
+    };
+    let unavailable = || rtdb_tx::transact::funding_kernel_unavailable()
+        .with_context("configuration", "flightSql.kernelTimedStore requires a writable commissioned Multi writer with private TLS, a hosted control owner, and an installed receiver clock".into());
+    if !cfg!(feature = "multi") || config.playground || config.read_only_databases
+        || flight.port < 0 || !flight.owned_native_actions || flight.hosted_controls.is_none()
+        || !matches!(backend, Backend::Configured(Some(_), Some(_)))
+    {
+        return Err(unavailable());
+    }
+    clock.cloned().map(Some).ok_or_else(unavailable)
+}
+
 pub struct ServerDriver {
     handle: ServerHandle,
     node: NodeDriver,
@@ -179,6 +196,20 @@ impl ServerDriver {
         tls: Option<tokio_rustls::rustls::ServerConfig>, clock: Option<Arc<rtdb_node::CertifiedDecisionClock>>,
     ) -> Result<(ServerHandle, Self)> {
         multi.validate_assignment_peer_auth(&config.auth)?;
+        if config.flight_sql.as_ref().is_some_and(|flight| flight.kernel_timed_store)
+            && !multi.timed_original_writes_configured()
+        {
+            return Err(rtdb_tx::transact::funding_kernel_unavailable());
+        }
+        let tls_directory = config.flight_sql.as_ref()
+            .and_then(|flight| flight.kernel_timed_store_tls_directory.as_deref());
+        let tls = match (tls, tls_directory) {
+            (None, Some(directory)) => Some(crate::cli::private_flight_tls(directory)?),
+            (Some(_), Some(_)) => return Err(Anomaly::incorrect(
+                "rtdb.server/timed-store-tls", "The Kernel writer requires one installed TLS identity",
+            )),
+            (tls, None) => tls,
+        };
         let backend = Backend::Configured(Some(multi.resource_override()), tls.map(Arc::new));
         let (handle, mut driver) = Self::open_mode(config, limit, memory, false, None, None, backend, clock).await?;
         match crate::multi::register_journal_metrics(handle.metrics()) {
@@ -240,6 +271,7 @@ impl ServerDriver {
         if config.funded_receiver_clock.is_some() {
             return Err(rtdb_tx::transact::funding_kernel_unavailable());
         }
+        let _timed_store_clock = kernel_timed_store_clock(&config, &backend, certified_clock.as_ref())?;
         if matches!(&config.auth, AuthConfig::ManagedWorkloadOidc(_))
             && !matches!(&backend, Backend::Configured(Some(_), _))
         {
@@ -388,6 +420,8 @@ impl ServerDriver {
                 forwarded_peer: flight_peer, classic_flight_exclusion, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions, store_only: settings.store_only,
                 hosted_controls: settings.hosted_controls.clone(), custody_providers,
                 #[cfg(feature = "multi")]
+                timed_store_clock: _timed_store_clock,
+                #[cfg(feature = "multi")]
                 deployment_admin: config.deployment_admin.clone(),
                 #[cfg(feature = "multi")]
                 default_checkpoint_restore_directory: config.default_checkpoint_restore_directory.clone(),
@@ -481,3 +515,21 @@ async fn address(host: &str, port: i32) -> Result<SocketAddr> {
 fn joined(result: std::result::Result<Result<()>, JoinError>) -> Result<()> { result.map_err(|error| Anomaly::fault("rtdb.server/task", error.to_string()))? }
 fn unexpected(component: &str) -> Anomaly { Anomaly::fault("rtdb.server/component-stopped", format!("Server {component} stopped before shutdown was requested")) }
 fn remember(first: &mut Option<Anomaly>, result: Result<()>) { if let Err(error) = result { if first.is_none() && error.category != AnomalyCategory::Interrupted { *first = Some(error); } } }
+
+#[cfg(test)]
+mod timed_store_configuration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timed_append_requires_a_certified_private_multi_writer() {
+        let config = NodeConfiguration::from_yaml_with_environment(
+            "flightSql: { port: 0, ownedNativeActions: true, hostedControls: { owner: xtdb, relations: [bj_installation] }, kernelTimedStore: true }",
+            &|_| None,
+            false,
+        ).unwrap();
+        assert!(config.flight_sql.as_ref().unwrap().kernel_timed_store);
+        let error = ServerDriver::open(config, 128 * 1024 * 1024).await.err().unwrap();
+        assert_eq!(error.category, rtdb_types::AnomalyCategory::Unavailable);
+        assert_eq!(error.code, "rtdb/funding-kernel-unavailable");
+    }
+}

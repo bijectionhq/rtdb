@@ -51,16 +51,17 @@ pub(crate) struct Session {
     pub caller: Arc<Caller>,
     pub fresh_replica: bool,
     pub(crate) store_release: Option<StoreRelease>,
+    pub(crate) timed_store_incarnation: Option<[u8; 16]>,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Session {
     pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, fresh_replica: bool,
-        store_release: Option<StoreRelease>, reservation: Arc<MemoryReservation>) -> Self {
+        store_release: Option<StoreRelease>, timed_store_incarnation: Option<[u8; 16]>, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
         Self {
-            id, caller, placement, fresh_replica, store_release,
+            id, caller, placement, fresh_replica, store_release, timed_store_incarnation,
             state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }),
             _reservation: reservation,
         }

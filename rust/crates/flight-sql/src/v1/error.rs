@@ -105,6 +105,14 @@ pub(super) fn purge_floor(native: Anomaly) -> Status {
 }
 
 #[cfg(feature = "multi")]
+pub(super) fn timed_append(native: Anomaly) -> Status {
+    let stable = (native.code == "rtdb/no-writer").then(|| native.code.clone());
+    let mut error = detail(native);
+    if let Some(code) = stable { error.code = code; }
+    as_status(error)
+}
+
+#[cfg(feature = "multi")]
 pub(crate) fn follower(native: Anomaly) -> Status {
     let stable = matches!(native.code.as_str(), "rtdb/basis-ahead" | "rtdb/foreign-basis" | "rtdb/unknown-basis"
         | "rtdb/follower-assignment" | "rtdb/follower-unavailable" | "rtdb/follower-progress-unavailable")
@@ -138,6 +146,9 @@ pub(super) fn detail(native: Anomaly) -> Error {
         | "rtdb.store/hold-deadline" | "rtdb.store/hold-quota" | "rtdb.store/hold-unavailable"
         | "rtdb.store/hold-unsupported"
         | "rtdb.store/stale-writer"
+        | "rtdb.store/timed-append-ordered" | "rtdb.store/timed-append-protocol" | "rtdb.store/timed-append-disconnected"
+        | "rtdb.store/timed-append-shape" | "rtdb.store/timed-append-refused"
+        | "rtdb/timed-store-unavailable" | "rtdb/timed-store-authorization"
         | "rtdb/default-serving-classic-history" | "rtdb/idempotency-key"
         | "rtdb/window-expired" | "rtdb/timed-transaction-refused"
         | "rtdb/funded-appointment" | "rtdb/funding-kernel-unavailable"

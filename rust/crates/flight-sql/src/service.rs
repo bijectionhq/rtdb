@@ -48,9 +48,21 @@ pub(crate) struct Inner {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store, StoreRead }
+enum CallKind { Ordinary, Handshake, Action, OwnedAction, OpenFresh, V1Query, V1Changes, V1Capabilities, V1ExactRead, V1Action, V1CustodyRelease, V1OriginalFamily, V1OriginalFamilyReadback, V1OriginalPrivateReplay, V1Appointment, ManagedCreate, ManagedWorkload, TxStatus, Store, StoreRead,
+    #[cfg(feature = "multi")]
+    StoreTimedAppend,
+}
 
 impl CallKind {
+    fn requires_store_release(self) -> bool {
+        match self {
+            Self::Store | Self::StoreRead => true,
+            #[cfg(feature = "multi")]
+            Self::StoreTimedAppend => true,
+            _ => false,
+        }
+    }
+
     fn allows_label_scope(self) -> bool {
         matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::Store | Self::StoreRead | Self::V1Appointment | Self::TxStatus)
     }
@@ -290,7 +302,7 @@ impl Service {
     pub async fn call<T>(&self, request: &Request<T>, body_bytes: usize) -> Result<Call, Status> {
         self.call_with_kind(request, body_bytes, CallKind::Ordinary).await
     }
-    async fn classic_flight_excluded(&self, attachment: Option<&rtdb_node::Database>) -> Result<bool, Status> {
+    pub(crate) async fn classic_flight_excluded(&self, attachment: Option<&rtdb_node::Database>) -> Result<bool, Status> {
         match self.0.config.classic_flight_exclusion.as_ref().zip(attachment) {
             Some((policy, attachment)) => policy.excludes_unclassified(attachment).await.map_err(status),
             None => Ok(false),
@@ -311,8 +323,21 @@ impl Service {
         }
         let transport = request.extensions().get::<crate::server::FlightConnectInfo>();
         let is_handshake = matches!(kind, CallKind::Handshake);
+        #[cfg(feature = "multi")]
+        let timed_store = crate::v1::store::timed_append::requested_incarnation(request.metadata())?;
+        #[cfg(not(feature = "multi"))]
+        let timed_store = None;
+        if timed_store.is_some() && (!is_handshake || self.follower_only()
+            || request.metadata().contains_key(FORWARDED_PEER_HEADER)
+            || request.metadata().contains_key(crate::GATEWAY_ANSWER_DEADLINE_HEADER))
+        {
+            return Err(Status::invalid_argument("Timed Store enrollment requires a direct writer handshake"));
+        }
         let store_access_probe = crate::v1::store_access::probe(request.metadata(), is_handshake)?;
-        let store_action = matches!(kind, CallKind::Store | CallKind::StoreRead);
+        if timed_store.is_some() && store_access_probe.is_some() {
+            return Err(Status::invalid_argument("A timed Store handshake cannot probe access"));
+        }
+        let store_action = kind.requires_store_release();
         let offers_store_release = request.metadata().contains_key(store_release::HEADER);
         let store_handshake = is_handshake && offers_store_release;
         if store_action && offers_store_release {
@@ -371,6 +396,10 @@ impl Service {
         };
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
+        #[cfg(feature = "multi")]
+        if matches!(kind, CallKind::StoreTimedAppend) && bearer.is_none() {
+            return Err(auth::unauthenticated("Timed Store requires its authenticated writer bearer"));
+        }
         if store_access_probe.is_some() && (bearer.or(cookie).is_some() || self.follower_only() || store_handshake) {
             return Err(Status::invalid_argument("A Store access probe requires new credentials on a placed writer route"));
         }
@@ -391,6 +420,9 @@ impl Service {
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             if store_handshake {
                 return Err(Status::failed_precondition("A store release handshake opens a new Flight session"));
+            }
+            if timed_store.is_some() {
+                return Err(Status::failed_precondition("A timed Store handshake opens a new Flight session"));
             }
             if session.fresh_replica && !linked_store_read && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
@@ -461,6 +493,11 @@ impl Service {
                 }
                 match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
             } else { None };
+            #[cfg(feature = "multi")]
+            let placement = match timed_store {
+                Some(incarnation) => Some(self.admit_timed_store_handshake(&caller, placed_name()?, incarnation).await?),
+                None => placement,
+            };
             let excluded = if fresh_replica || matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) {
                 self.classic_flight_excluded(placement.as_deref()).await?
             } else { false };
@@ -476,9 +513,10 @@ impl Service {
                 }
                 Some(StoreRelease::negotiate(request.metadata(), caller.verified_credential)?)
             } else { None };
+            if timed_store.is_some() { StoreRelease::require(store_release)?; }
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
             let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
-                placement.as_ref(), fresh_replica, store_release, self.memory().reserve(capacity).map_err(status)?));
+                placement.as_ref(), fresh_replica, store_release, timed_store, self.memory().reserve(capacity).map_err(status)?));
             sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
                 self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
@@ -611,7 +649,17 @@ impl FlightService for Service {
             && call.session.caller.principal.label_scope().is_none()
             && call.session.caller.principal.workload_grant().is_none_or(|grant| grant.is_store_grant())
             && !call.session.fresh_replica && !self.follower_only();
+        #[cfg(feature = "multi")]
+        let timed_append = call.session.timed_store_incarnation;
         let mut reply = result_stream(call, Vec::new())?;
+        #[cfg(feature = "multi")]
+        if let Some(incarnation) = timed_append {
+            reply.metadata_mut().insert(crate::v1::store::TIMED_APPEND_CAPABILITY, tonic::metadata::MetadataValue::from_static("1"));
+            reply.metadata_mut().insert_bin(
+                crate::v1::store::timed_append::INCARNATION_HEADER,
+                tonic::metadata::MetadataValue::from_bytes(&incarnation),
+            );
+        }
         if retained_basis_append {
             reply.metadata_mut().insert("x-rtdb-store-retained-basis", tonic::metadata::MetadataValue::from_static("1"));
         }
@@ -627,6 +675,26 @@ impl FlightService for Service {
     async fn poll_flight_info(&self, request: Request<flight::FlightDescriptor>) -> Result<Response<flight::PollInfo>, Status> { let call = self.call(&request, request.get_ref().encoded_len()).await?; Err(call.error(unsupported())) }
     async fn do_exchange(&self, request: Request<Streaming<flight::FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
         use crate::owned_actions::{DECIDE_HOSTED_STREAM_V1, HOSTED_UPLOAD_HEADER};
+        use crate::v1::store::{STORE_EXCHANGE_HEADER, TIMED_APPEND_VERSION};
+        if request.metadata().contains_key(STORE_EXCHANGE_HEADER) {
+            let versions = request.metadata().get_all(STORE_EXCHANGE_HEADER);
+            let mut versions = versions.iter();
+            if !versions.next().is_some_and(|version| version == TIMED_APPEND_VERSION)
+                || versions.next().is_some() || request.metadata().contains_key(HOSTED_UPLOAD_HEADER)
+                || request.metadata().contains_key(FORWARDED_PEER_HEADER)
+                || request.metadata().contains_key(crate::GATEWAY_ANSWER_DEADLINE_HEADER)
+            {
+                return Err(unsupported());
+            }
+            #[cfg(feature = "multi")]
+            {
+                let kind = CallKind::StoreTimedAppend;
+                let call = self.call_with_kind(&request, 0, kind).await.map_err(|status| kind.v1_admission_status(status))?;
+                return self.timed_store_exchange(call, request.into_inner()).await;
+            }
+            #[cfg(not(feature = "multi"))]
+            return Err(unsupported());
+        }
         let call = self.call(&request, 0).await?;
         let headers = request.metadata().get_all(HOSTED_UPLOAD_HEADER);
         let mut versions = headers.iter();
