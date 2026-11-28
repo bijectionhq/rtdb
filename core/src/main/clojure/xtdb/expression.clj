@@ -2869,6 +2869,7 @@
                           arrow-type (.getArrowType return-type)
                           utf8-output? (and (= #xt.arrow/type :utf8 arrow-type) (instance? Utf8Vector out))]
                       (if (or (and utf8-output? valid-utf8?)
+                              (VectorWriterKt/acceptsListProjection out return-type)
                               (VectorWriterKt/acceptsScalarProjection out return-type (boolean canonical-uuid?)))
                         (rethrowing-anomalies
                           (@!projection-fn in-rel schema args out))
@@ -2877,8 +2878,9 @@
                             (@!projection-fn in-rel schema args value))
                           (if (or utf8-output?
                                   (= arrow-type #xt.arrow/type :uuid)
+                                  (= arrow-type #xt.arrow/type :list)
                                   (= arrow-type #xt.arrow/type [:date :day]))
-                            (VectorWriterKt/writeScalarCell out value 0)
+                            (VectorWriterKt/writeTableCell out value 0)
                             (.writeObject out (.getObject value 0)))))))}))
 
 (defn ->expression-projection-spec ^ProjectionSpec$Factory [col-name expr {:keys [var-types param-types]}]

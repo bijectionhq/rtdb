@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import xtdb.InternalApi
 import xtdb.api.query.IKeyFn.KeyFn.SNAKE_CASE_STRING
 import xtdb.arrow.Relation.Companion.loader
 import xtdb.kw
@@ -40,6 +41,54 @@ class RelationTest {
     @AfterEach
     fun tearDown() {
         allocator.close()
+    }
+
+    @OptIn(InternalApi::class)
+    @Test
+    fun `bound primitive lists preserve empty lists nulls and child layout`() {
+        val listType = listTypeOf(maybe(VectorType.I64))
+        val types = mapOf("items" to maybe(listType))
+
+        Relation(allocator, types).use { dst ->
+            allocator.newChildAllocator("list-bindings", 0, Long.MAX_VALUE).use { sourceAllocator ->
+                Vector.open(sourceAllocator, "record", VectorType.structOf(types)).use { src ->
+                    src.writeObject(mapOf("items" to listOf(4L, null, -2L)))
+                    src.writeObject(mapOf("items" to emptyList<Long>()))
+                    src.writeObject(emptyMap<String, Any>())
+
+                    val selected = src["items"].select(intArrayOf(1, 0, 2))
+                    dst["items"].writeTableCell(selected, 0)
+                    dst.endRow()
+                    assertTrue(dst.tryCopyStructRow(src, 0))
+                    assertTrue(dst.tryCopyStructRow(src, 1))
+                    assertTrue(dst.tryCopyStructRow(src, 2))
+                }
+            }
+
+            assertEquals(types["items"], dst["items"].type)
+            assertEquals(listType.elType, dst["items"].listElements.type)
+            assertEquals(listOf(emptyList<Long>(), listOf(4L, null, -2L), emptyList<Long>(), null), dst["items"].asList)
+        }
+    }
+
+    @Test
+    fun `record list preflight leaves mismatched children available for promotion`() {
+        val types = linkedMapOf("before" to VectorType.I64, "items" to listTypeOf(VectorType.I64))
+        val record = linkedMapOf("before" to 3L, "items" to listOf(4L))
+        Vector.open(allocator, "record", VectorType.structOf(types)).use { src ->
+            src.writeObject(record)
+
+            Relation(allocator, types + ("items" to listTypeOf(VectorType.I32))).use { dst ->
+                assertFalse(dst.tryCopyStructRow(src, 0))
+                assertEquals(0, dst.rowCount)
+                assertEquals(0, dst["before"].valueCount)
+                assertEquals(VectorType.I32, dst["items"].listElements.type)
+
+                dst.writeRow(src.getObject(0) as Map<*, *>)
+                assertEquals(listOf(3L), dst["before"].asList)
+                assertEquals(listOf(listOf(4L)), dst["items"].asList)
+            }
+        }
     }
 
     @Test

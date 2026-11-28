@@ -112,6 +112,24 @@ class ListVector private constructor(
 
     override val listElements get() = elVector
 
+    internal val hasPrimitiveElements: Boolean
+        get() = when (elVector) {
+            is BitVector, is ByteVector, is ShortVector, is IntVector, is LongVector, is FloatVector, is DoubleVector -> true
+            is NullVector -> elVector.nullable
+            else -> false
+        }
+
+    internal fun acceptsPrimitiveCell(src: VectorReader, idx: Int): Boolean {
+        if (!hasPrimitiveElements || childFields != src.childFields) return false
+        if (src.isNull(idx)) return true
+
+        val start = src.getListStartIndex(idx)
+        val count = src.getListCount(idx)
+        val end = start.toLong() + count
+        val maxEnd = (elVector as? FixedWidthVector)?.let { Int.MAX_VALUE / it.byteWidth } ?: Int.MAX_VALUE
+        return start >= 0 && count >= 0 && end <= minOf(src.listElements.valueCount, maxEnd)
+    }
+
     override fun getListElements(arrowType: ArrowType, nullable: Boolean): VectorWriter =
         when {
             elVector.arrowType == arrowType && elVector.nullable == nullable -> elVector

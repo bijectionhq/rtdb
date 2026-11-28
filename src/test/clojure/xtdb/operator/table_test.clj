@@ -203,6 +203,17 @@
                                 :n 7, :label "é", :flag false}
                          :with-types? true}))))
 
+(t/deftest values-and-records-preserve-primitive-list-child-types
+  (t/is (= '{:res [{:xs [1 nil -2]} {:xs [5 nil 6]} {:xs [nil 9]} {} {}]
+             :types {xs #xt/type [:? [:list [:? :i64]]]}}
+           (tu/query-ra '[:table {:rows [{:xs ?values}
+                                        {:xs [?n nil (+ ?n 1)]}
+                                        ?record
+                                        {:xs nil}
+                                        {}]}]
+                        {:args {:values [1 nil -2], :n 5, :record {:xs [nil 9]}}
+                         :with-types? true}))))
+
 (t/deftest values-and-records-preserve-bound-uuid-and-date-day-types
   (let [id #uuid "fedcba98-7654-3210-8123-456789abcdef"
         first-day (LocalDate/ofEpochDay Integer/MIN_VALUE)

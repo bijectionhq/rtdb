@@ -60,13 +60,13 @@ interface RelationWriter : RelationReader {
             val target = if (child is StructVector && out is StructVector) {
                 if (!child.isNull(idx) && !child.canCopyObjectValueTo(out, idx)) return false
                 out
-            } else out.scalarObjectTarget(child, idx) ?: return false
+            } else out.tableCellObjectTarget(child, idx) ?: return false
             if (child.isNull(idx)) null else child to target
         } ?: return false
 
         for ((child, target) in children) {
             if (child is StructVector) child.rowCopier(target).copyRow(idx)
-            else target.copyNonNullScalar(child, idx)
+            else target.copyNonNullCell(child, idx)
         }
 
         endRow()

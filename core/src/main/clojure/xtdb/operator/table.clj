@@ -100,7 +100,7 @@
                                                                                       ^VectorType param-type (get param-types param)]
                                                                                   (.add type-set param-type)
                                                                                   (MapEntry/create k (fn write-param! [{:keys [^RelationReader args]} ^VectorWriter out-col]
-                                                                                                       (VectorWriterKt/writeScalarCell
+                                                                                                       (VectorWriterKt/writeTableCell
                                                                                                         out-col (.vectorForOrNull args (str param)) 0))))
 
                                                                          (let [{:keys [return-type write-cell!]} (expr/->table-cell-writer expr opts)]

@@ -95,6 +95,14 @@ fun VectorWriter.acceptsScalarProjection(resultType: VectorType, canonicalUuid: 
         else -> arrowType.hasScalarObjectIdentity()
     }
 
+/** @suppress */
+@InternalApi
+fun VectorWriter.acceptsListProjection(resultType: VectorType): Boolean {
+    if (this !is ListVector || !hasPrimitiveElements) return false
+    val result = if (resultType is VectorType.Maybe) resultType.mono else resultType
+    return monoType == result
+}
+
 internal fun ByteBuffer.isWellFormedUtf8() = UnsafeByteOperations.unsafeWrap(this).isValidUtf8
 
 internal fun VectorReader.hasCanonicalTemporalLayout() = when (this) {
@@ -107,8 +115,8 @@ internal fun VectorReader.hasCanonicalTemporalLayout() = when (this) {
 
 internal fun Long.isNanoTimeOfDay() = this in 0L..LocalTime.MAX.toNanoOfDay()
 
-private tailrec fun unwrapScalarSource(reader: VectorReader): VectorReader = when (val source = VectorReader.unwrapRenamed(reader)) {
-    is IndirectVector -> unwrapScalarSource(source.inner)
+private tailrec fun unwrapCellSource(reader: VectorReader): VectorReader = when (val source = VectorReader.unwrapRenamed(reader)) {
+    is IndirectVector -> unwrapCellSource(source.inner)
     else -> source
 }
 
@@ -116,10 +124,10 @@ internal fun VectorWriter.scalarObjectTarget(src: VectorReader, idx: Int): Vecto
     val sourceType = src.arrowType
     if (src.type.encoding != Encoding.Plain) return null
     val hasIdentity = when (sourceType) {
-        VectorType.DATE_DAY.arrowType -> unwrapScalarSource(src) is DateDayVector
-        UuidType -> (unwrapScalarSource(src) as? UuidVector)?.hasCanonicalWidth == true
+        VectorType.DATE_DAY.arrowType -> unwrapCellSource(src) is DateDayVector
+        UuidType -> (unwrapCellSource(src) as? UuidVector)?.hasCanonicalWidth == true
         UTF8_TYPE -> src.isNull(idx) || src.getBytes(idx).isWellFormedUtf8()
-        is ArrowType.Timestamp, is ArrowType.Duration, is ArrowType.Time -> unwrapScalarSource(src).let { source ->
+        is ArrowType.Timestamp, is ArrowType.Duration, is ArrowType.Time -> unwrapCellSource(src).let { source ->
             source.hasCanonicalTemporalLayout() &&
                 (source !is Time64Vector || src.isNull(idx) || src.getLong(idx).isNanoTimeOfDay())
         }
@@ -138,8 +146,17 @@ internal fun VectorWriter.scalarObjectTarget(src: VectorReader, idx: Int): Vecto
     return target
 }
 
-internal fun VectorWriter.copyNonNullScalar(src: VectorReader, idx: Int) {
-    if (src.nullable && !nullable) writeValue(src.valueReader().also { it.pos = idx })
+internal fun VectorWriter.tableCellObjectTarget(src: VectorReader, idx: Int): VectorWriter? {
+    if (src.arrowType != LIST) return scalarObjectTarget(src, idx)
+    if (unwrapCellSource(src) !is ListVector) return null
+
+    val target = (if (this is DenseUnionVector) vectorForOrNull(LIST.toLeg()) else this) ?: return null
+    val storage = if (target is DenseUnionVector.LegVector) target.inner else target
+    return if (storage is ListVector && storage.acceptsPrimitiveCell(src, idx)) target else null
+}
+
+internal fun VectorWriter.copyNonNullCell(src: VectorReader, idx: Int) {
+    if (src.arrowType != LIST && src.nullable && !nullable) writeValue(src.valueReader().also { it.pos = idx })
     else src.rowCopier(this).copyRow(idx)
 }
 
@@ -147,5 +164,14 @@ fun VectorWriter.writeScalarCell(src: VectorReader, idx: Int) {
     val target = scalarObjectTarget(src, idx)
     if (target == null) writeObject(src.getObject(idx))
     else if (src.isNull(idx)) writeObject(null)
-    else target.copyNonNullScalar(src, idx)
+    else target.copyNonNullCell(src, idx)
+}
+
+/** @suppress */
+@InternalApi
+fun VectorWriter.writeTableCell(src: VectorReader, idx: Int) {
+    val target = tableCellObjectTarget(src, idx)
+    if (target == null) writeObject(src.getObject(idx))
+    else if (src.isNull(idx)) writeObject(null)
+    else target.copyNonNullCell(src, idx)
 }

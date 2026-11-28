@@ -174,6 +174,7 @@ class StructVector private constructor(
             val target = dest.vectorForOrNull(name) ?: return@all false
             child.type.encoding == Encoding.Plain && !child.isNull(idx) && when (child) {
                 is StructVector -> target is StructVector && child.canCopyObjectChildrenTo(target, idx)
+                is ListVector -> target is ListVector && target.acceptsPrimitiveCell(child, idx)
                 else -> target.scalarObjectTarget(child, idx) != null
             }
         }
