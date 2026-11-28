@@ -44,6 +44,51 @@ class TxWriterTest {
 
     @Suppress("DEPRECATION")
     @Test
+    fun `sql source keeps canonical argument streams and distinguishes absent and zero-row binds`() {
+        RootAllocator().use { allocator ->
+            val argsSchema = schema("?_0" ofType VectorType.maybe(VectorType.I64), "?_1" ofType VectorType.UTF8)
+            Relation(allocator, argsSchema).use { args ->
+                args["?_0"].writeLong(42)
+                args["?_1"].writeObject("a".repeat(4097))
+                args.endRow()
+                args["?_0"].writeNull()
+                args["?_1"].writeObject("café")
+                args.endRow()
+
+                Relation(allocator, argsSchema).use { emptyArgs ->
+                    val sql = "UPDATE docs SET value = ? WHERE _id = ?"
+                    val bindings = listOf(null, args, emptyArgs, null, args)
+                    val ops = bindings.map { TxOp.Sql(sql, it) }
+                    val expectedCells = bindings.map { it?.toArrowStream()?.toByteArray() }
+                    val byteOps = expectedCells.map { TxOp.SqlBytes(sql, it ?: ByteArray(0)) }
+                    val opts = TxOpts(defaultTz = ZoneOffset.UTC)
+
+                    assertArrayEquals(byteOps.toLegacyBytes(allocator, opts), ops.toLegacyBytes(allocator, opts))
+
+                    val stream = ops.toArrowBytes(allocator)
+                    assertEquals(byteOps.toArrowBytes(allocator), stream)
+                    Relation.StreamLoader(allocator, Channels.newChannel(stream.newInput())).use { loader ->
+                        Relation(allocator, loader.schema).use { rel ->
+                            assertTrue(loader.loadNextPage(rel))
+                            assertEquals(bindings.size, rel.rowCount)
+                            val cells = rel["tx-ops"].vectorFor("sql").vectorFor("args")
+                            for ((idx, expected) in expectedCells.withIndex()) {
+                                if (expected == null) assertTrue(cells.isNull(idx))
+                                else assertArrayEquals(expected, cells.getObject(idx) as ByteArray)
+                            }
+                            Relation.openFromArrowStream(allocator, cells.getObject(2) as ByteArray).use { empty ->
+                                assertEquals(argsSchema, empty.schema)
+                                assertEquals(0, empty.rowCount)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    @Test
     fun `delete and erase source records keep ordered canonical IIDs and delete bounds`() {
         RootAllocator().use { allocator ->
             val uuid = UUID.fromString("f1234567-89ab-cdef-fedc-ba9876543210")

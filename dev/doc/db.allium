@@ -563,6 +563,8 @@ variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
+    -- JVM SQL source encoding copies the framed one-page argument stream into a single binary cell.
+    -- An absent JVM SQL argument relation produces a null cell, while a zero-row relation retains its schema and empty page.
     -- An unguarded Classic append without a retry key or placed attempt writes dense union tags from a uniform Arrow argument upload as child ordinals, including nested unions.
     -- Receipt encoding and the source encoding of keyed, guarded and placed transactions preserve the explicit type IDs in uniform Arrow argument uploads.
     -- Source replay accepts existing argument streams with explicitly declared non-ordinal type IDs.

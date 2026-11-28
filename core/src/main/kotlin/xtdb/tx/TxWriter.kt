@@ -58,14 +58,14 @@ private fun interface TxOpWriter<O : TxOp> {
 }
 
 private class SqlWriter(val al: BufferAllocator, ops: VectorWriter) {
-    private val sqlVec = ops.vectorFor("sql", STRUCT_TYPE, false)
+    private val sqlVec = ops.vectorFor("sql", STRUCT_TYPE, false) as DenseUnionVector.LegVector
     private val queryVec = sqlVec.vectorFor("query", UTF8_TYPE, false)
-    private val argsVec = sqlVec.vectorFor("args", VAR_BINARY_TYPE, false)
+    private val argsVec = sqlVec.vectorFor("args", VAR_BINARY_TYPE, false).inner as VarBinaryVector
 
     fun writeOp(op: TxOp.Sql) {
         queryVec.writeObject(op.sql)
         op.args?.let { args ->
-            args.openDirectSlice(al).use { argsVec.writeObject(it.toArrowStream().toByteArray()) }
+            args.openDirectSlice(al).use { argsVec.writeBytes(it.toArrowStream()) }
         }
         sqlVec.endStruct()
     }

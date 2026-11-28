@@ -1,5 +1,6 @@
 package xtdb.arrow
 
+import com.google.protobuf.ByteString
 import org.apache.arrow.memory.ArrowBuf
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.util.ArrowBufPointer
@@ -57,8 +58,8 @@ sealed class VariableWidthVector : MonoVector() {
         valueCount++
     }
 
-    private fun writeNotNull(len: Int) {
-        writeOffset(lastOffset + len)
+    private fun endValue(endOffset: Int) {
+        writeOffset(endOffset)
         validityBuffer?.writeBit(valueCount, 1)
         valueCount++
     }
@@ -70,13 +71,22 @@ sealed class VariableWidthVector : MonoVector() {
     }
 
     override fun writeBytes(v: ByteBuffer) {
-        writeNotNull(v.remaining())
+        endValue(lastOffset + v.remaining())
         dataBuffer.writeBytes(v.duplicate())
     }
 
     override fun writeBytes(v: ByteArray) {
-        writeNotNull(v.size)
+        endValue(lastOffset + v.size)
         dataBuffer.writeBytes(v)
+    }
+
+    internal fun writeBytes(v: ByteString) {
+        val len = v.size()
+        val endOffset = Math.addExact(lastOffset, len)
+        val start = dataBuffer.writerIndex
+        if (len > 0) v.copyTo(dataBuffer.ensureWritable(len.toLong()).nioBuffer(start, len))
+        endValue(endOffset)
+        dataBuffer.writerIndex = start + len
     }
 
     override fun writeValue0(v: ValueReader) = writeBytes(v.readBytes())
