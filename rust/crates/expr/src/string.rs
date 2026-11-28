@@ -222,6 +222,10 @@ pub(crate) fn text_substring(source: &str, position: i64, length: Option<i64>) -
     std::str::from_utf8(slice).map_err(|_| illegal("String operation produced invalid UTF-8"))
 }
 
+pub(crate) fn binary_substring(source: &[u8], position: i64, length: Option<i64>) -> Result<&[u8]> {
+    substring(source, position as i32, length.map(|length| length as i32), false)
+}
+
 fn substring(source: &[u8], position: i32, length: Option<i32>, utf8: bool) -> Result<&[u8]> {
     if length.is_some_and(|length| length < 0) { return Err(illegal("Negative substring length")); }
     let zero = position.wrapping_sub(1);

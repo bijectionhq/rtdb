@@ -181,6 +181,11 @@ pub fn text_substrings(values: &StringArray, positions: &Int64Array, lengths: Op
     Ok(Some(texts.finish()))
 }
 
+/// Borrows the scalar Binary SUBSTRING result using the same signed index narrowing and byte limits.
+pub fn binary_substring(source: &[u8], position: i64, length: Option<i64>) -> Result<&[u8]> {
+    crate::string::binary_substring(source, position, length)
+}
+
 /// LENGTH in characters over text; a text vector's `i32` offsets bound every count.
 pub fn text_lengths(values: &StringArray) -> Int32Array {
     values.iter().map(|text| text.map(|text| text.chars().count() as i32)).collect()

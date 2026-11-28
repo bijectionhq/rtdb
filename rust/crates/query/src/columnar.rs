@@ -1,6 +1,7 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 pub(crate) mod apply;
+mod binary;
 mod calendar;
 mod concat;
 pub(crate) mod float_vector;
@@ -5293,6 +5294,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binary_substring_uses_byte_offsets_and_reports_the_first_reached_limit_error() {
+        use arrow_array::BinaryArray;
+
+        let memory = MemoryBudget::new(1 << 22);
+        let input = field(0, ScalarType::Binary);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let batch = |values: &[Option<&[u8]>]| ColumnBatch::settled(vec![Column::Arrow {
+            array: Arc::new(BinaryArray::from_iter(values.iter().copied())),
+            field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+            logical: Some(input.data_type.clone()),
+        }], values.len(), memory.reserve(4096).unwrap()).unwrap();
+        let substring = |index: Expr, length: Option<Expr>| {
+            let args = [input.expression(), index].into_iter().chain(length).collect::<Vec<_>>();
+            let return_type = rtdb_plan::function_type_with_args("substring", &args).unwrap();
+            Expr::Call { name: "substring".into(), args, return_type }
+        };
+        let int = |value| Expr::Literal(Value::I64(value));
+        let negative = |value| Expr::unary(UnaryOp::Negate, int(value));
+        let mut cursor = record_projection_cursor(batch(&[None, Some(&[255, 0, 97]), Some(&[])]), schema.clone(), vec![
+            substring(negative(1), Some(int(3))), substring(int((1i64 << 32) + 2), None),
+        ], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        for (column, expected) in page.columns.iter().zip([
+            [None, Some(&[255][..]), Some(&[][..])], [None, Some(&[0, 97][..]), Some(&[][..])],
+        ]) {
+            let Column::Arrow { array, .. } = column else { panic!("Expected packed bytes"); };
+            let values = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+        }
+        let expression = substring(int(2), Some(int(i64::from(i32::MAX))));
+        let mut cursor = record_projection_cursor(batch(&[None, Some(&[])]), schema.clone(), vec![expression.clone()], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Null);
+        assert_eq!(page.columns[0].value(1).unwrap(), Value::Binary(vec![]));
+        let mut cursor = record_projection_cursor(batch(&[None, Some(&[]), Some(&[1, 2])]), schema.clone(), vec![expression], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().message.as_deref(), Some("newLimit < 0"));
+        let expression = substring(int(1), Some(negative(1)));
+        let mut cursor = record_projection_cursor(batch(&[None]), schema.clone(), vec![expression.clone()], &memory);
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(), Value::Null);
+        let mut cursor = record_projection_cursor(batch(&[None, Some(&[])]), schema, vec![expression], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().message.as_deref(), Some("Negative substring length"));
+    }
+
+    #[tokio::test]
+    async fn binary_substring_copies_only_the_reached_slice_of_a_funded_cell() {
+        use arrow_array::{BinaryArray, RecordBatch};
+
+        let memory = MemoryBudget::new(1 << 17);
+        let source_memory = MemoryBudget::new(1 << 23);
+        let input = field(0, ScalarType::Binary);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let field = rtdb_columnar::to_field(&input.name, &input.data_type).unwrap();
+        let bytes = vec![255u8; 1 << 20];
+        let source = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])),
+            vec![Arc::new(BinaryArray::from_vec(vec![bytes.as_slice()]))]).unwrap();
+        let batch = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(source, &source_memory).unwrap()).unwrap();
+        let args = vec![input.expression(), Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(1))];
+        let expr = Expr::Call { name: "substring".into(), return_type: rtdb_plan::function_type_with_args("substring", &args).unwrap(), args };
+        let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Binary(vec![255]));
+    }
+
+    #[tokio::test]
     async fn scalar_length_over_a_computed_argument_writes_an_i32_column() {
         let memory = MemoryBudget::new(1 << 22);
         let len = 256;
@@ -6577,6 +6642,11 @@ impl BatchCursor for BatchExpressions {
             if let Some((column, owner)) = projection::list_subscript(
                 expression, invocation.data_type(), &self.schema, &batch, &self.execution.context,
             )? {
+                columns.push(column);
+                owners[index] = Some(owner);
+                continue;
+            }
+            if let Some((column, owner)) = binary::column(expression, invocation.data_type(), &self.schema, &batch, &self.execution)? {
                 columns.push(column);
                 owners[index] = Some(owner);
                 continue;
