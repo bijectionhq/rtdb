@@ -1194,6 +1194,10 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
     use rtdb_crypt::FileKms;
     use rtdb_store::LocalStore;
 
+    const STORE_KEY: &[u8] = b"\x00kernel-record\xff";
+    const AT_BACKUP: &[u8] = b"\xfforiginal\x00";
+    const AT_SUCCESSOR_HEAD: &[u8] = b"\x00successor\xff";
+
     let source_vault = tempfile::tempdir().unwrap();
     let destination_vault = tempfile::tempdir().unwrap();
     let source_path = source_vault.path().join("keys");
@@ -1216,12 +1220,14 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
         writer.create().await.unwrap();
         writer.tick(&live(1)).await.unwrap();
         let receipt = writer.transact(&request).await.unwrap();
+        writer.transact(&store_write(5, STORE_KEY, Some(AT_BACKUP))).await.unwrap();
         let branch_cut = writer.transact(&self::request(2, Op::Fork {
             child: "backup-report".into(), from: (MAIN_BRANCH.into(), receipt.basis), writable: true, expires_at: None,
         })).await.unwrap();
         let source_lsn = writer.stream.head().await.unwrap();
         let archive = writer.portable_backup().await.unwrap().into_bytes();
         writer.transact(&put(3, 1, "after backup")).await.unwrap();
+        writer.transact(&store_write(6, STORE_KEY, Some(b"lost source tail"))).await.unwrap();
         (archive, receipt, branch_cut, source_lsn)
     };
     assert!(crate::PortableBackup::verify(&archive, destination_keys.clone()).await.is_err());
@@ -1260,7 +1266,8 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
     assert_eq!(successor.install_portable_backup(retry).await.unwrap(), install);
     let new = successor.transact(&put(4, 2, "new history")).await.unwrap();
     assert!(new.basis > install.destination_basis());
-    destination_time.store(new.system_time.0, Ordering::SeqCst);
+    let advanced = successor.transact(&store_write(7, STORE_KEY, Some(AT_SUCCESSOR_HEAD))).await.unwrap();
+    destination_time.store(advanced.system_time.0, Ordering::SeqCst);
     let checkpoint = successor.checkpoint(Vec::new()).await.unwrap();
     drop(successor);
     drop(source_keys);
@@ -1269,6 +1276,14 @@ async fn portable_backup_restores_a_fresh_stream_without_source_data() {
     assert_eq!(reopened.installed_backup().await.unwrap(), Some(install));
     assert_eq!(reopened.tx_status(&request.key).await.unwrap(), restored);
     assert_eq!(text_at(&mut reopened, MAIN_BRANCH, 2).await, Some(Value::Utf8("new history".into())));
+
+    let index = reopened.fresh_index().await.unwrap();
+    assert_eq!(index.exact(branch_cut.basis).unwrap_err().code, "rtdb/foreign-basis");
+    let selected = index.view(MAIN_BRANCH, At::Exactly(install.destination_basis()), Layer::Merged, advanced.system_time).unwrap();
+    assert_eq!(index.exact(install.destination_basis()).unwrap().system_time, install.source_system_time());
+    assert_eq!(selected.store_value(STORE_KEY).unwrap(), Some(AT_BACKUP));
+    let current = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, advanced.system_time).unwrap();
+    assert_eq!(current.store_value(STORE_KEY).unwrap(), Some(AT_SUCCESSOR_HEAD));
 
     let key = ObjectKey::new(checkpoint.to_string()).unwrap();
     let ciphertext = store.get_fresh(&key).await.unwrap();
