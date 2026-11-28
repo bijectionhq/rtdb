@@ -281,7 +281,7 @@ protocol version 4. Upgrade serving readers and operator brokers before that
 write. Existing names on versions 1 through 3 retain their legacy commands.
 
 Pass the same `--expected-incarnation`, `--expected-revision`, and
-`--operation-id` to each command.
+`--operation-id` to each command that changes recovery state.
 
 1. Run `begin-recovery --loss-policy lossless|accept-unknown-tail`. Pass
    `--cell-id` for a remote destination. The authority records the predecessor,
@@ -305,12 +305,17 @@ Pass the same `--expected-incarnation`, `--expected-revision`, and
    offline by this point.
 
 An accepted-unknown-tail recovery can record the installation before freezing.
-`recovery-status` returns the pending intent or the latest completed operation
-from the authority after restart. A retry of publication returns the same
-retained result. The expected binding revision fences retries after another
-successor has been published. To replace an unfinished attempt, supply
-`--supersede-operation-id` with a new operation ID to `begin-recovery`. This
-preserves an existing freeze and any sealed lossless source cut.
+With an operation ID, `recovery-status` checks the exact pending operation or the latest completed publication.
+If the operation ID was lost, omit `--operation-id` and provide the exact predecessor incarnation and revision.
+The authority returns the selected operation after supersession or publication, including the original successor binding and any recorded installation, source cut, and custody evidence.
+The same lookup works through the local broker or a direct consensus reader and can retrieve a publication after later successors have been published.
+Historical discovery reports the published evidence, and opening that candidate requires its current serving authorization and the retained provider holds for its selected cut.
+An unknown predecessor binding fails with `rtdb/activation-conflict`.
+
+A retry of publication returns the same retained result.
+The expected binding revision fences mutation retries after another successor has been published.
+To replace an unfinished attempt, supply `--supersede-operation-id` with a new operation ID to `begin-recovery`.
+This preserves an existing freeze and any sealed lossless source cut.
 
 Lossless source sealing uses a broker-configured stopped deployment with its
 incarnation, optional cell, and protected data directory and source journal

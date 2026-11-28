@@ -26,7 +26,9 @@ pub const HELP: &str = "Usage: rtdb multi-activation status DATABASE AUTHORITY
                  [--cell-id UUID --installation-proof FILE --manifest-sha256 HEX]
        rtdb multi-activation begin-recovery DATABASE AUTHORITY --expected-incarnation UUID --expected-revision N --operation-id UUID
                  --loss-policy lossless|accept-unknown-tail [--cell-id UUID] [--supersede-operation-id UUID]
-       rtdb multi-activation recovery-status|freeze-recovery|publish-recovery DATABASE AUTHORITY
+       rtdb multi-activation recovery-status DATABASE AUTHORITY
+                 --expected-incarnation UUID --expected-revision N [--operation-id UUID]
+       rtdb multi-activation freeze-recovery|publish-recovery DATABASE AUTHORITY
                  --expected-incarnation UUID --expected-revision N --operation-id UUID
        rtdb multi-activation commission-ranked DATABASE --authority-socket PATH --provider NAME
                  --expected-incarnation UUID --expected-revision N
@@ -163,6 +165,9 @@ enum Action {
         operation_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installation: Option<RemoteInstallation>,
+    },
+    RecoveryStatus {
+        predecessor: Binding,
     },
     Recovery {
         operation: recovery::Operation,
@@ -480,8 +485,17 @@ impl Options {
                 operation_id: id(take(&mut fields, "--operation-id")?)?,
                 installation: None,
             },
-            "begin-recovery" | "recovery-status" | "freeze-recovery" | "seal-source"
-            | "record-install" | "publish-recovery" => {
+            "recovery-status" => {
+                let predecessor = binding(&mut fields)?;
+                match fields.remove("--operation-id").map(id).transpose()? {
+                    Some(operation_id) => Action::Recovery {
+                        operation: recovery::Operation { predecessor, operation_id },
+                        action: RecoveryAction::Status,
+                    },
+                    None => Action::RecoveryStatus { predecessor },
+                }
+            }
+            "begin-recovery" | "freeze-recovery" | "seal-source" | "record-install" | "publish-recovery" => {
                 let selection = recovery::Operation {
                     predecessor: binding(&mut fields)?,
                     operation_id: id(take(&mut fields, "--operation-id")?)?,
@@ -496,7 +510,6 @@ impl Options {
                             _ => return Err(arguments_error()),
                         },
                     },
-                    "recovery-status" => RecoveryAction::Status,
                     "freeze-recovery" => RecoveryAction::Freeze,
                     "seal-source" => RecoveryAction::SealSource,
                     "record-install" => RecoveryAction::RecordInstall { installation: None },
@@ -590,7 +603,7 @@ impl Options {
                     Authority::Consensus { url, tls, identity } => {
                         let access = if matches!(
                             request.action,
-                            Action::Status | Action::Candidate { .. }
+                            Action::Status | Action::Candidate { .. } | Action::RecoveryStatus { .. }
                             | Action::Recovery { action: RecoveryAction::Status, .. }
                         ) {
                             Access::ConsensusReader
@@ -726,6 +739,9 @@ impl Request {
         let database = self.database;
         match self.action {
             Action::Status => (),
+            Action::RecoveryStatus { predecessor } => {
+                return Ok(json!(authority.recovery_status_for_predecessor(&database, predecessor).await?));
+            }
             Action::RankedOutcomes { predecessor, after } => {
                 return ranked.outcomes(authority, &database, predecessor, None, after).await;
             }
@@ -1412,6 +1428,38 @@ fn missing_installation() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_status_arguments_make_only_the_read_operation_id_optional() {
+        let incarnation = Uuid::new_v4();
+        let selected = Binding { incarnation, revision: 7 };
+        let operation_id = Uuid::new_v4();
+        let exact_binding = format!("--expected-incarnation {incarnation} --expected-revision 7");
+        let parse = |arguments: &str| Options::parse(arguments.split_whitespace().map(str::to_owned));
+        let direct = format!("--authority-id {} --authority-url logkeeper-consensus:///journal.json --authority-tls-dir tls", Uuid::new_v4());
+        let broker = "--authority-socket /tmp/authority.sock";
+        for authority in [direct.as_str(), broker] {
+            let status = format!("recovery-status xtdb {authority} {exact_binding}");
+            let request = |options: Options| match options.0 {
+                Command::Direct { request, .. } | Command::CallBroker { request, .. } => request,
+                _ => panic!("Expected a status request"),
+            };
+            assert!(matches!(
+                request(parse(&status).unwrap()).action,
+                Action::RecoveryStatus { predecessor } if predecessor == selected
+            ));
+            assert!(matches!(
+                request(parse(&format!("{status} --operation-id {operation_id}")).unwrap()).action,
+                Action::Recovery {
+                    operation: recovery::Operation { predecessor, operation_id: selected_id },
+                    action: RecoveryAction::Status,
+                } if predecessor == selected && selected_id == operation_id
+            ));
+            assert!(parse(&format!("recovery-status xtdb {authority} --expected-incarnation {incarnation}")).is_err());
+            assert!(parse(&format!("freeze-recovery xtdb {authority} {exact_binding}")).is_err());
+        }
+    }
 
     #[cfg(unix)]
     #[test]

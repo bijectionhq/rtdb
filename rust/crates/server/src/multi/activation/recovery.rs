@@ -211,18 +211,24 @@ impl State {
         if operation.predecessor != publication.predecessor {
             return Err(conflict());
         }
-        let completed = publication.recovery.as_ref().ok_or_else(conflict)?;
-        Ok(Some(Status::Published {
+        publication.recovery_status(self.binding).map(Some)
+    }
+}
+
+impl Publication {
+    fn recovery_status(&self, binding: Binding) -> Result<Status> {
+        let completed = self.recovery.as_ref().ok_or_else(conflict)?;
+        Ok(Status::Published {
             intent: Intent {
-                operation,
-                destination_cell: publication.destination_cell,
+                operation: Operation { predecessor: self.predecessor, operation_id: self.operation },
+                destination_cell: self.destination_cell,
                 loss_policy: completed.loss_policy,
             },
-            binding: self.binding,
-            installation: completed.installation(publication.manifest_digest),
+            binding,
+            installation: completed.installation(self.manifest_digest),
             final_source_lsn: completed.final_source_lsn,
             ranked_closure: completed.ranked_closure,
-        }))
+        })
     }
 }
 
@@ -326,6 +332,27 @@ impl ActivationAuthority {
     pub(crate) async fn recovery_status(&self, name: &str, operation: Operation) -> Result<Status> {
         let (_, state) = self.read(self.stream_id(name)?).await?;
         self.recovery_status_at(name, &state.ok_or_else(unavailable)?, operation)
+    }
+
+    pub(super) async fn recovery_status_for_predecessor(&self, name: &str, predecessor: Binding) -> Result<Status> {
+        let (_, state) = self.read(self.stream_id(name)?).await?;
+        let state = state.ok_or_else(unavailable)?;
+        if state.binding == predecessor {
+            let pending = state.recovery.ok_or_else(conflict)?;
+            return self.recovery_status_at(name, &state, pending.intent.operation);
+        }
+        if let Some(publication) = state.publication.as_ref().filter(|publication| publication.predecessor == predecessor) {
+            return publication.recovery_status(state.binding);
+        }
+        let revision = predecessor.revision.checked_add(1).ok_or_else(conflict)?;
+        if revision >= state.binding.revision {
+            return Err(conflict());
+        }
+        let publication = self.archived_publication(name, predecessor).await?.ok_or_else(conflict)?;
+        let incarnation = self.successor_incarnation_in_cell(
+            name, predecessor, publication.operation, publication.destination_cell,
+        )?;
+        publication.recovery_status(Binding { incarnation, revision })
     }
 
     #[cfg(unix)]
@@ -903,10 +930,14 @@ mod tests {
             successor: replacement_candidate,
             ..installed(2)
         };
-        authority
+        let staged = authority
             .record_recovery_installation("xtdb", replacement, exact)
             .await
             .unwrap();
+        assert_eq!(
+            serde_json::to_value(authority.recovery_status_for_predecessor("xtdb", predecessor).await.unwrap()).unwrap(),
+            serde_json::to_value(staged).unwrap(),
+        );
         let published = authority
             .publish_recovery("xtdb", replacement)
             .await
@@ -926,6 +957,11 @@ mod tests {
                 ..
             }
         ));
+        let published = serde_json::to_value(published).unwrap();
+        assert_eq!(
+            serde_json::to_value(authority.recovery_status_for_predecessor("xtdb", predecessor).await.unwrap()).unwrap(),
+            published,
+        );
         #[cfg(unix)]
         {
             let current = authority.binding("xtdb").await.unwrap();
@@ -942,7 +978,26 @@ mod tests {
             authority.freeze_recovery("xtdb", operation_after).await.unwrap();
             authority.publish_recovery("xtdb", operation_after).await.unwrap();
 
-            let reopened = ActivationAuthority::new(authority_journal, identity).unwrap();
+            let reopened = ActivationAuthority::with_access(
+                authority_journal, identity, super::super::Access::ConsensusReader,
+            ).unwrap();
+            assert_eq!(
+                serde_json::to_value(reopened.recovery_status_for_predecessor("xtdb", predecessor).await.unwrap()).unwrap(),
+                published,
+            );
+            assert_eq!(
+                reopened.recovery_status("xtdb", replacement).await.unwrap_err().code,
+                "rtdb/activation-conflict",
+            );
+            for wrong in [
+                Binding { incarnation: Uuid::new_v4(), ..predecessor },
+                Binding { revision: predecessor.revision + 1, ..predecessor },
+            ] {
+                assert_eq!(
+                    reopened.recovery_status_for_predecessor("xtdb", wrong).await.unwrap_err().code,
+                    "rtdb/activation-conflict",
+                );
+            }
             assert!(matches!(
                 reopened.require_custody_release("xtdb", operation, None, candidate).await.unwrap(),
                 CustodySettlement::Abandoned

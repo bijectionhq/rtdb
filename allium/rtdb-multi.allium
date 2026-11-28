@@ -434,6 +434,9 @@ contract CellMap {
         -- A recorded installation must cover that final source position or carry explicit acceptance of an unknown tail at its verified cut.
         -- The authority retains the verified installation and commits publication against that exact frozen operation.
         -- Publication retries read the retained result and the predecessor revision fences older operations after a later publication.
+        -- Read-only status discovery by the exact predecessor incarnation and revision returns the selected operation after supersession or publication.
+        -- After later generations publish, discovery returns the original successor binding and verified installation from that predecessor's retained publication.
+        -- Recovery mutations require the exact operation identity.
         -- Publication compares that same binding, verifies the installed successor, and measures a full conservative grant window after observing the committed closure.
         -- The successor's identity is derived from the name, next activation revision and recovery operation.
         -- The local activation broker authenticates operator peers and owns its journal writer credential.
