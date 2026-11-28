@@ -91,6 +91,7 @@ COPY rust/release/default.yaml /usr/local/lib/xtdb/config.yaml
 COPY rust/release/default.yaml /etc/rtdb/config.yaml
 COPY rust/release/default-var-lib-rtdb.yaml /etc/rtdb/config-var-lib-rtdb.yaml
 COPY --chmod=0555 rust/release/entrypoint.sh /usr/local/bin/rtdb-entrypoint
+COPY --chmod=0555 rust/release/install-recovery-reader.sh /usr/local/bin/rtdb-install-recovery-reader
 COPY rust/release/cluster-default.yaml rust/release/cluster-multi.yaml /etc/rtdb/
 ENV LD_PRELOAD=libjemalloc.so.2
 ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
