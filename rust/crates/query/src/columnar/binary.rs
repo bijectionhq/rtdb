@@ -4,8 +4,8 @@ use arrow_array::{
     Array, BinaryArray,
     builder::{BinaryBuilder, Int32Builder},
 };
-use arrow_schema::DataType;
-use rtdb_columnar::{ArrowCell, MemoryReservation};
+use arrow_schema::{DataType, Field};
+use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryReservation, read_execution_entity_id_as};
 use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
 use rtdb_types::{AnomalyKind, LogicalType, Result, ScalarType, Value};
 
@@ -217,49 +217,90 @@ fn entity_sort_key(
     batch: &ColumnBatch,
     execution: &Execution,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
-    let [Expr::Column { id, .. }] = args else {
-        return Ok(None);
-    };
-    let Some(position) = schema.position(*id) else {
-        return Ok(None);
-    };
-    let input = &batch.columns[position];
-    let read = |row| {
-        if input.arrow_cell(row)?.is_none() {
-            return Some(None);
+    match args {
+        [Expr::Column { id, .. }] => {
+            let Some(position) = schema.position(*id) else {
+                return Ok(None);
+            };
+            let input = &batch.columns[position];
+            write_entity_sort_keys(batch.len, execution, |row| {
+                if input.arrow_cell(row)?.is_none() {
+                    return Some(None);
+                }
+                let cell = input.expression_cell(row)?.physical().ok()?;
+                if cell.is_null().ok()? {
+                    return Some(None);
+                }
+                let logical = entity_sort_key_type(cell.field)?;
+                read_execution_entity_id_as(Some(&logical), cell.field, cell.array, cell.row).ok()
+            })
         }
-        let cell = input.expression_cell(row)?.physical().ok()?;
-        if cell.is_null().ok()? {
-            return Some(None);
+        [Expr::Parameter { index, .. }] if batch.len != 0 => {
+            let Some(id) = bound_entity_sort_key_id(*index, execution) else {
+                return Ok(None);
+            };
+            write_entity_sort_keys(batch.len, execution, |_| Some(id))
         }
-        let storage = cell.field.data_type();
-        if !storage.is_integer() && !matches!(storage, DataType::Utf8 | DataType::FixedSizeBinary(16)) {
+        _ => Ok(None),
+    }
+}
+
+fn bound_entity_sort_key_id(
+    index: usize,
+    execution: &Execution,
+) -> Option<Option<EntityIdRef<'_>>> {
+    execution.parameters.arrow_input(index)?;
+    let cell = execution.parameters.evaluator().arrow_cell(index)?;
+    let tagged = !cell.field.metadata().is_empty();
+    let _schema = if tagged {
+        if !matches!(cell.field.data_type(), DataType::Utf8 | DataType::FixedSizeBinary(16)) {
             return None;
         }
-        let logical = rtdb_columnar::from_field(cell.field).ok()?;
-        use ScalarType as S;
-        if !matches!(
-            plain_scalar(&logical),
-            Some(
-                S::Utf8
-                    | S::Keyword
-                    | S::Uuid
-                    | S::I8
-                    | S::I16
-                    | S::I32
-                    | S::I64
-                    | S::U8
-                    | S::U16
-                    | S::U32
-                    | S::U64
-            )
-        ) {
-            return None;
-        }
-        rtdb_columnar::read_execution_entity_id_as(Some(&logical), cell.field, cell.array, cell.row)
-            .ok()
+        let bytes = cell.field.size().checked_mul(4)?.checked_add(1024)?;
+        Some(execution.context.memory.try_reserve(bytes)?)
+    } else {
+        None
     };
-    let len = batch.len;
+    let logical = entity_sort_key_type(cell.field)?;
+    if rtdb_columnar::execution_type(&logical) != *execution.parameters.types().get(index)?
+        || (tagged && rtdb_columnar::to_field("", &logical).ok()?.metadata() != cell.field.metadata())
+    {
+        return None;
+    }
+    read_execution_entity_id_as(Some(&logical), cell.field, cell.array, cell.row).ok()
+}
+
+fn entity_sort_key_type(field: &Field) -> Option<LogicalType> {
+    let storage = field.data_type();
+    if !storage.is_integer() && !matches!(storage, DataType::Utf8 | DataType::FixedSizeBinary(16)) {
+        return None;
+    }
+    let logical = rtdb_columnar::from_field(field).ok()?;
+    use ScalarType as S;
+    matches!(
+        plain_scalar(&logical),
+        Some(
+            S::Utf8
+                | S::Keyword
+                | S::Uuid
+                | S::I8
+                | S::I16
+                | S::I32
+                | S::I64
+                | S::U8
+                | S::U16
+                | S::U32
+                | S::U64
+        )
+    )
+    .then_some(logical)
+}
+
+fn write_entity_sort_keys<'a>(
+    len: usize,
+    execution: &Execution,
+    read: impl Fn(usize) -> Option<Option<EntityIdRef<'a>>>,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     let context = &execution.context;
     let mut payload = 0usize;
     for row in 0..len {

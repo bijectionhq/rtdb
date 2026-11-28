@@ -474,3 +474,83 @@ async fn arrow_wave4_selected_checked_arithmetic_falls_back_at_the_first_failing
     let error = projection.next_batch().await.err().unwrap();
     assert_eq!((error.code, error.message), (expected.code, expected.message));
 }
+
+#[tokio::test]
+async fn sql_entity_sort_key_borrows_exact_bound_ids_without_caching_scalar_values() {
+    use crate::runtime_schema::EmittedRelation;
+    use arrow_array::RecordBatch;
+    use rtdb_columnar::{OwnedBatch, build_array, execution_type, to_field};
+    use rtdb_sql::PrepareOptions;
+    use rtdb_types::{EntityId, Keyword};
+
+    let sql = "SELECT ENTITY_SORT_KEY($1) AS sort_key FROM (VALUES (0), (1)) AS t(i)";
+    let cases = [
+        (Value::Utf8("outside".into()), Value::Utf8("東京".into())),
+        (Value::I16(7), Value::I16(-128)),
+        (Value::U8(7), Value::U8(u8::MAX)),
+        (
+            Value::Keyword(Keyword::from_name("outside")),
+            Value::Keyword(Keyword::from_name(":ns/東京")),
+        ),
+        (Value::Uuid([0; 16]), Value::Uuid([0xa5; 16])),
+        (Value::Utf8("outside".into()), Value::Null),
+        (Value::Binary(vec![0]), Value::Binary(vec![4])),
+    ];
+    for (outside, selected) in cases {
+        let mut execution = execution();
+        let memory = &execution.context.memory;
+        let catalog = &execution.context.catalog;
+        let prepared = rtdb_sql::prepare(sql, catalog, &PrepareOptions::default()).unwrap();
+        let query = crate::PreparedQuery::from_prepared(prepared, memory).unwrap();
+        assert!(!query.is_parameter_projection());
+        let ty = outside.logical_type().maybe();
+        let expected = match &selected {
+            Value::Null => Ok(Value::Null),
+            Value::U8(value) => Ok(Value::Binary(
+                EntityId::Integer(i64::from(*value as i8)).handle_bytes(),
+            )),
+            value => value.entity_id().map(|id| Value::Binary(id.handle_bytes())),
+        };
+        let fields = arrow_schema::Schema::new(vec![to_field("arg", &ty).unwrap()]);
+        let array = build_array(&ty, &[outside, selected]).unwrap();
+        let arguments = OwnedBatch::new(
+            RecordBatch::try_new(Arc::new(fields), vec![array]).unwrap(),
+            memory,
+        )
+        .unwrap();
+        execution.parameters = Arc::new(
+            BoundParameters::from_arrow(arguments, 1, vec![execution_type(&ty)], memory).unwrap(),
+        );
+        let runtime = EmittedRelation::derive(
+            Arc::clone(query.relation()),
+            catalog,
+            execution.parameters.types(),
+            memory,
+        )
+        .unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        match expected {
+            Ok(expected) => {
+                let mut rows = 0;
+                while let Some(batch) = cursor.next_batch().await.unwrap() {
+                    for row in 0..batch.len {
+                        assert_eq!(batch.columns[0].value(row).unwrap(), expected);
+                        rows += 1;
+                    }
+                }
+                assert_eq!(rows, 2);
+                assert!(execution.parameters.evaluator().known(0).is_none());
+            }
+            Err(expected) => {
+                let error = cursor.next_batch().await.err().unwrap();
+                assert_eq!(
+                    (error.code, error.message),
+                    (expected.code, expected.message)
+                );
+            }
+        }
+    }
+}
