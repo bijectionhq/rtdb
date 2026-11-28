@@ -49,6 +49,7 @@ mod rotation;
 mod retirement;
 mod store_floor;
 mod store_hold;
+mod timed_store;
 mod timing;
 pub use backup::{AuthenticatedCut, BackupFileRelocation, BackupObjectReadback, InstallationAnchor, InstalledBackup, PortableBackup, VerifiedBackup};
 pub use classic_migration::{ClassicInstallation, classic_import_basis};
@@ -60,6 +61,7 @@ use rotation::ArmedRotation;
 pub use rotation::RotationReceipt;
 pub use retirement::DeploymentRetirement;
 pub use store_hold::{StoreVersionHold, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest};
+pub use timed_store::{TimedStoreAppend, TimedStoreAuthorizer, TimedStoreCommitment, TimedStoreReceipt};
 
 /// Wakes a waiter when its residence applies a new journal position, or when the journal holds an entry the residence has not applied, such as one another writer appended.
 /// It never holds the residence, so the waiter reads afresh after each wake.

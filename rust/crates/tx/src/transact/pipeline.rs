@@ -155,25 +155,92 @@ impl TransactPipeline {
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, authority, None, None)
+        self.decide_with_admission(request, now, features, claims, authority, None, None, None)
     }
 
     pub fn decide_workload(&mut self, request: &Transact, now: Timestamp, features: &[&str],
                            claims: &dyn ClaimVerifier, workload: &workload::Admission) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, None, Some(workload), None)
+        self.decide_with_admission(request, now, features, claims, None, Some(workload), None, None)
     }
 
     pub fn decide_funded(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>, funding: FundingInput, record_limit: usize,
     ) -> Result<Decision> {
-        self.decide_with_admission(request, now, features, claims, authority, None, Some((funding, record_limit)))
+        self.decide_with_admission(request, now, features, claims, authority, None, Some((funding, record_limit)), None)
+    }
+
+    /// Preview two fresh Store writes from the acknowledged prefix without staging either of them.
+    pub fn preview_timed_store_pair(
+        &self, companion: &Transact, effect: &Transact, now: Timestamp, features: &[&str],
+        claims: &dyn ClaimVerifier, cutoff: TimedJournalCutoff,
+    ) -> Result<(Decision, Decision)> {
+        self.require_store_pair_prefix()?;
+        if companion.key == effect.key || companion.store_append().is_none_or(|append| append.writes.is_empty()) {
+            return Err(timed_store_shape());
+        }
+        if self.durable.receipts.get(&None).is_some_and(|receipts| {
+            receipts.contains_key(&companion.key) || receipts.contains_key(&effect.key)
+        }) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/timed-append-ordered",
+                "The timed Store attempt is already ordered. Recover its original evidence"));
+        }
+        let resolve = |request, index: &BranchIndex, position, timing| -> Result<(Decision, BranchIndex)> {
+            let view = View {
+                index,
+                durable_index: index,
+                receipts: &self.durable.receipts,
+                appointment_addresses: &self.durable.appointment_addresses,
+                pending: false,
+            };
+            let (resolution, after) = TransactState::resolve_in(
+                view, request, position, now, features, claims, None, None, None, timing,
+            )?;
+            let (Resolution::Append(prepared), Some(after)) = (resolution, after) else {
+                return Err(timed_store_refused());
+            };
+            let TransactionRecord::Tx(tx) = prepared.record() else {
+                return Err(order_error("A Store append must prepare a resolved transaction"));
+            };
+            if tx.receipt.outcome != Outcome::Then || tx.effects.is_empty() {
+                return Err(timed_store_refused());
+            }
+            Ok((Decision::Append { position, record: prepared.record().encode()? }, after))
+        };
+        let position = self.next_position;
+        let (companion, after) = resolve(companion, self.durable.index(), position, None)?;
+        let effect_position = position.checked_add(1).ok_or_else(exhausted)?;
+        let (effect, _) = resolve(effect, &after, effect_position, Some(cutoff.into()))?;
+        Ok((companion, effect))
+    }
+
+    /// Stage the timed effect after its companion is acknowledged.
+    pub fn decide_timed_store(
+        &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
+        cutoff: TimedJournalCutoff,
+    ) -> Result<Decision> {
+        self.require_store_pair_prefix()?;
+        let decision = self.decide_with_admission(
+            request, now, features, claims, None, None, None, Some(cutoff.into()),
+        )?;
+        match decision {
+            Decision::Answer(_) => Err(timed_store_refused()),
+            decision => Ok(decision),
+        }
+    }
+
+    fn require_store_pair_prefix(&self) -> Result<()> {
+        if !self.in_flight.is_empty() || !self.timed.is_empty() || self.durable.pending.is_some() {
+            return Err(pending_error());
+        }
+        Ok(())
     }
 
     fn decide_with_admission(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>, workload: Option<&workload::Admission>,
         funding: Option<(FundingInput, usize)>,
+        timed_store: Option<TimedStoreEvidence>,
     ) -> Result<Decision> {
         let namespace = workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace))
             .or(funding.and_then(|(input, _)| input.managed_appointment_namespace()));
@@ -182,7 +249,7 @@ impl TransactPipeline {
         if funding.is_some_and(|(input, _)| input.is_appointment()) && !self.in_flight.is_empty() {
             return Err(pending_error());
         }
-        if funding.is_none() && workload.is_none() && request.validates_only() {
+        if timed_store.is_none() && funding.is_none() && workload.is_none() && request.validates_only() {
             // A validation answers at the durable prefix: never reveal an unacknowledged decision.
             let view = View {
                 index: &self.durable.index,
@@ -192,7 +259,7 @@ impl TransactPipeline {
                 pending: false,
             };
             let position = self.durable.index.head().basis.position();
-            return match TransactState::resolve_in(view, request, position, now, features, claims, authority, workload, None)?.0 {
+            return match TransactState::resolve_in(view, request, position, now, features, claims, authority, workload, None, None)?.0 {
                 Resolution::Answer(receipt) => Ok(Decision::Answer(receipt)),
                 Resolution::Append(_) => Err(order_error("A validation cannot append")),
             };
@@ -210,7 +277,7 @@ impl TransactPipeline {
             pending: false,
         };
         let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority, workload,
-            funding.map(|(input, _)| input))?;
+            funding.map(|(input, _)| input), timed_store)?;
         let prepared = match resolution {
             Resolution::Answer(receipt) => return Ok(Decision::Answer(receipt)),
             Resolution::Append(prepared) => prepared,
@@ -241,7 +308,7 @@ impl TransactPipeline {
             let TransactionRecord::Tx(tx) = prepared.record else { unreachable!("checked above") };
             Entry::Untimed { after: after.clone(), receipt: StoredReceipt {
                 receipt: tx.receipt, fingerprint: tx.fingerprint, receipt_namespace: tx.receipt_namespace,
-                installed: None, workload: tx.workload, workload_digest: tx.workload_digest,
+                installed: None, workload: tx.workload, workload_digest: tx.workload_digest, timed_store: tx.timed_store,
             } }
         };
         // A timed write's overlay assumes it settles at `position + 1`.
@@ -720,6 +787,96 @@ mod tests {
             otherwise: Vec::new(),
             requires: Vec::new(),
         }
+    }
+
+    fn timed_store_test_requests() -> (Transact, Transact) {
+        let write = |n| StoreWrite {
+            key: vec![0, 1, b'p', n], value: Some(vec![n]), key_stamp: None, value_stamp: None,
+        };
+        let companion = store(1, vec![write(1)]);
+        let mut effect = store(2, vec![write(2)]);
+        let Op::Store(append) = &mut effect.ops[0] else { unreachable!() };
+        append.window = Window { not_before: Some(Timestamp(90)), before: Some(Timestamp(120)) };
+        (companion, effect)
+    }
+
+    #[test]
+    fn timed_store_pair_previews_exact_bytes_and_retains_authenticated_checkpoint_boundary() {
+        let mut pipeline = pipeline();
+        let (companion, effect) = timed_store_test_requests();
+        let cutoff = TimedJournalCutoff::new(Timestamp(115), [7; 32]).unwrap();
+        let (Decision::Append { position: 1, record: companion_bytes }, Decision::Append { position: 2, record: effect_bytes }) =
+            pipeline.preview_timed_store_pair(&companion, &effect, Timestamp(100), FEATURES, &claims(), cutoff).unwrap()
+        else { panic!("expected the two fresh Store appends"); };
+        assert_eq!(pipeline.next_position(), 1);
+        assert_eq!(pipeline.in_flight(), 0);
+        assert!(pipeline.durable().tx_status(&companion.key).is_err());
+
+        assert!(!TransactionRecord::is_timed_store_record(&companion_bytes));
+        assert!(TransactionRecord::is_timed_store_record(&effect_bytes));
+        assert_eq!(TransactionRecord::timed_journal_cutoff(&companion_bytes).unwrap(), None);
+        assert_eq!(TransactionRecord::timed_journal_cutoff(&effect_bytes).unwrap(), Some(cutoff));
+        let framed = TransactionRecord::decode(&effect_bytes).unwrap();
+        assert_eq!(framed.encode().unwrap(), effect_bytes);
+        let mut erased = effect_bytes.to_vec();
+        erased[0] = RECORD_VERSION;
+        assert!(TransactionRecord::decode(&erased).is_err());
+        let mut missing = companion_bytes.to_vec();
+        missing[0] = TIMED_STORE_RECORD_VERSION;
+        assert!(TransactionRecord::timed_journal_cutoff(&missing).is_err());
+
+        let TransactionRecord::Tx(tx) = framed else { panic!("expected a resolved Store effect") };
+        let mut timing = tx.timed_store.unwrap();
+        timing.certificate_sha256 = [8; 32];
+        let changed = encoding::encode_versioned(TIMED_STORE_RECORD_VERSION, &(TransactionRecord::Tx(tx), timing)).unwrap();
+        assert!(TransactionRecord::timed_journal_cutoff(&changed).is_err());
+
+        assert_eq!(append(&mut pipeline, &companion, 100), (1, companion_bytes.clone()));
+        pipeline.acknowledge(1).unwrap();
+        let Decision::Append { position: 2, record } =
+            pipeline.decide_timed_store(&effect, Timestamp(100), FEATURES, &claims(), cutoff).unwrap()
+        else { panic!("expected the timed Store effect"); };
+        assert_eq!(record, effect_bytes);
+        assert_eq!(pipeline.acknowledge(2).unwrap()[0].basis.position(), 2);
+        assert_matches_follower(&pipeline, &[(1, companion_bytes), (2, effect_bytes)]);
+        let stored = pipeline.durable();
+        assert!(stored.require_portable_checkpoint().is_err());
+        let checkpoint = stored.encode_authenticated_portable_checkpoint().unwrap();
+        let restored = TransactState::decode_binary_checkpoint(&checkpoint, stored.index().head()).unwrap();
+        assert!(restored.require_authenticated_portable_checkpoint().is_ok());
+        assert!(restored.require_portable_checkpoint().is_err());
+
+        assert!(matches!(
+            pipeline.decide(&effect, Timestamp(140), FEATURES, &claims()),
+            Err(error) if error.code == "rtdb/idempotency-key"
+        ));
+        assert!(pipeline.decide_timed_store(&effect, Timestamp(140), FEATURES, &claims(), cutoff).is_err());
+        assert_eq!(pipeline.next_position(), 3);
+    }
+
+    #[test]
+    fn timed_store_pair_refuses_non_effects_and_companion_conflicts_without_staging() {
+        let pipeline = pipeline();
+        let (companion, effect) = timed_store_test_requests();
+        let cutoff = TimedJournalCutoff::new(Timestamp(115), [7; 32]).unwrap();
+        let preview = |companion, effect, now, cutoff| {
+            pipeline.preview_timed_store_pair(companion, effect, Timestamp(now), FEATURES, &claims(), cutoff)
+        };
+        let mut checks_companion = effect.clone();
+        checks_companion.guards.push(Guard::Unwritten {
+            range: KeyRange { start: vec![0, 1, b'p', 1], end: Some(vec![0, 1, b'p', 2]) },
+            since: Basis::new(INCARNATION, 0),
+        });
+        assert!(preview(&companion, &checks_companion, 100, cutoff).is_err());
+        let empty_companion = store(1, Vec::new());
+        let empty_effect = store(2, Vec::new());
+        assert!(preview(&empty_companion, &effect, 100, cutoff).is_err());
+        assert!(preview(&companion, &empty_effect, 100, cutoff).is_err());
+        assert!(preview(&companion, &effect, 114, cutoff).is_err());
+        let too_late = TimedJournalCutoff::new(Timestamp(121), [7; 32]).unwrap();
+        assert!(preview(&companion, &effect, 100, too_late).is_err());
+        assert_eq!(pipeline.next_position(), 1);
+        assert_eq!(pipeline.in_flight(), 0);
     }
 
     /// Each request of a group samples the clock at its own ordering point, so every

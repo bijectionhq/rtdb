@@ -2559,6 +2559,102 @@ mod tests {
         keepers.shutdown().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timed_store_orders_kernel_authorization_before_exact_effect() {
+        use journal_contract::Lsn;
+        use rtdb_db::{ActivationScope, TimedStoreAppend, WritePipeline};
+        use rtdb_tx::transact::{StoreAppend, StoreWrite, Window};
+        use rtdb_types::{TimedJournalCutoff, Timestamp, rtdb_v1::{At, Layer, MAIN_BRANCH}};
+        use stream_logkeeper::stream::consensus::{CLUSTER_VERSION_CURRENT, testing::LocalCluster};
+
+        fn write(request: u8, key: &[u8], value: Vec<u8>, window: Window) -> Transact {
+            Transact {
+                key: vec![request; 16], require: vec![], window: Default::default(),
+                guards: vec![], requires: vec![], otherwise: vec![], custody_request_digest: None, request_memory: None,
+                ops: vec![Op::Store(StoreAppend {
+                    writes: vec![StoreWrite { key: key.to_vec(), value: Some(value), key_stamp: None, value_stamp: None }],
+                    bounds: vec![], derives: vec![], window,
+                })],
+            }
+        }
+
+        const PRINCIPAL: &str = "urn:logkeeper:client:timed-store-pair";
+        let mut keepers = LocalCluster::start_authenticated(&[PRINCIPAL]).await.unwrap();
+        let application = Arc::new(keepers.journal(PRINCIPAL, &keepers.journal_config(8 << 20, 256 << 10)).unwrap()
+            .with_timed_original(keepers.timed_verifier(), Some(64 << 10)));
+        let mut control_keepers = LocalCluster::start_independent_catalog(&[PRINCIPAL]).await.unwrap();
+        let control = Arc::new(control_keepers.journal(PRINCIPAL, &control_keepers.journal_config(8 << 20, 256 << 10)).unwrap());
+        for journal in [&application, &control] { journal.finalize_version(CLUSTER_VERSION_CURRENT).await.unwrap(); }
+        let history = application.catalog_history().await.unwrap();
+        let root = history.genesis.root();
+        let catalog = history.genesis.catalog;
+        let authority = ActivationAuthority::new(control, Uuid::new_v4()).unwrap();
+        let incarnation = Uuid::new_v4();
+        authority.bootstrap("xtdb", incarnation).await.unwrap();
+        let node = Ipv4Addr::LOCALHOST.into();
+        let store = Arc::new(rtdb_storage::MemoryStore::default());
+        let keys = Arc::new(rtdb_crypt::LocalKms::new(|| SystemClock.now().0));
+        let residence = || MultiDatabase::new(
+            MultiOptions { database: incarnation, node, lease_micros: 60_000_000, drift_micros: 0 },
+            application.clone(), store.clone(), keys.clone(), Arc::new(|| SystemClock.now()),
+        ).unwrap().with_immutable_journal().with_authenticated_journal(application.clone(), true)
+            .with_activation_scope(ActivationScope::new(authority.identity(), "xtdb").unwrap()).unwrap()
+            .with_serving_authority(authority.serving_authority("xtdb", incarnation).unwrap());
+        let batch = || Arc::new(ConsensusJournalBatch(application.clone()));
+        let mut database = residence().with_batch_appender(batch());
+        database.create().await.unwrap();
+        assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
+        let stream = database.journal_stream();
+        let before = application.head(stream).await.unwrap();
+        let start = SystemClock.now();
+        let decision_before = Timestamp(start.0 + 20_000_000);
+        let end = Timestamp(decision_before.0 + 5_000_000);
+        let journal_cutoff = TimedJournalCutoff::new(end, [33; 32]).unwrap();
+        let effect = write(1, b"effect", b"value".to_vec(), Window { not_before: Some(start), before: Some(end) });
+        let authorization_window = Window { not_before: Some(start), before: Some(decision_before) };
+        let preview = write(2, b"authorization", vec![0; 32], authorization_window);
+        let database = Arc::new(tokio::sync::Mutex::new(database));
+        let pipeline = WritePipeline::start(database.clone());
+        let observer = application.clone();
+        let result = pipeline.append_timed_store(TimedStoreAppend {
+            preview: preview.clone(), effect: effect.clone(), application_root: root, decision_before, journal_cutoff,
+            authorize: Box::new(move |commitment| Box::pin(async move {
+                assert_eq!(observer.head(stream).await.unwrap(), before);
+                assert_eq!(commitment.catalog, catalog);
+                assert_eq!(commitment.original.at, Lsn(before.0 + 2));
+                Ok(write(2, b"authorization", commitment.original.payload_sha256.to_vec(), authorization_window))
+            })),
+        }).await.unwrap();
+        let at = result.evidence.original.at;
+        assert_eq!(result.receipt.outcome, Outcome::Then);
+        assert_eq!(application.head(stream).await.unwrap(), at);
+        let archive = application.authenticated_archive(stream, Some(at.0)).await.unwrap();
+        let inclusion = archive.inclusion(at).unwrap();
+        let leaf = inclusion.verify(root).unwrap();
+        assert_eq!(leaf.payload_sha256, result.evidence.original.payload_sha256);
+        assert_eq!(leaf.timing.unwrap().exclusive_cutoff_micros, end.0);
+        {
+            let mut database = database.lock().await;
+            let authorization = database.tx_status(&preview.key).await.unwrap();
+            assert_eq!(authorization.basis.position() + 1, result.receipt.basis.position());
+            assert_eq!(database.tx_status(&effect.key).await.unwrap().basis, result.receipt.basis);
+            let (index, _) = database.fresh_view().await.unwrap();
+            let view = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+            assert_eq!(view.store_value(b"authorization").unwrap(), Some(result.evidence.original.payload_sha256.as_slice()));
+        }
+        assert!(residence().tx_status(&effect.key).await.is_err());
+        assert_eq!(residence().with_batch_appender(batch()).tx_status(&effect.key).await.unwrap().basis, result.receipt.basis);
+        let retry = pipeline.append_timed_store(TimedStoreAppend {
+            preview, effect, application_root: root, decision_before, journal_cutoff,
+            authorize: Box::new(|_| panic!("An ordered authorization cannot be offered again")),
+        }).await;
+        assert_eq!(retry.err().unwrap().code, "rtdb.store/timed-append-ordered");
+        assert_eq!(application.head(stream).await.unwrap(), at);
+        drop(pipeline);
+        control_keepers.shutdown().await.unwrap();
+        keepers.shutdown().await.unwrap();
+    }
+
     #[test]
     fn multi_dev_moves_its_stream_off_a_draining_keeper() {
         std::thread::Builder::new()

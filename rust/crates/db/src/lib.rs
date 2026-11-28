@@ -9,6 +9,7 @@ pub use journal::{JournalBatchAppender, TimedOriginal, TimedOriginalProof, journ
 pub use multi::{
     AppliedWatch, AuthenticatedCut, BackupFileRelocation, BackupObjectReadback, ClassicInstallation, DeploymentRetirement, InstallationAnchor, InstalledBackup, MultiDatabase, MultiOptions, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, PortableBackup, RankedBuild, RankedFiles, RankedPublication, Role, RotationReceipt, StoreVersionHold, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest, VerifiedBackup, WritePipeline, classic_import_basis, journal_recoveries_acknowledged,
 };
+pub use multi::{TimedStoreAppend, TimedStoreAuthorizer, TimedStoreCommitment, TimedStoreReceipt};
 pub use placement::{discover_nodes, preferred};
 pub use replay::{AppliedEffects, ChangeHistory, CheckpointSource, JournalRecovery};
 

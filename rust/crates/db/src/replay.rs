@@ -506,7 +506,7 @@ impl Committed {
         // the record decoded.
         let entry = match typed {
             Some(typed) => stream.decode_recovery(lsn, typed, self.generation).await?,
-            None => stream.decode_unproven(lsn, bytes).await?,
+            None => stream.decode(lsn, bytes).await?,
         };
         Ok(entry.epoch == self.epoch && entry.generation == self.generation
             && self.records.last() == Some(&entry.record))

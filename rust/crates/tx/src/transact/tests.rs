@@ -1984,6 +1984,7 @@ fn a_transaction_record_round_trips_with_its_refusal_context_and_encodes_determi
         },
         effects: Vec::new(), before: None, receipt_namespace: Some([3; 32]), admitted_at: Timestamp(39),
         workload: None, workload_digest: None, request: Some(request.canonical_request().unwrap()),
+        timed_store: None,
     });
     let bytes = record.encode().unwrap();
     assert_eq!(record.encode().unwrap(), bytes);

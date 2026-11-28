@@ -147,7 +147,11 @@ impl PortableBackup {
         } else {
             (TransactState::decode_binary_checkpoint(&plaintext.bytes, cut)?, None)
         };
-        transactions.require_portable_checkpoint()?;
+        if source.is_some() {
+            transactions.require_authenticated_portable_checkpoint()?;
+        } else {
+            transactions.require_portable_checkpoint()?;
+        }
         source_kms.check_readable(source_generation).await?;
         Ok(VerifiedBackup {
             source: BackupSource { cut, through_lsn: header.through_lsn, authentication: BackupAuthentication { source, installation: None } },

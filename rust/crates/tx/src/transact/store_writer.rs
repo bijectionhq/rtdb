@@ -55,6 +55,7 @@ pub(super) fn resolve_change(
     let record = TransactionRecord::Tx(ResolvedTransact {
         fingerprint, receipt: receipt(cut), effects: vec![effect], before: None, receipt_namespace: namespace,
         admitted_at: now, workload: None, workload_digest: None, request: Some(canonical_request),
+        timed_store: None,
     });
     Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
 }

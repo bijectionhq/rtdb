@@ -17,7 +17,7 @@ use rtdb_index::branches::store::{
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
-    Term, TimeUnit, Timestamp, Value,
+    Term, TimeUnit, TimedJournalCutoff, Timestamp, Value,
     rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, NativeCheckpointCustody, NativeCustodyFence, NativeDependentCustodyOrder, NativeDependentCustodyScope, valid_branch_name},
 };
 pub use rtdb_types::rtdb_v1::{ValidTime, ValidTimeBound};
@@ -366,6 +366,14 @@ fn store_time_order() -> Anomaly {
     Anomaly::fault("rtdb.tx/system-time", "The store append's time does not follow the head's")
 }
 
+fn timed_store_shape() -> Anomaly {
+    Anomaly::incorrect("rtdb.store/timed-append-shape", "A timed Store append needs a write and a finite window covering its journal cutoff")
+}
+
+fn timed_store_refused() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.store/timed-append-refused", "The timed Store append cannot stage its accepted effects")
+}
+
 fn store_append_shape() -> Anomaly {
     Anomaly::incorrect("rtdb.store/append-shape", "A store append carries only its store operation and read guards")
 }
@@ -558,6 +566,59 @@ const APPOINTMENT_RECORD_VERSION: u8 = 8;
 const MANAGED_APPOINTMENT_RECORD_VERSION: u8 = 9;
 const PRUNED_STORE_CHECKPOINT_VERSION: u8 = 10;
 const FENCED_STORE_CHECKPOINT_VERSION: u8 = 11;
+const TIMED_STORE_RECORD_VERSION: u8 = 12;
+const TIMED_STORE_CHECKPOINT_VERSION: u8 = 12;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TimedStoreEvidence {
+    before: Timestamp,
+    certificate_sha256: [u8; 32],
+}
+
+impl From<TimedJournalCutoff> for TimedStoreEvidence {
+    fn from(cutoff: TimedJournalCutoff) -> Self {
+        Self { before: cutoff.before(), certificate_sha256: cutoff.certificate_sha256() }
+    }
+}
+
+impl TimedStoreEvidence {
+    fn cutoff(self) -> Result<TimedJournalCutoff> {
+        TimedJournalCutoff::new(self.before, self.certificate_sha256).map_err(|_| invalid_record())
+    }
+
+    fn fingerprint(self, request: &CanonicalRequest) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"rtdb.store/timed-append/v1\0");
+        digest.update(self.before.0.to_be_bytes());
+        digest.update(self.certificate_sha256);
+        digest.update(request.as_bytes());
+        digest.finalize().into()
+    }
+
+    fn check_request(self, request: &Transact) -> Result<()> {
+        let append = request.store_append().ok_or_else(timed_store_shape)?;
+        let (Some(start), Some(end)) = (append.window.not_before, append.window.before) else {
+            return Err(timed_store_shape());
+        };
+        if append.writes.is_empty() || start >= self.before || self.before > end
+            || request.window != Window::default() || !request.otherwise.is_empty()
+            || !request.require.is_empty() || !request.requires.is_empty() || request.custody_request_digest.is_some()
+        {
+            return Err(timed_store_shape());
+        }
+        Ok(())
+    }
+
+    fn check_receipt(self, receipt: &Receipt) -> Result<()> {
+        self.cutoff()?;
+        if receipt.outcome != Outcome::Then || receipt.system_time >= self.before
+            || receipt.decision_clock.is_some() || receipt.erasure.is_some()
+        {
+            return Err(invalid_record());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -571,18 +632,31 @@ impl TransactionRecord {
         if matches!(self, Self::Tx(tx) if tx.request.is_none()) {
             return Err(Anomaly::fault("rtdb/transaction-encoding", "An admitted transaction needs its canonical request"));
         }
-        encoding::encode_versioned(self.version(), self).map(Bytes::from)
+        let encoded = if let Self::Tx(tx) = self && let Some(timing) = tx.timed_store {
+            tx.validate_admission()?;
+            encoding::encode_versioned(TIMED_STORE_RECORD_VERSION, &(self, timing))
+        } else {
+            encoding::encode_versioned(self.version(), self)
+        };
+        encoded.map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-encoding", error.to_string()))
     }
 
     /// Decodes a record after its version byte, refusing a version this encoder does not write.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let unknown = || Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version");
-        let (&version, record) = bytes.split_first().ok_or_else(unknown)?;
-        if !(RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION).contains(&version) { return Err(unknown()); }
-        let record: Self = encoding::decode(record)
-            .map_err(|error| Anomaly::fault("rtdb/transaction-decoding", error.to_string()))?;
-        if version != record.version() { return Err(unknown()); }
+        let (&version, record) = bytes.split_first().ok_or_else(unknown_transaction_version)?;
+        let decode_error = |error: bincode::Error| Anomaly::fault("rtdb/transaction-decoding", error.to_string());
+        let record: Self = match version {
+            RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION => encoding::decode(record).map_err(decode_error)?,
+            TIMED_STORE_RECORD_VERSION => {
+                let (mut record, timing): (Self, TimedStoreEvidence) = encoding::decode(record).map_err(decode_error)?;
+                let Self::Tx(tx) = &mut record else { return Err(invalid_record()); };
+                tx.timed_store = Some(timing);
+                record
+            }
+            _ => return Err(unknown_transaction_version()),
+        };
+        if version != record.version() { return Err(unknown_transaction_version()); }
         if let Self::Tx(tx) = &record {
             tx.validate_admission()?;
         }
@@ -591,20 +665,36 @@ impl TransactionRecord {
 
     fn version(&self) -> u8 {
         match self {
+            Self::Tx(tx) if tx.timed_store.is_some() => TIMED_STORE_RECORD_VERSION,
             Self::Tx(tx) => tx.receipt.record_version(tx.receipt_namespace),
             _ => RECORD_VERSION,
         }
     }
 
-    pub fn funded_journal_cutoff(bytes: &[u8]) -> Result<Option<rtdb_types::TimedJournalCutoff>> {
-        if !funded_record(bytes) { return Ok(None); }
+    pub fn is_timed_store_record(bytes: &[u8]) -> bool {
+        bytes.first() == Some(&TIMED_STORE_RECORD_VERSION)
+    }
+
+    pub fn timed_journal_cutoff(bytes: &[u8]) -> Result<Option<TimedJournalCutoff>> {
+        match bytes.first().copied() {
+            Some(RECORD_VERSION) => return Ok(None),
+            Some(FUNDED_RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION | TIMED_STORE_RECORD_VERSION) => (),
+            _ => return Err(unknown_transaction_version()),
+        }
         let Self::Tx(tx) = Self::decode(bytes)? else { return Err(invalid_record()); };
-        Ok(tx.funded_guard()?.map(|(_, _, cutoff)| cutoff))
+        match tx.timed_store {
+            Some(timing) => timing.cutoff().map(Some),
+            None => Ok(tx.funded_guard()?.map(|(_, _, cutoff)| cutoff)),
+        }
+    }
+
+    pub fn funded_journal_cutoff(bytes: &[u8]) -> Result<Option<TimedJournalCutoff>> {
+        Self::timed_journal_cutoff(bytes)
     }
 }
 
-fn funded_record(bytes: &[u8]) -> bool {
-    bytes.first().is_some_and(|version| (FUNDED_RECORD_VERSION..=MANAGED_APPOINTMENT_RECORD_VERSION).contains(version))
+fn unknown_transaction_version() -> Anomaly {
+    Anomaly::unsupported("rtdb/transaction-version", "Unknown resolved transaction version")
 }
 
 impl Receipt {
@@ -629,6 +719,8 @@ pub struct ResolvedTransact {
     workload: Option<WorkloadFamily>,
     workload_digest: Option<[u8; 32]>,
     request: Option<CanonicalRequest>,
+    #[serde(skip)]
+    timed_store: Option<TimedStoreEvidence>,
 }
 
 impl ResolvedTransact {
@@ -664,6 +756,21 @@ impl ResolvedTransact {
 
         if self.workload_digest.is_some() && (self.workload.is_none() || self.request.is_none()) {
             return Err(invalid_record());
+        }
+        if let Some(timing) = self.timed_store {
+            let canonical = self.request.as_ref().ok_or_else(invalid_record)?;
+            let request = canonical.decode().map_err(|_| invalid_record())?;
+            timing.check_request(&request).map_err(|_| invalid_record())?;
+            timing.check_receipt(&self.receipt)?;
+            if self.before.is_some() || self.receipt_namespace.is_some() || self.workload.is_some()
+                || self.effects.is_empty() || request.key != self.receipt.key || timing.fingerprint(canonical) != self.fingerprint
+                || self.admitted_at > self.receipt.system_time
+                || request.store_append().and_then(|append| append.window.not_before)
+                    .is_none_or(|start| self.receipt.system_time < start)
+            {
+                return Err(invalid_record());
+            }
+            return Ok(());
         }
         if let Some(funding) = self.receipt.decision_clock {
             let request = self.request.as_ref().ok_or_else(invalid_record)?;
@@ -718,6 +825,8 @@ pub(crate) struct StoredReceipt {
     workload: Option<WorkloadFamily>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workload_digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timed_store: Option<TimedStoreEvidence>,
 }
 
 impl StoredReceipt {
@@ -856,6 +965,7 @@ impl TransactState {
             for (key, expected) in receipts {
                 let actual = actual.get(key).ok_or_else(invalid_record)?;
                 if actual.fingerprint != expected.fingerprint || actual.receipt != expected.receipt
+                    || actual.timed_store != expected.timed_store
                     || actual.workload != expected.workload || actual.workload_digest != expected.workload_digest
                     || expected.installed.is_some_and(|position| actual.installed != Some(position))
                 {
@@ -895,12 +1005,21 @@ impl TransactState {
     }
 
     pub fn require_portable_checkpoint(&self) -> Result<()> {
+        self.require_portable_checkpoint_in(false)
+    }
+
+    pub fn require_authenticated_portable_checkpoint(&self) -> Result<()> {
+        self.require_portable_checkpoint_in(true)
+    }
+
+    fn require_portable_checkpoint_in(&self, authenticated: bool) -> Result<()> {
         if self.pending.is_some() { return Err(pending_error()); }
         if self.pending_erasure.is_some() { return Err(erasure_pending()); }
         let unsupported_receipt = self.receipts.values().flat_map(|scope| scope.values()).any(|stored| {
             stored.receipt_namespace.is_some_and(|namespace| namespace != store_writer::receipt_namespace())
                 || stored.receipt.decision_clock.is_some()
                 || stored.installed.is_some() || stored.workload.is_some()
+                || (!authenticated && stored.timed_store.is_some())
         });
         if unsupported_receipt || self.index.has_custody_groups() || self.index.inherited_custody().is_some()
             || self.index.retained_images().any(|(_, table, _, image)| {
@@ -928,7 +1047,7 @@ impl TransactState {
             }).collect();
         }
         cut.receipts.retain(|_, receipts| !receipts.is_empty());
-        cut.require_portable_checkpoint()?;
+        cut.require_authenticated_portable_checkpoint()?;
         cut.encode_binary_checkpoint()
     }
 
@@ -1056,9 +1175,17 @@ impl TransactState {
     }
 
     fn checkpoint_version<'a>(index: &BranchIndex, receipts: impl Iterator<Item = &'a StoredReceipt>) -> u8 {
-        if index.has_store_writer_fence() { return FENCED_STORE_CHECKPOINT_VERSION; }
-        let floor_version = if index.store_history_floor() == 0 { RECORD_VERSION } else { PRUNED_STORE_CHECKPOINT_VERSION };
-        receipts.map(|stored| stored.receipt.record_version(stored.receipt_namespace)).fold(floor_version, u8::max)
+        let floor_version = if index.has_store_writer_fence() {
+            FENCED_STORE_CHECKPOINT_VERSION
+        } else if index.store_history_floor() > 0 {
+            PRUNED_STORE_CHECKPOINT_VERSION
+        } else {
+            RECORD_VERSION
+        };
+        receipts.map(|stored| {
+            if stored.timed_store.is_some() { TIMED_STORE_CHECKPOINT_VERSION }
+            else { stored.receipt.record_version(stored.receipt_namespace) }
+        }).fold(floor_version, u8::max)
     }
 
     /// The checkpoint of [`Self::encode_checkpoint`] in CBOR instead of JSON:
@@ -1103,6 +1230,12 @@ impl TransactState {
                 || stored.workload_digest.is_some() && stored.workload.is_none()
             {
                 return Err(invalid());
+            }
+            if let Some(timing) = stored.timed_store {
+                if stored.receipt_namespace.is_some() || stored.workload.is_some() || stored.installed.is_some() {
+                    return Err(invalid());
+                }
+                timing.check_receipt(receipt).map_err(|_| invalid())?;
             }
             if receipt.erasure == Some(Erasure::Pending) && state.pending_erasure.is_some() {
                 return Err(invalid());
@@ -1231,16 +1364,17 @@ impl TransactState {
             appointment_addresses: &self.appointment_addresses,
             pending: self.pending.is_some(),
         };
-        Self::resolve_in(view, request, position, now, features, claims, authority, None, None).map(|(resolution, _)| resolution)
+        Self::resolve_in(view, request, position, now, features, claims, authority, None, None, None).map(|(resolution, _)| resolution)
     }
 
     /// Resolves `request` at `position` against `view`. For an append it also returns the
     /// index after the transaction publishes: exactly what [`TransactState::apply`] computes
     /// for the record, or for a timed write for its `Settle` (advance to the receipt cut,
     /// then the effects in order).
-    pub(crate) fn resolve_in(
+    fn resolve_in(
         view: View<'_>, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>, workload: Option<&workload::Admission>, funding: Option<FundingInput>,
+        timed_store: Option<TimedStoreEvidence>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         view.index.require_local_custody()?;
         validate_key(&request.key)?;
@@ -1276,8 +1410,15 @@ impl TransactState {
         let family = workload.map(workload::Admission::family);
         let workload_digest = workload.map(workload::Admission::authorization_digest);
         let canonical_request = request.canonical_request()?;
-        let fingerprint = request.custody_request_digest
-            .unwrap_or_else(|| Sha256::digest(canonical_request.as_bytes()).into());
+        let fingerprint = if let Some(timing) = timed_store {
+            if authority.is_some() || workload.is_some() || funded_request || hold.is_some() || receipt_namespace.is_some() {
+                return Err(timed_store_shape());
+            }
+            timing.check_request(request)?;
+            timing.fingerprint(&canonical_request)
+        } else {
+            request.custody_request_digest.unwrap_or_else(|| Sha256::digest(canonical_request.as_bytes()).into())
+        };
         if let Some((incarnation, fence)) = request.store_writer_change() {
             if authority.is_some() || workload.is_some() || funded_request || hold.is_some()
                 || request.custody_request_digest.is_some()
@@ -1307,7 +1448,7 @@ impl TransactState {
             if authority.is_some() || workload.is_some() || funded_request || hold.is_some() || receipt_namespace.is_some() {
                 return Err(store_append_shape());
             }
-            return Self::resolve_store(view, request, append, position, now, claims, fingerprint, canonical_request);
+            return Self::resolve_store(view, request, append, position, now, claims, fingerprint, canonical_request, timed_store);
         }
         let funded = if let Some(input) = funding {
             if workload.is_some() { return Err(funding_invalid()); }
@@ -1454,6 +1595,7 @@ impl TransactState {
                 fingerprint, receipt, effects, before, receipt_namespace, admitted_at: now, workload: family,
                 workload_digest,
                 request: Some(canonical_request),
+                timed_store: None,
             });
             Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
         }
@@ -1474,6 +1616,7 @@ impl TransactState {
     fn resolve_store(
         view: View<'_>, request: &Transact, append: &StoreAppend, position: u64, now: Timestamp,
         claims: &dyn ClaimVerifier, fingerprint: [u8; 32], canonical_request: CanonicalRequest,
+        timed_store: Option<TimedStoreEvidence>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         let (guards, writer) = match request.guards.split_last() {
             Some((Guard::StoreWriter { incarnation, fence }, guards)) => (guards, Some((*incarnation, *fence))),
@@ -1591,6 +1734,9 @@ impl TransactState {
             Vec::new()
         };
         let commits = mutates && failed.is_empty() && failed_bound.is_none() && failed_claim.is_none();
+        if timed_store.is_some_and(|timing| !commits || now >= timing.before) {
+            return Err(timed_store_refused());
+        }
         // Every store record takes the append's time: a conflict's, a bound
         // refusal's and a validation's too.
         let system_time = now;
@@ -1630,10 +1776,12 @@ impl TransactState {
             // A validation: its receipt, and nothing else, at its own position.
             (Outcome::Then, Vec::new(), index)
         };
+        if timed_store.is_some() && effects.is_empty() { return Err(timed_store_refused()); }
         let record = TransactionRecord::Tx(ResolvedTransact {
             fingerprint, receipt: receipt(cut.basis, cut.system_time, outcome), effects, before: None,
             receipt_namespace: None, admitted_at: sample, workload: None, workload_digest: None,
             request: Some(canonical_request),
+            timed_store,
         });
         Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
     }
@@ -1795,7 +1943,7 @@ impl TransactState {
         match record {
             TransactionRecord::Tx(tx) => {
                 let receipt = &tx.receipt;
-                if receipt.decision_clock.is_some() { tx.validate_admission()?; }
+                if receipt.decision_clock.is_some() || tx.timed_store.is_some() { tx.validate_admission()?; }
                 let expected = if tx.before.is_some() { position.checked_add(1) } else { Some(position) };
                 let head = self.index.head();
                 let previous = self.receipts.get(&tx.receipt_namespace).and_then(|namespace| namespace.get(&receipt.key));
@@ -1830,7 +1978,7 @@ impl TransactState {
                     self.pending = Some(Pending { position, tx });
                     Ok(None)
                 } else {
-                    self.publish(tx.receipt, tx.fingerprint, tx.receipt_namespace, tx.workload, tx.workload_digest, tx.effects).map(Some)
+                    self.publish(tx.receipt, tx.fingerprint, tx.receipt_namespace, tx.workload, tx.workload_digest, tx.effects, tx.timed_store).map(Some)
                 }
             }
             TransactionRecord::Settle { tx_lsn } => {
@@ -1843,7 +1991,7 @@ impl TransactState {
                 }
                 let receipt = self.publish(
                     pending.tx.receipt.clone(), pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload,
-                    pending.tx.workload_digest, pending.tx.effects.clone(),
+                    pending.tx.workload_digest, pending.tx.effects.clone(), None,
                 )?;
                 self.pending = None;
                 Ok(Some(receipt))
@@ -1861,7 +2009,7 @@ impl TransactState {
                     };
                 }
                 let receipt = self.publish(receipt, pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload,
-                    pending.tx.workload_digest, Vec::new())?;
+                    pending.tx.workload_digest, Vec::new(), None)?;
                 self.pending = None;
                 Ok(Some(receipt))
             }
@@ -1869,7 +2017,8 @@ impl TransactState {
     }
 
     fn publish(&mut self, receipt: Receipt, fingerprint: [u8; 32], receipt_namespace: Option<[u8; 32]>,
-               workload: Option<WorkloadFamily>, workload_digest: Option<[u8; 32]>, effects: Vec<BranchEffect>) -> Result<Receipt> {
+               workload: Option<WorkloadFamily>, workload_digest: Option<[u8; 32]>, effects: Vec<BranchEffect>,
+               timed_store: Option<TimedStoreEvidence>) -> Result<Receipt> {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects {
@@ -1907,7 +2056,9 @@ impl TransactState {
             candidate.apply(effect)?;
         }
         self.index = candidate;
-        self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload, workload_digest });
+        self.store_receipt(StoredReceipt {
+            fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload, workload_digest, timed_store,
+        });
         Ok(receipt)
     }
 }

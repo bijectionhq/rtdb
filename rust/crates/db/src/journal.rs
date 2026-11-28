@@ -35,6 +35,10 @@ impl PreparedTimedAppend {
     pub(crate) fn commitment(&self) -> TimedOriginal {
         self.original
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.payload.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -562,7 +566,7 @@ impl Stream {
     pub(crate) async fn decode(&self, lsn: Lsn, bytes: &[u8]) -> Result<Entry> {
         let entry = self.decode_unproven(lsn, bytes).await?;
         if let Record::Tx { payload, .. } = &entry.record
-            && let Some(cutoff) = TransactionRecord::funded_journal_cutoff(payload)?
+            && let Some(cutoff) = TransactionRecord::timed_journal_cutoff(payload)?
         {
             let batch = self.batch.as_ref().ok_or_else(rtdb_tx::transact::funding_unsupported)?;
             let original = self.timed_original(lsn, entry.epoch, bytes, cutoff);
@@ -681,13 +685,16 @@ impl Stream {
     }
 
     pub(crate) async fn append_timed_original(
-        &self, prepared: PreparedTimedAppend,
+        &self, prepared: PreparedTimedAppend, dispatch_is_open: impl FnOnce() -> bool,
     ) -> journal_contract::Result<TimedOriginalProof> {
         let PreparedTimedAppend { original, payload } = prepared;
         if original.stream != self.id() {
             return Err(JournalError::Corrupted);
         }
         self.authorize_mutation().await?;
+        if !dispatch_is_open() {
+            return Err(JournalError::Unavailable);
+        }
         let batch = self.batch.as_ref().ok_or(JournalError::Unsupported)?;
         match self.session_fence(original.epoch)? {
             Some(fence) => batch.append_session_timed_original(fence, original, payload).await,

@@ -21,11 +21,13 @@ use tokio::{
 };
 
 use crate::replay::JournalCoordinates;
+use crate::journal::{PreparedTimedAppend, TimedOriginalProof};
 
 use super::{
     Entry, Lease, MultiDatabase, PinnedExport, Role, StoreVersionHoldReply, StoreVersionHoldRequest,
     Stream, Uuid, missing_receipt, next, no_writer,
 };
+use super::timed_store::{TimedStoreAppend, TimedStoreReceipt};
 
 const CAPACITY: usize = 64;
 const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, PHYSICAL_ERASURE, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, "row-visibility", "branches",
@@ -41,6 +43,7 @@ type Reply<T> = oneshot::Sender<Result<T>>;
 
 enum Command {
     Transact(Work),
+    TimedStore(Box<TimedStoreAppend>, Reply<TimedStoreReceipt>),
     Funded {
         transaction: Transact,
         scope: Option<Scope>,
@@ -165,6 +168,13 @@ impl WritePipeline {
 
     pub async fn transact(&self, request: Transact) -> Result<Receipt> {
         self.submit(request, None).await
+    }
+
+    /// Orders a Kernel-authorized Store effect as one writer turn. The callback
+    /// signs the prepared commitment and returns its companion append without
+    /// calling back into this pipeline.
+    pub async fn append_timed_store(&self, request: TimedStoreAppend) -> Result<TimedStoreReceipt> {
+        self.request(|reply| Command::TimedStore(Box::new(request), reply)).await
     }
 
     pub async fn transact_scoped(
@@ -310,14 +320,33 @@ impl Authority {
             return Err(AttemptError::Local(Anomaly::new(AnomalyCategory::Conflict,
                 "rtdb/window-expired", "The original timed append missed its admission bounds")));
         }
-        let original = prepared.commitment();
-        let proof = self.stream.append_timed_original(prepared)
-            .await.map_err(AttemptError::Journal)?;
-        proof.verify_exact(original).map_err(AttemptError::Local)?;
-        Ok(original.payload_sha256)
+        Ok(self.dispatch_timed(prepared, decision_before).await?.original.payload_sha256)
     }
 
-    fn upper(&self) -> Timestamp {
+    pub(super) async fn dispatch_timed(
+        &self,
+        prepared: PreparedTimedAppend,
+        decision_before: Timestamp,
+    ) -> std::result::Result<TimedOriginalProof, AttemptError> {
+        let original = prepared.commitment();
+        if self.next != original.at || self.lease.epoch != original.epoch {
+            return Err(AttemptError::Local(order_error("The timed append no longer follows its writer's acknowledged prefix")));
+        }
+        self.check_timed_window(decision_before, original.cutoff).map_err(AttemptError::Local)?;
+        let proof = self.stream.append_timed_original(prepared, || self.upper() < decision_before)
+            .await.map_err(AttemptError::Journal)?;
+        proof.verify_exact(original).map_err(AttemptError::Local)?;
+        Ok(proof)
+    }
+
+    pub(super) fn check_timed_window(&self, decision_before: Timestamp, cutoff: rtdb_types::TimedJournalCutoff) -> Result<()> {
+        if cutoff.before().0 > self.lease.until || self.upper() >= decision_before {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/window-expired", "The original timed append missed its admission bounds"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn upper(&self) -> Timestamp {
         Timestamp((self.clock)().0.saturating_add(self.drift_micros))
     }
 
@@ -337,6 +366,9 @@ impl Authority {
     ) -> std::result::Result<(Timestamp, [u8; 32]), AttemptError> {
         let mut records = Vec::with_capacity(writes.len());
         for (offset, write) in writes.iter().enumerate() {
+            if matches!(&write.entry.record, Record::Tx { payload, .. } if TransactionRecord::is_timed_store_record(payload)) {
+                return Err(AttemptError::Local(order_error("A timed Store record requires original quorum timing")));
+            }
             if self.next.0.checked_add(offset as u64) != Some(write.at.0) {
                 return Err(AttemptError::Local(order_error(
                     "The append group must follow the acknowledged prefix",
@@ -394,6 +426,10 @@ async fn run(
             },
         };
         match command {
+            Command::TimedStore(request, reply) => {
+                let result = Box::pin(async { database.lock().await.append_timed_store_serial(*request).await }).await;
+                let _ = reply.send(result);
+            }
             Command::Transact(work) if work.batchable() => {
                 Box::pin(burst(&database, &mut input, &mut barrier, work)).await;
             }
@@ -1376,7 +1412,7 @@ fn check_classic_placement(fence: workload::Fence, install: &super::ClassicInsta
     Ok(fence)
 }
 
-fn plan(decision: Decision, lease: Lease, generation: u64, coordinates: JournalCoordinates) -> Result<Planned> {
+pub(super) fn plan(decision: Decision, lease: Lease, generation: u64, coordinates: JournalCoordinates) -> Result<Planned> {
     Ok(match decision {
         Decision::Answer(receipt) => Planned::Answer(receipt),
         Decision::Append { position, record } => Planned::Append(Append {
