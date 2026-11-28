@@ -877,7 +877,7 @@ mod tests {
         let mut database = MultiDatabase::new(
             MultiOptions { database: binding.incarnation, node, lease_micros: 60_000_000, drift_micros: 0 },
             source_journal.clone(), Arc::new(MemoryStore::default()), keys, Arc::new(|| SystemClock.now()),
-        ).unwrap().with_immutable_journal().with_authenticated_journal(source_journal.clone(), true)
+        ).unwrap().with_immutable_journal().with_authenticated_journal(source_journal.clone(), rtdb_db::NewStream::Authenticated)
             .with_activation_scope(ActivationScope::new(identity, NAME).unwrap()).unwrap();
         database.create().await.unwrap();
         assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));
@@ -940,7 +940,7 @@ mod tests {
         let database = MultiDatabase::new(
             MultiOptions { database: Uuid::new_v4(), node: std::net::Ipv4Addr::LOCALHOST.into(), lease_micros: 60_000_000, drift_micros: 0 },
             journal.clone(), Arc::new(MemoryStore::default()), keys, Arc::new(|| SystemClock.now()),
-        ).unwrap().with_immutable_journal().with_authenticated_journal(journal, true);
+        ).unwrap().with_immutable_journal().with_authenticated_journal(journal, rtdb_db::NewStream::Authenticated);
         assert_eq!(database.create().await.unwrap_err().code, "rtdb/lineage-application-catalog");
     }
 
@@ -989,7 +989,7 @@ mod tests {
             MultiDatabase::new(
                 MultiOptions { database: incarnation, node, lease_micros: 60_000_000, drift_micros: 0 },
                 journal.clone(), Arc::new(MemoryStore::default()), keys, Arc::new(|| SystemClock.now()),
-            ).unwrap().with_immutable_journal().with_authenticated_journal(journal, true)
+            ).unwrap().with_immutable_journal().with_authenticated_journal(journal, rtdb_db::NewStream::Authenticated)
                 .with_activation_scope(scope).unwrap()
         };
         let predecessor = authority.bootstrap(NAME, Uuid::new_v4()).await.unwrap();

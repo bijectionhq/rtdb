@@ -177,7 +177,7 @@ impl Stage {
                 },
                 journal.clone(), store, keys.clone(), Arc::new(|| SystemClock.now()),
             )?.with_immutable_journal()
-                .with_authenticated_journal(placement.journal, lineage)
+                .with_authenticated_journal(placement.journal, rtdb_db::NewStream::settling_lineage(lineage))
                 .with_batch_appender(batch).with_activation_scope(candidate.scope)?
                 .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));
             match journal.head(database.journal_stream()).await {

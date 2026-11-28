@@ -25,6 +25,20 @@ pub struct TimedOriginal {
     pub cutoff: TimedJournalCutoff,
 }
 
+/// How a database creates its stream on an authenticated journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewStream {
+    /// The database settles against its lineage, so its stream is authenticated.
+    Authenticated,
+    Immutable,
+}
+
+impl NewStream {
+    pub fn settling_lineage(lineage: bool) -> Self {
+        if lineage { Self::Authenticated } else { Self::Immutable }
+    }
+}
+
 /// Whether a consensus journal holds one stream as authenticated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamAuthentication {
@@ -122,7 +136,7 @@ pub(crate) struct Stream {
     pub(crate) database: Uuid,
     journal: Arc<dyn Journal>,
     pub(crate) authenticated_journal: Option<Arc<ConsensusJournal>>,
-    create_authenticated: bool,
+    new_stream: NewStream,
     pub(crate) serving_authority: Option<Arc<dyn crate::ServingAuthority>>,
     pub(crate) activation_scope: Option<ActivationScope>,
     pub(crate) batch: Option<Arc<dyn JournalBatchAppender>>,
@@ -196,7 +210,7 @@ impl Stream {
             database,
             journal,
             authenticated_journal: None,
-            create_authenticated: false,
+            new_stream: NewStream::Immutable,
             serving_authority: None,
             activation_scope: None,
             batch: None,
@@ -216,10 +230,10 @@ impl Stream {
         self
     }
 
-    pub(crate) fn with_authenticated_journal(mut self, journal: Arc<ConsensusJournal>, create: bool) -> Self {
+    pub(crate) fn with_authenticated_journal(mut self, journal: Arc<ConsensusJournal>, new_stream: NewStream) -> Self {
         self.journal = journal.clone();
         self.authenticated_journal = Some(journal);
-        self.create_authenticated = create;
+        self.new_stream = new_stream;
         self
     }
 
@@ -243,7 +257,7 @@ impl Stream {
             })
             .await?;
         if let Some(session) = &self.session {
-            if let Some(authenticated) = self.authenticated_journal.as_ref().filter(|_| self.create_authenticated) {
+            if let Some(authenticated) = self.authenticated_journal.as_ref().filter(|_| self.new_stream == NewStream::Authenticated) {
                 match StreamAuthentication::of(authenticated, self.id()).await.map_err(journal_error)? {
                     StreamAuthentication::Authenticated => (),
                     StreamAuthentication::Missing => authenticated.create_authenticated(self.id()).await.map_err(|error| match error {

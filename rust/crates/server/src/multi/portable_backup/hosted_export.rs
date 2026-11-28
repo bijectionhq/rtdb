@@ -67,7 +67,7 @@ impl Export {
                 Arc::new(|| SystemClock.now()),
             )?
             .with_immutable_journal()
-            .with_authenticated_journal(placement.journal, false)
+            .with_authenticated_journal(placement.journal, rtdb_db::NewStream::Immutable)
             .with_activation_scope(self.scope)?
             .with_batch_appender(batch)
             .with_manifest_budget(MemoryBudget::new(PortableBackup::MAX_BYTES));

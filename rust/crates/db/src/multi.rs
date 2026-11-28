@@ -289,9 +289,9 @@ impl MultiDatabase {
     }
 
     pub fn with_authenticated_journal(
-        mut self, journal: Arc<stream_logkeeper::stream::consensus::ConsensusJournal>, create: bool,
+        mut self, journal: Arc<stream_logkeeper::stream::consensus::ConsensusJournal>, new_stream: crate::NewStream,
     ) -> Self {
-        self.stream = self.stream.with_authenticated_journal(journal, create);
+        self.stream = self.stream.with_authenticated_journal(journal, new_stream);
         self
     }
 

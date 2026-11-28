@@ -442,7 +442,7 @@ mod tests {
             .with_activation_scope(authority.scope(DATABASE).unwrap()).unwrap()
             .with_serving_authority(authority.serving_authority(DATABASE, source).unwrap());
         if authenticated {
-            database = database.with_authenticated_journal(journal.clone(), true);
+            database = database.with_authenticated_journal(journal.clone(), rtdb_db::NewStream::Authenticated);
         }
         database.create().await.unwrap();
         assert!(matches!(database.tick(&BTreeSet::from([node])).await.unwrap(), Role::Writer(_)));

@@ -17,7 +17,7 @@ use rtdb_auth::{AuthConfig, Authenticator};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Generation, Kms};
 use rtdb_db::{
-    ActivationScope, DeploymentRetirement, JournalBatchAppender, MultiDatabase, MultiOptions, Role,
+    ActivationScope, DeploymentRetirement, JournalBatchAppender, MultiDatabase, MultiOptions, NewStream, Role,
     discover_nodes,
 };
 use rtdb_format::database::proto::{DatabaseConfig, LocalStorage, database_config::Storage};
@@ -200,7 +200,7 @@ impl MultiRuntime {
         expected: Option<Uuid>,
         stream_journal: Option<DevelopmentStreamJournal>,
         activation: Option<Arc<ActivationAuthority>>,
-        offline_scope: Option<(ActivationScope, bool)>,
+        offline_scope: Option<(ActivationScope, NewStream)>,
     ) -> Result<Self> {
         if expected.is_some_and(|id| id.is_nil()) {
             return Err(invalid("Multi development requires a nonzero incarnation"));
@@ -1484,7 +1484,7 @@ struct Backends {
     activation: Option<Arc<ActivationAuthority>>,
     #[cfg(all(feature = "s3", feature = "backup-object-holds"))]
     ranked_provider: Option<rtdb_s3::S3Config>,
-    offline_scope: Option<(ActivationScope, bool)>,
+    offline_scope: Option<(ActivationScope, NewStream)>,
     _journal_lock: Option<Arc<File>>,
 }
 
@@ -1599,11 +1599,11 @@ async fn open_database_for_name(
     if backends.journal_settings.immutable_streams {
         database = database.with_immutable_journal();
         if let Some(placement) = &backends.placement {
-            let create = match (application_name, &backends.activation) {
-                (Some(name), Some(authority)) => authority.supports_lineage_for(name).await?,
-                _ => backends.offline_scope.is_some_and(|(_, lineage)| lineage),
+            let new_stream = match (application_name, &backends.activation) {
+                (Some(name), Some(authority)) => NewStream::settling_lineage(authority.supports_lineage_for(name).await?),
+                _ => backends.offline_scope.map_or(NewStream::Immutable, |(_, new_stream)| new_stream),
             };
-            database = database.with_authenticated_journal(Arc::clone(&placement.journal), create);
+            database = database.with_authenticated_journal(Arc::clone(&placement.journal), new_stream);
         }
     }
     if let Some(name) = application_name {
@@ -2610,7 +2610,7 @@ mod tests {
         let residence = || MultiDatabase::new(
             MultiOptions { database: incarnation, node, lease_micros: 60_000_000, drift_micros: 0 },
             application.clone(), store.clone(), keys.clone(), Arc::new(|| SystemClock.now()),
-        ).unwrap().with_immutable_journal().with_authenticated_journal(application.clone(), true)
+        ).unwrap().with_immutable_journal().with_authenticated_journal(application.clone(), NewStream::Authenticated)
             .with_activation_scope(ActivationScope::new(authority.identity(), "xtdb").unwrap()).unwrap()
             .with_serving_authority(authority.serving_authority("xtdb", incarnation).unwrap());
         let batch = || Arc::new(ConsensusJournalBatch(application.clone()));

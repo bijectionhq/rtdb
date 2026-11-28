@@ -5,7 +5,7 @@ mod multi;
 mod placement;
 mod replay;
 
-pub use journal::{JournalBatchAppender, StreamAuthentication, TimedOriginal, TimedOriginalProof, journal_recovery_faults};
+pub use journal::{JournalBatchAppender, NewStream, StreamAuthentication, TimedOriginal, TimedOriginalProof, journal_recovery_faults};
 pub use multi::{
     AppliedWatch, AuthenticatedCut, BackupFileRelocation, BackupObjectReadback, ClassicInstallation, DeploymentRetirement, InstallationAnchor, InstalledBackup, MultiDatabase, MultiOptions, NativeCheckpointInstallation, NativeDependentCarrier, NativeDependentOriginal, PinnedExport, PortableBackup, RankedBuild, RankedFiles, RankedPublication, Role, RotationReceipt, StoreVersionHold, StoreVersionHoldKey, StoreVersionHoldReply, StoreVersionHoldRequest, VerifiedBackup, WritePipeline, classic_import_basis, journal_recoveries_acknowledged,
 };

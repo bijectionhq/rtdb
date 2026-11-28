@@ -314,7 +314,7 @@ impl LocalBackupOptions {
             .transpose()?;
         let offline_scope = self.activation_scope.map(|scope| {
             let lineage = backup.as_ref().and_then(|backup| backup.authenticated_cut()).is_some();
-            (scope, lineage)
+            (scope, rtdb_db::NewStream::settling_lineage(lineage))
         });
         let runtime = MultiRuntime::development_with_access(
             &self.data,
@@ -380,7 +380,7 @@ impl LocalBackupOptions {
         if let Some(scope) = self.activation_scope {
             database = database.with_activation_scope(scope)?;
             if let Some(placement) = placement {
-                database = database.with_authenticated_journal(placement.journal, false);
+                database = database.with_authenticated_journal(placement.journal, rtdb_db::NewStream::Immutable);
             }
         }
         let backup = database.portable_backup().await;

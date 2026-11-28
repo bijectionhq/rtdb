@@ -1146,7 +1146,7 @@ async fn read_installation(
         Some(intent.candidate()?),
         Some(journal),
         None,
-        Some((intent.scope()?, false)),
+        Some((intent.scope()?, rtdb_db::NewStream::Immutable)),
     )
     .await?;
     let result = async {
@@ -1342,7 +1342,7 @@ impl StoppedDatabase {
             Arc::new(|| SystemClock.now()),
         )?
         .with_immutable_journal()
-        .with_authenticated_journal(journal.clone(), false)
+        .with_authenticated_journal(journal.clone(), rtdb_db::NewStream::Immutable)
         .with_activation_scope(scope)?;
         Ok(Self { _lock: lock, journal, keys, database, io })
     }
