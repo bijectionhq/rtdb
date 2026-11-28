@@ -263,10 +263,8 @@ fn the_vendored_store_judge_is_bijections_pinned_copy() {
 
 #[test]
 fn a_store_derive_diffs_retires_and_purges_atomically() {
-    use rtdb_index::branches::store::{
-        Projection, StoreRead,
-        store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind},
-    };
+    use ::store::derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind};
+    use rtdb_index::branches::store::{Projection, StoreRead};
     let mut state = TransactState::new(INCARNATION);
     // Bijection's stored key: `partition ‖ family ‖ segment(world) ‖ …`, the
     // manifest in the Row family (16), its markers in the Index family (17).
@@ -333,7 +331,7 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
 
 #[test]
 fn a_store_derive_claim_is_judged_on_its_filled_key_at_ordering() {
-    use rtdb_index::branches::store::store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind, KeyInstant};
+    use ::store::derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind, KeyInstant};
     let mut state = TransactState::new(INCARNATION);
     let place = |family: u8, inner: &[u8]| {
         let world: Vec<u8> = [0u8; 16].iter().flat_map(|_| [0u8, 0xff]).chain([0u8, 1]).collect();
@@ -391,7 +389,7 @@ fn a_store_derive_claim_is_judged_on_its_filled_key_at_ordering() {
 
 #[test]
 fn a_store_derive_close_removes_a_claim_at_ordering() {
-    use rtdb_index::branches::store::store_derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind};
+    use ::store::derive::{Derive, DeriveEntry, DeriveInterval, DeriveLevel, DeriveMode, EntryKind};
     let mut state = TransactState::new(INCARNATION);
     let place = |family: u8, inner: &[u8]| {
         let world: Vec<u8> = [0u8; 16].iter().flat_map(|_| [0u8, 0xff]).chain([0u8, 1]).collect();

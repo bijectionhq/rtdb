@@ -263,7 +263,6 @@ impl Call {
 }
 impl Service {
     pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>, binding: Binding) -> rtdb_types::Result<Self> {
-        crate::v1::store::check_rank_digest()?;
         let memory = Arc::clone(node.memory());
         let exact_reads = Registry::new(clock.clone(), memory.clone());
         Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), exact_reads, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, binding, cancellation, status })))
@@ -331,8 +330,8 @@ impl Service {
         if retained_proof && !matches!(kind, CallKind::OwnedAction | CallKind::OpenFresh) {
             return Err(classic_retained_refusal());
         }
-        let linked_store_read = matches!(kind, CallKind::StoreRead) && StoreRelease::is_linked();
-        if self.follower_only() && (!(kind.serves_assigned_follower() || linked_store_read)
+        let store_read = matches!(kind, CallKind::StoreRead);
+        if self.follower_only() && (!(kind.serves_assigned_follower() || store_read)
             || request.metadata().contains_key(FORWARDED_PEER_HEADER)
             || request.metadata().contains_key(crate::GATEWAY_ANSWER_DEADLINE_HEADER))
         {
@@ -443,7 +442,7 @@ impl Service {
             if timed_store.is_some() {
                 return Err(Status::failed_precondition("A timed Store handshake opens a new Flight session"));
             }
-            if session.fresh_replica && !linked_store_read && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
+            if session.fresh_replica && !store_read && !matches!(kind, CallKind::Action | CallKind::OwnedAction | CallKind::OpenFresh | CallKind::V1Capabilities | CallKind::V1Action | CallKind::V1Appointment | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if let Some(raw) = credentials.raw() {

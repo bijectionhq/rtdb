@@ -16,10 +16,11 @@ On an assigned follower or a gateway-routed fresh reader, the handshake binds th
 The gateway acknowledges a fresh handshake when the writer serves the selected fresh reader route.
 After agreement, reader routes admit `Read`, `Watch` and `Rank` on that attachment.
 The assigned follower reads from its locally applied cut and rechecks the assignment and the observed key generation before returning data.
-An unknown or expired bearer on the assigned follower returns `UNAUTHENTICATED`, so the client can open a new release-checked session.
+An unknown or expired bearer on a Store reader action returns `UNAUTHENTICATED`, so the client can open a new release-checked session.
 A store action takes its release from that session, and a release header on the action is rejected.
-A listener without a linked release refuses release offers before issuing a session.
-Activation requires the same exact published `store` package on both peers, RTDB's store operations using the linked implementation, and every Store client negotiating on connect, including the direct Basic-auth route.
+RTDB pins Bijection's Store, Geo and Text sources to one Git revision.
+A fresh RTDB build needs read access to the Bijection Git repository.
+Both peers use the Store contract version from that source and negotiate it on every new or renewed Store session.
 
 `rtdb.store.v1.Read`:: Returns the live entries of each requested range, ascending by key, at one version.
 The reply carries the serving node's clock sample at the read, `clock_micros`, so the host opens its present in the clock domain that stamps commits.
@@ -89,7 +90,8 @@ A verified principal denied database read access receives `PERMISSION_DENIED` wi
 The denial binds the selected database, current incarnation and authenticated principal.
 Probes issue no session.
 
-*Derived writes.* A write may be a _derive_ (`AppendRequest.derives`, encoded by Bijection's `store_read::derive` and vendored verbatim as `rust/vendor/bijection-store-derive`), also called retire-on-write.
+*Derived writes.* A write may be a _derive_, also called retire-on-write.
+`AppendRequest.derives` carries the linked `store::derive::Derive` encoding.
 It names a row's derived-line manifest prefix, the lookup levels in which its previous line is found (the target world's own, then each ancestor bounded by its fork stamp), an interval `[from, to)` of the `i64` valid axis (each bound a fixed instant or the stamp's micros plus an offset, so a period bound placed as `now + d`, start or end, takes the stamp), and the row's new derived entries over that interval, or `Close` on a unit's closure, or `Purge` on erasure or expiry, or `Backfill`: a path backfill's entries for the row's history, written as given and added to the line's inventory so a purge deletes them. A `Close` and a `Purge` also name the compaction bases of the row's counted paths (`CountedBase`: the path's record identity, its value lanes, and where its bases lie), read from Bijection's catalog without reading the store.
 Each entry is one of five kinds, each with one exact law:
 
@@ -109,16 +111,20 @@ An entry carries at most one key stamp and any number of instant placeholders; e
 
 At the ordering point, after the reads, the window and the bounds are judged, the store takes the latest manifest, at or below its bound, of the first level that has one, re-roots it into the target world, and applies Bijection's one total function `apply`: an entry the line already holds identically over the whole interval writes nothing, so an identical re-put emits no index key.
 It stores the new manifest at the stamp, with every concrete key it wrote (markers, singles, statistics and presence deltas, claims and unretained edged records): the exact inventory a `Close` or a `Purge` deletes.
-A `Close` (Bijection aggregates-close-2) deletes that inventory across every manifest version, at every stamp, retracting nothing at its own, and re-derives each named compaction base that folded some of it in without it: it reads the base (an aggregate edge's under the path's floor, or a statistics or presence path's newest), the row's line as of the base's cut, and the row's records compaction left beside the base, and subtracts lane by lane what the row folded in, through the vendored `close`. So no read at any cut, before the closure or after it, counts or reveals the closed row through a derived key, and the writer read nothing. It keeps the line's versions and stores a closed one on top; a closed line takes no further write, and a `Close` of a closed line or of a row with no line writes nothing.
+A `Close` (Bijection aggregates-close-2) deletes that inventory across every manifest version, at every stamp, retracting nothing at its own, and re-derives each named compaction base that folded some of it in without it: it reads the base (an aggregate edge's under the path's floor, or a statistics or presence path's newest), the row's line as of the base's cut, and the row's records compaction left beside the base, and subtracts lane by lane what the row folded in, through the linked `close`.
+So no read at any cut, before the closure or after it, counts or reveals the closed row through a derived key, and the writer read nothing.
+It removes the prior manifests, stores one closed manifest at the append position, and scrubs physical path and group columns from the row's events.
+A closed line takes no further write, and a `Close` of a closed line or of a row with no line writes nothing.
 A `Purge` does the same on an open line and deletes every manifest version; on a closed line it deletes only the versions, so a destruction changes no derived read. Retained edged records are never inventoried and survive both.
 These are the store's only reads at ordering besides the manifests and the claims, each answered under the append's earlier derived writes; a stored record that does not match its path's lanes is a store fault (`rtdb.store/corrupt-derived-record`).
 Derives apply in write order, before plain writes, and each sees the manifest left by earlier derives of the same row in the same append.
-Emitted writes count toward no request size limit, and are recorded in the transaction's effects, so recovery replays them without re-deriving and a vendored upgrade never rewrites history.
+Emitted writes count toward no request size limit and are recorded in the transaction's effects.
+Recovery replays those recorded effects.
 A derive's entries and lookup levels share its manifest's partition prefix (entries also its world), no plain write may overlap a derive's manifest prefix, and nothing derived is returned.
 *Applying a derive never changes an append's outcome*: the store reads the manifest only to emit, never to judge, and a malformed stored manifest is a store fault, not an outcome. Only the claims, judged after every derive applied, over the claimed values' records and never over a manifest, may refuse it.
 Its emitted writes refuse later appends and wake watches like any other write, so conflicts and wakes are exact per row.
 The store decodes no value and knows no index.
-RTDB pins the vendored source by SHA-256 (`DERIVE_DIGEST`) and refuses a mismatched `derive_digest` with `rtdb.store/derive-version`.
+The listener runs the linked Derive and Rank engines after the session has agreed to their contract version.
 
 `rtdb.store.v1.Watch`:: Reports the first version after `after` that wrote into one of its ranges, waiting up to a bounded time.
 It always reports how far it inspected, so a caller resumes from there.

@@ -6,6 +6,7 @@ use rtdb_flight_sql::rtdb::v1::{self as v1, at::Selection};
 use rtdb_types::EntityId;
 
 const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
+const STORE_RELEASE_HEADER: &str = "x-rtdb-store-release";
 
 #[path = "store_purge.rs"]
 mod store_purge;
@@ -133,8 +134,8 @@ async fn store_reads_on_the_writer_route_request_a_new_handshake_for_an_unknown_
 }
 
 #[tokio::test]
-async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
-    const RELEASE: &str = "x-rtdb-store-release";
+async fn a_store_read_requires_the_session_that_negotiated_the_linked_release() {
+    let release = tonic::metadata::MetadataValue::from_static(::store::CONTRACT_VERSION);
     let running = Running::start(Some("secret"), FlightConfig::default()).await;
     let channel = Channel::from_shared(format!("http://{}", running.server.address())).unwrap()
         .connect().await.unwrap();
@@ -146,17 +147,17 @@ async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
     };
 
     let mut offered = handshake();
-    offered.metadata_mut().insert(RELEASE, "unreleased".parse().unwrap());
+    offered.metadata_mut().insert(STORE_RELEASE_HEADER, "mismatched".parse().unwrap());
     let status = client.handshake(offered).await.err().expect("the release offer is refused");
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    for header in [RELEASE, "authorization", "set-cookie"] {
+    for header in [STORE_RELEASE_HEADER, "authorization", "set-cookie"] {
         assert!(!status.metadata().contains_key(header));
     }
     assert_eq!(running.server.status().sessions, 0);
 
     let mut duplicate = handshake();
-    duplicate.metadata_mut().append(RELEASE, "unreleased".parse().unwrap());
-    duplicate.metadata_mut().append(RELEASE, "unreleased".parse().unwrap());
+    duplicate.metadata_mut().append(STORE_RELEASE_HEADER, release.clone());
+    duplicate.metadata_mut().append(STORE_RELEASE_HEADER, release.clone());
     let status = client.handshake(duplicate).await.err().expect("the repeated offer is refused");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert_eq!(running.server.status().sessions, 0);
@@ -167,26 +168,37 @@ async fn an_unlinked_store_release_does_not_establish_a_flight_session() {
         request
     };
     let status = client.do_action(direct("Basic eHRkYjpzZWNyZXQ=".parse().unwrap())).await
-        .err().expect("the empty store read is refused");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert_eq!(status.message(), "A read names at least one range");
+        .err().expect("direct Basic cannot admit a store read");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
 
     let reply = client.handshake(handshake()).await.unwrap();
-    assert!(!reply.metadata().contains_key(RELEASE));
+    assert!(!reply.metadata().contains_key(STORE_RELEASE_HEADER));
     assert_eq!(reply.metadata().get("x-rtdb-store-writer-fence").unwrap(), "2");
     let bearer = reply.metadata().get("authorization").unwrap().clone();
     assert!(reply.into_inner().message().await.unwrap().is_none());
 
     let mut reuse = handshake();
     reuse.metadata_mut().insert("authorization", bearer.clone());
-    reuse.metadata_mut().insert(RELEASE, "unreleased".parse().unwrap());
+    reuse.metadata_mut().insert(STORE_RELEASE_HEADER, release.clone());
     let status = client.handshake(reuse).await.err().expect("a session cannot be upgraded");
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 
+    let status = client.do_action(direct(bearer.clone())).await.err().expect("the unchecked session is refused");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
     let mut action = direct(bearer);
-    action.metadata_mut().insert(RELEASE, "unreleased".parse().unwrap());
+    action.metadata_mut().insert(STORE_RELEASE_HEADER, release.clone());
     let status = client.do_action(action).await.err().expect("store actions cannot negotiate a release");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let mut matching = handshake();
+    matching.metadata_mut().insert(STORE_RELEASE_HEADER, release.clone());
+    let reply = client.handshake(matching).await.unwrap();
+    assert_eq!(reply.metadata().get_all(STORE_RELEASE_HEADER).iter().collect::<Vec<_>>(), [&release]);
+    let bearer = reply.metadata().get("authorization").unwrap().clone();
+    assert!(reply.into_inner().message().await.unwrap().is_none());
+    let status = client.do_action(direct(bearer)).await.err().expect("the empty store read is refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.message(), "A read names at least one range");
     running.stop().await;
 }
 
@@ -207,18 +219,21 @@ async fn a_forwarded_reader_checks_the_release_before_issuing_a_session() {
     let channel = Channel::from_shared(format!("http://{}", running.server.address())).unwrap()
         .connect().await.unwrap();
     let mut client = FlightServiceClient::new(channel);
-    let mut request = Request::new(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
-    let headers = request.metadata_mut();
-    headers.insert("authorization", "Basic eHRkYjpzZWNyZXQ=".parse().unwrap());
-    headers.insert("x-xtdb-database", "application".parse().unwrap());
-    headers.insert(rtdb_flight_sql::FORWARDED_PEER_HEADER, "fresh-fixture".parse().unwrap());
-    headers.insert("x-rtdb-store-release", "unreleased".parse().unwrap());
+    let handshake = |release: &'static str| {
+        let mut request = Request::new(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
+        let headers = request.metadata_mut();
+        headers.insert("authorization", "Basic eHRkYjpzZWNyZXQ=".parse().unwrap());
+        headers.insert("x-xtdb-database", "application".parse().unwrap());
+        headers.insert(rtdb_flight_sql::FORWARDED_PEER_HEADER, "fresh-fixture".parse().unwrap());
+        headers.insert(STORE_RELEASE_HEADER, tonic::metadata::MetadataValue::from_static(release));
+        request
+    };
 
-    let status = client.handshake(request).await.err().expect("the release offer is refused");
+    let status = client.handshake(handshake("mismatched")).await.err().expect("the release offer is refused");
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(!status.metadata().contains_key("authorization"));
     assert!(!status.metadata().contains_key("set-cookie"));
-    assert!(!status.metadata().contains_key("x-rtdb-store-release"));
+    assert!(!status.metadata().contains_key(STORE_RELEASE_HEADER));
     assert_eq!(running.server.status().sessions, 0);
 
     let mut replica = Client::connect_with_peer(
@@ -227,6 +242,32 @@ async fn a_forwarded_reader_checks_the_release_before_issuing_a_session() {
     for action in ["rtdb.store.v1.Read", "rtdb.store.v1.Watch", "rtdb.store.v1.Rank", "rtdb.store.v1.Append", "rtdb.store.v1.PurgeFloor"] {
         assert_eq!(replica.action(action, Bytes::new()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
+
+    let reply = client.handshake(handshake(::store::CONTRACT_VERSION)).await.unwrap();
+    assert_eq!(reply.metadata().get(STORE_RELEASE_HEADER).unwrap().as_encoded_bytes(), ::store::CONTRACT_VERSION.as_bytes());
+    let mut headers = MetadataMap::new();
+    headers.insert("authorization", reply.metadata().get("authorization").unwrap().clone());
+    headers.insert("x-xtdb-database", "application".parse().unwrap());
+    assert!(reply.into_inner().message().await.unwrap().is_none());
+    let mut checked = Client { client: client.clone(), headers };
+    let status = checked.action("rtdb.store.v1.Read", Bytes::new()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(status.message(), "A read names at least one range");
+    for action in ["rtdb.store.v1.Append", "rtdb.store.v1.StorageSizes", "rtdb.store.v1.PurgeFloor"] {
+        assert_eq!(checked.action(action, Bytes::new()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    }
+
+    checked.headers.insert("authorization", "Bearer expired".parse().unwrap());
+    let status = checked.action("rtdb.store.v1.Read", Bytes::new()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+    let status = client.handshake(handshake("mismatched")).await.err().unwrap();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    let reply = client.handshake(handshake(::store::CONTRACT_VERSION)).await.unwrap();
+    checked.headers.insert("authorization", reply.metadata().get("authorization").unwrap().clone());
+    assert!(reply.into_inner().message().await.unwrap().is_none());
+    let status = checked.action("rtdb.store.v1.Read", Bytes::new()).await.unwrap_err();
+    assert_eq!(status.message(), "A read names at least one range");
     running.stop().await;
 }
 
@@ -304,11 +345,11 @@ async fn store_appends_require_the_latest_claim_for_the_same_placement() {
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
         matches!(status.role, rtdb_replication::Role::Leading(_))
     })).await.unwrap().unwrap();
-    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let mut client = connect_linked_store(&running.server).await;
 
     let order = |epoch, writer| store::FenceWriterRequest { incarnation: incarnation.to_vec(), epoch, writer }.encode_to_vec().into();
     let append = |key, writer_fence| store::AppendRequest {
-            claim_alternative: None,
+        claim_alternative: None,
         key: vec![key; 16], incarnation: incarnation.to_vec(), writer_fence,
         writes: vec![store::Write { key: vec![key], value: Some(vec![key]), ..Default::default() }],
         ..Default::default()
@@ -338,24 +379,151 @@ async fn store_appends_require_the_latest_claim_for_the_same_placement() {
     running.stop().await;
 }
 
-#[tokio::test]
-async fn store_sizes_reports_the_committed_version_and_checks_incarnation() {
-    use rtdb_flight_sql::rtdb::store::v1 as store;
+async fn connect_linked_store(server: &ServerHandle) -> Client {
+    let channel = Channel::from_shared(format!("http://{}", server.address())).unwrap()
+        .connect().await.unwrap();
+    let mut client = Client { client: FlightServiceClient::new(channel), headers: MetadataMap::new() };
+    let mut request = Request::new(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
+    request.metadata_mut().insert("authorization", "Basic eHRkYjpzZWNyZXQ=".parse().unwrap());
+    let release = tonic::metadata::MetadataValue::from_static(::store::CONTRACT_VERSION);
+    request.metadata_mut().insert(STORE_RELEASE_HEADER, release.clone());
+    let reply = client.client.handshake(request).await.unwrap();
+    assert_eq!(reply.metadata().get_all(STORE_RELEASE_HEADER).iter().collect::<Vec<_>>(), [&release]);
+    client.headers.insert("authorization", reply.metadata().get("authorization").unwrap().clone());
+    assert!(reply.into_inner().message().await.unwrap().is_none());
+    client
+}
+
+async fn linked_store() -> (Running, Client, [u8; 16]) {
     use rtdb_node::serving::NativeServingAuthority;
-    use store_read::segment::segment;
 
     let incarnation = [51; 16];
     let resources: FixtureResources = Box::new(move |clock| Arc::new(super::fixture_resources(clock)
         .with_native_serving_authority("xtdb", NativeServingAuthority { incarnation, checkpoints: None })));
     let config = FlightConfig { store_only: true, ..Default::default() };
     let running = Running::start_with_clocked_resources(
-        None, config, &[], None, Default::default(), None, Some(resources),
+        Some("secret"), config, &[], None, Default::default(), None, Some(resources),
     ).await;
     let mut status = running.node.catalog().database("xtdb").unwrap().watch_status();
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
         matches!(status.role, rtdb_replication::Role::Leading(_))
     })).await.unwrap().unwrap();
-    let mut client = Client::connect(&running.server, None).await;
+    let client = connect_linked_store(&running.server).await;
+    (running, client, incarnation)
+}
+
+#[tokio::test]
+async fn linked_rank_reads_the_stated_cut_and_refuses_the_old_digest() {
+    use ::store::{
+        RankReply, RankRequest, Stamp, Version,
+        catalog::{PathDeclaration, PathKind},
+        event::{Event, Interval, Op, Precedence, ReadStamp},
+        keys::{self, FactId},
+        layout::{Place, catalog_place},
+        rank::{RankQuery, frame::Frame, vector::{self, VectorPartition, VectorQuery}},
+    };
+    use rtdb_flight_sql::rtdb::store::v1 as proto;
+
+    let (running, mut client, incarnation) = linked_store().await;
+    let relation = "documents";
+    let path = "embedding";
+    let place = Place { partition: [7; 16], world: [0; 16] };
+    let fact = FactId::Utf8("stored-fact".into());
+    let path_key = keys::path(catalog_place(), relation, path);
+    let declaration = PathDeclaration {
+        columns: vec![path.into()],
+        unique: false,
+        kind: PathKind::Vector { dimensions: 1, recall: None, filters: vec![] },
+        claims: None,
+    };
+    let one_i8_vector = vec![0x14, 1, 0x02, 0x81, 0];
+    let image = std::collections::BTreeMap::from([(path.to_owned(), one_i8_vector)]);
+    let [(path_values, path_value)]: [_; 1] = vector::entries(path, &[], &image).unwrap().try_into().unwrap();
+    let (posting_key, posting_stamp) = keys::pending_path_entry(place, relation, path, &path_values, &fact, 1);
+    let (event_key, event_stamp) = keys::pending_event(&keys::row(place, relation, &fact), 1);
+    let event = Event {
+        precedence: Precedence::planned(1), op: Op::Put, valid: Interval::ALL,
+        assertion_ordinal: None, commit_position: 0, image: Some(image),
+    };
+    let writes = vec![
+        proto::Write {
+            key: keys::relation(catalog_place(), relation),
+            value: Some(br#"{"validity":"explicit","fields":["embedding"],"document":""}"#.to_vec()),
+            ..Default::default()
+        },
+        proto::Write {
+            key: path_key.clone(),
+            value: Some(serde_json::to_vec(&declaration).unwrap()),
+            ..Default::default()
+        },
+        proto::Write {
+            key: posting_key, value: Some(path_value), key_stamp: Some(posting_stamp), ..Default::default()
+        },
+        proto::Write {
+            key: event_key, value: Some(event.encode_value()), key_stamp: Some(event_stamp), ..Default::default()
+        },
+    ];
+    let append = proto::AppendRequest { key: vec![1; 16], incarnation: incarnation.to_vec(), writes, ..Default::default() };
+    let replies = client.action("rtdb.store.v1.Append", append.encode_to_vec().into()).await.unwrap();
+    let reply = proto::AppendReply::decode(replies[0].body.clone()).unwrap();
+    let Some(proto::append_reply::Outcome::Committed(original)) = reply.outcome else { panic!("{reply:?}"); };
+    let delete = proto::AppendRequest {
+        key: vec![2; 16], incarnation: incarnation.to_vec(), since: original.version,
+        writes: vec![proto::Write { key: path_key, ..Default::default() }],
+        ..Default::default()
+    };
+    let replies = client.action("rtdb.store.v1.Append", delete.encode_to_vec().into()).await.unwrap();
+    let reply = proto::AppendReply::decode(replies[0].body.clone()).unwrap();
+    let Some(proto::append_reply::Outcome::Committed(deleted)) = reply.outcome else { panic!("{reply:?}"); };
+
+    let program = |stamp: proto::Stamp| {
+        let version = Version(stamp.version);
+        let frame = Frame {
+            place, version, present_micros: stamp.micros,
+            cut: ReadStamp::through(Stamp { version, micros: stamp.micros }),
+            scope: None, sealed: false, world: None, derived: Default::default(),
+        };
+        RankRequest::new(vec![frame], RankQuery::Vector(VectorQuery {
+            partitions: vec![VectorPartition {
+                frame: 0, relation: relation.into(), path: path.into(), filters: vec![], ordinal: 0,
+            }],
+            filters: vec![], probe: vec![1.0], k: 1, valid: None, staged: vec![], project: None,
+        })).encode().unwrap()
+    };
+    let request = |program| proto::RankRequest { incarnation: incarnation.to_vec(), program }.encode_to_vec().into();
+    let bytes = program(original);
+    let replies = client.action("rtdb.store.v1.Rank", request(bytes.clone())).await.unwrap();
+    let reply = proto::RankReply::decode(replies[0].body.clone()).unwrap();
+    assert_eq!(reply.incarnation, incarnation);
+    let RankReply::Vector(page) = RankReply::decode(&reply.reply).unwrap() else { panic!("expected a vector window"); };
+    assert_eq!(page.hits.len(), 1);
+    assert_eq!(page.hits[0].id, fact);
+    assert_eq!(page.hits[0].distance, 0.0);
+    assert_eq!(page.reads.len(), 1);
+    assert_eq!(page.reads[0].len(), 1);
+
+    let foreign = proto::RankRequest { incarnation: vec![0; 16], program: bytes.clone() };
+    let status = client.action("rtdb.store.v1.Rank", foreign.encode_to_vec().into()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+    let status = client.action("rtdb.store.v1.Rank", request(program(deleted))).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains("the partition has no vector path"));
+
+    let mut prerelease: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    prerelease["digest"] = "pre-release".into();
+    let status = client.action("rtdb.store.v1.Rank", request(serde_json::to_vec(&prerelease).unwrap())).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains("the ranked program does not decode"));
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn store_sizes_reports_the_committed_version_and_checks_incarnation() {
+    use ::store::segment::segment;
+    use rtdb_flight_sql::rtdb::store::v1 as store;
+
+    let (running, mut client, incarnation) = linked_store().await;
     let tablet = [8; 16];
     let mut key = vec![0, 1, b'p', 16];
     key.extend(segment(&[7; 16]));
@@ -363,7 +531,7 @@ async fn store_sizes_reports_the_committed_version_and_checks_incarnation() {
     key.extend(segment(b"row"));
     key.push(0);
     let append = store::AppendRequest {
-            claim_alternative: None,
+        claim_alternative: None,
         key: vec![1; 16], incarnation: incarnation.to_vec(),
         writes: vec![store::Write { key: key.clone(), value: Some(vec![0; 42]), ..Default::default() }],
         ..Default::default()
@@ -397,13 +565,13 @@ async fn default_store_reads_every_range_at_the_selected_retained_version() {
         .with_native_serving_authority("xtdb", NativeServingAuthority { incarnation, checkpoints: None })));
     let config = FlightConfig { store_only: true, ..Default::default() };
     let running = Running::start_with_clocked_resources(
-        None, config, &[], None, Default::default(), None, Some(resources),
+        Some("secret"), config, &[], None, Default::default(), None, Some(resources),
     ).await;
     let mut status = running.node.catalog().database("xtdb").unwrap().watch_status();
     tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
         matches!(status.role, rtdb_replication::Role::Leading(_))
     })).await.unwrap().unwrap();
-    let mut client = Client::connect(&running.server, None).await;
+    let mut client = connect_linked_store(&running.server).await;
 
     let mut versions = Vec::new();
     for value in [1, 2] {

@@ -161,17 +161,15 @@ message AppendRequest {
   // version after the reads and window. A bound with min > max fails with
   // INVALID_ARGUMENT before anything is ordered.
   repeated Bound bounds = 7;
-  // Derived writes (vendor/bijection-store-derive, T3): each entry is an
-  // encoded store_read::derive::Derive. Applied in order after the reads, window
+  // Each derived write is an encoded store::derive::Derive from the linked Store.
+  // Applied in order after the reads, window
   // and bounds are judged and before plain writes. Applying one never changes
   // the append's outcome; the unique claims they make are judged once all
   // apply, on their filled keys (claimed). Emitted writes do not count toward
   // any request size limit.
   repeated bytes derives = 8;
-  // Optional SHA-256 digest of Bijection's store_read::derive source; when
-  // present it must match RTDB's vendored DERIVE_DIGEST or the append fails
-  // with rtdb.store/derive-version.
-  optional string derive_digest = 9;
+  reserved 9;
+  reserved "derive_digest";
   // Optional ordered denial effects for one selected bound or fixed claims.
   optional ClaimAlternative claim_alternative = 10;
   // Inclusive oldest committed basis the ordered append requires to remain
@@ -298,7 +296,7 @@ message AppendReply {
     uint32 bound = 6;
     // The index of the first derive whose unique claim, filled at the stamp,
     // counted a second claimant at an instant of its coverage once the
-    // append's derives applied (store_derive::claim_exceeded). Nothing was
+    // append's derives applied (store::derive::claim_exceeded). Nothing was
     // written; recorded as a receipt under the append's key.
     uint32 claimed = 7;
     // The alternative's writes committed at this stamp.
@@ -322,15 +320,8 @@ message WatchReply {
   uint64 through = 3;
 }
 
-// A ranked read run next to the data (`rtdb.store.v1.Rank`): text BM25,
-// exact cosine, spatial predicates and nearest, as Bijection's vendored
-// `store_read::rank` (vendor/bijection). `program` is that crate's own
-// encoding of the request: its frames (label-partition key prefixes,
-// versions and cuts, never labels), the query and the RANK_DIGEST it
-// expects. The store runs the program over its ordered entries and adds no
-// semantics; a program for other ranking code fails with
-// `rtdb.store/rank-version`, and a sealed partition with
-// `rtdb.store/rank-sealed`.
+// The linked Store's RankRequest encoding supplies opaque partition prefixes,
+// versions, cuts and the query. The engine refuses sealed partitions.
 message RankRequest {
   bytes incarnation = 1;
   bytes program = 2;
@@ -338,7 +329,7 @@ message RankRequest {
 
 message RankReply {
   bytes incarnation = 1;
-  // `store_read::rank::RankReply`: the window (or a split read's part) and
+  // `store::rank::RankReply`: the window (or a split read's part) and
   // the ranges each partition consulted.
   bytes reply = 2;
 }

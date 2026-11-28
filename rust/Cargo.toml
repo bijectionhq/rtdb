@@ -17,6 +17,8 @@ publish = false
 repository = "https://github.com/bijectionhq/rtdb"
 
 [workspace.dependencies]
+# Store resolves its geo and text workspace dependencies from the same revision.
+store = { package = "bijection-store", git = "https://github.com/bijectionhq/bijection", rev = "569c31227d169712840e9f80e7778777cb776e0d" }
 stacker = "0.1.25"
 rtdb-types = { path = "crates/types" }
 rtdb-java-date = { path = "crates/java-date" }

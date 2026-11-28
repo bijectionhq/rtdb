@@ -375,7 +375,7 @@ pub const STORE_OUTSIDE_LATE: &str = "rtdb.store/outside-late";
 /// A `Bound` check left `[min, max]` or overflowed `i64`; nothing was written.
 pub const STORE_BOUND: &str = "rtdb.store/bound";
 /// A derive's unique claim, filled at the stamp, counted a second claimant
-/// (Bijection T7-4, `store_derive::claim_exceeded`); nothing was written.
+/// (Bijection T7-4, `store::derive::claim_exceeded`); nothing was written.
 pub const STORE_CLAIM: &str = "rtdb.store/claim";
 /// A store-ordered denial selected and committed its alternative effects.
 pub const STORE_DENIAL_COMMITTED: &str = "rtdb.store/denial-committed";

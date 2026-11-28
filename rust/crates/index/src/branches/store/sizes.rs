@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+use ::store::derive;
 use parking_lot::Mutex;
 use rtdb_types::{Anomaly, EntityId, Result, TableRef, Timestamp, rtdb_v1::{At, Basis, Layer, MAIN_BRANCH}};
 
-use super::{BranchEvent, BranchView, store_derive, store_table, value_of, STORE_RELATION, STORE_SCHEMA};
+use super::{BranchEvent, BranchView, store_table, value_of, STORE_RELATION, STORE_SCHEMA};
 use crate::branches::{BranchEffect, BranchIndex, Map};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,18 +88,18 @@ pub(in crate::branches) struct SizedKey {
 }
 
 fn sized_key(key: &[u8]) -> Option<SizedKey> {
-    let prefix = store_derive::partition_prefix_len(key)?;
+    let prefix = derive::partition_prefix_len(key)?;
     if &key[2..prefix] == b"host" { return None; }
     let family = match *key.get(prefix)? {
         byte if byte == SizeFamily::Row as u8 => SizeFamily::Row,
         byte if byte == SizeFamily::Index as u8 => SizeFamily::Index,
         _ => return None,
     };
-    let (_, world_end) = store_derive::place_bounds(key)?;
+    let (_, world_end) = derive::place_bounds(key)?;
     decode_id(&key[prefix + 1..world_end - 2])?;
-    let tablet_end = store_derive::segment_end(key, world_end)?;
+    let tablet_end = derive::segment_end(key, world_end)?;
     let tablet = decode_id(&key[world_end..tablet_end - 2])?;
-    let address_end = store_derive::segment_end(key, tablet_end)?;
+    let address_end = derive::segment_end(key, tablet_end)?;
     Some(SizedKey {
         bucket: SizeBucket { family, tablet },
         bytes: u64::try_from(key.len()).ok()?,

@@ -11,6 +11,7 @@
 
 use std::{collections::BTreeMap, ops::Bound};
 
+use ::store::derive;
 use rtdb_types::{Anomaly, EntityId, Result, TableRef, Value, rtdb_v1::Basis};
 
 use super::{BranchCut, BranchEvent, BranchView};
@@ -19,12 +20,7 @@ pub mod sizes;
 mod writer;
 pub use writer::{StoreWriterClaim, StoreWriterFence};
 pub(super) use writer::StoreWriterState;
-pub use store_derive;
 pub use store_filter::ValueFilter;
-
-/// SHA-256 of Bijection's `crates/store_read/src/derive.rs`, vendored verbatim
-/// as `rust/vendor/bijection-store-derive/src/lib.rs`.
-pub const DERIVE_DIGEST: &str = "28573c08f8be69158d7834b14d06edcbe01ad67fed7fd4ea2974114f062a9de5";
 
 pub const STORE_SCHEMA: &str = "store";
 pub const STORE_RELATION: &str = "entries";
@@ -249,14 +245,14 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Decode and validate every derived write of a store append before ordering:
 /// partition/world confinement, placeholder bounds and non-overlap with plain
 /// writes.
-pub fn check_derives(derives: &[Vec<u8>], writes: &[StoreWrite]) -> Result<Vec<store_derive::Derive>> {
+pub fn check_derives(derives: &[Vec<u8>], writes: &[StoreWrite]) -> Result<Vec<derive::Derive>> {
     let mut decoded = Vec::with_capacity(derives.len());
     for raw in derives {
-        let derive = store_derive::Derive::decode(raw).map_err(|error| invalid_derive(error.message))?;
-        store_derive::check(&derive).map_err(|error| invalid_derive(error.message))?;
+        let derive = derive::Derive::decode(raw).map_err(|error| invalid_derive(error.message))?;
+        derive::check(&derive).map_err(|error| invalid_derive(error.message))?;
         decoded.push(derive);
     }
-    store_derive::check_plain_overlap(&decoded, writes.iter().map(|write| write.key.as_slice()))
+    derive::check_plain_overlap(&decoded, writes.iter().map(|write| write.key.as_slice()))
         .map_err(|error| invalid_derive(error.message))?;
     Ok(decoded)
 }
@@ -264,18 +260,18 @@ pub fn check_derives(derives: &[Vec<u8>], writes: &[StoreWrite]) -> Result<Vec<s
 /// Check that the selected fixed keys occur in the primary and that its
 /// alternative writes cannot make another claim or change a prior line.
 pub fn check_denial_derives(
-    primary: &[store_derive::Derive],
+    primary: &[derive::Derive],
     claims: &std::collections::BTreeSet<Vec<u8>>,
     derives: &[Vec<u8>],
     writes: &[StoreWrite],
-) -> Result<Vec<store_derive::Derive>> {
-    use store_derive::{DeriveMode, EntryKind};
+) -> Result<Vec<derive::Derive>> {
+    use derive::{DeriveMode, EntryKind};
     let mut matched = std::collections::BTreeSet::new();
     for derive in primary {
         if let DeriveMode::Replace { entries, .. } = &derive.mode {
             for entry in entries.iter().filter(|entry| entry.kind == EntryKind::Claim && claims.contains(&entry.identity)) {
                 if entry.key_stamp.is_some() || !entry.key_instants.is_empty()
-                    || !store_derive::same_place(&entry.identity, &derive.manifest_prefix) {
+                    || !derive::same_place(&entry.identity, &derive.manifest_prefix) {
                     return Err(invalid_derive("A denial must select fixed claim keys in the deriving place"));
                 }
                 matched.insert(entry.identity.clone());
@@ -298,7 +294,7 @@ pub fn check_denial_derives(
 /// concrete `(key, value)` mutations to apply before plain writes (T3).
 pub fn resolve_derives(
     view: &BranchView<'_>,
-    derives: &[store_derive::Derive],
+    derives: &[derive::Derive],
     stamp: StoreStamp,
 ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
     if derives.is_empty() {
@@ -306,14 +302,14 @@ pub fn resolve_derives(
     }
     let stamp_bytes = stamp.encode();
     let mut out: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-    let mut ordinal = store_derive::DERIVE_ORDINAL_BASE;
-    let mut pending_manifests: BTreeMap<Vec<u8>, Vec<(Vec<u8>, store_derive::Manifest)>> = BTreeMap::new();
+    let mut ordinal = derive::DERIVE_ORDINAL_BASE;
+    let mut pending_manifests: BTreeMap<Vec<u8>, Vec<(Vec<u8>, derive::Manifest)>> = BTreeMap::new();
     let mut purged_prefixes = std::collections::BTreeSet::<Vec<u8>>::new();
 
     for derive in derives {
         match &derive.mode {
-            store_derive::DeriveMode::Replace { .. } | store_derive::DeriveMode::Backfill { .. } => {
-                let mut previous = store_derive::Manifest::empty();
+            derive::DeriveMode::Replace { .. } | derive::DeriveMode::Backfill { .. } => {
+                let mut previous = derive::Manifest::empty();
                 for level in &derive.levels {
                     if level.through.is_none() {
                         if let Some(list) = pending_manifests.get(&level.prefix)
@@ -342,7 +338,7 @@ pub fn resolve_derives(
                         reverse: true,
                     })?;
                     if let Some(raw) = page.entries.into_iter().next().and_then(|entry| entry.value) {
-                        previous = store_derive::Manifest::decode(&raw)
+                        previous = derive::Manifest::decode(&raw)
                             .map_err(|error| Anomaly::fault("rtdb.store/corrupt-derive-manifest", error.message))?;
                         break;
                     }
@@ -354,20 +350,20 @@ pub fn resolve_derives(
                 }
                 // Total: the outcome never depends on the manifest (P8).
                 let applied = match &derive.mode {
-                    store_derive::DeriveMode::Replace { interval, entries } => {
-                        let valid = store_derive::resolve_interval(*interval, stamp.micros);
-                        store_derive::apply(&derive.manifest_prefix, &previous, valid, entries, stamp_bytes, ordinal)
+                    derive::DeriveMode::Replace { interval, entries } => {
+                        let valid = derive::resolve_interval(*interval, stamp.micros);
+                        derive::apply(&derive.manifest_prefix, &previous, valid, entries, stamp_bytes, ordinal)
                     },
                     // A path backfill's history entries, joining the line's
                     // inventory (Bijection erase-derive).
-                    store_derive::DeriveMode::Backfill { writes } => store_derive::backfill(&derive.manifest_prefix, &previous, writes, ordinal),
-                    store_derive::DeriveMode::Purge { .. } | store_derive::DeriveMode::Close { .. } => unreachable!("matched above"),
+                    derive::DeriveMode::Backfill { writes } => derive::backfill(&derive.manifest_prefix, &previous, writes, ordinal),
+                    derive::DeriveMode::Purge { .. } | derive::DeriveMode::Close { .. } => unreachable!("matched above"),
                 };
                 ordinal = applied.next_ordinal;
                 for write in applied.writes {
                     out.push((write.key, write.value));
                 }
-                let manifest_key = store_derive::stamped_key(&derive.manifest_prefix, &stamp_bytes, ordinal);
+                let manifest_key = derive::stamped_key(&derive.manifest_prefix, &stamp_bytes, ordinal);
                 ordinal = ordinal.wrapping_add(1);
                 out.push((manifest_key.clone(), Some(applied.manifest.encode())));
                 pending_manifests.entry(derive.manifest_prefix.clone()).or_default().push((manifest_key, applied.manifest));
@@ -375,14 +371,13 @@ pub fn resolve_derives(
             // A unit's closure and an erasure remove the row's derived
             // history at every cut and rebase the compaction bases that
             // folded some of it, reading the store here, at the ordering
-            // point, through the vendored derive (Bijection
-            // aggregates-close-2).
-            store_derive::DeriveMode::Purge { bases } | store_derive::DeriveMode::Close { bases } => {
+            // point, through the shared derive.
+            derive::DeriveMode::Purge { bases } | derive::DeriveMode::Close { bases } => {
                 let mut stored = Vec::new();
                 if !purged_prefixes.contains(&derive.manifest_prefix) {
                     let range = KeyRange { start: derive.manifest_prefix.clone(), end: prefix_successor(&derive.manifest_prefix) };
                     for (key, raw) in store_entries(view, range)? {
-                        let manifest = store_derive::Manifest::decode(&raw)
+                        let manifest = derive::Manifest::decode(&raw)
                             .map_err(|error| Anomaly::fault("rtdb.store/corrupt-derive-manifest", error.message))?;
                         stored.push((key, manifest));
                     }
@@ -406,21 +401,21 @@ pub fn resolve_derives(
                     }
                     Ok(held.into_iter().collect())
                 };
-                if matches!(derive.mode, store_derive::DeriveMode::Purge { .. }) {
-                    let emitted = store_derive::purge::<Removal>(&derive.manifest_prefix, &stored, bases, &mut lookup).map_err(Removal::anomaly)?;
+                if matches!(derive.mode, derive::DeriveMode::Purge { .. }) {
+                    let emitted = derive::purge::<Removal>(&derive.manifest_prefix, &stored, bases, &mut lookup).map_err(Removal::anomaly)?;
                     out.extend(emitted.into_iter().map(|write| (write.key, write.value)));
                     continue;
                 }
                 // A successful close replaces the old manifests with
                 // one closed version at this append's position.
-                let Some((emitted, closed)) = store_derive::close::<Removal>(&derive.manifest_prefix, &stored, bases, &mut lookup).map_err(Removal::anomaly)? else {
+                let Some((emitted, closed)) = derive::close::<Removal>(&derive.manifest_prefix, &stored, bases, &mut lookup).map_err(Removal::anomaly)? else {
                     if !stored.is_empty() {
                         pending_manifests.insert(derive.manifest_prefix.clone(), stored);
                     }
                     continue;
                 };
                 out.extend(emitted.into_iter().map(|write| (write.key, write.value)));
-                let manifest_key = store_derive::stamped_key(&derive.manifest_prefix, &stamp_bytes, ordinal);
+                let manifest_key = derive::stamped_key(&derive.manifest_prefix, &stamp_bytes, ordinal);
                 ordinal = ordinal.wrapping_add(1);
                 out.push((manifest_key.clone(), Some(closed.encode())));
                 pending_manifests.insert(derive.manifest_prefix.clone(), vec![(manifest_key, closed)]);
@@ -430,16 +425,16 @@ pub fn resolve_derives(
     Ok(out)
 }
 
-/// Why a derived removal (`store_derive::close`, `store_derive::purge`)
+/// Why a derived removal (`derive::close`, `derive::purge`)
 /// failed: the store's own read, or a stored record that does not match its
 /// path's lanes.
 enum Removal {
     Store(Anomaly),
-    Corrupt(store_derive::DeriveError),
+    Corrupt(derive::DeriveError),
 }
 
-impl From<store_derive::DeriveError> for Removal {
-    fn from(error: store_derive::DeriveError) -> Self {
+impl From<derive::DeriveError> for Removal {
+    fn from(error: derive::DeriveError) -> Self {
         Self::Corrupt(error)
     }
 }
@@ -478,12 +473,12 @@ fn store_entries(view: &BranchView<'_>, range: KeyRange) -> Result<Vec<(Vec<u8>,
 /// The first derive whose unique claim (`EntryKind::Claim`, Bijection T7-4)
 /// counts a second claimant once `derived` (the append's derived writes,
 /// in order, from [`resolve_derives`]) applies over `view`: each claim's
-/// filled key, read at every level it inherits, judged by the vendored
-/// `store_derive::claim_exceeded`. One judgment, at the ordering point; a
+/// filled key, read at every level it inherits, judged by
+/// `derive::claim_exceeded`. One judgment, at the ordering point; a
 /// refusal writes nothing.
 pub fn claim_refused(
     view: &BranchView<'_>,
-    derives: &[store_derive::Derive],
+    derives: &[derive::Derive],
     derived: &[(Vec<u8>, Option<Vec<u8>>)],
     stamp: StoreStamp,
     selects: impl Fn(&[u8]) -> bool,
@@ -491,12 +486,12 @@ pub fn claim_refused(
     let stamp_bytes = stamp.encode();
     let overlay: BTreeMap<&[u8], Option<&[u8]>> = derived.iter().map(|(key, value)| (key.as_slice(), value.as_deref())).collect();
     for (index, derive) in derives.iter().enumerate() {
-        for (identity, coverage) in store_derive::claims(derive, &stamp_bytes) {
+        for (identity, coverage) in derive::claims(derive, &stamp_bytes) {
             if !selects(&identity) {
                 continue;
             }
             let mut records = Vec::new();
-            for (level, through) in store_derive::claim_levels(derive, &identity) {
+            for (level, through) in derive::claim_levels(derive, &identity) {
                 let range = KeyRange { start: level.clone(), end: prefix_successor(&level) };
                 let mut held: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
                 let mut after = None;
@@ -531,9 +526,9 @@ pub fn claim_refused(
                         };
                     }
                 }
-                records.extend(held.iter().filter_map(|(key, value)| store_derive::claim_record(&level, through.as_ref(), key, value)));
+                records.extend(held.iter().filter_map(|(key, value)| derive::claim_record(&level, through.as_ref(), key, value)));
             }
-            if store_derive::claim_exceeded(&records, coverage) {
+            if derive::claim_exceeded(&records, coverage) {
                 return Ok(Some(index));
             }
         }
@@ -709,14 +704,6 @@ mod tests {
         let source = include_bytes!("../../../../vendor/bijection-store-filter/src/lib.rs");
         let digest = Sha256::digest(source).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         assert_eq!(digest, BIJECTION_STORE_FILTER_SHA256, "vendor/bijection-store-filter drifted from Bijection's filter.rs");
-    }
-
-    #[test]
-    fn the_vendored_store_derive_is_bijections_pinned_copy() {
-        use sha2::{Digest, Sha256};
-        let source = include_bytes!("../../../../vendor/bijection-store-derive/src/lib.rs");
-        let digest = Sha256::digest(source).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        assert_eq!(digest, DERIVE_DIGEST, "vendor/bijection-store-derive drifted from Bijection's store_read/src/derive.rs");
     }
 
     fn cut(position: u64) -> BranchCut {

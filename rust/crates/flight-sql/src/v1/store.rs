@@ -16,18 +16,14 @@
 //! derives, whose keys the scope cannot bound. Anything else refuses with
 //! `rtdb.store/outside-grant` before it is read or ordered.
 //!
-//! `Rank` runs Bijection's vendored `store_read::rank` (vendor/bijection)
-//! over the same ordered entries: the ranking is Bijection's code, the store
-//! only reads ranges at versions for it. A program for other ranking code is
-//! refused; the server refuses to start with a vendored copy whose compiled
-//! digest differs from the recorded one.
+//! `Rank` runs the linked Store engine over RTDB's ordered entries.
 
 use std::time::Duration;
 
 use bytes::Bytes;
 use prost::Message;
 use rtdb_index::branches::store::{
-    DERIVE_DIGEST, KeyRange, MAX_PAGE_ENTRIES, Projection, StoreBound, StorePage, StoreRead, StoreWrite, ValueFilter, check_bounds,
+    KeyRange, MAX_PAGE_ENTRIES, Projection, StoreBound, StorePage, StoreRead, StoreWrite, ValueFilter, check_bounds,
     check_derives, check_placeholders, store_table,
 };
 use rtdb_node::{DatabaseAccess, SessionIdentity, serving::{ChangeImages, ChangeOrder, Changes}};
@@ -63,22 +59,6 @@ pub(crate) use purge::{PURGE_FLOOR, PURGE_WRITER_HEADER};
 pub(crate) use writer::{CLAIM_WRITER, FENCE_WRITER, WRITER_FENCE_HEADER};
 pub(super) use sizes::STORAGE_SIZES;
 pub(crate) const ACTIONS: [&str; 8] = [READ, APPEND, WATCH, RANK, STORAGE_SIZES, PURGE_FLOOR, FENCE_WRITER, CLAIM_WRITER];
-
-/// The `RANK_DIGEST` recorded with the vendored copy (vendor/bijection).
-const VENDORED_RANK_DIGEST: &str = include_str!("../../../../vendor/bijection/RANK_DIGEST");
-
-/// Refuse to serve with a vendored ranking crate whose compiled digest is not
-/// the one recorded from Bijection: a local edit of the copy, or a copy and
-/// record out of step.
-pub(crate) fn check_rank_digest() -> rtdb_types::Result<()> {
-    if store_read::rank::RANK_DIGEST != VENDORED_RANK_DIGEST.trim() {
-        return Err(rtdb_types::Anomaly::unsupported(
-            "rtdb.store/rank-version",
-            "The vendored Bijection ranking code does not match its recorded RANK_DIGEST",
-        ));
-    }
-    Ok(())
-}
 
 struct StoreBatch {
     basis: Basis,
@@ -137,8 +117,8 @@ struct StoreRanges<'a> {
     hold: std::sync::Mutex<Option<rtdb_node::serving::StoreReadTurn>>,
 }
 
-impl store_read::source::RangeSource for StoreRanges<'_> {
-    fn read(&self, read: store_read::source::RangeRead) -> impl std::future::Future<Output = anyhow::Result<store_read::source::RangePages>> + Send {
+impl ::store::source::RangeSource for StoreRanges<'_> {
+    fn read(&self, read: ::store::source::RangeRead) -> impl std::future::Future<Output = anyhow::Result<::store::source::RangePages>> + Send {
         async move {
             let at = read.at.map_or(At::Latest, |at| At::Exactly(Basis::new(self.incarnation, at.0)));
             let limit = read.limit.clamp(1, MAX_PAGE_ENTRIES);
@@ -151,7 +131,7 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
             reads_within(self.scope, &read_ranges)?;
             let mut reads = read_ranges.into_iter().map(|range| {
                 let after = read.after.clone().filter(|after| range.contains(after));
-                StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: false }
+                StoreRead { range, after, limit, projection: Projection::Values, filter: None, reverse: read.reverse }
             });
             let batch = self.service.read_store_batch(self.driver, &mut reads, at, self.incarnation, self.now, self.cancellation).await?;
             {
@@ -177,16 +157,16 @@ impl store_read::source::RangeSource for StoreRanges<'_> {
                 let mut admitted = self.delivery.lock().map_err(|_| Status::internal("Rank delivery state is unavailable"))?;
                 include_delivery(&mut admitted, delivery)?;
             }
-            let at = store_read::store::Version(batch.basis.position());
-            let pages = batch.pages.into_iter().map(|page| store_read::source::RangePage {
-                entries: page.entries.into_iter().map(|entry| store_read::store::Entry {
+            let at = ::store::Version(batch.basis.position());
+            let pages = batch.pages.into_iter().map(|page| ::store::source::RangePage {
+                entries: page.entries.into_iter().map(|entry| ::store::Entry {
                     key: entry.key,
                     value: entry.value,
-                    written: store_read::store::Version(entry.written.position()),
+                    written: ::store::Version(entry.written.position()),
                 }).collect(),
                 resume: page.resume,
             }).collect();
-            Ok(store_read::source::RangePages { at, pages })
+            Ok(::store::source::RangePages { at, pages })
         }
     }
 }
@@ -487,14 +467,6 @@ impl StoreAppendInput {
                 .collect();
             Ok(StoreDenial { check, writes, derives: alternative.derives })
         }).transpose()?;
-        if let Some(digest) = request.derive_digest.as_deref()
-            && digest != DERIVE_DIGEST
-        {
-            return Err(error::anomaly(rtdb_types::Anomaly::incorrect(
-                "rtdb.store/derive-version",
-                format!("The append expects derive code {digest} but this store runs {DERIVE_DIGEST}"),
-            )));
-        }
         // Placeholder, bound, derive and window errors are the request's, decided before anything is ordered.
         check_placeholders(&writes).map_err(error::anomaly)?;
         check_bounds(&bounds).map_err(error::anomaly)?;
@@ -689,7 +661,7 @@ impl Service {
         if request.incarnation.is_empty() {
             return Err(error::incorrect("A ranked read states its incarnation"));
         }
-        let program = store_read::rank::RankRequest::decode(&request.program).map_err(|refused| error::incorrect(&refused.to_string()))?;
+        let program = ::store::rank::RankRequest::decode(&request.program).map_err(|refused| error::incorrect(&refused.to_string()))?;
         let (database, incarnation, scope) = self.store_database(call, DatabaseAccess::Read, Some(&request.incarnation)).await?;
         let driver = database.serving_driver().ok_or_else(|| error::unsupported("rtdb.store.v1"))?;
         let source = StoreRanges {
@@ -700,16 +672,10 @@ impl Service {
             #[cfg(feature = "multi")]
             hold: std::sync::Mutex::new(None),
         };
-        let reply = store_read::rank::rank(&source, program).await.map_err(|refused| {
-            let refused = match refused.downcast::<Status>() {
-                Ok(status) => return status,
-                Err(refused) => refused,
-            };
-            let message = refused.to_string();
-            if message.starts_with("rtdb.store/rank-version") {
-                Status::failed_precondition(message)
-            } else {
-                error::incorrect(&message)
+        let reply = ::store::rank::rank(&source, program).await.map_err(|refused| {
+            match refused.downcast::<Status>() {
+                Ok(status) => status,
+                Err(refused) => error::incorrect(&refused.to_string()),
             }
         })?;
         let reply = reply.encode().map_err(|failed| Status::internal(failed.to_string()))?;
@@ -733,21 +699,6 @@ impl Service {
         }
         self.check_attachment(call, &database)?;
         Ok(reply)
-    }
-}
-
-#[cfg(test)]
-mod rank_tests {
-    /// The vendored ranking code is the copy recorded from Bijection, and
-    /// its pins are the versions this workspace locks.
-    #[test]
-    fn the_vendored_ranking_code_is_bijections_recorded_copy() {
-        super::check_rank_digest().expect("vendor/bijection/RANK_DIGEST is the compiled digest");
-        let lock = include_str!("../../../../Cargo.lock");
-        for pin in store_read::rank::PINS.lines() {
-            let (name, version) = pin.split_once('=').expect("a pin is name=version");
-            assert!(lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")), "{name} {version} is not locked");
-        }
     }
 }
 

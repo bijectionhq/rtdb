@@ -439,6 +439,10 @@ async fn handshake(
         TIMED_INCARNATION,
         MetadataValue::from_bytes(incarnation.as_bytes()),
     );
+    request.metadata_mut().insert(
+        "x-rtdb-store-release",
+        MetadataValue::from_static(::store::CONTRACT_VERSION),
+    );
     client.handshake(request).await
 }
 

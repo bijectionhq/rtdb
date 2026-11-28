@@ -194,8 +194,7 @@ surface StatelessDatabase {
 
     @guarantee StoreReleaseAgreement
         -- A caller offers one store release in the x-rtdb-store-release metadata of a new Flight handshake using verified credentials.
-        -- A listener without a linked store release refuses an offer before it issues session credentials.
-        -- A listener with a linked store release confirms only an exact match and returns its linked release in the handshake metadata.
+        -- The listener confirms only an exact match and returns its linked release in the handshake metadata.
         -- A release-checked session on a reader route retains the exact admitted database attachment.
         -- The gateway acknowledges a fresh handshake when the writer serves the fresh reader route.
         -- Read, Watch and Rank are the Store actions admitted on a reader route after agreement.
@@ -206,7 +205,8 @@ surface StatelessDatabase {
         -- If the follower cannot authenticate that suffix within its admission bound, it must catch up before it can confirm the floor.
         -- It rechecks the same replica assignment and observed key generation before returning a Read, Rank or Watch reply.
         -- Read, Watch and Rank return UNAUTHENTICATED on an admitted route when the Store bearer is unknown or expired, so the caller can start a new handshake.
-        -- Each store action on a listener with a linked release requires the session established by that agreement.
+        -- Each Store action requires the session established by that agreement.
+        -- A new or renewed Store session repeats the agreement.
 
     @guarantee StoreRangeBatch
         -- A Store Read and each range batch in Store Rank return one page per requested range at one version of the admitted incarnation.

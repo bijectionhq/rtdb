@@ -28,6 +28,13 @@ async fn trust_only_flight_cannot_purge_store_history() {
     let mut client = Client::connect(&running.server, Some("xtdb:unverified")).await;
     let refusal = client.action(ACTION, request(INCARNATION)).await.unwrap_err();
     assert_eq!(refusal.code(), Code::PermissionDenied);
+
+    let mut handshake = Request::new(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
+    handshake.metadata_mut().insert("authorization", "Basic eHRkYjp1bnZlcmlmaWVk".parse().unwrap());
+    handshake.metadata_mut().insert(STORE_RELEASE_HEADER, tonic::metadata::MetadataValue::from_static(::store::CONTRACT_VERSION));
+    let refusal = client.client.handshake(handshake).await.err().expect("trust cannot establish a checked session");
+    assert_eq!(refusal.code(), Code::Unauthenticated);
+    assert!(!refusal.metadata().contains_key("authorization"));
     running.stop().await;
 }
 
@@ -37,7 +44,7 @@ async fn the_default_store_refuses_a_purge_and_a_foreign_incarnation() {
     let running = Running::start_with_clocked_resources(
         Some("secret"), config, &[], None, Default::default(), None, Some(resources()),
     ).await;
-    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let mut client = connect_linked_store(&running.server).await;
     let refusal = client.action(ACTION, request([0; 16])).await.unwrap_err();
     assert_eq!(refusal.code(), Code::FailedPrecondition);
     let refusal = client.action(ACTION, request(INCARNATION)).await.unwrap_err();

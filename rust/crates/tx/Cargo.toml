@@ -37,6 +37,7 @@ tracing.workspace = true
 store_judge = { package = "bijection-store-judge", path = "../../vendor/bijection-store-judge" }
 
 [dev-dependencies]
+store.workspace = true
 rtdb-metrics.workspace = true
 rtdb-trie.workspace = true
 tempfile.workspace = true

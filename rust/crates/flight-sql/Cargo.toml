@@ -10,7 +10,7 @@ multi = ["rtdb-node/multi", "tonic/tls-ring", "tonic/tls-native-roots"]
 
 [dependencies]
 anyhow = "1"
-store_read = { package = "bijection-store-read", path = "../../vendor/bijection/store_read" }
+store.workspace = true
 async-trait.workspace = true
 rtdb-spatial.workspace = true
 rtdb-types.workspace = true

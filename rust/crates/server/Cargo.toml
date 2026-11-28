@@ -87,6 +87,7 @@ libc = "0.2"
 tracing.workspace = true
 
 [dev-dependencies]
+store.workspace = true
 arrow-flight = "=58.4.1"
 prost.workspace = true
 rcgen = "=0.14.10"
