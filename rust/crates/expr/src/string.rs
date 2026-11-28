@@ -144,8 +144,7 @@ impl StringFunction {
                 let placing = bytes(&args[1])?;
                 let start = int(&args[2])?;
                 let length = int(&args[3])?;
-                let prefix = substring(source, 1, Some(start.wrapping_sub(1)), !binary)?;
-                let suffix = substring(source, start.wrapping_add(length), None, !binary)?;
+                let [prefix, suffix] = overlay_edges(source, start, length, !binary)?;
                 let mut output = Vec::with_capacity(add(add(prefix.len(), placing.len())?, suffix.len())?);
                 output.extend_from_slice(prefix); output.extend_from_slice(placing); output.extend_from_slice(suffix);
                 from_bytes(output, binary)?
@@ -157,14 +156,14 @@ impl StringFunction {
             Self::Trim | Self::TrimLeading | Self::TrimTrailing => {
                 if binary {
                     let source = bytes(&args[0])?;
-                    let octet = match args.get(1) {
-                        Some(Value::Binary(bytes)) => *bytes.first().ok_or_else(|| illegal("Cannot trim with an empty binary value"))?,
-                        Some(value) => numeric_octet(value)?,
-                        None => b' ',
+                    let leading = self != Self::TrimTrailing;
+                    let trailing = self != Self::TrimLeading;
+                    let retained = match args.get(1) {
+                        Some(Value::Binary(token)) => binary_trim(source, token, leading, trailing)?,
+                        Some(value) => trim_octet(source, numeric_octet(value)?, leading, trailing),
+                        None => trim_octet(source, b' ', leading, trailing),
                     };
-                    let start = if self == Self::TrimTrailing { 0 } else { source.iter().position(|byte| *byte != octet).unwrap_or(source.len()) };
-                    let end = if self == Self::TrimLeading { source.len() } else { source.iter().rposition(|byte| *byte != octet).map_or(0, |index| index + 1) };
-                    Value::Binary(source[start.min(end)..end].to_vec())
+                    Value::Binary(retained.to_vec())
                 } else {
                     let source = text(&args[0])?;
                     let trim = args.get(1).map(text).transpose()?.unwrap_or(" ");
@@ -223,6 +222,23 @@ pub(crate) fn text_substring(source: &str, position: i64, length: Option<i64>) -
 
 pub(crate) fn binary_substring(source: &[u8], position: i64, length: Option<i64>) -> Result<&[u8]> {
     substring(source, position as i32, length.map(|length| length as i32), false)
+}
+
+pub(crate) fn overlay_edges(source: &[u8], start: i32, length: i32, utf8: bool) -> Result<[&[u8]; 2]> {
+    let prefix = substring(source, 1, Some(start.wrapping_sub(1)), utf8)?;
+    let suffix = substring(source, start.wrapping_add(length), None, utf8)?;
+    Ok([prefix, suffix])
+}
+
+pub(crate) fn binary_trim<'a>(source: &'a [u8], token: &[u8], leading: bool, trailing: bool) -> Result<&'a [u8]> {
+    let octet = *token.first().ok_or_else(|| illegal("Cannot trim with an empty binary value"))?;
+    Ok(trim_octet(source, octet, leading, trailing))
+}
+
+fn trim_octet(source: &[u8], octet: u8, leading: bool, trailing: bool) -> &[u8] {
+    let start = if leading { source.iter().position(|byte| *byte != octet).unwrap_or(source.len()) } else { 0 };
+    let end = if trailing { source.iter().rposition(|byte| *byte != octet).map_or(0, |index| index + 1) } else { source.len() };
+    &source[start.min(end)..end]
 }
 
 pub(crate) fn octet_position(needle: &[u8], haystack: &[u8]) -> Result<i32> {

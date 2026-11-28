@@ -137,10 +137,16 @@
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
--- A native Binary SUBSTRING with signed literal indices can write reached byte slices into a bounded Binary result.
+-- Native Binary concatenation and OVERLAY can write reached byte spans directly into a funded Binary result.
+-- Binary TRIM with a Binary token uses its first octet and reports an empty token when both operands are present.
+-- Native Binary TRIM and SUBSTRING can write reached byte slices into a funded Binary result.
+-- SUBSTRING accepts signed literals and exact plain Arrow signed controls on this path.
 -- Its byte slicing retains the scalar index narrowing, null behavior, and errors.
 -- Native Binary OCTET_LENGTH and OCTET_POSITION can read reached bytes from plain Arrow cells and write the scalar counts into a funded integer result.
 -- A bounded native UTF-8 NULLIF, LEAST, or GREATEST result can write reached text directly from its Arrow input while preserving operand demand and byte ordering.
+-- Native Binary NULLIF, LEAST, and GREATEST can compare reached plain Binary operands and write the selected span into a funded result.
+-- A null left operand ends NULLIF before it reads the right operand, and a null right operand selects the left operand.
+-- Binary extrema stop at the first null and select the later position on equal bytes.
 -- A direct Arrow parameter projection chooses retention or detachment for each result column independently.
 -- A compatible first-cell view keeps its source backing charge when the retained storage is proportionate to the cell.
 -- A detached result column holds its own backing charge, and the projected page admits its descriptors and schema separately.

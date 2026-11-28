@@ -5383,8 +5383,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binary_substring_copies_only_the_reached_slice_of_a_funded_cell() {
-        use arrow_array::{BinaryArray, RecordBatch};
+    async fn binary_substring_with_a_bound_signed_length_copies_only_the_reached_slice() {
+        use arrow_array::{BinaryArray, Int16Array, RecordBatch};
 
         let memory = MemoryBudget::new(1 << 17);
         let source_memory = MemoryBudget::new(1 << 23);
@@ -5395,11 +5395,177 @@ mod tests {
         let source = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])),
             vec![Arc::new(BinaryArray::from_vec(vec![bytes.as_slice()]))]).unwrap();
         let batch = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::new(source, &source_memory).unwrap()).unwrap();
-        let args = vec![input.expression(), Expr::Literal(Value::I64(1)), Expr::Literal(Value::I64(1))];
+        let length_type = LogicalType::Scalar(ScalarType::I16);
+        let parameter_field = rtdb_columnar::to_field("length", &length_type).unwrap();
+        let parameters = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![parameter_field])),
+            vec![Arc::new(Int16Array::from(vec![1, 2]))]).unwrap();
+        let parameters = rtdb_columnar::OwnedBatch::new(parameters, &memory).unwrap();
+        let args = vec![input.expression(), Expr::Literal(Value::I64(1)), Expr::Parameter { index: 0, data_type: length_type.clone() }];
         let expr = Expr::Call { name: "substring".into(), return_type: rtdb_plan::function_type_with_args("substring", &args).unwrap(), args };
         let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        cursor.execution.parameters = Arc::new(crate::parameters::BoundParameters::from_arrow(parameters, 1, vec![length_type], &memory).unwrap());
+        cursor.scalar_fallbacks = Some(0);
         let page = cursor.next_batch().await.unwrap().unwrap();
-        assert_eq!(page.columns[0].value(0).unwrap(), Value::Binary(vec![255]));
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::Binary(vec![255, 255]));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn binary_substring_reads_runtime_signed_columns_in_row_order() {
+        use arrow_array::BinaryArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(0, ScalarType::Binary), field(1, ScalarType::I64), field(2, ScalarType::I32)]).unwrap();
+        let batch = |len| {
+            let bytes = [None, Some(&[255, 0][..]), Some(&[255, 0]), Some(&[255, 0]), Some(&[255, 0]), Some(&[]), Some(&[255, 0]), Some(&[255, 0])];
+            let starts = [Some(1), None, Some(1), Some((1i64 << 32) + 2), Some(-1), Some(2), Some(2), Some(1)];
+            let lengths = [Some(-1), Some(-1), None, Some(1), Some(3), Some(i32::MAX), Some(i32::MAX), Some(-1)];
+            let arrays: [ArrayRef; 3] = [
+                Arc::new(BinaryArray::from_iter(bytes.into_iter().take(len))),
+                Arc::new(Int64Array::from_iter(starts.into_iter().take(len))),
+                Arc::new(Int32Array::from_iter(lengths.into_iter().take(len))),
+            ];
+            let columns = arrays.into_iter().zip(schema.fields()).map(|(array, field)| Column::Arrow {
+                array,
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                logical: Some(field.data_type.clone()),
+            }).collect();
+            ColumnBatch::settled(columns, len, memory.reserve(4096).unwrap()).unwrap()
+        };
+        let args = schema.fields().iter().map(rtdb_plan::Field::expression).collect::<Vec<_>>();
+        let expression = Expr::Call { name: "substring".into(), return_type: rtdb_plan::function_type_with_args("substring", &args).unwrap(), args };
+        let mut cursor = record_projection_cursor(batch(6), schema.clone(), vec![expression.clone()], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let Column::Arrow { array, .. } = &page.columns[0] else { panic!("Expected packed bytes"); };
+        let values = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [None, None, None, Some(&[0][..]), Some(&[255]), Some(&[])]);
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        let mut cursor = record_projection_cursor(batch(8), schema.clone(), vec![expression], &memory);
+        assert_eq!(cursor.next_batch().await.err().unwrap().message.as_deref(), Some("newLimit < 0"));
+    }
+
+    #[tokio::test]
+    async fn binary_projections_write_reached_spans_and_observed_nulls() {
+        use arrow_array::BinaryArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(0, ScalarType::Binary), field(1, ScalarType::Binary), field(2, ScalarType::Binary)]).unwrap();
+        let inputs = [
+            [Some(&[255, 0, 255][..]), Some(&[255]), None, Some(&[]), Some(&[127])],
+            [Some(&[255, 7][..]), None, Some(&[1]), Some(&[]), Some(&[128])],
+            [Some(&[255, 0][..]), Some(&[255]), Some(&[]), Some(&[255]), None],
+        ];
+        let columns = inputs.into_iter().zip(schema.fields()).map(|(cells, field)| Column::Arrow {
+            array: Arc::new(BinaryArray::from_iter(cells)),
+            field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+            logical: Some(field.data_type.clone()),
+        }).collect();
+        let batch = ColumnBatch::settled(columns, 5, memory.reserve(4096).unwrap()).unwrap();
+        let source = schema.fields()[0].expression();
+        let operand = schema.fields()[1].expression();
+        let token = schema.fields()[2].expression();
+        let call = |name: &str, args: Vec<Expr>| Expr::Call {
+            name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args,
+        };
+        let start = Expr::Literal(Value::I64((1i64 << 32) + 2));
+        let default_length = call("default_overlay_length", vec![operand.clone()]);
+        let expressions = vec![
+            Expr::binary(BinaryOp::Concat, source.clone(), operand.clone()),
+            call("overlay", vec![source.clone(), operand.clone(), start.clone(), Expr::Literal(Value::I64(1))]),
+            call("overlay", vec![source.clone(), operand.clone(), start, default_length]),
+            call("trim", vec![source.clone(), token.clone()]),
+            call("trim_leading", vec![source.clone(), token.clone()]),
+            call("trim_trailing", vec![source.clone(), token]),
+            call("nullif", vec![source.clone(), operand.clone()]),
+            call("least", vec![source.clone(), operand.clone()]),
+            call("greatest", vec![source.clone(), operand]),
+            call("nullif", vec![source.clone(), source]),
+        ];
+        let mut cursor = record_projection_cursor(batch, schema, expressions, &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let expected: [[Option<&[u8]>; 5]; 9] = [
+            [Some(&[255, 0, 255, 255, 7]), None, None, Some(&[]), Some(&[127, 128])],
+            [Some(&[255, 255, 7, 255]), None, None, Some(&[]), Some(&[127, 128])],
+            [Some(&[255, 255, 7]), None, None, Some(&[]), Some(&[127, 128])],
+            [Some(&[0]), Some(&[]), None, Some(&[]), None],
+            [Some(&[0, 255]), Some(&[]), None, Some(&[]), None],
+            [Some(&[255, 0]), Some(&[]), None, Some(&[]), None],
+            [Some(&[255, 0, 255]), Some(&[255]), None, None, Some(&[127])],
+            [Some(&[255, 0, 255]), None, None, Some(&[]), Some(&[127])],
+            [Some(&[255, 7]), None, None, Some(&[]), Some(&[128])],
+        ];
+        for (column, expected) in page.columns.iter().zip(expected) {
+            let Column::Arrow { array, .. } = column else { panic!("Expected packed bytes"); };
+            let values = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+        }
+        assert!(matches!(&page.columns[9], Column::Arrow { array, .. } if array.data_type() == &DataType::Null));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn binary_overlay_and_trim_errors_require_nonnull_operands() {
+        use arrow_array::BinaryArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Binary);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let batch = |len| ColumnBatch::settled(vec![Column::Arrow {
+            array: Arc::new(BinaryArray::from_iter([None, Some(&[255, 0][..])].into_iter().take(len))),
+            field: Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap()),
+            logical: Some(input.data_type.clone()),
+        }], len, memory.reserve(4096).unwrap()).unwrap();
+        for (name, args, message) in [
+            ("overlay", vec![input.expression(), Expr::Literal(Value::Binary(vec![1])), Expr::Literal(Value::I64(1i64 << 32)), Expr::Literal(Value::I64(1))], "Negative substring length"),
+            ("trim", vec![input.expression(), Expr::Literal(Value::Binary(vec![]))], "Cannot trim with an empty binary value"),
+        ] {
+            let expression = Expr::Call { name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args };
+            let mut cursor = record_projection_cursor(batch(1), schema.clone(), vec![expression.clone()], &memory);
+            cursor.scalar_fallbacks = Some(0);
+            assert_eq!(cursor.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(), Value::Null);
+            assert_eq!(cursor.scalar_fallbacks, Some(0));
+            let mut cursor = record_projection_cursor(batch(2), schema.clone(), vec![expression], &memory);
+            assert_eq!(cursor.next_batch().await.err().unwrap().message.as_deref(), Some(message));
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_null_shortcuts_skip_declined_right_operand_layouts() {
+        use arrow_array::BinaryArray;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![field(0, ScalarType::Binary), field(1, ScalarType::Binary)]).unwrap();
+        let [left, right] = [schema.fields()[0].expression(), schema.fields()[1].expression()];
+        let call = |name: &str, args: Vec<Expr>| Expr::Call {
+            name: name.into(), return_type: rtdb_plan::function_type_with_args(name, &args).unwrap(), args,
+        };
+        let expressions = vec![
+            Expr::binary(BinaryOp::Concat, left.clone(), right.clone()),
+            call("nullif", vec![left.clone(), right.clone()]),
+            call("greatest", vec![left, right]),
+        ];
+        let batch = |left: Option<&[u8]>| {
+            let field = &schema.fields()[0];
+            let columns = vec![Column::Arrow {
+                array: Arc::new(BinaryArray::from_iter([left])),
+                field: Arc::new(rtdb_columnar::to_field(&field.name, &field.data_type).unwrap()),
+                logical: Some(field.data_type.clone()),
+            }, Column::Values(vec![Value::Binary(vec![255])])];
+            ColumnBatch::settled(columns, 1, memory.reserve(4096).unwrap()).unwrap()
+        };
+        let mut cursor = record_projection_cursor(batch(None), schema.clone(), expressions.clone(), &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert!(page.columns.iter().all(|column| column.value(0).unwrap() == Value::Null));
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        let mut cursor = record_projection_cursor(batch(Some(&[1])), schema.clone(), expressions, &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let values = page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>();
+        assert_eq!(values, [Value::Binary(vec![1, 255]), Value::Binary(vec![1]), Value::Binary(vec![255])]);
+        assert_eq!(cursor.scalar_fallbacks, Some(3));
     }
 
     #[tokio::test]

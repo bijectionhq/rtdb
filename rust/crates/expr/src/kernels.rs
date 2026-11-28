@@ -186,6 +186,16 @@ pub fn binary_substring(source: &[u8], position: i64, length: Option<i64>) -> Re
     crate::string::binary_substring(source, position, length)
 }
 
+/// Borrows the source spans before and after the replacement in Binary OVERLAY.
+pub fn binary_overlay_edges(source: &[u8], start: i64, length: i64) -> Result<[&[u8]; 2]> {
+    crate::string::overlay_edges(source, start as i32, length as i32, false)
+}
+
+/// Borrows the retained Binary span, using the first octet of a nonempty trim token.
+pub fn binary_trim<'a>(source: &'a [u8], token: &[u8], leading: bool, trailing: bool) -> Result<&'a [u8]> {
+    crate::string::binary_trim(source, token, leading, trailing)
+}
+
 /// Counts the octets of a borrowed Binary cell with the scalar result width.
 pub fn binary_octet_length(source: &[u8]) -> Result<i32> {
     crate::string::octet_length(source)
