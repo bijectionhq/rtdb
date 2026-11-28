@@ -448,6 +448,8 @@ async fn store_purge_floor_replays_through_deferred_and_classic_checkpoints() {
         since: second, keep_from: second.position(),
     });
     writer.publish_store_purge_floor(second, second.position(), 0, &[], None).await.unwrap();
+    assert_eq!(writer.publish_store_purge_floor(first, first.position(), 0, &[], None)
+        .await.unwrap_err().code, "rtdb/cursor-expired");
     writer.publish_store_purge_floor(second, first.position(), 0, &[], None).await.unwrap();
     assert_eq!(writer.stream.head().await.unwrap(), publication);
 

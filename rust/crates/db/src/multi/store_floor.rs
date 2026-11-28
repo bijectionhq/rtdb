@@ -68,6 +68,10 @@ impl MultiDatabase {
         let index = state.transactions.index();
         index.require_store_writer(writer.map(|claim| (since.incarnation(), claim.fence, claim.generation, claim.claim)))?;
         index.check_store_purge_guards(since, keep_from, reads)?;
+        if since.position() < state.store_purge_floor {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired",
+                "The purge basis precedes the effective Store floor"));
+        }
         let lower = self.lower();
         if !(0..=lower.max(0)).contains(&retention_micros) {
             return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.store/purge-clock",

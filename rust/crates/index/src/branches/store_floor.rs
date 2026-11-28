@@ -65,6 +65,7 @@ impl BranchIndex {
         if self.has_custody_groups() || self.has_visibility_history() {
             return Err(Anomaly::unsupported("rtdb.store/unsupported", "The ordered-bytes store serves only an unlabelled database"));
         }
+        self.require_store_history(since)?;
         let now = self.head.system_time;
         self.view(MAIN_BRANCH, At::Exactly(since), Layer::Merged, now)?;
         let view = self.view(MAIN_BRANCH, At::Latest, Layer::Merged, now)?;
