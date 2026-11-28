@@ -208,7 +208,8 @@
 -- Those spill pages retain each record's fields and preserve their original page boundaries.
 -- Mixed column spill can replay complete fragments in their original order while the page keeps their Arrow backing charged.
 -- Computed VALUES and replayed literal pages admit their results column by column.
--- A multi-row native VALUES page of plain Arrow parameters with one exact physical layout per result column copies the selected cells and their validity in row order under the execution budget.
+-- An exact plain bound column of a multi-row native VALUES page copies its selected Arrow cells and their validity under the execution budget, including when other columns require evaluation.
+-- The page prepares expressions and evaluates reached computed cells in row and field order before publishing its columns.
 -- An all-null column in a multi-row native VALUES page has nullable Arrow Null layout.
 -- Compatible XTQL literal pages build their Arrow columns during binding and retain the order and size of every page.
 -- Legacy logical relation serialization emits Arrow-backed literal pages as typed expression rows, preserving empty pages and the order of pages, rows and columns.

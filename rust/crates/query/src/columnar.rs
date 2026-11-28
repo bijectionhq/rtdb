@@ -8514,19 +8514,24 @@ fn pack_utf8_values(values: &[impl Borrow<Value>], memory: &Arc<MemoryBudget>) -
         Value::Null => None,
         _ => unreachable!("The scalar result type admitted only strings and nulls"),
     });
+    pack_utf8_cells(texts, memory)
+}
+
+pub(crate) fn pack_utf8_cells<'a>(
+    texts: impl ExactSizeIterator<Item = Option<&'a str>> + Clone, memory: &Arc<MemoryBudget>,
+) -> Result<(ArrayRef, Arc<MemoryReservation>)> {
     let payload = texts.clone().flatten().try_fold(0usize, |bytes, text| {
         bytes.checked_add(text.len()).ok_or_else(size_error)
     })?;
     i32::try_from(payload).map_err(|_| size_error())?;
-    // The input values are already charged, and the pre-sized builder copies only their bytes into Arrow.
-    let bound = values.len().checked_add(1)
+    let bound = texts.len().checked_add(1)
         .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
         .and_then(|bytes| bytes.checked_add(payload))
-        .and_then(|bytes| bytes.checked_add(values.len().div_ceil(8)))
+        .and_then(|bytes| bytes.checked_add(texts.len().div_ceil(8)))
         .and_then(|bytes| bytes.checked_add(4096))
         .ok_or_else(size_error)?;
     let scratch = memory.reserve(bound)?;
-    let mut builder = StringBuilder::with_capacity(values.len(), payload);
+    let mut builder = StringBuilder::with_capacity(texts.len(), payload);
     for text in texts { builder.append_option(text); }
     Ok((Arc::new(builder.finish()), scratch))
 }

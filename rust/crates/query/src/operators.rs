@@ -775,17 +775,20 @@ async fn materialize_columns(
         }
     }
     let bytes = rows.len().checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size)?;
-    let mut columns = (0..width).map(|_| {
+    let mut columns = (0..width).map(|position| {
         let reservation = memory.reserve(bytes)?;
-        Ok((Vec::with_capacity(rows.len()), reservation, None))
+        let gathered = if rows.len() > 1 { bound_values_nulls(rows, position, execution)? } else { None };
+        let values = if gathered.is_none() { Vec::with_capacity(rows.len()) } else { Vec::new() };
+        Ok((values, reservation, None, gathered))
     }).collect::<Result<Vec<_>>>()?;
     let input = Schema::default();
     for (index, expressions) in rows.iter().enumerate() {
         execution.context.check_cancelled_at(index)?;
         if expressions.len() != width { return Err(invalid("table-width", "Table row does not match its declared width")); }
         let scope = execution.scope()?;
-        for (expression, (column, reservation, bound)) in expressions.iter().zip(&mut columns) {
+        for (expression, (column, reservation, bound, gathered)) in expressions.iter().zip(&mut columns) {
             let invocation = execution.prepare_expression(expression, &input, &scope)?;
+            if gathered.is_some() { continue; }
             if rows.len() == 1
                 && let Expr::Parameter { index, .. } = expression
                 && let Some((source, row)) = execution.parameters.arrow_input(*index)
@@ -809,7 +812,7 @@ async fn materialize_columns(
         }
     }
     let mut output = ColumnBatch::settled(Vec::new(), rows.len(), memory.reserve(256)?)?;
-    for (values, scratch, bound) in columns {
+    for (position, (values, scratch, bound, gathered)) in columns.into_iter().enumerate() {
         if let Some(cell) = bound {
             let reservation = memory.reserve_with_backing(1024, std::iter::once(Arc::clone(cell.owner)))?;
             let field = Arc::new(arrow_schema::Field::new("value", cell.field.data_type().clone(), false));
@@ -819,11 +822,101 @@ async fn materialize_columns(
             output.append_funded_column(column, reservation, memory)?;
             continue;
         }
-        let (column, reservation) = pack_evaluated_column(&values, memory)?;
+        let (column, reservation) = match gathered {
+            Some(nulls) => pack_bound_values_column(rows, position, nulls, execution)?,
+            None => pack_evaluated_column(&values, memory)?,
+        };
         drop((values, scratch));
         output.append_column(column, reservation, memory)?;
     }
     Ok(Some(output))
+}
+
+fn bound_table_cell<'a>(expression: &Expr, execution: &'a Execution) -> Option<(&'a arrow_array::ArrayRef, usize)> {
+    use arrow_schema::DataType;
+
+    let Expr::Parameter { index, .. } = expression else { return None; };
+    let (source, row) = execution.parameters.arrow_input(*index)?;
+    let array = source.batch().column(*index);
+    let field = source.batch().schema_ref().field(*index);
+    (field.data_type() == array.data_type() && field.metadata().is_empty()
+        && (array.is_valid(row) || field.is_nullable())
+        && matches!(array.data_type(), DataType::Boolean | DataType::Int8 | DataType::Int16
+            | DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary)
+        && &rtdb_columnar::from_field(field).ok()? == execution.parameters.types().get(*index)?)
+        .then_some((array, row))
+}
+
+fn bound_values_nulls(rows: &[Vec<Expr>], position: usize, execution: &Execution) -> Result<Option<usize>> {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+
+    let cell = |row: &[Expr]| row.get(position).and_then(|expr| bound_table_cell(expr, execution));
+    let Some((first, _)) = cell(&rows[0]) else { return Ok(None); };
+    let mut remaining = i32::MAX as usize;
+    let mut nulls = 0;
+    for (index, row) in rows.iter().enumerate() {
+        execution.context.check_cancelled_at(index)?;
+        let Some((array, row)) = cell(row).filter(|(array, _)| array.data_type() == first.data_type()) else {
+            return Ok(None);
+        };
+        if array.is_null(row) {
+            nulls += 1;
+            continue;
+        }
+        let payload = match array.data_type() {
+            DataType::Utf8 => array.as_string::<i32>().value_length(row) as usize,
+            DataType::Binary => array.as_binary::<i32>().value_length(row) as usize,
+            _ => 0,
+        };
+        let Some(bytes) = remaining.checked_sub(payload) else { return Ok(None); };
+        remaining = bytes;
+    }
+    Ok(Some(nulls))
+}
+
+fn pack_bound_values_column(
+    rows: &[Vec<Expr>], position: usize, nulls: usize, execution: &Execution,
+) -> Result<(crate::columnar::Column, Arc<rtdb_columnar::MemoryReservation>)> {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::{DataType, Field};
+    use crate::columnar::Column;
+
+    let picks = rows.iter().map(|row| bound_table_cell(&row[position], execution).expect("Admitted Arrow parameter"));
+    let (first, _) = picks.clone().next().expect("A bound VALUES column has rows");
+    let data_type = if nulls == rows.len() { DataType::Null } else { first.data_type().clone() };
+    let field = Arc::new(Field::new("value", data_type, nulls != 0));
+    let logical = rtdb_columnar::from_field(&field)?;
+    let memory = &execution.context.memory;
+    let (array, reservation) = match field.data_type() {
+        DataType::Null => {
+            let reservation = memory.reserve(rtdb_columnar::estimate_scalar_builder_bytes(&logical, (0..rows.len()).map(|_| None))?)?;
+            (arrow_array::new_null_array(&DataType::Null, rows.len()), reservation)
+        }
+        DataType::Utf8 => crate::columnar::pack_utf8_cells(picks.map(|(array, row)| {
+            array.is_valid(row).then(|| array.as_string::<i32>().value(row))
+        }), memory)?,
+        _ => {
+            let actual = match &logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+            let LogicalType::Scalar(scalar) = actual else { unreachable!("Admitted plain scalar VALUES column"); };
+            let reservation = memory.reserve(rtdb_columnar::estimate_scalar_builder_bytes(&logical, picks.clone().map(|(array, row)| {
+                array.is_valid(row).then(|| {
+                    let heap = if array.data_type() == &DataType::Binary { array.as_binary::<i32>().value_length(row) as usize } else { 0 };
+                    (scalar, heap)
+                })
+            }))?)?;
+            let mut arrays = Vec::with_capacity(rows.len());
+            let mut positions = Vec::with_capacity(rows.len());
+            for (index, (array, row)) in picks.enumerate() {
+                execution.context.check_cancelled_at(index)?;
+                arrays.push(array.as_ref());
+                positions.push((index, row));
+            }
+            (rtdb_columnar::copy_selected_cells(&arrays, &positions)?, reservation)
+        }
+    };
+    execution.context.check_cancelled()?;
+    Ok((Column::Arrow { array, field, logical: Some(logical) }, reservation))
 }
 
 fn materialize_bound_rows(rows: &[Vec<Expr>], width: usize, execution: &Execution) -> Result<Option<crate::columnar::ColumnBatch>> {
@@ -831,21 +924,7 @@ fn materialize_bound_rows(rows: &[Vec<Expr>], width: usize, execution: &Executio
     use arrow_schema::{DataType, Field};
     use crate::columnar::{Column, ColumnBatch};
 
-    let cell = |expression: &Expr| {
-        let Expr::Parameter { index, .. } = expression else { return None; };
-        let (source, row) = execution.parameters.arrow_input(*index)?;
-        let array = source.batch().column(*index);
-        let field = source.batch().schema_ref().field(*index);
-        if field.data_type() != array.data_type() || !field.metadata().is_empty()
-            || (array.is_null(row) && !field.is_nullable())
-            || !matches!(array.data_type(), DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
-                | DataType::Int64 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary)
-            || &rtdb_columnar::from_field(field).ok()? != execution.parameters.types().get(*index)?
-        {
-            return None;
-        }
-        Some((array, row))
-    };
+    let cell = |expression: &Expr| bound_table_cell(expression, execution);
     for (index, row) in rows.iter().enumerate() {
         execution.context.check_cancelled_at(index)?;
         if row.len() != width || row.iter().zip(&rows[0]).any(|(expression, first)| {

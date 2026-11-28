@@ -463,6 +463,120 @@ async fn single_row_values_keeps_bound_text_backing_alongside_a_computed_cell() 
 }
 
 #[tokio::test]
+async fn mixed_values_copies_exact_bound_columns_without_decoding_their_parameters() {
+    use arrow_array::{Array, BinaryArray, Float32Array, RecordBatch, StringArray};
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use crate::columnar::Column;
+    use rtdb_expr::ParameterLookup;
+    use rtdb_plan::{BinaryOp, CastTarget};
+
+    let mut execution = execution(3);
+    let source = MemoryBudget::new(1 << 20);
+    let memory = Arc::clone(&execution.context.memory);
+    let arrow = ArrowSchema::new(vec![
+        ArrowField::new("text", DataType::Utf8, false),
+        ArrowField::new("null_text", DataType::Utf8, true),
+        ArrowField::new("binary", DataType::Binary, false),
+        ArrowField::new("number_as_text", DataType::Utf8, false),
+        ArrowField::new("float", DataType::Float32, false),
+    ]);
+    let types = arrow.fields().iter().map(|field| rtdb_columnar::from_field(field).unwrap()).collect::<Vec<_>>();
+    let hidden = StringArray::from(vec!["unused", "hidden"]);
+    let args = RecordBatch::try_new(Arc::new(arrow), vec![
+        Arc::new(StringArray::from(vec!["unused", "é"])),
+        Arc::new(StringArray::new(hidden.offsets().clone(), hidden.values().clone(), Some(NullBuffer::from(vec![true, false])))),
+        Arc::new(BinaryArray::from_vec(vec![b"unused", b"\0\xff"])),
+        Arc::new(StringArray::from(vec!["unused", "41"])),
+        Arc::new(Float32Array::from(vec![1.0, -0.0])),
+    ]).unwrap();
+    let bound = rtdb_columnar::OwnedBatch::new(args, &source).unwrap();
+    execution.parameters = Arc::new(BoundParameters::from_arrow(bound, 1, types.clone(), &memory).unwrap());
+
+    let param = |index: usize| Expr::Parameter { index, data_type: types[index].clone() };
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let num = |offset| Expr::binary(BinaryOp::Add,
+        Expr::Cast { expr: Box::new(param(3)), target: CastTarget::Fixed(int.clone()) },
+        Expr::Literal(Value::I64(offset)),
+    );
+    let rows = vec![
+        vec![param(0), num(1), param(2), param(1), param(4)],
+        vec![param(1), num(0), param(2), param(1), param(4)],
+        vec![param(0), num(2), param(2), param(1), param(4)],
+    ];
+    for (position, values) in [
+        (0, vec![Value::Utf8("é".into()), Value::Null, Value::Utf8("é".into())]),
+        (2, vec![Value::Binary(vec![0, 255]); 3]),
+        (3, vec![Value::Null; 3]),
+        (4, vec![Value::F32(-0.0); 3]),
+    ] {
+        let nulls = super::bound_values_nulls(&rows, position, &execution).unwrap().unwrap();
+        let (_, bound) = super::pack_bound_values_column(&rows, position, nulls, &execution).unwrap();
+        let (_, evaluated) = crate::columnar::pack_evaluated_column(&values, &memory).unwrap();
+        assert_eq!(bound.bytes(), evaluated.bytes());
+    }
+    let schema = Schema::new([types[1].clone(), int, types[2].clone(), types[1].clone(), types[4].clone()]
+        .into_iter().enumerate().map(|(index, data_type)| Field {
+            id: ColumnId(index as u32), name: format!("c{index}"), qualifier: None, qualified_only: false, unnamed: false, data_type,
+        }).collect()).unwrap();
+    let relation = Arc::new(Relation::new(schema, RelationNode::Values { rows }).unwrap());
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, execution.parameters.types(), &memory).unwrap();
+    let mut cursor = build_columns(runtime, execution.clone()).await.unwrap().unwrap();
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    assert!([0, 1, 2, 4].into_iter().all(|slot| execution.parameters.known_value(slot).is_none()));
+    drop((cursor, execution));
+    assert_eq!(source.used_bytes(), 0);
+
+    let [Column::Arrow { array: text, field: text_field, .. }, computed, binary,
+        Column::Arrow { array: nulls, logical: Some(LogicalType::Null), .. },
+        Column::Arrow { array: float, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow result columns"); };
+    let text = text.as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(text_field.is_nullable());
+    assert_eq!(text.iter().collect::<Vec<_>>(), [Some("é"), None, Some("é")]);
+    assert_eq!(text.value_data(), "éé".as_bytes());
+    assert_eq!(nulls.data_type(), &DataType::Null);
+    let floats = float.as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(floats.values().iter().map(|value| value.to_bits()).collect::<Vec<_>>(), [(-0.0_f32).to_bits(); 3]);
+    for (row, number) in [42, 41, 43].into_iter().enumerate() {
+        assert_eq!(computed.value(row).unwrap(), Value::I64(number));
+        assert_eq!(binary.value(row).unwrap(), Value::Binary(vec![0, 255]));
+    }
+    drop(batch);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn mixed_values_reports_computed_errors_in_row_and_field_order() {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use rtdb_plan::BinaryOp;
+
+    let mut execution = execution(2);
+    let memory = &execution.context.memory;
+    let ty = LogicalType::Scalar(ScalarType::Utf8);
+    let args = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![rtdb_columnar::to_field("arg", &ty).unwrap()])),
+        vec![Arc::new(StringArray::from(vec!["bound"]))],
+    ).unwrap();
+    let bound = rtdb_columnar::OwnedBatch::new(args, memory).unwrap();
+    execution.parameters = Arc::new(BoundParameters::from_arrow(bound, 0, vec![ty.clone()], memory).unwrap());
+    let baseline = memory.used_bytes();
+    let param = || Expr::Parameter { index: 0, data_type: ty.clone() };
+    let int = |value| Expr::Literal(Value::I64(value));
+    let divide = || Expr::binary(BinaryOp::Divide, int(1), int(0));
+    let overflow = || Expr::binary(BinaryOp::Add, int(i64::MAX), int(1));
+    for (first, code) in [
+        (vec![param(), int(0), divide()], "xtdb.expression/division-by-zero"),
+        (vec![param(), overflow(), divide()], "xtdb.expression/overflow-error"),
+    ] {
+        let rows = [first, vec![param(), overflow(), int(0)]];
+        let error = super::materialize_columns(&rows, 3, &execution).await.err().unwrap();
+        assert_eq!(error.code, code);
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
 async fn numeric_list_batch_unnest_shares_one_child_array_across_parents() {
     use rtdb_plan::BinaryOp;
 
