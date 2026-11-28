@@ -3192,7 +3192,7 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
-        let mut bucket = rtdb_query::read_owned_purge_bucket(Arc::clone(&context), owner, relation, id).await?;
+        let bucket = rtdb_query::read_owned_purge_bucket(Arc::clone(&context), owner, relation, id).await?;
         // The full handle, including its type, is the erasure target even
         // when the locality prefix is shared or the key has no live winner.
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
@@ -3208,7 +3208,14 @@ impl<'a> OpenTransaction<'a> {
         let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
         self.record_owned_change(relation, id.clone(), kind, Interval::ALL, position, fixed)?;
         let floors = relation.purge_floor_table(owner);
-        self.buffer.put(floors.clone(), bucket.advance(id, ordered)?, Interval::ALL)?;
+        let update = bucket.advance(id, ordered)?;
+        if !update.arrow_document(&self.context.memory).ok().flatten().is_some_and(|document| {
+            self.try_stage_control_put(&floors, update.id().iid(), Interval::ALL, document)
+        }) {
+            self.buffer.put(floors.clone(), update.document(), Interval::ALL)?;
+        } else {
+            drop(update);
+        }
         if first_erase {
             let markers = relation.purge_table(owner);
             let through = self.snapshot()?.relation_event_frontier(&markers)?
@@ -3219,6 +3226,17 @@ impl<'a> OpenTransaction<'a> {
             self.buffer.put(floors, rtdb_query::purge_coverage_document(through), Interval::ALL)?;
         }
         Ok(())
+    }
+
+    fn try_stage_control_put(
+        &mut self, table: &TableRef, iid: Iid, valid_time: Interval, document: ArrayRef,
+    ) -> bool {
+        let header = EventHeader {
+            position: None, commit_position: 0, iid, system_from: self.tx_key().system_time, valid_time, op: EventOp::Put,
+        };
+        rtdb_format::data::funded_put_batch(document, &[header], &self.context.memory)
+            .and_then(|batch| self.buffer.append_assembled_put_batch(table, batch, &StructFields::new()))
+            .is_ok()
     }
 
     fn reserve_bounded_period_write(
@@ -6776,6 +6794,63 @@ mod tests {
         let writes = buffer.stage()?;
         let event = writes.tables()[&table].batch().unwrap().header(0)?;
         assert_eq!(event.valid_time, Interval::new(key.system_time, Timestamp::MAX)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_positioned_purge_bucket_preserves_coverage_row_order_and_replica_bytes() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            footprint_grants: Default::default(), decision_clock: None,
+            write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None,
+            world_constraints: None, database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let options = SubmitOptions::default();
+        let prior = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(20) };
+        let base = rtdb_index::PartitionState::empty(Default::default())?;
+        let owner = "owner";
+        let relation = OwnedRelation::new("facts")?;
+        let table = relation.purge_floor_table(owner);
+        let uuid = EntityId::Uuid([200; 16]);
+        let bucket = StructFields::from([
+            ("_id".into(), uuid.as_value()),
+            ("floors".into(), Value::list(vec![Value::Struct(StructFields::from([
+                ("handle".into(), Value::Binary(uuid.handle_bytes())),
+                ("at".into(), Value::I64(prior.system_time.0)),
+                ("tx".into(), Value::I64(prior.tx_id.0)),
+            ]))])),
+        ]);
+        let mut seed = TransactionBuffer::new(base.snapshot(), prior, Arc::clone(&memory))?;
+        seed.put(relation.purge_table(owner), StructFields::from([("_id".into(), Value::I64(1))]), Interval::ALL)?;
+        seed.put(table.clone(), bucket, Interval::ALL)?;
+        seed.put(table.clone(), rtdb_query::purge_coverage_document(1), Interval::ALL)?;
+        base.apply(&seed.stage()?)?;
+
+        for with_coverage in [false, true] {
+            let cut = context.query_context(base.snapshot(), key.system_time, "UTC", None)?;
+            let update = rtdb_query::read_owned_purge_bucket(cut, owner, &relation, &uuid).await?.advance(&uuid, key)?;
+            let arrow = update.arrow_document(&memory)?.expect("installed bucket keeps the canonical list layout");
+            let mut baseline = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
+            let mut positioned = OpenTransaction::new(base.snapshot(), key, &options, &context)?;
+            baseline.buffer.put(table.clone(), update.document(), Interval::ALL)?;
+            assert!(positioned.try_stage_control_put(&table, uuid.iid(), Interval::ALL, arrow));
+            if with_coverage {
+                for transaction in [&mut baseline, &mut positioned] {
+                    transaction.buffer.put(table.clone(), rtdb_query::purge_coverage_document(2), Interval::ALL)?;
+                }
+            }
+            let baseline = baseline.buffer.stage()?;
+            let positioned = positioned.buffer.stage()?;
+            let expected = baseline.tables()[&table].batch().unwrap().arrow();
+            let actual = positioned.tables()[&table].batch().unwrap().arrow();
+            let encode = |batch: &RecordBatch| crate::ipc::encode(batch.schema_ref(), [batch], &memory);
+            assert_eq!(encode(expected)?.as_slice(), encode(actual)?.as_slice());
+        }
         Ok(())
     }
 

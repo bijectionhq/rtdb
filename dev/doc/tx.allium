@@ -315,7 +315,10 @@
 -- Owned create, replace, delete, and erase operations apply atomically in their listed order.
 -- Owned erase requires a verified permanent root identity and emits an all-history erase event.
 -- An erase advances the owner's retained-read fence and the identity's historical release floor.
--- Purge floors compare complete typed handles inside protected buckets. Digest collisions share a bucket without sharing a floor.
+-- Purge floors compare complete typed handles inside protected buckets.
+-- Digest collisions share a bucket without sharing a floor.
+-- A canonical purge bucket keeps untouched entries in complete handle order when one floor advances.
+-- An existing floor advances only when both its transaction position and system time increase.
 -- The exact floor index covers the same ordered relation erase frontier. Missing coverage refuses historical release.
 -- Owned erase refuses governed paths and another mutation of the same identity in the commit.
 -- Held Original rank replay orders a bounded exact effect commitment with the archive and destination receipt.
