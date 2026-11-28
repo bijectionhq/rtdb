@@ -447,8 +447,10 @@ impl Projection {
 
     fn evaluated(&self, evaluation: &Evaluation<'_>) -> Result<Option<Column>> {
         let Some(charged) = evaluation.vector(&self.0, None)? else { return Ok(None) };
-        let vector = charged.vector;
-        let len = evaluation.len;
+        Self::observed(&charged.vector, evaluation.len)
+    }
+
+    fn observed(vector: &Vector, len: usize) -> Result<Option<Column>> {
         let (array, logical): (ArrayRef, LogicalType) = match (vector.array(), vector.scalar()) {
             (Some(array), Some(scalar)) if array.null_count() < len => {
                 let logical = LogicalType::Scalar(scalar);
@@ -525,6 +527,48 @@ pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, paramete
         Some(projection) => projection.column(batch, parameters, memory),
         None => Ok(None),
     }
+}
+
+pub(super) fn funded_record_case(
+    expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>, memory: &Arc<MemoryBudget>,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let Some(projection) = Projection::bind(expr, schema) else { return Ok(None); };
+    let Kind::TextCase { text, .. } = &projection.0.kind else { return Ok(None); };
+    let Kind::Column(position) = &text.kind else { return Ok(None); };
+    let plain = |array: &dyn Array, field: &ArrowField, logical: Option<&LogicalType>| {
+        field.metadata().is_empty() && array.data_type() == field.data_type()
+            && (field.data_type() == &DataType::Utf8 || (field.data_type() == &DataType::Null && field.is_nullable()))
+            && logical.is_none_or(|logical| super::stable_read_layout(logical, field))
+    };
+    let admitted = match &batch.columns[*position] {
+        Column::Arrow { array, field, logical } => {
+            let nulls = array.logical_null_count();
+            plain(array.as_ref(), field, logical.as_ref()) && (nulls == 0 || nulls == batch.len)
+        }
+        Column::Selected(selected) => {
+            if !selected.source_layouts().all(|(array, field, logical)| plain(array, field, logical)) { return Ok(None); }
+            let mut nulls = selected.arrow_cells().map(|cell| {
+                cell.is_none_or(|(array, field, _, row)| field.data_type() == &DataType::Null || array.is_null(row))
+            });
+            nulls.next().is_some_and(|first| nulls.all(|null| null == first))
+        }
+        Column::Values(_) => false,
+    };
+    if !admitted { return Ok(None); }
+    let evaluation = Evaluation { columns: &batch.columns, len: batch.len, parameters: Parameters::Values(parameters), memory };
+    let Some(Charged { vector, _charge: charge }) = evaluation.vector(&projection.0, None)? else { return Ok(None); };
+    let Some(column) = Projection::observed(&vector, batch.len)? else { return Ok(None); };
+    drop(vector);
+    let bytes = super::owned_projection_bytes(&column)?;
+    let owner = match charge {
+        Some(mut owner) => {
+            let lease = Arc::get_mut(&mut owner).expect("The case kernel owns its output reservation");
+            if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+            owner
+        }
+        None => memory.reserve(bytes)?,
+    };
+    Ok(Some((column, owner)))
 }
 
 /// Each row's three-valued truth under `predicate` over `batch`, keeping unknown (null) apart from false, or

@@ -1,12 +1,165 @@
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
+use arrow_array::{Array, ArrayRef, NullArray, StringArray, builder::{ArrayBuilder, StringBuilder}};
 use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_plan::{BinaryOp, Expr, Schema};
 use rtdb_types::{Anomaly, AnomalyKind, ListBuilder, LogicalType, Result, ScalarType, Value};
 
-use super::{BatchRow, Column, ColumnBatch, owned_projection_bytes, size_error, stable_read_layout};
+use super::{BatchRow, Column, ColumnBatch, SelectedColumn, StoredVector, owned_projection_bytes, plain_scalar, size_error, stable_read_layout};
 use crate::context::Execution;
+
+enum SplitInput<'a> {
+    Column(&'a Column),
+    Parameter(ArrowCell<'a>),
+    Literal(Option<&'a str>),
+}
+
+impl<'a> SplitInput<'a> {
+    fn bind(expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, execution: &'a Execution) -> Option<Self> {
+        let ty = expr.data_type();
+        if ty != LogicalType::Null && plain_scalar(&ty) != Some(&ScalarType::Utf8) { return None; }
+        Some(match expr {
+            Expr::Column { id, .. } => Self::Column(&batch.columns[schema.position(*id)?]),
+            Expr::Parameter { index, .. } => Self::Parameter(execution.parameters.evaluator().arrow_cell(*index)?),
+            Expr::Literal(Value::Utf8(text)) => Self::Literal(Some(text)),
+            Expr::Literal(Value::Null) => Self::Literal(None),
+            _ => return None,
+        })
+    }
+
+    fn text(&self, row: usize) -> Option<Option<&'a str>> {
+        let cell = match *self {
+            Self::Column(column) => {
+                let Some((array, field, logical, row)) = column.arrow_cell(row)? else { return Some(None); };
+                if logical.is_some_and(|logical| !stable_read_layout(logical, field)) { return None; }
+                ArrowCell { array, field, row }
+            }
+            Self::Parameter(cell) => cell,
+            Self::Literal(text) => return Some(text),
+        };
+        let ArrowCell { array, field, row } = cell;
+        if !field.metadata().is_empty() || array.data_type() != field.data_type() { return None; }
+        if field.data_type() == &DataType::Null && field.is_nullable() { return Some(None); }
+        let text = array.as_any().downcast_ref::<StringArray>()?;
+        Some(text.is_valid(row).then(|| text.value(row)))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitShape { Null, EmptyList, TextList }
+
+struct SplitRun { shape: SplitShape, end: usize, tokens: usize, payload: usize }
+
+pub(super) fn split_text(
+    expr: &Expr, schema: &Schema, batch: &ColumnBatch, execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let Expr::Call { name, args, .. } = expr else { return Ok(None); };
+    let [source, Expr::Literal(Value::Utf8(delimiter))] = args.as_slice() else { return Ok(None); };
+    if name != "string_to_array" || delimiter.is_empty() || batch.len == 0 { return Ok(None); }
+    let Some(source) = SplitInput::bind(source, schema, batch, execution) else { return Ok(None); };
+    match split_text_runs(&source, delimiter, batch.len, execution) {
+        Err(error) if error.is(AnomalyKind::ResourceExhausted) => Ok(None),
+        result => result,
+    }
+}
+
+fn split_text_runs(
+    source: &SplitInput<'_>, delimiter: &str, len: usize, execution: &Execution,
+) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let context = &execution.context;
+    let memory = &context.memory;
+    let mut run_slots = memory.reserve(0)?;
+    let mut runs: Vec<SplitRun> = Vec::new();
+    for row in 0..len {
+        context.check_cancelled_at(row)?;
+        let Some(text) = source.text(row) else { return Ok(None); };
+        let shape = match text { None => SplitShape::Null, Some("") => SplitShape::EmptyList, Some(_) => SplitShape::TextList };
+        if runs.last().is_none_or(|run| run.shape != shape) {
+            if runs.len() == runs.capacity() {
+                let capacity = runs.capacity().saturating_mul(2).max(4).min(len);
+                let bytes = capacity.checked_mul(size_of::<SplitRun>()).ok_or_else(size_error)?;
+                Arc::get_mut(&mut run_slots).expect("The split projection owns its run inventory").grow_to(bytes)?;
+                runs.reserve_exact(capacity - runs.len());
+            }
+            runs.push(SplitRun { shape, end: row, tokens: 0, payload: 0 });
+        }
+        let run = runs.last_mut().expect("The current split run exists");
+        run.end = row + 1;
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            let separators = text.matches(delimiter).count();
+            run.tokens = run.tokens.checked_add(separators + 1).ok_or_else(size_error)?;
+            run.payload = run.payload.checked_add(text.len() - separators * delimiter.len()).ok_or_else(size_error)?;
+            if i32::try_from(run.tokens).is_err() || i32::try_from(run.payload).is_err() { return Ok(None); }
+        }
+    }
+    if let [run] = runs.as_slice() {
+        return write_split_run(source, delimiter, 0..len, run, execution).map(Some);
+    }
+    let inventory = len.checked_mul(size_of::<(usize, usize)>())
+        .and_then(|bytes| bytes.checked_add(runs.len().checked_mul(size_of::<Option<StoredVector>>())?))
+        .and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+    let mut owner = memory.reserve(inventory)?;
+    let mut sources = Vec::with_capacity(runs.len());
+    let mut picks = Vec::with_capacity(len);
+    let mut start = 0;
+    for run in runs {
+        let (column, custody) = write_split_run(source, delimiter, start..run.end, &run, execution)?;
+        let Column::Arrow { array, field, logical } = column else { unreachable!("A split run is Arrow"); };
+        let index = sources.len();
+        picks.extend((0..run.end - start).map(|row| (index, row)));
+        sources.push(Some((array, field, logical, Some(custody))));
+        start = run.end;
+    }
+    let column = Column::Selected(SelectedColumn::new(sources, Arc::new(picks)));
+    settle_split_charge(&column, &mut owner)?;
+    Ok(Some((column, owner)))
+}
+
+fn write_split_run(
+    source: &SplitInput<'_>, delimiter: &str, rows: Range<usize>, run: &SplitRun, execution: &Execution,
+) -> Result<(Column, Arc<MemoryReservation>)> {
+    let bound = rows.len().checked_add(run.tokens).and_then(|slots| slots.checked_add(2))
+        .and_then(|slots| slots.checked_mul(size_of::<i32>())).and_then(|bytes| bytes.checked_add(run.payload))
+        .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(size_error)?;
+    let mut owner = execution.context.memory.reserve(bound)?;
+    let logical = match run.shape {
+        SplitShape::Null => LogicalType::Null,
+        SplitShape::EmptyList => LogicalType::list(LogicalType::Nothing),
+        SplitShape::TextList => LogicalType::list(LogicalType::Scalar(ScalarType::Utf8)),
+    };
+    let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+    let array: ArrayRef = match field.data_type() {
+        DataType::Null => Arc::new(NullArray::new(rows.len())),
+        DataType::List(child) => {
+            let (offsets, values): (_, ArrayRef) = if run.shape == SplitShape::EmptyList {
+                (vec![0; rows.len() + 1], Arc::new(NullArray::new(0)))
+            } else {
+                let mut offsets = Vec::with_capacity(rows.len() + 1);
+                let mut builder = StringBuilder::with_capacity(run.tokens, run.payload);
+                offsets.push(0);
+                for row in rows {
+                    execution.context.check_cancelled_at(row)?;
+                    let text = source.text(row).flatten().expect("The split run contains text");
+                    for part in text.split(delimiter) { builder.append_value(part); }
+                    offsets.push(builder.len() as i32);
+                }
+                (offsets, Arc::new(builder.finish()))
+            };
+            rtdb_columnar::build_list_array(Arc::clone(child), offsets.into(), &values, None)?
+        }
+        _ => unreachable!("A split result is a list or null"),
+    };
+    let column = Column::Arrow { array, field, logical: Some(logical) };
+    settle_split_charge(&column, &mut owner)?;
+    Ok((column, owner))
+}
+
+fn settle_split_charge(column: &Column, owner: &mut Arc<MemoryReservation>) -> Result<()> {
+    let bytes = owned_projection_bytes(column)?;
+    let lease = Arc::get_mut(owner).expect("The split projection owns its reservation");
+    if bytes <= lease.bytes() { lease.shrink_to(bytes) } else { lease.grow_to(bytes) }
+}
 
 pub(crate) fn column_constructor(
     expr: &Expr, schema: &Schema, batch: &ColumnBatch, execution: &Execution,

@@ -2474,6 +2474,8 @@ surface QueryAccess {
     @guarantee ColumnarScanProjection
         -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.
         -- A projection that shares input buffers retains their original charges through aliases, struct children, and assembled records.
+        -- A native record with one UPPER or LOWER field can retain the funded case conversion of a plain text column when the observed child type is uniform.
+        -- An all-null child retains its named field in a valid record.
         -- A selected field absent from a compatible plain record layout yields null while other layouts retain the reached child and its backing.
         -- The projection admits its own copied values, descriptors, and validity storage.
         -- System catalog and native inspection scans publish typed Arrow pages at the scan boundary.
