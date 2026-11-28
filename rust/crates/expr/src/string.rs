@@ -315,11 +315,15 @@ fn parse_ident(source: &str) -> Result<Vec<String>> {
     }
 }
 
-fn quote_ident(source: &str) -> String {
+pub(crate) fn identifier_needs_quotes(source: &str) -> bool {
     let mut bytes = source.bytes();
     let simple = bytes.next().is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_') && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
-    if simple && !include_str!("string/keywords.txt").lines().any(|keyword| source == keyword) { source.into() }
-    else { format!("\"{}\"", source.replace('"', "\"\"")) }
+    !simple || include_str!("string/keywords.txt").lines().any(|keyword| source == keyword)
+}
+
+fn quote_ident(source: &str) -> String {
+    if identifier_needs_quotes(source) { format!("\"{}\"", source.replace('"', "\"\"")) }
+    else { source.into() }
 }
 fn java_utf16(units: impl IntoIterator<Item = u16>) -> String { char::decode_utf16(units).map(|character| character.unwrap_or('?')).collect() }
 fn utf8_length(source: &[u8]) -> usize { source.iter().filter(|byte| (**byte & 0xc0) != 0x80).count() }

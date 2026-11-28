@@ -186,6 +186,11 @@ pub fn text_substring(source: &str, position: i64, length: Option<i64>) -> Resul
     crate::string::text_substring(source, position, length)
 }
 
+/// Applies the scalar QUOTE_IDENT spelling and SQL keyword checks.
+pub fn identifier_needs_quotes(source: &str) -> bool {
+    crate::string::identifier_needs_quotes(source)
+}
+
 /// Borrows the scalar Binary SUBSTRING result using the same signed index narrowing and byte limits.
 pub fn binary_substring(source: &[u8], position: i64, length: Option<i64>) -> Result<&[u8]> {
     crate::string::binary_substring(source, position, length)

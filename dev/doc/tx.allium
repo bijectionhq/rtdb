@@ -149,6 +149,7 @@
 -- A native UTF-8 OVERLAY over plain inputs can write reached spans to funded Arrow text using the scalar character bounds and signed controls.
 -- Native TRIM over plain text can write the retained span directly, including the scalar rule that a supplementary trim character is kept at the trailing edge.
 -- Native REPLACE with nonempty search text can write nonoverlapping matches into funded Arrow text, and native REVERSE can write the source's code points in reverse order.
+-- Native QUOTE_IDENT can write plain Arrow text directly with the scalar keyword test and quote escaping.
 -- A native STRUCT with a single exact UTF-8 REVERSE child can retain that funded result as its child, including an observed all-null child.
 -- Native STR and SQL CONCAT over plain text can combine borrowed spans into funded Arrow text, contributing empty text for each null argument.
 -- A reached empty REPLACE target uses the scalar UTF-16 rules, and a formatted CONCAT argument uses scalar formatting.

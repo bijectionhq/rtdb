@@ -2,7 +2,9 @@ use std::{fmt::Write, mem::size_of, sync::Arc};
 
 use arrow_array::{Array, StringArray, builder::StringBuilder};
 use rtdb_columnar::MemoryReservation;
-use rtdb_expr::kernels::{literal_replace_length, text_overlay_edges, text_substring, text_trim};
+use rtdb_expr::kernels::{
+    identifier_needs_quotes, literal_replace_length, text_overlay_edges, text_substring, text_trim,
+};
 use rtdb_plan::{Expr, Schema};
 use rtdb_types::{AnomalyKind, LogicalType, Result, ScalarType, Value};
 
@@ -47,6 +49,7 @@ impl<'a> Input<'a, &'a str> {
 
 enum Spans<'a> {
     Slice(&'a str),
+    QuotedIdentifier(&'a str),
     Overlay([&'a str; 3]),
     Replace {
         source: &'a str,
@@ -64,6 +67,10 @@ impl Spans<'_> {
     fn len(&self) -> Option<usize> {
         match *self {
             Self::Slice(text) | Self::Reverse(text) => Some(text.len()),
+            Self::QuotedIdentifier(text) => text
+                .len()
+                .checked_add(text.bytes().filter(|byte| *byte == b'"').count())?
+                .checked_add(2),
             Self::Overlay([prefix, replacement, suffix]) => prefix
                 .len()
                 .checked_add(replacement.len())?
@@ -87,6 +94,16 @@ impl Spans<'_> {
         };
         match self {
             Self::Slice(text) => write(builder, text),
+            Self::QuotedIdentifier(text) => {
+                write(builder, "\"");
+                for part in text.split_inclusive('"') {
+                    write(builder, part);
+                    if part.ends_with('"') {
+                        write(builder, "\"");
+                    }
+                }
+                write(builder, "\"");
+            }
             Self::Overlay(parts) => {
                 for part in parts {
                     write(builder, part);
@@ -305,6 +322,23 @@ fn transform(
                 return Ok(None);
             };
             reverse(source, batch.len, &execution.context)
+        }
+        [source]
+            if name.eq_ignore_ascii_case("quote_ident")
+                || name.eq_ignore_ascii_case("quote-ident") =>
+        {
+            let Some(source) = bind(source) else {
+                return Ok(None);
+            };
+            project(batch.len, execution, |row| {
+                Some(source.text(row)?.map(|text| {
+                    if identifier_needs_quotes(text) {
+                        Spans::QuotedIdentifier(text)
+                    } else {
+                        Spans::Slice(text)
+                    }
+                }))
+            })
         }
         [source] | [source, _] => {
             let (leading, trailing) = if name.eq_ignore_ascii_case("trim") {

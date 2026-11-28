@@ -6022,6 +6022,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quote_ident_writes_keywords_and_escaped_quotes_from_plain_arrow_text() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = field(0, ScalarType::Utf8);
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let cells = [
+            Some("foo_1"), Some("_foo"), Some("select"), Some("Foo"), Some("東京"),
+            Some("a.\"b\"\""), Some(""), None,
+        ];
+        let field = Arc::new(rtdb_columnar::to_field(&input.name, &input.data_type).unwrap());
+        let batch = ColumnBatch::settled(vec![Column::Arrow {
+            array: Arc::new(StringArray::from_iter(cells)),
+            field,
+            logical: Some(input.data_type.clone()),
+        }], cells.len(), memory.reserve(4096).unwrap()).unwrap();
+        let args = vec![input.expression()];
+        let expr = Expr::Call {
+            name: "quote_ident".into(),
+            return_type: rtdb_plan::function_type_with_args("quote_ident", &args).unwrap(),
+            args,
+        };
+        let mut cursor = record_projection_cursor(batch, schema, vec![expr], &memory);
+        cursor.scalar_fallbacks = Some(0);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let Column::Arrow { array, field, .. } = &page.columns[0] else { panic!("Expected packed identifiers"); };
+        assert!(field.is_nullable());
+        let actual = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(actual.iter().collect::<Vec<_>>(), [
+            Some("foo_1"), Some("_foo"), Some("\"select\""), Some("\"Foo\""), Some("\"東京\""),
+            Some("\"a.\"\"b\"\"\"\"\""), Some("\"\""), None,
+        ]);
+        assert_eq!(cursor.scalar_fallbacks, Some(0));
+        drop((page, cursor));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn text_substring_reads_small_signed_controls_and_preserves_character_bounds() {
         use arrow_array::{Int8Array, Int16Array};
 
