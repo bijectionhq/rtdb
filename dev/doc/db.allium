@@ -2553,9 +2553,12 @@ surface QueryAccess {
         -- Masked counts and percentile collection can use the active leg's nullness in a canonical dense union of primitive numeric cells.
         -- Compatible sums and variance square inputs can read primitive numeric values from the active leg of those unions.
         -- Variance computes its square inputs in page order before applying the aggregate mask.
-        -- Text and binary extrema compare compatible Arrow cells by bytes and copy only a replacement winner.
-        -- A compatible text or binary result copies the retained winners directly into the output page's Arrow buffers.
-        -- A text or binary extremum with no winners emits nullable Arrow Null for all groups.
+        -- Text, binary and canonical tagged keyword extrema compare compatible Arrow cells by bytes and copy only a replacement winner.
+        -- Keyword extrema validate argument cells in page order.
+        -- A canonical tagged keyword keeps its stored spelling, including a leading colon in its name.
+        -- A compatible text, binary or keyword result copies the retained winners directly into the output page's Arrow buffers.
+        -- A keyword result with winners preserves the keyword extension and reflects nullability observed across the result groups.
+        -- A text, binary or keyword extremum with no winners emits nullable Arrow Null for all groups.
         -- EVERY and ANY read compatible Arrow Boolean cells in selection order and retain a nullable Boolean per group.
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
         -- Aggregate FILTER can consume a compatible predicate bitmap and selects only true positions before DISTINCT and accumulation.

@@ -509,7 +509,7 @@ fn fixed_scalar_results(
         }),
         (A::Every | A::Any, S::Bool) => {
             let len = states.values.len();
-            let (column, charge) = build_fixed_results(field, context, len, len.div_ceil(8), |_| {
+            let (column, charge) = build_fixed_results(&field.name, &field.data_type, context, len, len.div_ceil(8), |_| {
                 let mut builder = BooleanBuilder::with_capacity(len);
                 for (row, state) in states.values.iter().enumerate() {
                     context.check_cancelled_at(row)?;
@@ -548,21 +548,26 @@ fn byte_scalar_results(
     states: &ScalarGroups, function: &AggregateFunction, field: &rtdb_plan::Field, context: &crate::QueryContext,
 ) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
     use arrow_array::builder::{BinaryBuilder, StringBuilder};
-    if !matches!(function, AggregateFunction::Min | AggregateFunction::Max)
-        || !matches!(without_nullability(&field.data_type), LogicalType::Scalar(ScalarType::Utf8 | ScalarType::Binary))
-    {
+    use ScalarType as S;
+    if !matches!(function, AggregateFunction::Min | AggregateFunction::Max) {
         return Ok(None);
     }
-    let text = without_nullability(&field.data_type) == &LogicalType::Scalar(ScalarType::Utf8);
+    let required = without_nullability(&field.data_type);
+    let LogicalType::Scalar(scalar @ (S::Utf8 | S::Binary | S::Keyword)) = required else { return Ok(None); };
     let len = states.values.len();
     let mut payload = 0usize;
     let mut has_winner = false;
+    let mut has_null = false;
     for (row, state) in states.values.iter().enumerate() {
         context.check_cancelled_at(row)?;
-        let size = match state.accumulator.retained() {
-            Some(Value::Utf8(value)) if text => value.len(),
-            Some(Value::Binary(value)) if !text => value.len(),
-            None if matches!(state.accumulator, ScalarState::Empty) => continue,
+        let size = match (scalar, state.accumulator.retained()) {
+            (S::Utf8, Some(Value::Utf8(value))) => value.len(),
+            (S::Binary, Some(Value::Binary(value))) => value.len(),
+            (S::Keyword, Some(Value::Keyword(value))) => value.as_str().len(),
+            (_, None) if matches!(state.accumulator, ScalarState::Empty) => {
+                has_null = true;
+                continue;
+            }
             _ => return Ok(None),
         };
         has_winner = true;
@@ -581,21 +586,34 @@ fn byte_scalar_results(
         .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
         .and_then(|bytes| bytes.checked_add(payload))
         .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
-    build_fixed_results(field, context, len, bytes, |_| {
+    // Match the observed field from pack_evaluated_column when writing keyword results.
+    let observed;
+    let (name, logical) = if *scalar == S::Keyword {
+        observed = if has_null { required.clone().maybe() } else { required.clone() };
+        ("value", &observed)
+    } else {
+        (field.name.as_str(), &field.data_type)
+    };
+    build_fixed_results(name, logical, context, len, bytes, |_| {
         macro_rules! build {
-            ($builder:ty, $variant:ident) => {{
+            ($builder:ty, $variant:ident, $value:ident => $text:expr) => {{
                 let mut builder = <$builder>::with_capacity(len, payload);
                 for (row, state) in states.values.iter().enumerate() {
                     context.check_cancelled_at(row)?;
                     match state.accumulator.retained() {
-                        Some(Value::$variant(value)) => builder.append_value(value),
+                        Some(Value::$variant($value)) => builder.append_value($text),
                         _ => builder.append_null(),
                     }
                 }
                 Ok(Arc::new(builder.finish()))
             }};
         }
-        if text { build!(StringBuilder, Utf8) } else { build!(BinaryBuilder, Binary) }
+        match scalar {
+            S::Utf8 => build!(StringBuilder, Utf8, value => value),
+            S::Binary => build!(BinaryBuilder, Binary, value => value),
+            S::Keyword => build!(StringBuilder, Keyword, value => value.as_str()),
+            _ => unreachable!(),
+        }
     }).map(Some)
 }
 
@@ -606,7 +624,7 @@ fn primitive_results<T: ArrowPrimitiveType>(
     let len = states.values.len();
     let values = len.checked_mul(size_of::<T::Native>())
         .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
-    build_fixed_results(field, context, len, values, |data_type| {
+    build_fixed_results(&field.name, &field.data_type, context, len, values, |data_type| {
         let mut builder = arrow_array::builder::PrimitiveBuilder::<T>::with_capacity(len).with_data_type(data_type.clone());
         for (row, state) in states.values.iter().enumerate() {
             context.check_cancelled_at(row)?;
@@ -617,20 +635,19 @@ fn primitive_results<T: ArrowPrimitiveType>(
 }
 
 fn build_fixed_results(
-    field: &rtdb_plan::Field, context: &crate::QueryContext, len: usize, values: usize,
+    name: &str, logical: &LogicalType, context: &crate::QueryContext, len: usize, values: usize,
     build: impl FnOnce(&DataType) -> Result<arrow_array::ArrayRef>,
 ) -> Result<(Column, Arc<MemoryReservation>)> {
-    let logical_bytes = field.data_type.retained_bytes()?;
+    let logical_bytes = logical.retained_bytes()?;
     let bytes = values.checked_add(len.div_ceil(8))
         .and_then(|bytes| bytes.checked_add(logical_bytes.checked_mul(2)?))
-        .and_then(|bytes| bytes.checked_add(field.name.len()))
+        .and_then(|bytes| bytes.checked_add(name.len()))
         .and_then(|bytes| bytes.checked_add(512))
         .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
     let charge = context.memory.reserve(bytes)?;
-    let logical = field.data_type.clone();
-    let field = Arc::new(rtdb_columnar::to_field(&field.name, &logical)?);
+    let field = Arc::new(rtdb_columnar::to_field(name, logical)?);
     let array = build(field.data_type())?;
-    Ok((Column::Arrow { array, field, logical: Some(logical) }, charge))
+    Ok((Column::Arrow { array, field, logical: Some(logical.clone()) }, charge))
 }
 
 fn double_results(values: Vec<Option<f64>>, reservation: Arc<MemoryReservation>) -> Result<(Column, Arc<MemoryReservation>)> {
@@ -885,6 +902,27 @@ fn admits_plain_leaf(field: &ArrowField, logical: Option<&LogicalType>, accepts_
     }
     accepts_type(field.data_type())
         && logical.is_none_or(|ty| crate::columnar::stable_read_layout(ty, field))
+}
+
+fn admits_byte_extremum(column: &Column, output: &LogicalType) -> bool {
+    use rtdb_columnar::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY};
+    use ScalarType as S;
+    match output {
+        LogicalType::Scalar(S::Utf8) => accepts_typed_column(column, |ty| *ty == DataType::Utf8),
+        LogicalType::Scalar(S::Binary) => accepts_typed_column(column, |ty| *ty == DataType::Binary),
+        LogicalType::Scalar(S::Keyword) => admits_reduction_column(column, |field, logical| {
+            if field.data_type() == &DataType::Null {
+                return admits_plain_leaf(field, logical, |_| false);
+            }
+            let metadata = field.metadata();
+            field.data_type() == &DataType::Utf8 && metadata.len() == 2
+                && metadata.get(EXTENSION_NAME_KEY).is_some_and(|name| name == "xt/clj-keyword")
+                && metadata.get(EXTENSION_METADATA_KEY).is_some_and(String::is_empty)
+                && logical.is_none_or(|ty| without_nullability(ty) == output
+                    && matches!(ty, LogicalType::Maybe(_)) == field.is_nullable())
+        }),
+        _ => false,
+    }
 }
 
 fn admits_reduction_column(column: &Column, leaf: impl Fn(&ArrowField, Option<&LogicalType>) -> bool) -> bool {
@@ -1867,11 +1905,8 @@ impl ScalarGroups {
                             || rtdb_columnar::decimal_field_parameters(field).is_ok_and(|params| params == Some(expected))
                     ))
                 });
-                let bytes = column.filter(|column| {
-                    accepts_typed_column(column, |ty| matches!((without_nullability(output), ty),
-                        (LogicalType::Scalar(ScalarType::Utf8), DataType::Utf8)
-                        | (LogicalType::Scalar(ScalarType::Binary), DataType::Binary)))
-                });
+                let required = without_nullability(output);
+                let bytes = column.filter(|column| admits_byte_extremum(column, required));
                 for (row, group) in mapping.iter().enumerate() {
                     execution.context.check_cancelled_at(row)?;
                     if selected(row) {
@@ -1895,12 +1930,22 @@ impl ScalarGroups {
                             }
                         } else if let Some(column) = bytes {
                             if let Some((array, offset)) = present_column_cell(column, row)? {
-                                if array.data_type() == &DataType::Utf8 {
-                                    let text = array.as_string::<i32>().value(offset);
-                                    state.byte_extremum(text.as_bytes(), minimum, &self.state, || Value::Utf8(text.to_owned()))?;
-                                } else {
-                                    let bytes = array.as_binary::<i32>().value(offset);
-                                    state.byte_extremum(bytes, minimum, &self.state, || Value::Binary(bytes.to_vec()))?;
+                                match required {
+                                    LogicalType::Scalar(ScalarType::Utf8) => {
+                                        let text = array.as_string::<i32>().value(offset);
+                                        state.byte_extremum(text.as_bytes(), minimum, &self.state, || Value::Utf8(text.to_owned()))?;
+                                    }
+                                    LogicalType::Scalar(ScalarType::Binary) => {
+                                        let bytes = array.as_binary::<i32>().value(offset);
+                                        state.byte_extremum(bytes, minimum, &self.state, || Value::Binary(bytes.to_vec()))?;
+                                    }
+                                    LogicalType::Scalar(ScalarType::Keyword) => {
+                                        let text = array.as_string_opt::<i32>()
+                                            .ok_or_else(|| rtdb_types::Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree"))?
+                                            .value(offset);
+                                        state.byte_extremum(text.as_bytes(), minimum, &self.state, || Value::Keyword(rtdb_types::Keyword::from_name(text)))?;
+                                    }
+                                    _ => unreachable!(),
                                 }
                             }
                         } else {
@@ -2081,7 +2126,8 @@ impl ScalarAccumulator {
             let previous = match previous {
                 Value::Utf8(text) => text.as_bytes(),
                 Value::Binary(bytes) => bytes,
-                _ => return Err(invalid("aggregate-state", "Expected a text or binary extremum")),
+                Value::Keyword(keyword) => keyword.as_str().as_bytes(),
+                _ => return Err(invalid("aggregate-state", "Expected a text, binary or keyword extremum")),
             };
             if bytes.cmp(previous) != if minimum { Ordering::Less } else { Ordering::Greater } {
                 return Ok(());

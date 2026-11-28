@@ -1364,6 +1364,8 @@ fn byte_extremum_result_owns_the_winners_and_keeps_empty_groups_null() {
     for winner in [
         Value::Utf8(String::new()), Value::Binary(Vec::new()),
         Value::Utf8("winner".repeat(1024)), Value::Binary(vec![0xff; 8192]),
+        Value::Keyword(rtdb_types::Keyword::from_name("")),
+        Value::Keyword(rtdb_types::Keyword::from_name(":ns/é".repeat(1024))),
     ] {
         let field = field(0, winner.logical_type().maybe());
         let (column, charge) = {
@@ -1388,11 +1390,11 @@ fn byte_extrema_without_winners_emit_nullable_arrow_null() {
     let context = &execution.context;
     let memory = &context.memory;
     let baseline = memory.used_bytes();
-    for ty in [ScalarType::Utf8, ScalarType::Binary] {
+    for (ty, len) in [(ScalarType::Utf8, 3), (ScalarType::Binary, 3), (ScalarType::Keyword, 3), (ScalarType::Keyword, 0)] {
         let field = field(0, LogicalType::Scalar(ty).maybe());
         let mut states = ScalarGroups::new(&execution).unwrap();
-        states.ensure(3).unwrap();
-        let (expected, reference_charge) = crate::columnar::pack_evaluated_column(&[Value::Null, Value::Null, Value::Null], memory).unwrap();
+        states.ensure(len).unwrap();
+        let (expected, reference_charge) = crate::columnar::pack_evaluated_column(&vec![Value::Null; len], memory).unwrap();
         let Column::Arrow { field: expected_field, .. } = expected else { panic!("Expected nullable Arrow Null"); };
         let pressure = memory.reserve(memory.available_bytes() - 512).unwrap();
         let (result, charge) = byte_scalar_results(&states, &AggregateFunction::Min, &field, context).unwrap().unwrap();
@@ -1401,8 +1403,8 @@ fn byte_extrema_without_winners_emit_nullable_arrow_null() {
         assert_eq!(field, &expected_field);
         assert_eq!(array.data_type(), &DataType::Null);
         assert_eq!(logical.as_ref(), Some(&LogicalType::Null));
-        assert_eq!(array.len(), 3);
-        for row in 0..3 {
+        assert_eq!(array.len(), len);
+        for row in 0..len {
             assert_eq!(result.value(row).unwrap(), Value::Null);
         }
         drop((result, charge, expected_field, reference_charge));
@@ -1631,6 +1633,123 @@ async fn aggregate_input_binary_extrema_compare_unsigned_bytes_across_pages() {
         assert_eq!(primitive_result(cursor).await, Value::Binary(expected));
     }
     assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[test]
+fn keyword_extrema_fund_winners_and_borrow_losing_and_equal_names() {
+    use crate::columnar::SelectedColumn;
+    use arrow_array::StringArray;
+
+    let execution = execution(8);
+    let context = &execution.context;
+    let memory = &context.memory;
+    let baseline = memory.used_bytes();
+    let ty = LogicalType::Scalar(ScalarType::Keyword).maybe();
+    let loser = "m".repeat(32 * 1024);
+    let scope = execution.scope().unwrap();
+    for (function, winner, replacement) in [
+        (AggregateFunction::Min, ":ns/key", "!/ns"),
+        (AggregateFunction::Max, "é/ns", "ω/ns"),
+    ] {
+        let source_field = Arc::new(rtdb_columnar::to_field("arg", &ty).unwrap());
+        let array = Arc::new(StringArray::from(vec![Some(winner), Some(loser.as_str()), Some(winner), None, Some(replacement)]));
+        let selected = SelectedColumn::new(vec![Some((array, source_field, Some(ty.clone()), None)), None],
+            Arc::new(vec![(0, 0), (0, 1), (1, 0), (0, 2), (0, 3), (0, 4)]));
+        let batch = ColumnBatch::settled(vec![Column::Selected(selected)], 6, memory.reserve(1 << 17).unwrap()).unwrap();
+        let page = Rows::columns(&batch, &[0], false, context).unwrap();
+        let aggregate = AggregateExpr {
+            field: field(1, ty.clone()), function, argument: Some(field(0, ty.clone()).expression()),
+            distinct: false, filter: None, order_by: vec![],
+        };
+        let types = AggregateTypes::derive(&aggregate, ty.clone(), false, EmissionMode::Execution).unwrap();
+        let mut states = ScalarGroups::new(&execution).unwrap();
+        states.ensure(2).unwrap();
+        let pressure = memory.reserve(memory.available_bytes()).unwrap();
+        let refused = memory.reserve(1).err().unwrap().code;
+        let groups = GroupMapping::Grouped(&[0, 0, 1, 0, 1, 0]);
+        assert_eq!(states.aggregate(page, groups, |_| true, 2, Some(0), &aggregate, &types, &scope, &execution)
+            .unwrap_err().code, refused);
+        assert!(matches!(states.values[0].accumulator, ScalarState::Empty));
+        drop(pressure);
+
+        let winner = Value::Keyword(rtdb_types::Keyword::from_name(winner));
+        let winner_charge = winner.retained_bytes().unwrap() + 256;
+        let pressure = memory.reserve(memory.available_bytes() - winner_charge).unwrap();
+        states.aggregate(page, groups, |row| row != 5, 2, Some(0), &aggregate, &types, &scope, &execution).unwrap();
+        assert_eq!(memory.available_bytes(), 0);
+        assert_eq!(states.aggregate(page, groups, |row| row == 5, 2, Some(0), &aggregate, &types, &scope, &execution)
+            .unwrap_err().code, refused);
+        drop((pressure, batch));
+
+        let (output, charge) = byte_scalar_results(&states, &aggregate.function, &aggregate.field, context).unwrap().unwrap();
+        drop(states);
+        let (reference, reference_charge) = crate::columnar::pack_evaluated_column(&[winner.clone(), Value::Null], memory).unwrap();
+        let (Column::Arrow { array, field, logical }, Column::Arrow { field: expected, logical: expected_type, .. }) =
+            (&output, &reference) else { panic!("Expected Arrow keyword results"); };
+        assert_eq!(field, expected);
+        assert_eq!(logical, expected_type);
+        assert_eq!(array.as_string::<i32>().value(0).as_bytes(), match &winner {
+            Value::Keyword(winner) => winner.as_str().as_bytes(), _ => unreachable!(),
+        });
+        assert_eq!(output.value(0).unwrap(), winner);
+        assert_eq!(output.value(1).unwrap(), Value::Null);
+        drop((output, charge, reference, reference_charge));
+    }
+    drop(scope);
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn keyword_extrema_keep_casted_and_tagged_spellings_across_pages() {
+    use arrow_array::StringArray;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let baseline = memory.used_bytes();
+    let keyword = LogicalType::Scalar(ScalarType::Keyword);
+    let page = |ty: &LogicalType, text| {
+        let array = Arc::new(StringArray::from(vec![text]));
+        let field = Arc::new(rtdb_columnar::to_field("arg", ty).unwrap());
+        ColumnBatch::settled(vec![Column::Arrow { array, field, logical: None }], 1, memory.reserve(4096).unwrap()).unwrap()
+    };
+    for (function, expected) in [(AggregateFunction::Min, ":ns/z"), (AggregateFunction::Max, "ns/a")] {
+        let mut cursor = primitive_cursor(&execution, function, keyword.clone(), keyword.clone(), vec![], None);
+        let untagged = page(&LogicalType::Scalar(ScalarType::Utf8), ":ns/a");
+        let tagged = page(&keyword, ":ns/z");
+        cursor.input = Some(AggregateInput { batches: Box::new(Pages([untagged, tagged].into())), projected: false });
+
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        assert!(cursor.next_batch().await.unwrap().is_none());
+        let Column::Arrow { array, field, logical } = &result.columns[0] else { panic!("Expected an Arrow keyword"); };
+        assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", &keyword).unwrap());
+        assert_eq!(logical.as_ref(), Some(&keyword));
+        assert_eq!(array.as_string::<i32>().value(0), expected);
+        assert_eq!(result.columns[0].value(0).unwrap(), Value::Keyword(rtdb_types::Keyword::from_name(expected)));
+    }
+    assert_eq!(memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn uri_extrema_compare_raw_spellings_and_validate_losing_inputs() {
+    use arrow_array::StringArray;
+
+    let execution = execution(8);
+    let memory = &execution.context.memory;
+    let ty = LogicalType::Scalar(ScalarType::Uri);
+    let valid = Value::Uri("https://example.test/./z".into());
+    let other = Value::Uri("https://example.test/a".into());
+    assert_eq!(compare_in_timezone(&valid, &other, false, "UTC").unwrap_err().code, "xtdb.expression/uri-comparator");
+    assert_eq!(primitive_result(primitive_cursor(&execution, AggregateFunction::Min, ty.clone(), ty.clone(),
+        vec![vec![other, valid.clone()]], None)).await, valid);
+
+    let field = Arc::new(rtdb_columnar::to_field("arg", &ty).unwrap());
+    let array = Arc::new(StringArray::from(vec!["https://a/", "z invalid"]));
+    let expected = rtdb_columnar::read_value(&field, array.as_ref(), 1).unwrap_err().code;
+    let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: Some(ty.clone()) }],
+        2, memory.reserve(4096).unwrap()).unwrap();
+    let mut cursor = primitive_cursor(&execution, AggregateFunction::Min, ty.clone(), ty, vec![], None);
+    cursor.input = Some(AggregateInput { batches: Box::new(Batches(Some(batch))), projected: false });
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, expected);
 }
 
 #[tokio::test]
