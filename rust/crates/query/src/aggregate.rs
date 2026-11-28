@@ -553,7 +553,7 @@ fn byte_scalar_results(
         return Ok(None);
     }
     let required = without_nullability(&field.data_type);
-    let LogicalType::Scalar(scalar @ (S::Utf8 | S::Binary | S::Keyword)) = required else { return Ok(None); };
+    let LogicalType::Scalar(scalar @ (S::Utf8 | S::Binary | S::Keyword | S::Uri)) = required else { return Ok(None); };
     let len = states.values.len();
     let mut payload = 0usize;
     let mut has_winner = false;
@@ -561,7 +561,7 @@ fn byte_scalar_results(
     for (row, state) in states.values.iter().enumerate() {
         context.check_cancelled_at(row)?;
         let size = match (scalar, state.accumulator.retained()) {
-            (S::Utf8, Some(Value::Utf8(value))) => value.len(),
+            (S::Utf8, Some(Value::Utf8(value))) | (S::Uri, Some(Value::Uri(value))) => value.len(),
             (S::Binary, Some(Value::Binary(value))) => value.len(),
             (S::Keyword, Some(Value::Keyword(value))) => value.as_str().len(),
             (_, None) if matches!(state.accumulator, ScalarState::Empty) => {
@@ -586,9 +586,8 @@ fn byte_scalar_results(
         .and_then(|offsets| offsets.checked_mul(size_of::<i32>()))
         .and_then(|bytes| bytes.checked_add(payload))
         .ok_or_else(|| invalid("aggregate-size", "Aggregate output exceeds addressable memory"))?;
-    // Match the observed field from pack_evaluated_column when writing keyword results.
     let observed;
-    let (name, logical) = if *scalar == S::Keyword {
+    let (name, logical) = if matches!(scalar, S::Keyword | S::Uri) {
         observed = if has_null { required.clone().maybe() } else { required.clone() };
         ("value", &observed)
     } else {
@@ -612,6 +611,10 @@ fn byte_scalar_results(
             S::Utf8 => build!(StringBuilder, Utf8, value => value),
             S::Binary => build!(BinaryBuilder, Binary, value => value),
             S::Keyword => build!(StringBuilder, Keyword, value => value.as_str()),
+            S::Uri => build!(StringBuilder, Uri, value => {
+                rtdb_types::UriParts::parse(value)?;
+                value
+            }),
             _ => unreachable!(),
         }
     }).map(Some)

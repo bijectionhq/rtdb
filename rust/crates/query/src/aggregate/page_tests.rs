@@ -1819,7 +1819,11 @@ async fn uri_extrema_keep_utf8_casts_and_all_null_result_layout() {
         page(&ty, Some("https://example.test/z")),
         page(&plain, Some("HTTP://EXAMPLE.test/%ab")),
     ].into())), projected: false });
-    assert_eq!(primitive_result(mixed).await, Value::Uri("HTTP://EXAMPLE.test/%ab".into()));
+    let result = mixed.next_batch().await.unwrap().unwrap();
+    let Column::Arrow { field, logical, .. } = &result.columns[0] else { panic!("Expected tagged Arrow URI"); };
+    assert_eq!(logical.as_ref(), Some(&LogicalType::Scalar(ScalarType::Uri)));
+    assert!(!field.is_nullable());
+    assert_eq!(result.columns[0].value(0).unwrap(), Value::Uri("HTTP://EXAMPLE.test/%ab".into()));
 
     let mut nulls = primitive_cursor(&execution, AggregateFunction::Max, ty.clone(), ty.clone(), vec![], None);
     nulls.input = Some(AggregateInput { batches: Box::new(Batches(Some(page(&ty, None)))), projected: false });
@@ -1828,6 +1832,49 @@ async fn uri_extrema_keep_utf8_casts_and_all_null_result_layout() {
     assert_eq!(field.as_ref(), &rtdb_columnar::to_field("value", &LogicalType::Null).unwrap());
     assert_eq!(logical.as_ref(), Some(&LogicalType::Null));
     assert_eq!(result.columns[0].value(0).unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn grouped_uri_extrema_publish_tagged_winners_and_nulls_together() {
+    let execution = execution(8);
+    let ty = LogicalType::Scalar(ScalarType::Uri).maybe();
+    let int = LogicalType::Scalar(ScalarType::I64);
+    let schema = Schema::new(vec![field(0, int.clone()), field(1, ty.clone())]).unwrap();
+    let groups = vec![NamedExpr { field: field(2, int), expr: schema.fields()[0].expression() }];
+    let aggregates = [AggregateFunction::Min, AggregateFunction::Max].into_iter().enumerate()
+        .map(|(index, function)| AggregateExpr {
+            field: field(3 + index as u32, ty.clone()), function,
+            argument: Some(schema.fields()[1].expression()), distinct: false, filter: None, order_by: vec![],
+        }).collect();
+    let min = "HTTP://EXAMPLE.test/%ab";
+    let max = "https://example.test/ω";
+    let pages = vec![
+        vec![vec![Value::I64(1), Value::Uri(max.into())], vec![Value::I64(2), Value::Null]],
+        vec![vec![Value::I64(1), Value::Uri(min.into())], vec![Value::I64(3), Value::Uri(max.into())]],
+    ];
+    let (mut cursor, _) = cursor(&execution, schema, pages, groups, aggregates, None);
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    let expected_field = rtdb_columnar::to_field("value", &ty).unwrap();
+    for (column, first) in result.columns[1..].iter().zip([min, max]) {
+        let Column::Arrow { array, field, logical } = column else { panic!("Expected a tagged Arrow URI column"); };
+        assert_eq!(field.as_ref(), &expected_field);
+        assert_eq!(logical.as_ref(), Some(&ty));
+        assert_eq!(array.as_string::<i32>().iter().collect::<Vec<_>>(), [Some(first), None, Some(max)]);
+    }
+}
+
+#[test]
+fn uri_extrema_validate_unchecked_winners_at_publication() {
+    let execution = execution(8);
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    states.ensure(1).unwrap();
+    let text = "bad uri";
+    states.values[0].byte_extremum(text.as_bytes(), true, &states.state, || Value::Uri(text.into())).unwrap();
+    let expected = rtdb_types::UriParts::parse(text).unwrap_err();
+    let field = field(0, LogicalType::Scalar(ScalarType::Uri));
+    let error = byte_scalar_results(&states, &AggregateFunction::Min, &field, &execution.context).err().unwrap();
+    assert_eq!(error.code, expected.code);
+    assert_eq!(error.message, expected.message);
 }
 
 #[tokio::test]

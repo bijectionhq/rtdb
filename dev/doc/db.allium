@@ -2598,8 +2598,8 @@ surface QueryAccess {
         -- Keyword extrema validate argument cells in page order.
         -- URI extrema validate argument cells in page order before applying the aggregate filter and preserve the winning URI's original spelling.
         -- A canonical tagged keyword keeps its stored spelling, including a leading colon in its name.
-        -- A compatible text, binary or keyword result copies the retained winners directly into the output page's Arrow buffers.
-        -- A keyword result with winners preserves the keyword extension and reflects nullability observed across the result groups.
+        -- A compatible text, binary, keyword or URI result copies the retained winners directly into the output page's Arrow buffers.
+        -- A keyword or URI result with winners preserves its extension and reflects nullability observed across the result groups.
         -- A text, binary, keyword or URI extremum with no winners emits nullable Arrow Null for all groups.
         -- EVERY and ANY read compatible Arrow Boolean cells in selection order and retain a nullable Boolean per group.
         -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
