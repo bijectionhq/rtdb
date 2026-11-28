@@ -20,8 +20,8 @@
            (org.apache.arrow.vector PeriodDuration)
            (org.apache.arrow.vector.types.pojo ArrowType$Decimal)
            (org.apache.commons.codec.binary Hex)
-           (xtdb.arrow KeywordVector ListValueReader RelationReader RowMask Utf8Vector ValueBox ValueReader VariableWidthVector Vector VectorReader VectorType VectorType$Listy VectorType$Maybe VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
-           (xtdb.expression PgFormat TextTransforms)
+           (xtdb.arrow KeywordVector ListValueReader ListVector RelationReader RowMask Utf8Vector ValueBox ValueReader VariableWidthVector Vector VectorReader VectorType VectorType$Listy VectorType$Maybe VectorType$Mono VectorType$Nothing VectorType$Poly VectorType$Struct VectorWriter VectorWriterKt)
+           (xtdb.expression PgFormat TextSlices TextTransforms)
            (xtdb.operator ProjectionSpec ProjectionSpec$Factory SelectionSpec SelectionSpec$Factory)
            (xtdb.pgwire PgTypes)
            xtdb.time.Interval
@@ -659,7 +659,7 @@
     * optional `:valid-utf8?` when all non-null results are valid UTF-8
     * optional `:->write-code` :: plain-output, emitted-args -> code
       for a root call writing one cell to a plain projection result.
-      The writer is a VariableWidthVector for UTF-8 or Binary and a KeywordVector for Keyword.
+      The writer is a VariableWidthVector for UTF-8 or Binary, a KeywordVector for Keyword, or a ListVector for List.
     and one of the following
     * for monomorphic return types: `:->call-code` :: emitted-args -> code
     * for polymorphic return types: `:continue-call` :: f, emitted-args -> code
@@ -1435,18 +1435,25 @@
     (fn [out value] `(TextTransforms/tryWriteAsciiReverse ~out ~value))))
 
 (defmethod codegen-call [:namespace :keyword] [_]
-  {:return-type #xt/type [:? :utf8]
-   :continue-call (fn [f [kw]]
-                    (let [res (symbol 'ns)]
-                      `(if-let [~res (-> (buf->str ~kw)
-                                         (symbol) (namespace))]
-                         ~(f #xt/type :utf8 `(str->buf ~res))
-                         ~(f #xt/type :null nil))))})
+  (letfn [(continue-namespace [f [kw]]
+            (let [res (gensym 'ns)]
+              `(if-let [~res (-> (buf->str ~kw) (symbol) (namespace))]
+                 ~(f #xt/type :utf8 `(str->buf ~res))
+                 ~(f #xt/type :null nil))))]
+    {:return-type #xt/type [:? :utf8]
+     :continue-call continue-namespace
+     :->write-code (fn [out [kw]]
+                     (let [input (gensym 'keyword-bytes)]
+                       `(let [~input ~kw]
+                          (when-not (TextSlices/tryWriteKeywordPart ~out ~input true)
+                            ~(continue-namespace #(write-value-code %1 out %2) [input])))))}))
 
 (defmethod codegen-call [:local_name :keyword] [_]
-  {:return-type #xt/type :utf8
-   :->call-code (fn [[kw]]
-                  `(-> (buf->str ~kw) (symbol) (name) str->buf))})
+  (with-byte-transform
+    {:return-type #xt/type :utf8
+     :->call-code (fn [[kw]]
+                    `(-> (buf->str ~kw) (symbol) (name) str->buf))}
+    (fn [out value] `(TextSlices/tryWriteKeywordPart ~out ~value false))))
 
 (defmethod codegen-call [:keyword :utf8] [_]
   {:return-type #xt/type :keyword
@@ -1796,9 +1803,17 @@
       (strings->list-reader parts))))
 
 (defmethod codegen-call [:string_to_array :utf8 :utf8] [_]
-  {:return-type #xt/type [:list :utf8]
-   :->call-code (fn [[s delim]]
-                  `(string-to-array (resolve-string ~s) (resolve-string ~delim)))})
+  (letfn [(split-code [[s delim]]
+            `(string-to-array (resolve-string ~s) (resolve-string ~delim)))]
+    {:return-type #xt/type [:list :utf8]
+     :->call-code split-code
+     :->write-code (fn [out [s delim]]
+                     (let [source (gensym 'source)
+                           separator (gensym 'separator)]
+                       `(let [~source ~s
+                              ~separator ~delim]
+                          (when-not (TextSlices/tryWriteSplit ~out ~source ~separator)
+                            (.writeObject ~out ~(split-code [source separator]))))))}))
 
 (defmethod codegen-call [:string_to_array :utf8 :null] [_]
   {:return-type #xt/type [:list :utf8]
@@ -2679,9 +2694,11 @@
                                    write-rows (fn [body] `(dotimes [~idx-sym ~row-count] ~body))
                                    scalar-loop (write-rows (continue write-value-out!))
                                    projection-writer (when continue-projection
-                                                       (if (= #xt.arrow/type :keyword (.getArrowType return-type))
-                                                         KeywordVector
-                                                         VariableWidthVector))
+                                                       (let [arrow-type (.getArrowType return-type)]
+                                                         (cond
+                                                           (= #xt.arrow/type :keyword arrow-type) KeywordVector
+                                                           (= #xt.arrow/type :list arrow-type) ListVector
+                                                           :else VariableWidthVector)))
                                    projection-loop (when continue-projection
                                                      (write-rows
                                                       (continue-projection write-value-out!

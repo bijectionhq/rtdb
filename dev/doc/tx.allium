@@ -151,6 +151,8 @@
 -- JVM Binary TRIM can write the retained span with the original first-octet behavior.
 -- JVM UTF-8 TRIM can write the retained span when the source is well-formed UTF-8 and the token is one ASCII byte.
 -- JVM casts between UTF-8 and Keyword can write their canonical byte spans when the input is well-formed UTF-8 and the default charset is UTF-8.
+-- JVM NAMESPACE and LOCAL_NAME can write the selected bytes of a well-formed unqualified or singly qualified Keyword when the default charset is UTF-8.
+-- NAMESPACE returns null for unqualified Keywords, and slash edge cases and names requiring decoding follow Clojure Symbol semantics.
 -- These projections preserve operand demand, nulls and the scalar functions' reached errors.
 -- A direct Arrow parameter projection chooses retention or detachment for each result column independently.
 -- A compatible first-cell view keeps its source backing charge when the retained storage is proportionate to the cell.
@@ -211,6 +213,9 @@
 -- The selected position uses the SQL index adjustment and yields null for a null parent, null child, or out-of-range index.
 -- Native STRING_TO_ARRAY with a literal nonempty delimiter can write tokens from plain text into funded Arrow lists.
 -- The result preserves null inputs, empty lists, and empty tokens within nonempty inputs in their observed layouts.
+-- JVM STRING_TO_ARRAY with well-formed UTF-8 operands can write token spans into a plain Arrow UTF-8 list using its projection allocator.
+-- It retains leading, consecutive, and trailing empty tokens in nonempty input, and preserves empty lists and null input.
+-- A null delimiter uses the scalar UTF-16 code unit split, and malformed byte operands use the scalar UTF-8 decoding rules.
 -- Owned numeric list reads copy the selected child range into buffers charged to the result and preserve the bits of present components and their validity.
 -- Dense-union list copies retain their leg identifiers and compact the child offsets in selection order.
 -- Fixed-width list read bounds account for the selected length and any null-sensitive payload charge.

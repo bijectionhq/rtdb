@@ -12,6 +12,7 @@
             [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw])
   (:import (java.nio ByteBuffer)
+           (java.nio.charset StandardCharsets)
            (java.time Duration Instant InstantSource LocalDate LocalDateTime LocalTime Period ZoneId ZonedDateTime)
            (java.time.temporal ChronoUnit)
            (java.util Locale Locale$Category)
@@ -478,6 +479,50 @@
         (t/is (= [#xt/type :utf8 expected-text] (project-bytes '(cast kw #xt/type :utf8))))
         (t/is (= [#xt/type :utf8 (mapv (comp vec utf8) ["a/東京" "bar" "�("])]
                  (project-bytes '(trim text ":"))))))))
+
+(t/deftest string-to-array-projection-preserves-utf8-tokens-and-list-layout
+  (with-open [^Vector source (tu/open-vec "s" #xt/type [:? :utf8] [])
+              ^Vector delimiter (tu/open-vec "delimiter" #xt/type [:? :utf8] [])]
+    (let [utf8 (fn [^String s] (.getBytes s StandardCharsets/UTF_8))
+          rows [[(utf8 "😀.*東京.*") (utf8 ".*") ["😀" "東京" ""]]
+                [(utf8 "α😀😀β") (utf8 "😀") ["α" "" "β"]]
+                [(utf8 "aaa") (utf8 "aa") ["" "a"]]
+                [(utf8 "") (utf8 ",") []]
+                [(utf8 "value") (utf8 "") ["value"]]
+                [(utf8 ",x,") (utf8 ",") ["" "x" ""]]
+                [(utf8 "a\\Eb") (utf8 "\\E") ["a" "b"]]
+                [(byte-array [-61 40 44 122]) (utf8 ",") ["�(" "z"]]
+                [(utf8 "x�y") (byte-array [-1]) ["x" "y"]]
+                [(utf8 "😀") nil ["?" "?"]]
+                [nil (utf8 ",") nil]]]
+      (doseq [[^bytes s ^bytes delim] rows]
+        (if s (.writeBytes source s) (.writeNull source))
+        (if delim (.writeBytes delimiter delim) (.writeNull delimiter)))
+      (t/is (= {:res (mapv #(nth % 2) rows), :res-type #xt/type [:? [:list :utf8]]}
+               (run-projection (vr/rel-reader [source delimiter]) '(string_to_array s delimiter))))))
+
+  (with-open [rel (tu/open-rel {:s ["x😀,東京z"], :delimiter ["[,]"]})]
+    (let [split '(string_to_array (substring s 2 4) (substring delimiter 2 1))]
+      (t/is (= {:res [["😀" "東京"]], :res-type #xt/type [:list :utf8]}
+               (run-projection rel split)))
+      (t/is (= ["東京"] (:res (run-projection rel (list 'nth split 1))))))))
+
+(t/deftest keyword-name-projections-preserve-symbol-splitting
+  (with-open [^Vector keywords (tu/open-vec "kw" #xt/type [:? :keyword] [])]
+    (let [inputs (conj (mapv #(.getBytes ^String % StandardCharsets/UTF_8)
+                            ["a/東京😀" "plain" "" "/" "/name" "ns/" "ns/a/b" "ns//"])
+                       (byte-array [110 115 47 -61 40]) nil)
+          symbols (mapv #(when % (symbol (String. ^bytes %))) inputs)
+          expected-names (mapv #(some-> % name) symbols)]
+      (doseq [^bytes kw inputs]
+        (if kw (.writeBytes keywords kw) (.writeNull keywords)))
+      (let [rel (vr/rel-reader [keywords])]
+        (t/is (= {:res (mapv #(some-> % namespace) symbols), :res-type #xt/type [:? :utf8]}
+                 (run-projection rel '(namespace kw))))
+        (t/is (= {:res expected-names, :res-type #xt/type [:? :utf8]}
+                 (run-projection rel '(local_name kw))))
+        (t/is (= (mapv #(when % (alength (.getBytes ^String % StandardCharsets/UTF_8))) expected-names)
+                 (:res (run-projection rel '(octet_length (local_name kw))))))))))
 
 (t/deftest test-nils
   (with-open [rel (tu/open-rel {:x [1 1 nil nil]
