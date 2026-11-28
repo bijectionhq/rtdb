@@ -1079,6 +1079,7 @@ async fn write(
     };
     match receipt.outcome {
         Outcome::Then | Outcome::Otherwise { .. } => Ok(()),
+        Outcome::StoreDenied => Err(Anomaly::fault("rtdb/catalog", "A catalog transaction cannot select a Store denial")),
         Outcome::Refused { error } => Err(error),
     }
 }

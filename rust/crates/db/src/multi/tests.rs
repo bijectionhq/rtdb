@@ -338,7 +338,7 @@ fn put(key: u8, id: i64, text: &str) -> Transact {
 fn store_write(request_key: u8, key: &[u8], value: Option<&[u8]>) -> Transact {
     use rtdb_tx::transact::{StoreAppend, StoreWrite};
 
-    request(request_key, Op::Store(StoreAppend {
+    request(request_key, Op::Store(StoreAppend { alternative: None,
         writes: vec![StoreWrite { key: key.to_vec(), value: value.map(<[u8]>::to_vec), key_stamp: None, value_stamp: None }],
         bounds: Vec::new(),
         derives: Vec::new(),

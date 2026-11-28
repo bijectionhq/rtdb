@@ -2571,7 +2571,7 @@ mod tests {
             Transact {
                 key: vec![request; 16], require: vec![], window: Default::default(),
                 guards: vec![], requires: vec![], otherwise: vec![], custody_request_digest: None, request_memory: None,
-                ops: vec![Op::Store(StoreAppend {
+                ops: vec![Op::Store(StoreAppend { alternative: None,
                     writes: vec![StoreWrite { key: key.to_vec(), value: Some(value), key_stamp: None, value_stamp: None }],
                     bounds: vec![], derives: vec![], window,
                 })],

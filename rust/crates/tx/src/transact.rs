@@ -12,7 +12,7 @@ pub use rtdb_index::branches::{
     store::{KeyRange, StoreBound, StoreWrite},
 };
 use rtdb_index::branches::store::{
-    StoreStamp, StoreWriterFence, VALUE_COLUMN, check_bounds, check_derives, check_placeholders, claim_refused, decode_bound_value, resolve_derives, stamp_writes,
+    StoreStamp, StoreWriterFence, VALUE_COLUMN, check_bounds, check_denial_derives, check_derives, check_placeholders, claim_refused, decode_bound_value, resolve_derives, stamp_writes,
     store_table,
 };
 use rtdb_types::{
@@ -350,6 +350,21 @@ pub struct StoreAppend {
     #[serde(default)]
     pub derives: Vec<Vec<u8>>,
     pub window: Window,
+    #[serde(default)]
+    pub alternative: Option<StoreDenial>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreDenial {
+    pub check: StoreDenialCheck,
+    pub writes: Vec<StoreWrite>,
+    pub derives: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoreDenialCheck {
+    Claims(BTreeSet<Vec<u8>>),
+    Bound(usize),
 }
 
 /// The clock sample is before the store window's `not_before`.
@@ -361,6 +376,8 @@ pub const STORE_BOUND: &str = "rtdb.store/bound";
 /// A derive's unique claim, filled at the stamp, counted a second claimant
 /// (Bijection T7-4, `store_derive::claim_exceeded`); nothing was written.
 pub const STORE_CLAIM: &str = "rtdb.store/claim";
+/// A store-ordered denial selected and committed its alternative effects.
+pub const STORE_DENIAL_COMMITTED: &str = "rtdb.store/denial-committed";
 
 /// The append's time is smoothed past the head's, so the judge never sees a
 /// regressed reading.
@@ -494,6 +511,7 @@ pub enum Outcome {
     Then,
     Otherwise { failed: Vec<usize> },
     Refused { error: Anomaly },
+    StoreDenied,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1116,7 +1134,7 @@ impl TransactState {
                 && (namespace.is_none() || stored.workload.is_some_and(&allows_family))
                 && !stored.receipt.decision_clock.is_some_and(|offer| offer.booked())
                 && stored.receipt.erasure != Some(Erasure::Pending)
-                && !matches!(stored.receipt.outcome, Outcome::Refused { .. }))
+                && !matches!(stored.receipt.outcome, Outcome::Refused { .. } | Outcome::StoreDenied))
                 .then_some(&stored.receipt)
         });
         let receipt = matches.next().ok_or_else(unknown_receipt)?;
@@ -1646,6 +1664,19 @@ impl TransactState {
         check_placeholders(&append.writes)?;
         check_bounds(&append.bounds)?;
         let decoded_derives = check_derives(&append.derives, &append.writes)?;
+        let empty_claims = BTreeSet::new();
+        let denial_derives = append.alternative.as_ref().map(|denial| {
+            let selected_claims = match &denial.check {
+                StoreDenialCheck::Claims(claims) if !claims.is_empty() => claims,
+                StoreDenialCheck::Bound(ordinal) if *ordinal < append.bounds.len() => &empty_claims,
+                _ => return Err(store_append_shape()),
+            };
+            if denial.writes.is_empty() || timed_store.is_some() {
+                return Err(store_append_shape());
+            }
+            check_placeholders(&denial.writes)?;
+            check_denial_derives(&decoded_derives, selected_claims, &denial.derives, &denial.writes)
+        }).transpose()?;
         let head = view.index.head();
         let mutates = !append.writes.is_empty() || !append.bounds.is_empty() || !decoded_derives.is_empty();
         let receipt = |basis: Basis, system_time: Timestamp, outcome: Outcome| Receipt {
@@ -1731,15 +1762,29 @@ impl TransactState {
         // apply, on their filled keys (Bijection T7-4).
         let stamp = StoreStamp { micros: now.0, version: position };
         let mut failed_claim: Option<usize> = None;
-        let derived = if mutates && failed.is_empty() && failed_bound.is_none() {
+        let mut selected_denial = append.alternative.as_ref().is_some_and(|denial| {
+            matches!(&denial.check, StoreDenialCheck::Bound(ordinal) if failed_bound == Some(*ordinal))
+        });
+        let mut derived = if mutates && failed.is_empty() && failed_bound.is_none() {
             let prior_view = view.index.view(MAIN_BRANCH, At::Latest, Layer::Merged, guard_time)?;
             let derived = resolve_derives(&prior_view, &decoded_derives, stamp)?;
-            failed_claim = claim_refused(&prior_view, &decoded_derives, &derived, stamp)?;
+            let selected = |key: &[u8]| append.alternative.as_ref().is_some_and(|denial| {
+                matches!(&denial.check, StoreDenialCheck::Claims(claims) if claims.contains(key))
+            });
+            failed_claim = claim_refused(&prior_view, &decoded_derives, &derived, stamp, |key| !selected(key))?;
+            if failed_claim.is_none() {
+                selected_denial = claim_refused(&prior_view, &decoded_derives, &derived, stamp, selected)?.is_some();
+            }
             derived
         } else {
             Vec::new()
         };
-        let commits = mutates && failed.is_empty() && failed_bound.is_none() && failed_claim.is_none();
+        if selected_denial {
+            let prior_view = view.index.view(MAIN_BRANCH, At::Latest, Layer::Merged, guard_time)?;
+            derived = resolve_derives(&prior_view, denial_derives.as_deref().expect("A selected denial has a plan"), stamp)?;
+            bound_updates.clear();
+        }
+        let commits = selected_denial || (mutates && failed.is_empty() && failed_bound.is_none() && failed_claim.is_none());
         if timed_store.is_some_and(|timing| !commits || now >= timing.before) {
             return Err(timed_store_refused());
         }
@@ -1751,7 +1796,7 @@ impl TransactState {
         index.advance(cut)?;
         let (outcome, effects, after) = if !failed.is_empty() {
             (Outcome::Otherwise { failed }, Vec::new(), index)
-        } else if let Some(bound_idx) = failed_bound {
+        } else if let Some(bound_idx) = failed_bound.filter(|_| !selected_denial) {
             let error = Anomaly::new(AnomalyCategory::Conflict, STORE_BOUND, "A store bound check failed")
                 .with_context("bound", (bound_idx as u64).into());
             (Outcome::Refused { error }, Vec::new(), index)
@@ -1762,7 +1807,12 @@ impl TransactState {
         } else if commits {
             let mut ops: Vec<Op> = Vec::new();
             let bound_writes = bound_updates.into_iter().map(|(key, next)| (key, Some(next.to_be_bytes().to_vec())));
-            for (key, value) in derived.into_iter().chain(stamp_writes(&append.writes, stamp)?).chain(bound_writes) {
+            let writes = if selected_denial {
+                &append.alternative.as_ref().expect("A selected denial has writes").writes
+            } else {
+                &append.writes
+            };
+            for (key, value) in derived.into_iter().chain(stamp_writes(writes, stamp)?).chain(bound_writes) {
                 let id = EntityId::Binary(key);
                 // Consecutive puts and deletes keep their order, so a later write of a key wins.
                 match (value, ops.last_mut()) {
@@ -1777,7 +1827,12 @@ impl TransactState {
             let mut then = Candidate::new(index, None);
             then.execute(&ops, &request.key, None)?;
             then.check_constraints()?;
-            (Outcome::Then, then.effects, then.index)
+            let outcome = if selected_denial {
+                Outcome::StoreDenied
+            } else {
+                Outcome::Then
+            };
+            (outcome, then.effects, then.index)
         } else {
             // A validation: its receipt, and nothing else, at its own position.
             (Outcome::Then, Vec::new(), index)
@@ -1950,6 +2005,16 @@ impl TransactState {
             TransactionRecord::Tx(tx) => {
                 let receipt = &tx.receipt;
                 if receipt.decision_clock.is_some() || tx.timed_store.is_some() { tx.validate_admission()?; }
+                if receipt.outcome == Outcome::StoreDenied {
+                    let canonical = tx.request.as_ref().ok_or_else(invalid_record)?;
+                    let request = canonical.decode().map_err(|_| invalid_record())?;
+                    if tx.before.is_some() || tx.timed_store.is_some() || receipt.decision_clock.is_some()
+                        || tx.effects.is_empty() || request.key != receipt.key
+                        || request.store_append().is_none_or(|append| append.alternative.is_none())
+                    {
+                        return Err(invalid_record());
+                    }
+                }
                 let expected = if tx.before.is_some() { position.checked_add(1) } else { Some(position) };
                 let head = self.index.head();
                 let previous = self.receipts.get(&tx.receipt_namespace).and_then(|namespace| namespace.get(&receipt.key));

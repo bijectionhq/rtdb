@@ -32,7 +32,8 @@ use rtdb_index::branches::store::{
 };
 use rtdb_node::{DatabaseAccess, SessionIdentity, serving::{ChangeImages, ChangeOrder, Changes}};
 use rtdb_tx::transact::{
-    Guard, Op, Outcome, STORE_BOUND, STORE_CLAIM, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE, StoreAppend, Transact, Window,
+    Guard, Op, Outcome, STORE_BOUND, STORE_CLAIM, STORE_OUTSIDE_EARLY, STORE_OUTSIDE_LATE,
+    StoreAppend, StoreDenial, StoreDenialCheck, Transact, Window,
 };
 use rtdb_auth::StoreScope;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Timestamp, rtdb_v1::{At, Basis, MAIN_BRANCH}};
@@ -312,6 +313,7 @@ struct StoreAppendInput {
     request: proto::AppendRequest,
     writes: Vec<StoreWrite>,
     bounds: Vec<StoreBound>,
+    alternative: Option<StoreDenial>,
     window: Window,
 }
 
@@ -327,6 +329,17 @@ impl StoreAppendInput {
         let bounds = std::mem::take(&mut request.bounds).into_iter()
             .map(|bound| StoreBound { key: bound.key, delta: bound.delta, min: bound.min, max: bound.max })
             .collect::<Vec<_>>();
+        let alternative = request.claim_alternative.take().map(|alternative| {
+            let check = match alternative.bound {
+                Some(ordinal) if alternative.claims.is_empty() => StoreDenialCheck::Bound(ordinal as usize),
+                None if !alternative.claims.is_empty() => StoreDenialCheck::Claims(alternative.claims.into_iter().collect()),
+                _ => return Err(error::incorrect("A denial names either a bound or fixed claim keys")),
+            };
+            let writes = alternative.writes.into_iter()
+                .map(|write| StoreWrite { key: write.key, value: write.value, key_stamp: write.key_stamp, value_stamp: write.value_stamp })
+                .collect();
+            Ok(StoreDenial { check, writes, derives: alternative.derives })
+        }).transpose()?;
         if let Some(digest) = request.derive_digest.as_deref()
             && digest != DERIVE_DIGEST
         {
@@ -346,7 +359,7 @@ impl StoreAppendInput {
         if window.not_before.zip(window.before).is_some_and(|(start, end)| start >= end) {
             return Err(error::incorrect("The append's window is empty"));
         }
-        Ok(Self { request, writes, bounds, window })
+        Ok(Self { request, writes, bounds, alternative, window })
     }
 
     fn transaction(
@@ -356,12 +369,12 @@ impl StoreAppendInput {
         admits_retained_basis: bool,
         request_memory: std::sync::Arc<rtdb_columnar::MemoryReservation>,
     ) -> Result<(Transact, bool), Status> {
-        let Self { request, writes, bounds, window } = self;
+        let Self { request, writes, bounds, alternative, window } = self;
         let validation = writes.is_empty() && bounds.is_empty() && request.derives.is_empty();
         let read_guards = ranges(request.reads)?;
         reads_within(scope, &read_guards)?;
         within(scope, |scope| {
-            request.derives.is_empty()
+            alternative.is_none() && request.derives.is_empty()
                 && writes.iter().all(|write| scope.admits_write(&write.key, write.key_stamp))
                 && bounds.iter().all(|bound| scope.admits_write(&bound.key, None))
         })?;
@@ -394,7 +407,7 @@ impl StoreAppendInput {
             require: Vec::new(),
             window: Window::default(),
             guards,
-            ops: vec![Op::Store(StoreAppend { writes, bounds, derives: request.derives, window })],
+            ops: vec![Op::Store(StoreAppend { writes, bounds, derives: request.derives, window, alternative })],
             otherwise: Vec::new(),
             requires: Vec::new(),
             custody_request_digest: None,
@@ -418,6 +431,11 @@ fn append_reply(
                     Outcome::Otherwise { failed } => {
                         let first = failed.first().copied().ok_or_else(|| Status::internal("A failed append names no read"))?;
                         proto::append_reply::Outcome::Conflict(u32::try_from(first).map_err(|_| Status::internal("Read index overflow"))?)
+                    }
+                    Outcome::StoreDenied => {
+                        proto::append_reply::Outcome::ClaimDenied(proto::Stamp {
+                            micros: receipt.system_time.0, version: receipt.basis.position(),
+                        })
                     }
                     Outcome::Refused { error } if error.code == STORE_BOUND => {
                         let bound = error.context.get("bound").and_then(|value| value.as_u64())

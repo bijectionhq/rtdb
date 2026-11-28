@@ -53,6 +53,9 @@ A sample outside it answers `outside` (early or late), writes nothing and keeps 
 Next, each `Bound { key, delta, min, max }` is evaluated at the append's version over a 64-bit signed big-endian integer stored at `key` (absent key = `0`).
 If `current + delta` leaves `[min, max]` or overflows `i64`, the whole append refuses with `bound` naming that index, writes nothing, and records a receipt under its idempotency key.
 Concurrent `Bound`s on the same key never add to `reads` and never conflict with each other.
+An installation writer can attach an alternative to the first failed bound or to a set of fixed primary claims.
+After the request's read and clock guards pass, the selected denial publishes only its own writes and receipt at that append's stamp.
+For a claim alternative, the bounds and all unselected claims must pass before the selected claims are judged.
 A committing append receives its stamp: the clock sample in microseconds and the commit's version.
 The store overwrites every stamp placeholder of the writes (16 zero bytes at a named offset of a key or value) with the stamp's encoding, micros big-endian with the sign bit flipped and then the version big-endian, so stamped keys sort in commit order.
 A key placeholder lies at or past the key's partition prefix (a big-endian `u16` length, then that many bytes).
@@ -157,7 +160,7 @@ An entry's id is its key bytes and its `v` cell holds the value.
 `Append` is a v1 transaction whose guards are `Guard::Unwritten { range, since }` and whose one operation is `Op::Store`, its writes, bounds and window.
 The resolver judges the guards over the same branch index every other guard reads, then the window against its clock sample, which becomes the commit's system time, and then each `Bound` against the live 8-byte signed big-endian entry (absent = `0`).
 It fills the placeholders and applies the stamped writes and updated bound counters as puts and deletes of `store.entries`.
-A failing bound records `Outcome::Refused` with `rtdb.store/bound` and its index as a receipt under the append's key and writes nothing.
+A failing bound with no matching alternative records `Outcome::Refused` with `rtdb.store/bound` and its index as a receipt under the append's key. A selected alternative writes its effects and records `Outcome::StoreDenied` under the same key.
 The append's smoothed time is judged by `store_judge::admit` (the vendored `judge.rs`): outside the window it answers `outside`; otherwise a write-free append validates and any other commits with stamp `{ time, position }`.
 No pending timed v1 transaction blocks a store append, and no shared-main time floor raises one: each append settles at its own position.
 

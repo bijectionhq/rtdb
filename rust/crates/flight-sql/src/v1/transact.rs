@@ -549,6 +549,9 @@ pub(super) fn receipt(receipt: tx::Receipt) -> proto::Receipt {
                     .collect(),
             }),
             tx::Outcome::Refused { error: anomaly } => Outcome::Refused(error::detail(anomaly)),
+            tx::Outcome::StoreDenied => Outcome::Refused(error::detail(rtdb_types::Anomaly::fault(
+                tx::STORE_DENIAL_COMMITTED, "Read this denial through the Store append interface",
+            ))),
         }),
         replayed: receipt.replayed,
         decision_clock: None,

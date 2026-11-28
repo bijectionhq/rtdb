@@ -51,7 +51,7 @@ impl WriterCommand {
         Transact {
             key: hash.finalize().to_vec(), require: Vec::new(), window: Window::default(),
             guards: vec![guard],
-            ops: vec![Op::Store(StoreAppend { writes: Vec::new(), bounds: Vec::new(), derives: Vec::new(), window: Window::default() })],
+            ops: vec![Op::Store(StoreAppend { alternative: None, writes: Vec::new(), bounds: Vec::new(), derives: Vec::new(), window: Window::default() })],
             otherwise: Vec::new(), requires: Vec::new(), custody_request_digest: None, request_memory: None,
         }
     }

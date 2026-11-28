@@ -57,7 +57,7 @@ fn store_append_with_bounds(
     Transact {
         key: vec![key; 16], require: Vec::new(), window: Window::default(),
         guards: reads.into_iter().map(|range| Guard::Unwritten { range, since: basis(since) }).collect(),
-        ops: vec![Op::Store(StoreAppend { writes, bounds, derives: Vec::new(), window })], otherwise: Vec::new(), requires: Vec::new(),
+        ops: vec![Op::Store(StoreAppend { alternative: None, writes, bounds, derives: Vec::new(), window })], otherwise: Vec::new(), requires: Vec::new(),
         custody_request_digest: None, request_memory: None,
     }
 }
@@ -290,7 +290,7 @@ fn a_store_derive_diffs_retires_and_purges_atomically() {
         require: Vec::new(),
         window: Window::default(),
         guards: reads.into_iter().map(|range| Guard::Unwritten { range, since: basis(since) }).collect(),
-        ops: vec![Op::Store(StoreAppend { writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
+        ops: vec![Op::Store(StoreAppend { alternative: None, writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
         otherwise: Vec::new(),
         requires: Vec::new(),
         custody_request_digest: None,
@@ -365,7 +365,7 @@ fn a_store_derive_claim_is_judged_on_its_filled_key_at_ordering() {
         require: Vec::new(),
         window: Window::default(),
         guards: Vec::new(),
-        ops: vec![Op::Store(StoreAppend { writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
+        ops: vec![Op::Store(StoreAppend { alternative: None, writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
         otherwise: Vec::new(),
         requires: Vec::new(),
         custody_request_digest: None,
@@ -417,7 +417,7 @@ fn a_store_derive_close_removes_a_claim_at_ordering() {
         require: Vec::new(),
         window: Window::default(),
         guards: Vec::new(),
-        ops: vec![Op::Store(StoreAppend { writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
+        ops: vec![Op::Store(StoreAppend { alternative: None, writes: Vec::new(), bounds: Vec::new(), derives: vec![derive.encode()], window: Window::default() })],
         otherwise: Vec::new(),
         requires: Vec::new(),
         custody_request_digest: None,
@@ -554,6 +554,35 @@ fn a_store_append_bound_updates_without_conflicts_and_refuses_out_of_range() {
     }).unwrap();
     assert_eq!(page.entries.len(), 2);
     assert_eq!(view.store_value(&counter).unwrap(), Some(3i64.to_be_bytes().as_slice()));
+}
+
+#[test]
+fn a_store_bound_denial_spends_the_slot_before_a_competing_append_can_judge() {
+    let mut state = TransactState::new(INCARNATION);
+    let slot = b"rate-slot".to_vec();
+    let mut end = slot.clone();
+    end.push(0);
+    let mut first = store_append_with_bounds(
+        1, 0, vec![KeyRange { start: slot.clone(), end: Some(end) }], Vec::new(),
+        vec![StoreBound { key: b"counter".to_vec(), delta: 1, min: 0, max: 0 }], Window::default(),
+    );
+    let Op::Store(append) = &mut first.ops[0] else { unreachable!() };
+    append.alternative = Some(StoreDenial {
+        check: StoreDenialCheck::Bound(0),
+        writes: vec![StoreWrite { key: slot, value: Some(vec![1]), key_stamp: None, value_stamp: None }],
+        derives: Vec::new(),
+    });
+    let mut second = first.clone();
+    second.key = vec![2; 16];
+    let denied = plan(&state, &first, 1, 100, DEFAULT);
+    assert_eq!(apply(&mut state, 1, denied.record()).unwrap().outcome, Outcome::StoreDenied);
+    let conflicted = plan(&state, &second, 2, 200, DEFAULT);
+    assert_eq!(apply(&mut state, 2, conflicted.record()).unwrap().outcome, Outcome::Otherwise { failed: vec![0] });
+    let Resolution::Answer(replay) = state.resolve(&first, 3, Timestamp(300), DEFAULT, &claims()).unwrap() else {
+        panic!("The charged denial must replay the original receipt");
+    };
+    assert!(replay.replayed);
+    assert_eq!(replay.outcome, Outcome::StoreDenied);
 }
 
 #[test]
@@ -1963,7 +1992,7 @@ fn every_shape() -> Transact {
             Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent: true },
             Op::Delete { branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(-1)], valid: Some(ValidTime::Literal(Interval::from_micros(1, 2).unwrap())) },
             Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by".into(), column: "a".into(), additional_columns: Vec::new() }) },
-            Op::Store(StoreAppend { writes: vec![StoreWrite { key: vec![0; 16], value: None, key_stamp: Some(0), value_stamp: None }], bounds: vec![StoreBound { key: vec![1; 16], delta: -1, min: 0, max: 9 }], derives: Vec::new(), window: Window::default() }),
+            Op::Store(StoreAppend { alternative: None, writes: vec![StoreWrite { key: vec![0; 16], value: None, key_stamp: Some(0), value_stamp: None }], bounds: vec![StoreBound { key: vec![1; 16], delta: -1, min: 0, max: 9 }], derives: Vec::new(), window: Window::default() }),
         ],
         otherwise: vec![Op::DropBranch { branch: "child".into() }],
         requires: Vec::new(), custody_request_digest: None, request_memory: None,

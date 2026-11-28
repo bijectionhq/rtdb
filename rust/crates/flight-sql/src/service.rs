@@ -667,6 +667,7 @@ impl FlightService for Service {
             reply.metadata_mut().insert("x-rtdb-store-retained-basis", tonic::metadata::MetadataValue::from_static("1"));
         }
         if fenced_append {
+            reply.metadata_mut().insert("x-rtdb-claim-alternative", tonic::metadata::MetadataValue::from_static("1"));
             reply.metadata_mut().insert(crate::v1::WRITER_FENCE_HEADER, tonic::metadata::MetadataValue::from_static("2"));
         }
         if fenced_purge {

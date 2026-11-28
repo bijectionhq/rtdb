@@ -261,6 +261,39 @@ pub fn check_derives(derives: &[Vec<u8>], writes: &[StoreWrite]) -> Result<Vec<s
     Ok(decoded)
 }
 
+/// Check that the selected fixed keys occur in the primary and that its
+/// alternative writes cannot make another claim or change a prior line.
+pub fn check_denial_derives(
+    primary: &[store_derive::Derive],
+    claims: &std::collections::BTreeSet<Vec<u8>>,
+    derives: &[Vec<u8>],
+    writes: &[StoreWrite],
+) -> Result<Vec<store_derive::Derive>> {
+    use store_derive::{DeriveMode, EntryKind};
+    let mut matched = std::collections::BTreeSet::new();
+    for derive in primary {
+        if let DeriveMode::Replace { entries, .. } = &derive.mode {
+            for entry in entries.iter().filter(|entry| entry.kind == EntryKind::Claim && claims.contains(&entry.identity)) {
+                if entry.key_stamp.is_some() || !entry.key_instants.is_empty()
+                    || !store_derive::same_place(&entry.identity, &derive.manifest_prefix) {
+                    return Err(invalid_derive("A denial must select fixed claim keys in the deriving place"));
+                }
+                matched.insert(entry.identity.clone());
+            }
+        }
+    }
+    if &matched != claims {
+        return Err(invalid_derive("A denial selects an unknown claim"));
+    }
+    let decoded = check_derives(derives, writes)?;
+    if !decoded.iter().all(|derive| matches!(&derive.mode, DeriveMode::Replace { entries, .. }
+        if entries.iter().all(|entry| entry.kind != EntryKind::Claim)))
+    {
+        return Err(invalid_derive("A denial may only derive claim-free replacements"));
+    }
+    Ok(decoded)
+}
+
 /// Resolve every derived write against `view` at `stamp`, returning the
 /// concrete `(key, value)` mutations to apply before plain writes (T3).
 pub fn resolve_derives(
@@ -453,11 +486,15 @@ pub fn claim_refused(
     derives: &[store_derive::Derive],
     derived: &[(Vec<u8>, Option<Vec<u8>>)],
     stamp: StoreStamp,
+    selects: impl Fn(&[u8]) -> bool,
 ) -> Result<Option<usize>> {
     let stamp_bytes = stamp.encode();
     let overlay: BTreeMap<&[u8], Option<&[u8]>> = derived.iter().map(|(key, value)| (key.as_slice(), value.as_deref())).collect();
     for (index, derive) in derives.iter().enumerate() {
         for (identity, coverage) in store_derive::claims(derive, &stamp_bytes) {
+            if !selects(&identity) {
+                continue;
+            }
             let mut records = Vec::new();
             for (level, through) in store_derive::claim_levels(derive, &identity) {
                 let range = KeyRange { start: level.clone(), end: prefix_successor(&level) };

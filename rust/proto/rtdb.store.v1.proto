@@ -172,6 +172,8 @@ message AppendRequest {
   // present it must match RTDB's vendored DERIVE_DIGEST or the append fails
   // with rtdb.store/derive-version.
   optional string derive_digest = 9;
+  // Optional ordered denial effects for one selected bound or fixed claims.
+  optional ClaimAlternative claim_alternative = 10;
   // Inclusive oldest committed basis the ordered append requires to remain
   // available. It uses this request's incarnation and must be at or below since.
   optional uint64 required_basis = 11;
@@ -269,6 +271,13 @@ message StoreAccessDenial {
   string principal = 3;
 }
 
+message ClaimAlternative {
+  repeated bytes claims = 1;
+  repeated Write writes = 2;
+  repeated bytes derives = 3;
+  optional uint32 bound = 4;
+}
+
 message AppendReply {
   bytes incarnation = 1;
   oneof outcome {
@@ -292,6 +301,8 @@ message AppendReply {
     // append's derives applied (store_derive::claim_exceeded). Nothing was
     // written; recorded as a receipt under the append's key.
     uint32 claimed = 7;
+    // The alternative's writes committed at this stamp.
+    Stamp claim_denied = 8;
   }
 }
 

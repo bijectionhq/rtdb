@@ -343,6 +343,7 @@ mod tests {
 
     fn companion() -> proto::AppendRequest {
         proto::AppendRequest {
+            claim_alternative: None,
             key: vec![1; 16],
             incarnation: vec![2; 16],
             since: 7,

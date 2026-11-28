@@ -1504,7 +1504,7 @@ mod tests {
             window: Window::default(),
             guards: Vec::new(),
             requires: Vec::new(),
-            ops: vec![Op::Store(StoreAppend {
+            ops: vec![Op::Store(StoreAppend { alternative: None,
                 writes: vec![StoreWrite { key: key.to_vec(), value: Some(value.to_vec()), key_stamp: None, value_stamp: None }],
                 bounds: Vec::new(),
                 derives: Vec::new(),

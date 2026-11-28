@@ -308,6 +308,7 @@ async fn store_appends_require_the_latest_claim_for_the_same_placement() {
 
     let order = |epoch, writer| store::FenceWriterRequest { incarnation: incarnation.to_vec(), epoch, writer }.encode_to_vec().into();
     let append = |key, writer_fence| store::AppendRequest {
+            claim_alternative: None,
         key: vec![key; 16], incarnation: incarnation.to_vec(), writer_fence,
         writes: vec![store::Write { key: vec![key], value: Some(vec![key]), ..Default::default() }],
         ..Default::default()
@@ -362,6 +363,7 @@ async fn store_sizes_reports_the_committed_version_and_checks_incarnation() {
     key.extend(segment(b"row"));
     key.push(0);
     let append = store::AppendRequest {
+            claim_alternative: None,
         key: vec![1; 16], incarnation: incarnation.to_vec(),
         writes: vec![store::Write { key: key.clone(), value: Some(vec![0; 42]), ..Default::default() }],
         ..Default::default()
@@ -409,6 +411,7 @@ async fn default_store_reads_every_range_at_the_selected_retained_version() {
             key: key.to_vec(), value: Some(vec![value]), ..Default::default()
         }).collect();
         let append = store::AppendRequest {
+            claim_alternative: None,
             key: vec![value; 16], incarnation: incarnation.to_vec(), writes, ..Default::default()
         };
         let replies = client.action("rtdb.store.v1.Append", append.encode_to_vec().into()).await.unwrap();

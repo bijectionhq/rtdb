@@ -397,7 +397,7 @@ impl FundedReceipt {
                 let ops = match receipt.outcome {
                     Outcome::Then => &request.ops,
                     Outcome::Otherwise { .. } => &request.otherwise,
-                    Outcome::Refused { .. } => return Err(invalid_record()),
+                    Outcome::Refused { .. } | Outcome::StoreDenied => return Err(invalid_record()),
                 };
                 point.check_ops(ops, true).and_then(|()| point.check_effects(&tx.effects, true)).map_err(|_| invalid_record())
             }
