@@ -100,6 +100,7 @@ impl MultiDatabase {
             self.state().store_purge_floor,
             self.binary_checkpoints,
         )?;
+        let store_holds = self.state().store_holds.checkpoint();
         let kms = self.stream.kms.as_ref();
         let store = self.store.as_ref();
         let objects = &mut self.writer.as_mut().ok_or_else(no_writer)?.objects;
@@ -116,6 +117,7 @@ impl MultiDatabase {
                 &Manifest {
                     files,
                     pins: Vec::new(),
+                    store_holds,
                     payload,
                 },
             )

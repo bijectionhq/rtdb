@@ -173,7 +173,7 @@ impl VerifiedManifest {
     pub fn summary(&self) -> Self {
         Self {
             id: self.id,
-            manifest: Manifest { files: self.manifest.files.clone(), pins: self.manifest.pins.clone(), payload: Vec::new() },
+            manifest: Manifest { files: self.manifest.files.clone(), pins: self.manifest.pins.clone(), store_holds: self.manifest.store_holds.clone(), payload: Vec::new() },
             generation: self.generation,
         }
     }
@@ -186,7 +186,7 @@ impl PreparedObject {
         require_kind(self.id, ObjectKind::Manifest)?;
         Ok(VerifiedManifest {
             id: self.id,
-            manifest: Manifest { files: manifest.files.clone(), pins: manifest.pins.clone(), payload: Vec::new() },
+            manifest: Manifest { files: manifest.files.clone(), pins: manifest.pins.clone(), store_holds: manifest.store_holds.clone(), payload: Vec::new() },
             generation,
         })
     }

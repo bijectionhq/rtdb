@@ -2,7 +2,7 @@ use std::future::Future;
 
 use bytes::Bytes;
 use rtdb_crypt::{Context, Generation, Kms};
-use rtdb_format::journal::{Checkpoint, Manifest, Pin, Record};
+use rtdb_format::journal::{Checkpoint, Manifest, OrderedStoreHold, Pin, Record};
 use rtdb_types::{Anomaly, Result};
 
 use crate::{ObjectStore, PreparedObject, WriterObjects};
@@ -76,6 +76,7 @@ impl ErasurePlan {
         kms: &dyn Kms,
         clean_files: &[Bytes],
         pins: Vec<Pin>,
+        store_holds: Vec<OrderedStoreHold>,
         checkpoint_payload: Vec<u8>,
     ) -> Result<PreparedErasure> {
         if writer.database() != self.old.database {
@@ -93,6 +94,7 @@ impl ErasurePlan {
                 &Manifest {
                     files: files.iter().map(PreparedObject::id).collect(),
                     pins,
+                    store_holds,
                     payload: checkpoint_payload,
                 },
             )

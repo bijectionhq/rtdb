@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use rtdb_crypt::Generation;
-use rtdb_format::journal::{Checkpoint, Manifest, ObjectId};
+use rtdb_format::journal::{OrderedStoreHold, Checkpoint, Manifest, ObjectId};
 use rtdb_store::{ObjectStore, ReservedManifest};
 use rtdb_tx::transact::TransactState;
 use rtdb_types::{Anomaly, Result};
@@ -31,6 +31,7 @@ pub struct CheckpointCapture {
     through: Lsn,
     coordinates: JournalCoordinates,
     store_purge_floor: u64,
+    store_holds: Vec<OrderedStoreHold>,
     transactions: TransactState,
     closure: ClosureInputs,
     slot: ReservedManifest,
@@ -90,7 +91,7 @@ impl CheckpointBuilder {
         })
         .await
         .map_err(|error| Anomaly::fault("rtdb/checkpoint-build", error.to_string()))??;
-        let manifest = Manifest { files, pins: closure.pins().cloned().collect(), payload };
+        let manifest = Manifest { files, pins: closure.pins().cloned().collect(), store_holds: capture.store_holds, payload };
         timing.mark("payload");
         let image = capture.slot.seal(self.stream.kms.as_ref(), capture.generation, &manifest).await?;
         timing.mark("seal");
@@ -145,6 +146,7 @@ impl MultiDatabase {
         }
         let (through, generation, coordinates) = (state.head, state.generation, state.coordinates);
         let store_purge_floor = state.store_purge_floor;
+        let store_holds = state.store_holds.checkpoint();
         let closure = state.closure_inputs();
         let transactions = self.durable_transactions().clone();
         let slot = self.writer.as_mut().ok_or_else(no_writer)?.objects.reserve_manifest()?;
@@ -156,6 +158,7 @@ impl MultiDatabase {
             through,
             coordinates,
             store_purge_floor,
+            store_holds,
             transactions,
             closure,
             slot,

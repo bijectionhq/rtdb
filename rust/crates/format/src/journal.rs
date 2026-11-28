@@ -123,6 +123,22 @@ pub struct Pin {
     pub until: Option<i64>,
 }
 
+/// A private byte retention promise in one Store incarnation. The reader
+/// is an opaque identity and the deadline is exclusive in UTC microseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedStoreHold {
+    pub basis: Basis,
+    pub id: [u8; 16],
+    pub reader: [u8; 32],
+    pub expires_at_micros: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreHoldChange {
+    Retain(OrderedStoreHold),
+    Release(OrderedStoreHold),
+}
+
 /// The requested retention census and the ordered writer's lower time bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorePurgeClock {
@@ -198,6 +214,10 @@ pub enum Record {
         keep_from: u64,
         clock: StorePurgeClock,
     },
+    StoreHold {
+        change: StoreHoldChange,
+        lower_bound_micros: i64,
+    },
 }
 
 impl Record {
@@ -223,6 +243,8 @@ impl Record {
 pub struct Manifest {
     pub files: Vec<ObjectId>,
     pub pins: Vec<Pin>,
+    /// Byte retention promises at the local replay boundary, by hold ID.
+    pub store_holds: Vec<OrderedStoreHold>,
     pub payload: Vec<u8>,
 }
 

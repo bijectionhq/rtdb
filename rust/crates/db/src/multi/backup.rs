@@ -633,6 +633,7 @@ impl MultiDatabase {
         let manifest = Manifest {
             files,
             pins: Vec::new(),
+            store_holds: Vec::new(),
             payload: Committed::checkpoint_payload(&transactions, lease.until, false, coordinates)?,
         };
         let image = self.writer.as_mut().ok_or_else(no_writer)?.objects

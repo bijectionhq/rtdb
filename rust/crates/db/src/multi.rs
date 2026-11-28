@@ -48,7 +48,7 @@ mod ranked;
 mod rotation;
 mod retirement;
 mod store_floor;
-mod store_hold;
+pub(crate) mod store_hold;
 mod timed_store;
 mod timing;
 pub use backup::{AuthenticatedCut, BackupFileRelocation, BackupObjectReadback, InstallationAnchor, InstalledBackup, PortableBackup, VerifiedBackup};
@@ -137,7 +137,6 @@ struct Writer {
     uploaded: BTreeSet<ObjectId>,
     reclaimed_store_history_through: Option<Lsn>,
     retired_store_checkpoints: BTreeSet<ObjectId>,
-    store_holds: store_hold::StoreHolds,
 }
 
 /// One serialized database residence. The owner drives ticks and serving calls.
@@ -417,7 +416,6 @@ impl MultiDatabase {
                 uploaded: BTreeSet::new(),
                 reclaimed_store_history_through: None,
                 retired_store_checkpoints: BTreeSet::new(),
-                store_holds: store_hold::StoreHolds::default(),
             });
             if let Err(error) = self.finish_pending_erasure().await {
                 self.withdraw_writer();
@@ -957,6 +955,7 @@ impl MultiDatabase {
         let manifest = Manifest {
             files,
             pins: closure.pins().cloned().collect(),
+            store_holds: self.state().store_holds.checkpoint(),
             payload: Committed::checkpoint_payload_in(
                 self.durable_transactions(),
                 lease.until,

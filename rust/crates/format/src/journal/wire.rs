@@ -6,7 +6,7 @@ use super::{ObjectKind, invalid, require_kind};
 
 #[derive(Message)]
 pub(super) struct Record {
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17")]
     kind: Option<Kind>,
 }
 
@@ -44,6 +44,8 @@ enum Kind {
     StorePurgeFloor(StorePurgeFloor),
     #[prost(message, tag = "16")]
     StorePurgeReclaim(StorePurgeReclaim),
+    #[prost(message, tag = "17")]
+    StoreHold(StoreHold),
 }
 
 #[derive(Message)]
@@ -158,6 +160,34 @@ struct StorePurgeReclaim {
 }
 
 #[derive(Message)]
+struct StoreHold {
+    #[prost(sint64, optional, tag = "1")]
+    lower_bound_micros: Option<i64>,
+    #[prost(oneof = "HoldChange", tags = "2, 3")]
+    change: Option<HoldChange>,
+}
+
+#[derive(Oneof)]
+enum HoldChange {
+    #[prost(message, tag = "2")]
+    Retain(OrderedStoreHold),
+    #[prost(message, tag = "3")]
+    Release(OrderedStoreHold),
+}
+
+#[derive(Message)]
+struct OrderedStoreHold {
+    #[prost(bytes, tag = "1")]
+    basis: Vec<u8>,
+    #[prost(bytes, tag = "2")]
+    id: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    reader: Vec<u8>,
+    #[prost(sint64, optional, tag = "4")]
+    expires_at_micros: Option<i64>,
+}
+
+#[derive(Message)]
 struct TimedDecision {
     #[prost(uint64, tag = "1")]
     tx_lsn: u64,
@@ -171,6 +201,8 @@ pub(super) struct Manifest {
     pins: Vec<Pin>,
     #[prost(bytes, tag = "3")]
     payload: Vec<u8>,
+    #[prost(message, repeated, tag = "4")]
+    store_holds: Vec<OrderedStoreHold>,
 }
 
 impl TryFrom<&super::Record> for Record {
@@ -233,6 +265,13 @@ impl TryFrom<&super::Record> for Record {
                     census_micros: Some(clock.census_micros), lower_bound_micros: Some(clock.lower_bound_micros),
                 })
             },
+            StoreHold { change, lower_bound_micros } => Kind::StoreHold(self::StoreHold {
+                lower_bound_micros: Some(*lower_bound_micros),
+                change: Some(match change {
+                    super::StoreHoldChange::Retain(hold) => HoldChange::Retain(hold.into()),
+                    super::StoreHoldChange::Release(hold) => HoldChange::Release(hold.into()),
+                }),
+            }),
         };
         Ok(Self { kind: Some(kind) })
     }
@@ -317,8 +356,35 @@ impl TryFrom<Record> for super::Record {
                         keep_from: floor.keep_from, clock,
                     }
                 },
+                Kind::StoreHold(hold) => Self::StoreHold {
+                    lower_bound_micros: hold.lower_bound_micros.ok_or_else(|| invalid("A Store hold records its lower clock bound"))?,
+                    change: match hold.change.ok_or_else(|| invalid("A Store hold records its ordered change"))? {
+                        HoldChange::Retain(hold) => super::StoreHoldChange::Retain(hold.try_into()?),
+                        HoldChange::Release(hold) => super::StoreHoldChange::Release(hold.try_into()?),
+                    },
+                },
             },
         )
+    }
+}
+
+impl From<&super::OrderedStoreHold> for OrderedStoreHold {
+    fn from(hold: &super::OrderedStoreHold) -> Self {
+        Self { basis: hold.basis.to_bytes().to_vec(), id: hold.id.to_vec(), reader: hold.reader.to_vec(),
+            expires_at_micros: Some(hold.expires_at_micros) }
+    }
+}
+
+impl TryFrom<OrderedStoreHold> for super::OrderedStoreHold {
+    type Error = Anomaly;
+
+    fn try_from(hold: OrderedStoreHold) -> Result<Self> {
+        Ok(Self {
+            basis: Basis::from_bytes(&hold.basis).map_err(|_| invalid("A Store hold names its exact basis"))?,
+            id: hold.id.try_into().map_err(|_| invalid("A Store hold ID has 16 bytes"))?,
+            reader: hold.reader.try_into().map_err(|_| invalid("A Store hold reader has 32 bytes"))?,
+            expires_at_micros: hold.expires_at_micros.ok_or_else(|| invalid("A Store hold has an absolute deadline"))?,
+        })
     }
 }
 
@@ -361,6 +427,7 @@ impl TryFrom<&super::Manifest> for Manifest {
                 .iter()
                 .map(Pin::try_from)
                 .collect::<Result<_>>()?,
+            store_holds: manifest.store_holds.iter().map(OrderedStoreHold::from).collect(),
             payload: manifest.payload.clone(),
         })
     }
@@ -381,6 +448,7 @@ impl TryFrom<Manifest> for super::Manifest {
                 .into_iter()
                 .map(super::Pin::try_from)
                 .collect::<Result<_>>()?,
+            store_holds: manifest.store_holds.into_iter().map(super::OrderedStoreHold::try_from).collect::<Result<_>>()?,
             payload: manifest.payload,
         })
     }

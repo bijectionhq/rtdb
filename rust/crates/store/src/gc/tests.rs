@@ -25,6 +25,7 @@ fn manifest(epoch: u64, seq: u64, files: Vec<ObjectId>, pins: Vec<Pin>) -> Verif
     let manifest = Manifest {
         files,
         pins,
+        store_holds: Vec::new(),
         payload: Vec::new(),
     };
     VerifiedManifest {

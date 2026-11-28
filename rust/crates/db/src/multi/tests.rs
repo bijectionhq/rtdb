@@ -684,7 +684,7 @@ async fn store_version_holds_and_purge_share_the_writer_queue() {
 }
 
 #[tokio::test]
-async fn store_version_hold_cannot_reopen_on_a_replacement_writer() {
+async fn store_version_hold_survives_checkpoint_and_replacement_writer() {
     let journal = journals().await;
     let cluster = Cluster::new();
     let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
@@ -696,6 +696,9 @@ async fn store_version_hold_cannot_reopen_on_a_replacement_writer() {
     let retain = StoreVersionHoldRequest::Retain { basis: old, expires_at: Timestamp(1_000) };
     let StoreVersionHoldReply::Held(hold) = writer.store_version_hold(reader, retain).await.unwrap() else { panic!("expected a hold"); };
     let reopen = StoreVersionHoldRequest::Reopen(hold.key);
+    let through = writer.state().head;
+    writer.checkpoint(Vec::new()).await.unwrap();
+    assert!(writer.retained_floor().unwrap() > through);
     let next_journal = Arc::new(journal.handle(NODE_2_IDENTITY));
     let mut successor = cluster.node(2, next_journal.clone());
     assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap_err().code, "rtdb/no-writer");
@@ -706,7 +709,12 @@ async fn store_version_hold_cannot_reopen_on_a_replacement_writer() {
     cluster.at(200);
     successor.tick(&live(2)).await.unwrap();
     assert_eq!(writer.store_version_hold(reader, reopen).await.unwrap_err().code, "rtdb/no-writer");
-    assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap_err().code, "rtdb.store/hold-unavailable");
+    assert_eq!(successor.store_version_hold([2; 32], reopen).await.unwrap_err().code, "rtdb.store/hold-unavailable");
+    assert_eq!(successor.store_version_hold(reader, reopen).await.unwrap(), StoreVersionHoldReply::Held(hold));
+    assert_eq!(successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap_err().code,
+        "rtdb.store/purge-retention");
+    let release = StoreVersionHoldRequest::Release(hold.key);
+    assert_eq!(successor.store_version_hold(reader, release).await.unwrap(), StoreVersionHoldReply::Released(hold.key));
     successor.publish_store_purge_floor(current, current.position(), 0, &[], None).await.unwrap();
     assert_eq!(successor.store_version_hold(reader, retain).await.unwrap_err().code, "rtdb/cursor-expired");
 }

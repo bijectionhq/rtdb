@@ -80,6 +80,7 @@ async fn erasure_retries_exact_rotation_bytes_and_keeps_clean_checkpoint_recover
             &kms,
             &[Bytes::from_static(b"keep me")],
             vec![],
+            vec![],
             vec![42],
         )
         .await

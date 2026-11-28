@@ -4394,6 +4394,7 @@ actor Gateway {
     -- Multi writer Store reads, ranks and watches acquire a byte-basis turn before reading. Final delivery checks the same ordered Store writer claim or fence, journal writer and runtime generation.
     -- A replacement Store claim fences the previous turn's delivery even if the journal writer stays in place. Its original in-flight buffers retain their byte protection until released.
     -- An ordered Store purge records its census time and the writer lower-clock bound used for expiry. Replay checks those coordinates against the writer lease.
+    -- Store Version hold acquisition and release order with purge under the same writer. Checkpoints carry the settled hold inventory for that incarnation. A fresh restore does not inherit source receipt ownership.
     identified_by: MemberRecord where role = gateway
 }
 

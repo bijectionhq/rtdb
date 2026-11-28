@@ -71,6 +71,7 @@ impl MultiDatabase {
         let manifest = Manifest {
             files: Vec::new(),
             pins: Vec::new(),
+            store_holds: Vec::new(),
             payload: Committed::checkpoint_payload(transactions, lease.until, false, coordinates)?,
         };
         let image = self

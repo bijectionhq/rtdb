@@ -4,7 +4,7 @@ use std::{
 };
 
 use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryEntry, RecoverySource};
-use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Record};
+use rtdb_format::journal::{Checkpoint, ObjectId, ObjectKind, Record, StoreHoldChange};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex};
 use rtdb_store::{ObjectStore, Reachability, VerifiedManifest, read_manifest};
 use rtdb_tx::transact::{Receipt, TransactState, TransactionRecord};
@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::journal::{Entry, Stream, journal_error, journal_rewritten, journal_shortened, next};
+use crate::multi::store_hold::StoreHolds;
 
 const ROTATING_CHECKPOINT: u8 = 1;
 const RESTORED_HISTORY: u8 = 2;
@@ -290,6 +291,7 @@ pub(crate) struct Committed {
     pub(crate) rotation: Option<Rotation>,
     pub(crate) coordinates: JournalCoordinates,
     pub(crate) store_purge_floor: u64,
+    pub(crate) store_holds: StoreHolds,
     pub(crate) checkpointed_store_history_floor: u64,
     /// The latest retained recovery record.
     pub(crate) recovery: Option<JournalRecovery>,
@@ -319,6 +321,7 @@ impl Committed {
             rotation: None,
             coordinates: JournalCoordinates::default(),
             store_purge_floor: 0,
+            store_holds: StoreHolds::default(),
             checkpointed_store_history_floor: 0,
             recovery: None,
             recovery_epoch: 0,
@@ -768,10 +771,43 @@ impl Committed {
                 }
                 index.check_store_purge_guards(*since, *keep_from, &[])?;
                 index.check_store_purge_branch_retention(*keep_from)?;
+                let lower = match &entry.record {
+                    Record::StorePurgeReclaim { clock, .. } => clock.lower_bound_micros,
+                    _ => i64::MIN,
+                };
+                self.store_holds.check_floor(*keep_from, lower)?;
+                self.store_holds.expire(lower);
                 if reclaim {
                     self.transactions.reclaim_store_history(*keep_from);
                 }
                 self.store_purge_floor = self.store_purge_floor.max(*keep_from);
+                self.generation
+            }
+            Record::StoreHold { change, lower_bound_micros } => {
+                if self.lease.is_none_or(|(epoch, until)| epoch != entry.epoch || *lower_bound_micros >= until)
+                    || self.generation != entry.generation
+                    || self.transactions.recover_pending().is_some()
+                    || self.transactions.pending_erasure().is_some()
+                {
+                    return Err(invalid("A Store hold requires a settled writer and clock"));
+                }
+                let index = self.transactions.index();
+                let hold = match change {
+                    StoreHoldChange::Retain(hold) | StoreHoldChange::Release(hold) => hold,
+                };
+                if hold.basis.incarnation() != index.head().basis.incarnation() {
+                    return Err(invalid("A Store hold belongs to another incarnation"));
+                }
+                if matches!(change, StoreHoldChange::Retain(_)) {
+                    if index.has_custody_groups() || index.has_visibility_history() {
+                        return Err(invalid("The ordered-bytes store serves only an unlabelled database"));
+                    }
+                    if hold.basis.position() < self.store_purge_floor.max(index.store_history_floor()) {
+                        return Err(store_delivery_expired());
+                    }
+                    index.exact(hold.basis)?;
+                }
+                self.store_holds.apply(*change, *lower_bound_micros)?;
                 self.generation
             }
             Record::KeyRotate { generation, at } => {
@@ -1055,7 +1091,22 @@ impl Committed {
         } else {
             TransactState::decode_checkpoint(bytes, expected)?
         };
-        self.checkpointed_store_history_floor = self.transactions.index().store_history_floor();
+        let index = self.transactions.index();
+        let holds = &image.contents().store_holds;
+        if checkpoint.restore && !holds.is_empty() {
+            return Err(invalid("A new Store incarnation does not inherit its source reader promises"));
+        }
+        if !checkpoint.restore && (!self.records.is_empty() || self.base.is_some())
+            && *holds != self.store_holds.checkpoint()
+        {
+            return Err(invalid("The checkpoint does not preserve the settled Store hold inventory"));
+        }
+        self.checkpointed_store_history_floor = index.store_history_floor();
+        self.store_holds = StoreHolds::from_checkpoint(holds, expected.basis,
+            store_purge_floor.max(self.checkpointed_store_history_floor))?;
+        for hold in holds {
+            index.exact(hold.basis)?;
+        }
         self.store_purge_floor = store_purge_floor;
         self.lease = Some((epoch, until));
         Ok(())

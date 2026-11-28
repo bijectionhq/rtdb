@@ -69,6 +69,12 @@ fn record_kinds_round_trip_with_fixed_tags() {
             keep_from: u64::MAX - 1,
             clock: StorePurgeClock { census_micros: 7, lower_bound_micros: 8 },
         },
+        Record::StoreHold {
+            change: StoreHoldChange::Retain(OrderedStoreHold {
+                basis: Basis::new([0xab; 16], 12), id: [1; 16], reader: [2; 32], expires_at_micros: 25,
+            }),
+            lower_bound_micros: 4,
+        },
     ];
     for (i, record) in records.into_iter().enumerate() {
         let encoded = record.encode().unwrap();
@@ -104,7 +110,7 @@ fn malformed_record_envelopes_are_refused() {
     assert!(Record::decode(&bytes).is_err());
 
     let mut unknown = RECORD_HEADER.to_vec();
-    unknown.extend_from_slice(&[0x8a, 0x01, 0]);
+    unknown.extend_from_slice(&[0x92, 0x01, 0]);
     assert!(Record::decode(&unknown).is_err());
     let mut missing_floor_basis = RECORD_HEADER.to_vec();
     missing_floor_basis.extend_from_slice(&[0x7a, 0]);
@@ -131,6 +137,7 @@ fn manifest_round_trips_complete_file_and_pin_state() {
             manifest: object(ObjectKind::Manifest),
             until: None,
         }],
+        store_holds: vec![OrderedStoreHold { basis: Basis::new([0xab; 16], 12), id: [1; 16], reader: [2; 32], expires_at_micros: 25 }],
         payload: vec![1, 2, 3],
     };
     let encoded = manifest.encode().unwrap();

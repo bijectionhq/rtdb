@@ -187,7 +187,7 @@ impl MultiDatabase {
         payload.extend_from_slice(&cut.basis.position().to_be_bytes());
         payload.extend_from_slice(&cut.system_time.0.to_be_bytes());
         payload.extend_from_slice(&checkpoint);
-        let manifest = Manifest { files: Vec::new(), pins: Vec::new(), payload };
+        let manifest = Manifest { files: Vec::new(), pins: Vec::new(), store_holds: Vec::new(), payload };
         let image = self.writer.as_mut().ok_or_else(no_writer)?.objects
             .manifest(self.stream.kms.as_ref(), generation, &manifest).await?;
         image.put(self.store.as_ref()).await?;

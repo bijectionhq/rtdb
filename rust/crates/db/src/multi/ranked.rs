@@ -230,6 +230,7 @@ impl MultiDatabase {
                 &Manifest {
                     files: members,
                     pins: Vec::new(),
+                    store_holds: Vec::new(),
                     payload,
                 },
             )

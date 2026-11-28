@@ -117,6 +117,7 @@ impl Reachability {
                 | Record::Commissioned
                 | Record::StorePurgeFloor { .. }
                 | Record::StorePurgeReclaim { .. }
+                | Record::StoreHold { .. }
                 | Record::KeyRotate { .. }
                 | Record::KeyRetirement { .. }
                 | Record::Settle { .. }
