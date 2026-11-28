@@ -616,9 +616,11 @@ impl WorldShadow {
     pub fn record(self, id: &EntityId) -> Result<StructFields<Value>> {
         let (mut row, fields) = match self {
             Self::Present(row) => {
-                if row.get("_id").map(Value::entity_id).transpose()?.as_ref() != Some(id)
-                    || row.keys().any(|name| name != "_id" && name.starts_with('_'))
-                {
+                let matches_id = match row.get("_id") {
+                    Some(Value::Utf8(stored)) => matches!(id, EntityId::String(key) if stored == key),
+                    stored => stored.map(Value::entity_id).transpose()?.as_ref() == Some(id),
+                };
+                if !matches_id || row.keys().any(|name| name != "_id" && name.starts_with('_')) {
                     return Err(OwnedWorld::unavailable());
                 }
                 let fields = row.keys().filter(|name| *name != "_id")

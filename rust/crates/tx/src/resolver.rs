@@ -3360,13 +3360,7 @@ impl<'a> OpenTransaction<'a> {
                 let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
                     .checked_mul(2).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
                 let id = crate::source::owned_document_id(row, &self.context.memory)?;
-                let shadow = rtdb_types::WorldShadow::from_record(row.clone())?;
-                match &shadow {
-                    rtdb_types::WorldShadow::Present(fact) => validate_owned_schema(schema, fact)?,
-                    rtdb_types::WorldShadow::Deleted if create_only => return Err(unavailable()),
-                    rtdb_types::WorldShadow::Deleted => (),
-                }
-                if &shadow.record(&id)? != row { return Err(unavailable()); }
+                validate_world_shadow_row(schema, row, &id, create_only)?;
                 if create_only {
                     self.require_world_create_absence(owner, &root, relation, &id).await?;
                 }
@@ -4550,6 +4544,34 @@ fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Va
     row.values().try_for_each(validate_owned_decimals)
 }
 
+fn validate_world_shadow_row(
+    schema: &rtdb_types::OwnedSchema, row: &StructFields<Value>, id: &EntityId, create_only: bool,
+) -> Result<()> {
+    use rtdb_types::{OwnedWorld, WorldShadow};
+
+    if matches!((row.first_key_value(), id),
+        (Some((name, Value::Utf8(stored))), EntityId::String(id)) if name == "_id" && stored == id)
+        && let Some((name, Value::List(marker))) = row.last_key_value()
+        && name == WorldShadow::FIELDS
+        && row.len() == marker.len() + 2
+        && row.iter().skip(1).take(marker.len()).enumerate().all(|(index, (name, value))| {
+            !name.starts_with('_') && marker.view().utf8(index) == Some(name.as_str())
+                && matches!(value, Value::Utf8(_) | Value::Binary(_) | Value::Null)
+        })
+    {
+        return schema.validate_world_payload(row);
+    }
+
+    let shadow = WorldShadow::from_record(row.clone())?;
+    match &shadow {
+        WorldShadow::Present(fact) => validate_owned_schema(schema, fact)?,
+        WorldShadow::Deleted if create_only => return Err(OwnedWorld::unavailable()),
+        WorldShadow::Deleted => (),
+    }
+    if &shadow.record(id)? != row { return Err(OwnedWorld::unavailable()); }
+    Ok(())
+}
+
 fn validate_owned_decimals(value: &Value) -> Result<()> {
     match value {
         Value::Decimal(_) => { rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))?; }
@@ -5169,6 +5191,63 @@ fn require_unchanged_range(verified: Result<bool>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_world_shadow_validation_preserves_presence_and_checked_errors() -> Result<()> {
+        use rtdb_types::{OwnedSchema, OwnedWorld, WorldShadow};
+
+        let schema = OwnedSchema::from_json(br#"{"fields":[
+            {"name":"note","type":{"kind":"utf8"},"optional":true,"nullable":false},
+            {"name":"label","type":{"kind":"utf8"},"optional":false,"nullable":true},
+            {"name":"payload","type":{"kind":"binary"},"optional":false,"nullable":false},
+            {"name":"score","type":{"kind":"f64"},"optional":true,"nullable":false}
+        ]}"#)?;
+        let id = EntityId::String("world-column/slot".into());
+        let mut fact = StructFields::from([
+            ("_id".into(), id.as_value()),
+            ("payload".into(), Value::Binary(vec![0xa5; 4096])),
+            ("label".into(), Value::Null),
+        ]);
+        let row = WorldShadow::Present(fact.clone()).record(&id)?;
+        assert_eq!(WorldShadow::Present(fact.clone()).record(&EntityId::Binary(b"world-column/slot".to_vec())).unwrap_err(),
+            OwnedWorld::unavailable());
+        validate_world_shadow_row(&schema, &row, &id, false)?;
+        assert_eq!(row.keys().map(String::as_str).collect::<Vec<_>>(), ["_id", "payload", "label", WorldShadow::FIELDS]);
+        assert_eq!(row.get("label"), Some(&Value::Null));
+
+        let names = arrow_array::StringArray::from(vec!["payload", "label"]);
+        let packed_names = rtdb_types::ListValue::from_scalar_arrow(
+            Arc::new(arrow_schema::Field::new("item", DataType::Utf8, false)), Arc::new(names),
+        ).unwrap();
+        let mut packed = row.clone();
+        packed.insert(WorldShadow::FIELDS.into(), Value::List(packed_names));
+        validate_world_shadow_row(&schema, &packed, &id, false)?;
+        packed.swap_indices(1, 2);
+        validate_world_shadow_row(&schema, &packed, &id, false)?;
+
+        fact.insert("note".into(), Value::Utf8("café".into()));
+        validate_world_shadow_row(&schema, &WorldShadow::Present(fact.clone()).record(&id)?, &id, true)?;
+        let mut nan = fact.clone();
+        nan.insert("score".into(), Value::F64(f64::NAN));
+        let nan = WorldShadow::Present(nan).record(&id)?;
+        assert_eq!(validate_world_shadow_row(&schema, &nan, &id, false).unwrap_err(), OwnedWorld::unavailable());
+        fact.remove("label");
+        let missing = WorldShadow::Present(fact.clone()).record(&id)?;
+        assert_eq!(validate_world_shadow_row(&schema, &missing, &id, false).unwrap_err(),
+            validate_owned_schema(&schema, &fact).unwrap_err());
+
+        let mut malformed = row.clone();
+        malformed.insert(WorldShadow::FIELDS.into(), Value::list(vec![Value::Utf8("payload".into()); 2]));
+        assert_eq!(validate_world_shadow_row(&schema, &malformed, &id, false).unwrap_err(), OwnedWorld::unavailable());
+        let mut padded = row;
+        padded.insert("extra".into(), Value::Undefined);
+        assert_eq!(validate_world_shadow_row(&schema, &padded, &id, false).unwrap_err(), OwnedWorld::unavailable());
+
+        let deleted = WorldShadow::Deleted.record(&id)?;
+        validate_world_shadow_row(&schema, &deleted, &id, false)?;
+        assert_eq!(validate_world_shadow_row(&schema, &deleted, &id, true).unwrap_err(), OwnedWorld::unavailable());
+        Ok(())
+    }
 
     #[test]
     fn range_validation_reports_a_stale_range_only_for_a_completed_negative_evaluation() {

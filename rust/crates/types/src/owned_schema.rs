@@ -684,13 +684,22 @@ impl OwnedSchema {
     }
 
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
+        self.validate_row_omitting(row, None)
+    }
+
+    /// Validates the fact fields of a canonical world row with an already checked presence marker.
+    pub fn validate_world_payload(&self, row: &StructFields<Value>) -> Result<()> {
+        self.validate_row_omitting(row, Some(crate::WorldShadow::FIELDS))
+    }
+
+    fn validate_row_omitting(&self, row: &StructFields<Value>, omit: Option<&str>) -> Result<()> {
         for field in &self.0.fields {
             if !field.accepts(row.get(field.name.as_str())) {
                 return Err(nonconforming(&field.name));
             }
         }
         for (name, value) in row {
-            if !matches!(name.as_str(), "_id" | "_valid_from" | "_valid_to")
+            if Some(name.as_str()) != omit && !matches!(name.as_str(), "_id" | "_valid_from" | "_valid_to")
                 && !matches!(value, Value::Undefined)
                 && !self.0.fields.iter().any(|field| &field.name == name)
             {

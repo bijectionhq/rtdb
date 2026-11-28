@@ -459,6 +459,7 @@
 -- A null fact in a delete selects an absence shadow, and a replacement or insert supplies a complete fact.
 -- Flight records the typed identity first in a present shadow and lists its remaining payload fields in their submitted order.
 -- An admitted absence marker removes its named fields from the shadow while other explicit null fields remain present.
+-- The ordered writer checks each complete shadow fact against the retained parent declaration using the shadow's explicit field presence.
 -- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
 -- An ordered write that advances a capacity frontier under existing rules preserves the complete rule list, including its predicate bytes.
 -- An ordered write that advances a uniqueness frontier under existing paths preserves their projected columns in canonical path-name order.
